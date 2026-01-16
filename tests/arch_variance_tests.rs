@@ -1,7 +1,8 @@
 mod common;
 use common::TestBus;
+use m68k::NoOpHleHandler;
+use m68k::core::cpu::CpuCore;
 use m68k::core::types::CpuType;
-use m68k::{CpuCore, NoOpHleHandler};
 
 fn run_test_inspect(cpu_type: CpuType, binary: &[u8], max_instructions: i32) -> u32 {
     let mut cpu = CpuCore::new();
@@ -17,16 +18,12 @@ fn run_test_inspect(cpu_type: CpuType, binary: &[u8], max_instructions: i32) -> 
 
     let mut hle = NoOpHleHandler;
     for _ in 0..max_instructions {
-        if cpu.stopped != 0 {
+        if cpu.is_stopped() || cpu.is_halted() {
             break;
         }
         cpu.step_with_hle_handler(&mut bus, &mut hle);
 
-        // If we hit a double bus fault (halted), we stop
-        // m68k implementation of double fault usually sets halted state?
-        // CpuCore::step returns void.
-        // No public halted field; rely on `stopped` for now.
-        // Need to check cpu structure or just rely on 'stopped' if stop instruction used)
+        // `is_halted()` surfaces double-fault halts.
     }
 
     // Return D0 register value
