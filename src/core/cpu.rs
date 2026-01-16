@@ -434,6 +434,18 @@ impl CpuCore {
         self.dar[reg & 7] = value;
     }
 
+    /// Returns true if the CPU is stopped via STOP.
+    #[inline]
+    pub fn is_stopped(&self) -> bool {
+        self.stopped != 0 && self.run_mode != RUN_MODE_BERR_AERR_RESET
+    }
+
+    /// Returns true if the CPU halted due to a double-fault/bus-error reset condition.
+    #[inline]
+    pub fn is_halted(&self) -> bool {
+        self.stopped != 0 && self.run_mode == RUN_MODE_BERR_AERR_RESET
+    }
+
     /// Get address register.
     #[inline]
     pub fn a(&self, reg: usize) -> u32 {

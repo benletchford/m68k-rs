@@ -25,7 +25,7 @@ fn run_test_inspect(cpu_type: CpuType, binary: &[u8], max_instructions: i32) -> 
         // If we hit a double bus fault (halted), we stop
         // m68k implementation of double fault usually sets halted state?
         // CpuCore::step returns void.
-        // If cpu.halted? (m68k doesn't expose halted public field directly perhaps?
+        // No public halted field; rely on `stopped` for now.
         // Need to check cpu structure or just rely on 'stopped' if stop instruction used)
     }
 

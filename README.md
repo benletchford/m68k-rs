@@ -194,13 +194,15 @@ m68k/
 
 ### Key Types
 
-| Type         | Description                        |
-| ------------ | ---------------------------------- |
-| `CpuCore`    | Main CPU state and execution       |
-| `CpuType`    | CPU model selection enum           |
-| `AddressBus` | Trait for memory/IO implementation |
-| `HleHandler` | Trait for HLE interception         |
-| `StepResult` | Instruction execution result       |
+| Type                    | Description                        |
+| ----------------------- | ---------------------------------- |
+| `CpuCore`               | Main CPU state and execution       |
+| `CpuType`               | CPU model selection enum           |
+| `AddressBus`            | Trait for memory/IO implementation |
+| `HleHandler`            | Trait for HLE interception         |
+| `StepResult`            | Instruction execution result       |
+| `CpuCore::is_stopped()` | STOP state check                   |
+| `CpuCore::is_halted()`  | Double-fault halt check            |
 
 ## Performance
 

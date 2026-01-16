@@ -10,6 +10,5 @@ pub mod fpu;
 pub mod mmu;
 
 // Re-export commonly used types from core
-pub use core::cpu::CpuCore;
 pub use core::memory::AddressBus;
 pub use core::types::{CpuType, HleHandler, NoOpHleHandler, Size, StepResult};
