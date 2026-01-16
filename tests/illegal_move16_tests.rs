@@ -80,7 +80,7 @@ fn test_move16_is_illegal_on_68020() {
     // Illegal instruction vector (vector 4) -> 0x0300
     bus.write_long_at(0x10, 0x0300);
 
-    // MOVE16 (0xF620) - 68040 only, should take Line-F on 68020
+    // MOVE16 (0xF620) - 68030/68040 only, should be illegal on 68020
     bus.write_word_at(0x0200, 0xF620);
 
     cpu.reset(&mut bus);

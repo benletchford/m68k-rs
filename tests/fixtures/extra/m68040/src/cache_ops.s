@@ -1,5 +1,5 @@
 .include "entry.s"
-/* Test: CINV/CPUSH - Cache Invalidate/Push (68040 only) */
+/* Test: CINV/CPUSH - Cache Invalidate/Push (68030/68040; this fixture targets 68040) */
 
 run_test:
     /* Test 1: CINVA DC - Invalidate all data cache */

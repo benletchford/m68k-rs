@@ -131,7 +131,7 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
 
     let sub = (opcode >> 8) & 0xF;
 
-    // MOVE16 (68040 only): 16-byte aligned block transfer
+    // MOVE16 (68030/68040): 16-byte aligned block transfer
     // Pattern: 1111 0110 0010 0yyy (0xF620-0xF627) for (Ax)+,(Ay)+
     if (opcode & 0xFFF8) == 0xF620 {
         let supports_move16 = matches!(

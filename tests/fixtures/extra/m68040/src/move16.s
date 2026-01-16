@@ -1,5 +1,5 @@
 .include "entry.s"
-/* Test: MOVE16 - 16-byte Aligned Block Move (68040 only) */
+/* Test: MOVE16 - 16-byte Aligned Block Move (68030/68040; this fixture targets 68040) */
 
 .set SRC_LOC, STACK2_BASE
 .set DST_LOC, STACK2_BASE + 0x100

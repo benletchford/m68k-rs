@@ -1,4 +1,4 @@
-// MOVE16 - 16-byte Aligned Block Transfer (68040 only)
+// MOVE16 - 16-byte Aligned Block Transfer (68030/68040)
 //
 // Opcode (Ax)+,(Ay)+: 1111 0110 0010 0yyy with extension 1xxx 0000 0000 0000
 // Transfers 16 bytes from source to destination, both addresses aligned to 16-byte boundary
@@ -7,7 +7,7 @@ use crate::core::cpu::CpuCore;
 use crate::core::memory::AddressBus;
 
 impl CpuCore {
-    /// MOVE16 - 16-byte aligned block transfer (68040 only).
+    /// MOVE16 - 16-byte aligned block transfer (68030/68040).
     /// Format: (Ax)+,(Ay)+
     /// Opcode: 1111 0110 0010 0yyy, extension: 1xxx 0000 0000 0000
     pub fn exec_move16<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
