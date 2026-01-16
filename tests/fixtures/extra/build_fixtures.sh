@@ -14,7 +14,7 @@ if ! command -v docker &> /dev/null; then
     exit 1
 fi
 
-IMAGE_NAME="rusashi-m68k-builder"
+IMAGE_NAME="m68k-builder"
 
 # Build Docker image if needed
 if ! docker image inspect "$IMAGE_NAME" > /dev/null 2>&1; then

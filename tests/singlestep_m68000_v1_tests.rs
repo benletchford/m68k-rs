@@ -651,7 +651,7 @@ fn check_state_68000(
     has_addr_error_txn: bool,
 ) -> Result<(), String> {
     // If the fixture includes bus-level address-error cycles, it is asserting bus/prefetch-
-    // accurate behavior (including exactly when the fault occurs). Rusashi is not bus/prefetch-
+    // accurate behavior (including exactly when the fault occurs). m68k is not bus/prefetch-
     // accurate, so we skip these cases entirely.
     if has_addr_error_txn {
         let _ = (expected, cpu, bus, ctx, opcode);
@@ -713,7 +713,7 @@ fn check_state_68000(
         ));
     }
     // PC in these fixtures is MAME's `m_au` (next prefetch address) and is sensitive to prefetch
-    // modeling details. Rusashi currently doesn't emulate the full prefetch queue, so don't fail
+    // modeling details. m68k currently doesn't emulate the full prefetch queue, so don't fail
     // tests solely on PC unless explicitly requested.
     if std::env::var("M68K_SST_STRICT_PC").ok().as_deref() == Some("1") {
         let exp_pc = reg(expected, "pc");
@@ -747,7 +747,7 @@ fn check_state_68000(
     // Memory expectations: compare bytes at specified addresses.
     //
     // SingleStepTests includes bus-level address-error cycles (tw=4/5) and expects the resulting
-    // stack frame / bus artifacts in RAM. Rusashi is not bus-cycle accurate, so we skip RAM
+    // stack frame / bus artifacts in RAM. m68k is not bus-cycle accurate, so we skip RAM
     // assertions for these cases and focus on architectural state (regs/SR/PC).
     if !has_addr_error_txn {
         for (addr, b) in &expected.ram {

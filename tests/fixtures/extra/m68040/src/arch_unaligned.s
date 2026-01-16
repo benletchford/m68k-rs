@@ -57,7 +57,7 @@ addr_err_handler:
     /* If it faults, we are likely on 68000/010. */
     
     /* Let's trigger a STOP 0x2700, and rely on Rust harness inspecting registers from Stopped state? */
-    /* Rusashi harness loops until `cpu.stopped != 0`. */
+    /* m68k harness loops until `cpu.stopped != 0`. */
     
     stop #0x2700
     

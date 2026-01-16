@@ -23,9 +23,9 @@ fn run_test_inspect(cpu_type: CpuType, binary: &[u8], max_instructions: i32) -> 
         cpu.step_with_hle_handler(&mut bus, &mut hle);
 
         // If we hit a double bus fault (halted), we stop
-        // Rusashi implementation of double fault usually sets halted state?
+        // m68k implementation of double fault usually sets halted state?
         // CpuCore::step returns void.
-        // If cpu.halted? (Rusashi doesn't expose halted public field directly perhaps?
+        // If cpu.halted? (m68k doesn't expose halted public field directly perhaps?
         // Need to check cpu structure or just rely on 'stopped' if stop instruction used)
     }
 
