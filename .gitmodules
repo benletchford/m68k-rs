@@ -1,0 +1,7 @@
+[submodule "tests/fixtures/m68000"]
+	path = tests/fixtures/m68000
+	url = https://github.com/SingleStepTests/m68000
+
+[submodule "tests/fixtures/Musashi"]
+	path = tests/fixtures/Musashi
+	url = https://github.com/kstenerud/Musashi

@@ -1,0 +1,12 @@
+[package]
+name = "m68k"
+version = "0.1.2"
+edition = "2024"
+license = "MIT"
+description = "A safe Rust M68000 family CPU emulator"
+
+[dependencies]
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
