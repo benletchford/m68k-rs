@@ -122,8 +122,11 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     // - 040fpu1: 1111 0011 ........  (0xF3xx) -> m68040_fpu_op1
     //
     // FPU coprocessor interface is available on 68020+ (via external 68881/82 or integrated 68040 FPU).
-    // 68000/68010 don't have the coprocessor interface, so all F-line opcodes are Line-F exceptions.
-    let has_coproc_interface = !matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010);
+    // 68000/68010/SCC68070 don't have the coprocessor interface, so all F-line opcodes are Line-F exceptions.
+    let has_coproc_interface = !matches!(
+        cpu.cpu_type,
+        CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+    );
 
     if !has_coproc_interface {
         return exception_1111(cpu, opcode);
@@ -284,7 +287,10 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     // 68020+ CAS / CAS2 (compare-and-swap)
     // CAS2: 0000 1ss0 1111 1100 with two extension words
     if opcode == 0x0EFC || opcode == 0x0CFC || opcode == 0x0AFC {
-        if cpu.cpu_type == CpuType::M68000 || cpu.cpu_type == CpuType::M68010 {
+        if cpu.cpu_type == CpuType::M68000
+            || cpu.cpu_type == CpuType::M68010
+            || cpu.cpu_type == CpuType::SCC68070
+        {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_cas2(bus, opcode);
@@ -292,7 +298,10 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     // CAS: 0000 1ss0 11 mmm rrr with extension word (Du/Dc)
     // ss encodes size (A=byte, C=word, E=long) in bits 11..9.
     if (opcode & 0x0FC0) == 0x0AC0 || (opcode & 0x0FC0) == 0x0CC0 || (opcode & 0x0FC0) == 0x0EC0 {
-        if cpu.cpu_type == CpuType::M68000 || cpu.cpu_type == CpuType::M68010 {
+        if cpu.cpu_type == CpuType::M68000
+            || cpu.cpu_type == CpuType::M68010
+            || cpu.cpu_type == CpuType::SCC68070
+        {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_cas(bus, opcode);
@@ -352,7 +361,10 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         && (opcode & 0x00C0) == 0x00C0
         && ((opcode >> 9) & 3) != 3
     {
-        if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+        if matches!(
+            cpu.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_cmp2_chk2(bus, opcode);
@@ -530,7 +542,10 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
 
     // 68020+ LINK.L: 0100 1000 0000 1rrr (0x4808..0x480F)
     if (opcode & 0xFFF8) == 0x4808 {
-        if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+        if matches!(
+            cpu.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_link_long(bus, ea_reg as usize);
@@ -539,13 +554,19 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     // 68020+ long multiply/divide (MULL/MULS/MULU, DIVL/DIVS/DIVU, and remainder forms).
     // These share opcode space with MOVEM and must be decoded before MOVEM heuristics.
     if (opcode & 0xFFC0) == 0x4C00 {
-        if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+        if matches!(
+            cpu.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_mull(bus, opcode);
     }
     if (opcode & 0xFFC0) == 0x4C40 {
-        if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+        if matches!(
+            cpu.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_divl(bus, opcode);
@@ -615,7 +636,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         cpu.set_sr(sr);
                         20
                     }
-                    CpuType::M68010 => {
+                    CpuType::M68010 | CpuType::SCC68070 => {
                         // Musashi m68k_in.c: format word at (SP+6) >> 12
                         let sp = cpu.a(7);
                         let format = cpu.read_16(bus, sp.wrapping_add(6)) >> 12;
@@ -714,7 +735,8 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let reg_type = (ext >> 15) & 1; // 0=Dn, 1=An
             let reg_num = ((ext >> 12) & 7) as usize;
             let ctrl_reg = ext & 0xFFF;
-            if cpu.cpu_type == CpuType::M68010 && !matches!(ctrl_reg, 0x000 | 0x001 | 0x800 | 0x801)
+            if matches!(cpu.cpu_type, CpuType::M68010 | CpuType::SCC68070)
+                && !matches!(ctrl_reg, 0x000 | 0x001 | 0x800 | 0x801)
             {
                 return illegal_instruction(cpu, bus);
             }
@@ -755,7 +777,8 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let reg_type = (ext >> 15) & 1; // 0=Dn, 1=An
             let reg_num = ((ext >> 12) & 7) as usize;
             let ctrl_reg = ext & 0xFFF;
-            if cpu.cpu_type == CpuType::M68010 && !matches!(ctrl_reg, 0x000 | 0x001 | 0x800 | 0x801)
+            if matches!(cpu.cpu_type, CpuType::M68010 | CpuType::SCC68070)
+                && !matches!(ctrl_reg, 0x000 | 0x001 | 0x800 | 0x801)
             {
                 return illegal_instruction(cpu, bus);
             }
@@ -860,7 +883,10 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 }
                 0x9 if (opcode >> 6) & 3 == 3 && ea_mode == 0 => {
                     // EXTB.L (68020+) - sign extend byte to long
-                    if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                    if matches!(
+                        cpu.cpu_type,
+                        CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+                    ) {
                         illegal_instruction(cpu, bus)
                     } else {
                         cpu.exec_extb(ea_reg as usize)
@@ -1171,7 +1197,10 @@ fn dispatch_group_8<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             } else if op_mode == 5 && (ea_mode == 0 || ea_mode == 1) {
                 // PACK (68020+): 1000 xxx1 0100 yrrr
                 // y=0: PACK Ds, Dd, #adj  y=1: PACK -(As), -(Ad), #adj
-                if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                if matches!(
+                    cpu.cpu_type,
+                    CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+                ) {
                     return illegal_instruction(cpu, bus);
                 }
                 let adj = cpu.read_imm_16(bus);
@@ -1182,7 +1211,10 @@ fn dispatch_group_8<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 }
             } else if op_mode == 6 && (ea_mode == 0 || ea_mode == 1) {
                 // UNPK (68020+): 1000 xxx1 1000 yrrr
-                if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                if matches!(
+                    cpu.cpu_type,
+                    CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+                ) {
                     return illegal_instruction(cpu, bus);
                 }
                 let adj = cpu.read_imm_16(bus);
@@ -1517,7 +1549,10 @@ fn dispatch_group_e<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     // 68020+ bitfield instructions live in group E with bits 7..6 == 11 and op selector 0x8..0xF.
     // Example: BFCHG (0xEAF9), BFTST (0xE8F9), BFINS (0xEFF9), etc.
     if (opcode & 0x00C0) == 0x00C0 && ((opcode >> 8) & 0xF) >= 0x8 {
-        if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+        if matches!(
+            cpu.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) {
             return illegal_instruction(cpu, bus);
         }
         return cpu.exec_bitfield(bus, opcode);

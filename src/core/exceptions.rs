@@ -121,7 +121,7 @@ impl CpuCore {
                 self.push_32(bus, self.pc);
                 self.push_16(bus, old_sr);
             }
-            super::types::CpuType::M68010 => {
+            super::types::CpuType::M68010 | super::types::CpuType::SCC68070 => {
                 self.push_16(bus, (vector::CHK as u16) << 2);
                 self.push_32(bus, self.pc);
                 self.push_16(bus, old_sr);
@@ -202,9 +202,9 @@ impl CpuCore {
                 self.push_16_raw(bus, old_sr);
                 self.push_32_raw(bus, self.ppc);
             }
-            CpuType::M68010 => {
+            CpuType::M68010 | CpuType::SCC68070 => {
                 // 68010 uses the "format 8" (0x8) bus/address error stack frame (29 words).
-                // We intentionally mirror Musashi’s placeholder implementation here: most internal
+                // We intentionally mirror Musashi's placeholder implementation here: most internal
                 // words are zero/undefined and we primarily preserve the format/vector word, PC, SR.
                 //
                 // Layout (from Musashi m68kcpu.h m68ki_stack_frame_1000):
@@ -285,7 +285,7 @@ impl CpuCore {
                 self.push_16_raw(bus, old_sr);
                 self.push_32_raw(bus, self.ppc);
             }
-            CpuType::M68010 => {
+            CpuType::M68010 | CpuType::SCC68070 => {
                 // 68010 format 8 (0x8) bus error frame (placeholder, matching Musashi).
                 for _ in 0..8 {
                     self.fake_push_32_raw();

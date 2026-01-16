@@ -295,6 +295,13 @@ impl CpuCore {
                 self.sr_mask = 0xA71F;
                 self.has_pmmu = false;
             }
+            CpuType::SCC68070 => {
+                // SCC68070 is a 68010 with a 32-bit data bus.
+                // Instruction set is 68010-compatible, but the address bus is 32-bit.
+                self.address_mask = 0xFFFFFFFF;
+                self.sr_mask = 0xA71F;
+                self.has_pmmu = false;
+            }
             CpuType::M68EC020 | CpuType::M68020 => {
                 self.address_mask = 0xFFFFFFFF;
                 self.sr_mask = 0xF71F;
@@ -690,7 +697,11 @@ impl CpuCore {
             return 0;
         }
         let mut addr = self.address(addr);
-        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && (addr & 1) != 0 {
+        if matches!(
+            self.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) && (addr & 1) != 0
+        {
             self.trigger_address_error(bus, addr, false, false);
             return 0;
         }
@@ -732,7 +743,11 @@ impl CpuCore {
             return 0;
         }
         let mut addr = self.address(addr);
-        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && (addr & 1) != 0 {
+        if matches!(
+            self.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) && (addr & 1) != 0
+        {
             self.trigger_address_error(bus, addr, false, false);
             return 0;
         }
@@ -808,7 +823,11 @@ impl CpuCore {
             return;
         }
         let mut addr = self.address(addr);
-        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && (addr & 1) != 0 {
+        if matches!(
+            self.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) && (addr & 1) != 0
+        {
             self.trigger_address_error(bus, addr, true, false);
             return;
         }
@@ -846,7 +865,11 @@ impl CpuCore {
             return;
         }
         let mut addr = self.address(addr);
-        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && (addr & 1) != 0 {
+        if matches!(
+            self.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) && (addr & 1) != 0
+        {
             self.trigger_address_error(bus, addr, true, false);
             return;
         }
