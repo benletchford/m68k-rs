@@ -143,6 +143,12 @@ impl HleHandler for MacToolbox {
     }
 }
 
+fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
+    let mut hle = MacToolbox;
+    let result = cpu.step_with_hle_handler(bus, &mut hle);
+}
+```
+
 ### Choosing an Approach
 
 | Method | Best For | Behavior on Trap |
