@@ -78,6 +78,11 @@ fn main() {
         match cpu.step(&mut bus) {
             StepResult::Ok { cycles } => println!("Executed: {} cycles", cycles),
             StepResult::Stopped => break,
+            StepResult::AlineTrap { opcode } => println!("A-line trap: {:04X}", opcode),
+            StepResult::FlineTrap { opcode } => println!("F-line trap: {:04X}", opcode),
+            StepResult::TrapInstruction { trap_num } => println!("TRAP #{}", trap_num),
+            StepResult::Breakpoint { bp_num } => println!("BKPT #{}", bp_num),
+            StepResult::IllegalInstruction { opcode } => println!("Illegal instruction: {:04X}", opcode),
         }
     }
 }
