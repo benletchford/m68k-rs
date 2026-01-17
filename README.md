@@ -97,7 +97,11 @@ use m68k::{AddressBus, CpuCore, HleHandler};
 
 struct MacToolbox;
 
+// All methods in HleHandler are optional (default return is false).
+// Return `true` to indicate the HLE handled the trap (suppressing the hardware exception).
+// Return `false` to let the CPU take the standard hardware exception.
 impl HleHandler for MacToolbox {
+    // Optional: Intercept A-line traps (0xAxxx)
     fn handle_aline(
         &mut self,
         cpu: &mut CpuCore,
@@ -105,25 +109,50 @@ impl HleHandler for MacToolbox {
         opcode: u16,
     ) -> bool {
         println!("A-line trap: {:04X} at PC=0x{:08X}", opcode, cpu.pc);
-        // ... implement HLE by reading/writing through `bus` ...
-        true // Handled - don't take exception
+        // ... implement HLE logic ...
+        true // Handled: do NOT take the standard Line-A exception
+    }
+
+    // Optional: Intercept TRAP #n instructions
+    fn handle_trap(&mut self, _cpu: &mut CpuCore, _bus: &mut dyn AddressBus, trap: u8) -> bool {
+        // Example: Only intercept TRAP #0, let #1-15 go to real hardware vectors
+        if trap == 0 {
+            println!("OS Call (TRAP #0)");
+            true // Handled
+        } else {
+            false // Not handled: CPU will take exception vector 32+n
+        }
+    }
+
+    // Optional: Intercept F-line traps (coprocessor instructions)
+    fn handle_fline(&mut self, _cpu: &mut CpuCore, _bus: &mut dyn AddressBus, opcode: u16) -> bool {
+        println!("Generic Coprocessor instruction: {:04X}", opcode);
+        true // Handled
+    }
+
+    // Optional: Intercept BKPT #n instructions
+    fn handle_breakpoint(&mut self, _cpu: &mut CpuCore, _bus: &mut dyn AddressBus, bp: u8) -> bool {
+        println!("Breakpoint #{}", bp);
+        true // Handled
+    }
+
+    // Optional: Intercept ILLEGAL instructions (0x4AFC)
+    fn handle_illegal(&mut self, _cpu: &mut CpuCore, _bus: &mut dyn AddressBus, opcode: u16) -> bool {
+        println!("Illegal instruction: {:04X}", opcode);
+        false // Not handled: CPU will take illegal instruction exception
     }
 }
 
-fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
-    let mut hle = MacToolbox;
-    let result = cpu.step_with_hle_handler(bus, &mut hle);
-}
-```
+### Choosing an Approach
 
-Other `HleHandler` callbacks you can implement (all are optional):
+| Method | Best For | Behavior on Trap |
+| :--- | :--- | :--- |
+| **`step()`** | Debuggers, Analyzers, Custom Control | Returns a `StepResult` variant (e.g., `AlineTrap`). The CPU **does not** take the exception automatically. If you do nothing, it acts like a NOP. You must manually call `cpu.take_exception(...)` if you want standard behavior. |
+| **`step_with_hle_handler()`** | OS Emulation (Mac/Amiga/Atari) | Calls your `HleHandler` callback. If it returns `true`, execution continues. If it returns `false`, the CPU **automatically** triggers the standard hardware exception (stacks frame, jumps to vector). |
 
-- `handle_fline(cpu, bus, opcode)`: intercepts 0xFxxx (Line-F) instructions (e.g., FPU probes).
-- `handle_trap(cpu, bus, trap_num)`: intercepts `TRAP #n`.
-- `handle_breakpoint(cpu, bus, bp_num)`: intercepts `BKPT #n`.
-- `handle_illegal(cpu, bus, opcode)`: intercepts illegal instructions.
+Use **`step()`** when you need full control over the execution loop or are building a debugger that needs to pause on every event.
 
-Return `true` to indicate the HLE handled the trap, or `false` to fall back to the real hardware exception.
+Use **`step_with_hle_handler()`** when implementing a high-level emulator (like a Macintosh or Amiga emulator) where you want to patch specific system calls but otherwise let the guest OS run normally.
 
 ## Supported CPU Types
 
