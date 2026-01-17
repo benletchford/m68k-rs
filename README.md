@@ -43,13 +43,12 @@ impl AddressBus for MyBus {
         if let Some(m) = self.memory.get_mut(addr as usize) { *m = val; }
     }
     fn read_word(&mut self, addr: u32) -> u16 {
-        let hi = self.read_byte(addr) as u16;
-        let lo = self.read_byte(addr + 1) as u16;
-        (hi << 8) | lo
+        u16::from_be_bytes([self.read_byte(addr), self.read_byte(addr + 1)])
     }
     fn write_word(&mut self, addr: u32, val: u16) {
-        self.write_byte(addr, (val >> 8) as u8);
-        self.write_byte(addr + 1, val as u8);
+        let bytes = val.to_be_bytes();
+        self.write_byte(addr, bytes[0]);
+        self.write_byte(addr + 1, bytes[1]);
     }
     fn read_long(&mut self, addr: u32) -> u32 {
         ((self.read_word(addr) as u32) << 16) | self.read_word(addr + 2) as u32
