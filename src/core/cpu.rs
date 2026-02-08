@@ -990,7 +990,7 @@ impl CpuCore {
         // Determine whether this is PMOVE <reg> -> <ea> or <ea> -> <reg>.
         // Musashi uses bit 9 (0x0200): if set, it writes EA from MMU reg.
         let to_ea = (modes & 0x0200) != 0;
-        let regsel = ((modes >> 10) & 0x7) as u8;
+        let preg = ((modes >> 10) & 0x1F) as u8;
 
         // Helper: resolve EA and require memory for 64-bit transfers.
         let ea = self.resolve_ea(bus, am, Size::Long);
@@ -1002,32 +1002,48 @@ impl CpuCore {
             }
         }
 
+        // 68030 PMOVE preg encoding (5-bit):
+        //   0x10 = TC    (32-bit)
+        //   0x12 = SRP   (64-bit)
+        //   0x13 = CRP   (64-bit)
+        //   0x02 = TT0   (32-bit)
+        //   0x03 = TT1   (32-bit)
         if to_ea {
-            match regsel {
-                0 => {
+            match preg {
+                0x10 => {
                     // TC (32)
                     self.write_resolved_ea(bus, ea, Size::Long, self.mmu_tc);
                     4
                 }
-                2 => {
+                0x12 => {
                     // SRP (64): [limit, aptr]
                     let Some(a) = ea_addr_only(ea) else { return 0 };
                     self.write_32(bus, a, self.mmu_srp_limit);
                     self.write_32(bus, a.wrapping_add(4), self.mmu_srp_aptr);
                     8
                 }
-                3 => {
+                0x13 => {
                     // CRP (64)
                     let Some(a) = ea_addr_only(ea) else { return 0 };
                     self.write_32(bus, a, self.mmu_crp_limit);
                     self.write_32(bus, a.wrapping_add(4), self.mmu_crp_aptr);
                     8
                 }
+                0x02 => {
+                    // TT0 (32)
+                    self.write_resolved_ea(bus, ea, Size::Long, self.mmu_tt0);
+                    4
+                }
+                0x03 => {
+                    // TT1 (32)
+                    self.write_resolved_ea(bus, ea, Size::Long, self.mmu_tt1);
+                    4
+                }
                 _ => 0,
             }
         } else {
-            match regsel {
-                0 => {
+            match preg {
+                0x10 => {
                     // TC (32)
                     let v = self.read_resolved_ea(bus, ea, Size::Long);
                     self.mmu_tc = v;
@@ -1035,7 +1051,7 @@ impl CpuCore {
                     self.pmmu_enabled = (self.mmu_tc & 0x8000_0000) != 0;
                     4
                 }
-                2 => {
+                0x12 => {
                     // SRP (64)
                     let Some(a) = ea_addr_only(ea) else { return 0 };
                     let limit = self.read_32(bus, a);
@@ -1044,7 +1060,7 @@ impl CpuCore {
                     self.mmu_srp_aptr = aptr;
                     8
                 }
-                3 => {
+                0x13 => {
                     // CRP (64)
                     let Some(a) = ea_addr_only(ea) else { return 0 };
                     let limit = self.read_32(bus, a);
@@ -1052,6 +1068,18 @@ impl CpuCore {
                     self.mmu_crp_limit = limit;
                     self.mmu_crp_aptr = aptr;
                     8
+                }
+                0x02 => {
+                    // TT0 (32)
+                    let v = self.read_resolved_ea(bus, ea, Size::Long);
+                    self.mmu_tt0 = v;
+                    4
+                }
+                0x03 => {
+                    // TT1 (32)
+                    let v = self.read_resolved_ea(bus, ea, Size::Long);
+                    self.mmu_tt1 = v;
+                    4
                 }
                 _ => 0,
             }
