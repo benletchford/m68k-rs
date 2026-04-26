@@ -137,16 +137,6 @@ impl CpuCore {
             return StepResult::Ok { cycles: 0 };
         }
 
-        if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-            self.run_mode = RUN_MODE_NORMAL;
-            return StepResult::Ok { cycles: 0 };
-        }
-
-        if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-            self.run_mode = RUN_MODE_NORMAL;
-            return StepResult::Ok { cycles: 0 };
-        }
-
         let result = dispatch_instruction(self, bus, self.ir as u16);
 
         let res = match result {

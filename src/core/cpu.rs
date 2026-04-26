@@ -125,6 +125,8 @@ pub struct CpuCore {
     pub has_pmmu: bool,
     /// PMMU enabled
     pub pmmu_enabled: bool,
+    /// Cached `cpu_type` is pre-68020. Updated in `set_cpu_type`.
+    pub is_pre_68020: bool,
     /// FPU just reset
     pub fpu_just_reset: bool,
     /// Reset cycles counter
@@ -238,6 +240,7 @@ impl CpuCore {
             exception_processing: false,
             has_pmmu: false,
             pmmu_enabled: false,
+            is_pre_68020: true,
             fpu_just_reset: false,
             reset_cycles: 0,
             cyc_bcc_notake_b: -2,
@@ -284,6 +287,10 @@ impl CpuCore {
     /// Set CPU type and configure appropriate masks/timing.
     pub fn set_cpu_type(&mut self, cpu_type: CpuType) {
         self.cpu_type = cpu_type;
+        self.is_pre_68020 = matches!(
+            cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        );
         match cpu_type {
             CpuType::M68000 => {
                 self.address_mask = 0x00FFFFFF;

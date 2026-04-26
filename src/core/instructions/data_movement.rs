@@ -11,6 +11,7 @@ impl CpuCore {
     /// Execute MOVE instruction.
     ///
     /// MOVE <ea>, <ea>
+    #[inline]
     pub fn exec_move<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -296,6 +297,7 @@ impl CpuCore {
     // ========== Helper Methods ==========
 
     /// Read value from effective address.
+    #[inline]
     pub fn read_ea<B: AddressBus>(&mut self, bus: &mut B, mode: AddressingMode, size: Size) -> u32 {
         match self.resolve_ea(bus, mode, size) {
             EaResult::DataReg(reg) => self.d(reg as usize) & size.mask(),
@@ -314,6 +316,7 @@ impl CpuCore {
     }
 
     /// Write value to effective address.
+    #[inline]
     pub fn write_ea<B: AddressBus>(
         &mut self,
         bus: &mut B,

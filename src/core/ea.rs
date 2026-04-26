@@ -38,6 +38,7 @@ pub enum AddressingMode {
 
 impl AddressingMode {
     /// Decode mode and register fields from opcode.
+    #[inline]
     pub fn decode(mode: u8, reg: u8) -> Option<Self> {
         match mode {
             0b000 => Some(Self::DataDirect(reg)),
@@ -60,6 +61,7 @@ impl AddressingMode {
     }
 
     /// Check if this mode is a register direct mode.
+    #[inline]
     pub fn is_register_direct(&self) -> bool {
         matches!(self, Self::DataDirect(_) | Self::AddressDirect(_))
     }
