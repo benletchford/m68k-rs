@@ -243,9 +243,7 @@ impl TraceJit {
         cpu_type: CpuType,
     ) -> Option<CachedRunResult> {
         #[cfg(not(target_family = "wasm"))]
-        if self.module.is_none() {
-            return None;
-        }
+        self.module.as_ref()?;
 
         if cpu.has_pmmu && cpu.pmmu_enabled || cpu.cycles_remaining <= 0 {
             return None;
@@ -254,52 +252,53 @@ impl TraceJit {
         let pc = cpu.pc;
         let idx = trace_cache_index(pc);
 
-        if let TraceSlot::Compiled(trace) = &self.slots[idx] {
-            if trace.pc == pc && trace.cpu_type == cpu_type {
-                if cpu.cycles_remaining < trace.max_cycles {
-                    return None;
+        if let TraceSlot::Compiled(trace) = &self.slots[idx]
+            && trace.pc == pc
+            && trace.cpu_type == cpu_type
+        {
+            if cpu.cycles_remaining < trace.max_cycles {
+                return None;
+            }
+
+            let mut miss = None;
+            for op in &trace.ops {
+                let addr = cpu.address(op.pc);
+                match bus.try_read_word(addr) {
+                    Ok(opcode) if opcode == op.opcode => {}
+                    Ok(opcode) => {
+                        miss = Some((op.pc, opcode));
+                        break;
+                    }
+                    Err(_) => return None,
                 }
 
-                let mut miss = None;
-                for op in &trace.ops {
-                    let addr = cpu.address(op.pc);
+                if let Some(expected) = op.extension {
+                    let addr = cpu.address(op.pc.wrapping_add(2));
                     match bus.try_read_word(addr) {
-                        Ok(opcode) if opcode == op.opcode => {}
-                        Ok(opcode) => {
-                            miss = Some((op.pc, opcode));
+                        Ok(extension) if extension == expected => {}
+                        Ok(_) => {
+                            miss = Some((op.pc, op.opcode));
                             break;
                         }
                         Err(_) => return None,
                     }
-
-                    if let Some(expected) = op.extension {
-                        let addr = cpu.address(op.pc.wrapping_add(2));
-                        match bus.try_read_word(addr) {
-                            Ok(extension) if extension == expected => {}
-                            Ok(_) => {
-                                miss = Some((op.pc, op.opcode));
-                                break;
-                            }
-                            Err(_) => return None,
-                        }
-                    }
                 }
-
-                if let Some((ppc, opcode)) = miss {
-                    self.slots[idx] = TraceSlot::Empty;
-                    cpu.ppc = ppc;
-                    cpu.ir = opcode as u32;
-                    cpu.pc = cpu.ppc.wrapping_add(2);
-                    return Some(CachedRunResult::Miss(opcode));
-                }
-
-                #[cfg(not(target_family = "wasm"))]
-                let cycles = unsafe { (trace.func)(cpu as *mut CpuCore) };
-                #[cfg(target_family = "wasm")]
-                let cycles = execute_portable_trace(cpu, &trace.ops);
-                cpu.cycles_remaining -= cycles;
-                return Some(CachedRunResult::Ran);
             }
+
+            if let Some((ppc, opcode)) = miss {
+                self.slots[idx] = TraceSlot::Empty;
+                cpu.ppc = ppc;
+                cpu.ir = opcode as u32;
+                cpu.pc = cpu.ppc.wrapping_add(2);
+                return Some(CachedRunResult::Miss(opcode));
+            }
+
+            #[cfg(not(target_family = "wasm"))]
+            let cycles = unsafe { (trace.func)(cpu as *mut CpuCore) };
+            #[cfg(target_family = "wasm")]
+            let cycles = execute_portable_trace(cpu, &trace.ops);
+            cpu.cycles_remaining -= cycles;
+            return Some(CachedRunResult::Ran);
         }
 
         match &mut self.slots[idx] {
@@ -896,93 +895,6 @@ fn portable_write_data_reg(cpu: &mut CpuCore, reg: u8, size: Size, value: u32) {
     let reg = reg as usize;
     let mask = size.mask();
     cpu.dar[reg] = (cpu.dar[reg] & !mask) | (value & mask);
-}
-
-#[cfg(test)]
-mod portable_tests {
-    use super::*;
-
-    fn cpu() -> CpuCore {
-        let mut cpu = CpuCore::new();
-        cpu.set_cpu_type(CpuType::M68000);
-        cpu.set_sr(0x2700);
-        cpu.pc = 0x0100;
-        cpu
-    }
-
-    #[test]
-    fn portable_trace_executes_unconditional_loop_iteration() {
-        let mut cpu = cpu();
-        let ops = [
-            TraceBuildOp {
-                opcode: 0x5280,
-                extension: None,
-                pc: 0x0100,
-                op: JitTraceOp::AddqSubqReg {
-                    reg: 0,
-                    data: 1,
-                    size: Size::Long,
-                    is_sub: false,
-                },
-            },
-            TraceBuildOp {
-                opcode: 0x60FC,
-                extension: None,
-                pc: 0x0102,
-                op: JitTraceOp::Branch {
-                    condition: 0,
-                    displacement: -4,
-                    length: 2,
-                },
-            },
-        ];
-
-        let cycles = execute_portable_trace(&mut cpu, &ops);
-
-        assert_eq!(cycles, 14);
-        assert_eq!(cpu.d(0), 1);
-        assert_eq!(cpu.pc, 0x0100);
-        assert_eq!(cpu.ppc, 0x0102);
-        assert_eq!(cpu.ir, 0x60FC);
-    }
-
-    #[test]
-    fn portable_trace_uses_flags_for_conditional_branch() {
-        let mut cpu = cpu();
-        cpu.set_d(0, 1);
-        let ops = [
-            TraceBuildOp {
-                opcode: 0x5340,
-                extension: None,
-                pc: 0x0100,
-                op: JitTraceOp::AddqSubqReg {
-                    reg: 0,
-                    data: 1,
-                    size: Size::Word,
-                    is_sub: true,
-                },
-            },
-            TraceBuildOp {
-                opcode: 0x66FC,
-                extension: None,
-                pc: 0x0102,
-                op: JitTraceOp::Branch {
-                    condition: 6,
-                    displacement: -4,
-                    length: 2,
-                },
-            },
-        ];
-
-        let cycles = execute_portable_trace(&mut cpu, &ops);
-
-        assert_eq!(cycles, 12);
-        assert_eq!(cpu.d(0), 0);
-        assert!(cpu.flag_z());
-        assert_eq!(cpu.pc, 0x0104);
-        assert_eq!(cpu.ppc, 0x0102);
-        assert_eq!(cpu.ir, 0x66FC);
-    }
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1825,4 +1737,91 @@ fn iconst_u32(builder: &mut FunctionBuilder<'_>, value: u32) -> Value {
 
 fn trace_cache_index(pc: u32) -> usize {
     ((pc >> 1) as usize) & (TRACE_CACHE_SIZE - 1)
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+
+    fn cpu() -> CpuCore {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.set_sr(0x2700);
+        cpu.pc = 0x0100;
+        cpu
+    }
+
+    #[test]
+    fn portable_trace_executes_unconditional_loop_iteration() {
+        let mut cpu = cpu();
+        let ops = [
+            TraceBuildOp {
+                opcode: 0x5280,
+                extension: None,
+                pc: 0x0100,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 0,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60FC,
+                extension: None,
+                pc: 0x0102,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -4,
+                    length: 2,
+                },
+            },
+        ];
+
+        let cycles = execute_portable_trace(&mut cpu, &ops);
+
+        assert_eq!(cycles, 14);
+        assert_eq!(cpu.d(0), 1);
+        assert_eq!(cpu.pc, 0x0100);
+        assert_eq!(cpu.ppc, 0x0102);
+        assert_eq!(cpu.ir, 0x60FC);
+    }
+
+    #[test]
+    fn portable_trace_uses_flags_for_conditional_branch() {
+        let mut cpu = cpu();
+        cpu.set_d(0, 1);
+        let ops = [
+            TraceBuildOp {
+                opcode: 0x5340,
+                extension: None,
+                pc: 0x0100,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 0,
+                    data: 1,
+                    size: Size::Word,
+                    is_sub: true,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x66FC,
+                extension: None,
+                pc: 0x0102,
+                op: JitTraceOp::Branch {
+                    condition: 6,
+                    displacement: -4,
+                    length: 2,
+                },
+            },
+        ];
+
+        let cycles = execute_portable_trace(&mut cpu, &ops);
+
+        assert_eq!(cycles, 12);
+        assert_eq!(cpu.d(0), 0);
+        assert!(cpu.flag_z());
+        assert_eq!(cpu.pc, 0x0104);
+        assert_eq!(cpu.ppc, 0x0102);
+        assert_eq!(cpu.ir, 0x66FC);
+    }
 }

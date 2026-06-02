@@ -51,6 +51,7 @@ impl TestBus {
     }
 
     /// Load a test binary into ROM slots.
+    #[allow(dead_code)]
     pub fn load_rom(&mut self, data: &[u8]) {
         for (i, chunk) in data.chunks(SLOT_SIZE as usize).enumerate() {
             if i < 4 {
@@ -60,6 +61,7 @@ impl TestBus {
     }
 
     /// Setup boot vectors (SP and PC).
+    #[allow(dead_code)]
     pub fn setup_boot(&mut self) {
         // Match Musashi test harness: initial SSP at 0x3F0.
         self.write_long(0, 0x3F0);

@@ -61,6 +61,7 @@ impl RomSlot {
         }
     }
 
+    #[allow(dead_code)]
     pub fn load(&mut self, data: &[u8]) {
         let len = data.len().min(SLOT_SIZE as usize);
         self.data[..len].copy_from_slice(&data[..len]);

@@ -35,7 +35,7 @@ impl AddressBus for FullAddressBus {
     fn read_byte(&mut self, address: u32) -> u8 {
         if address < 0x0100_0000 {
             self.low_mem[address as usize]
-        } else if address >= 0xFF00_0000 && address < 0xFF01_0000 {
+        } else if (0xFF00_0000..0xFF01_0000).contains(&address) {
             self.high_mem[(address - 0xFF00_0000) as usize]
         } else {
             0
@@ -57,7 +57,7 @@ impl AddressBus for FullAddressBus {
     fn write_byte(&mut self, address: u32, value: u8) {
         if address < 0x0100_0000 {
             self.low_mem[address as usize] = value;
-        } else if address >= 0xFF00_0000 && address < 0xFF01_0000 {
+        } else if (0xFF00_0000..0xFF01_0000).contains(&address) {
             self.high_mem[(address - 0xFF00_0000) as usize] = value;
         }
     }

@@ -5,7 +5,7 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::CachedRunResult;
+use super::op_cache::{CachedRunResult, DecodedSimpleOp};
 use super::trace_jit;
 use super::types::StepResult;
 
@@ -30,6 +30,28 @@ impl CpuCore {
         } else {
             self.sr_save = 0;
         }
+    }
+
+    #[inline]
+    fn try_execute_decoded_simple_step(&mut self, opcode: u16) -> Option<StepResult> {
+        if !self.can_run_decoded_simple_ops() {
+            return None;
+        }
+
+        let op = self.decoded_simple_op(self.ppc, opcode, self.cpu_type)?;
+        let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+            Some(self.ppc)
+        } else {
+            None
+        };
+        let cycles = op.execute(self);
+        if let Some(branch_pc) = branch_pc
+            && self.pc <= branch_pc
+        {
+            trace_jit::record_trace_target(self.pc, self.cpu_type);
+        }
+
+        Some(StepResult::Ok { cycles })
     }
 
     /// Execute instructions for the given number of cycles.
@@ -169,6 +191,10 @@ impl CpuCore {
             return StepResult::Ok { cycles: 0 };
         }
 
+        if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
+            return result;
+        }
+
         self.prepare_rollback_snapshot(self.ir as u16);
 
         let result = dispatch_instruction(self, bus, self.ir as u16);
@@ -253,6 +279,10 @@ impl CpuCore {
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
             self.run_mode = RUN_MODE_NORMAL;
             return StepResult::Ok { cycles: 0 };
+        }
+
+        if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
+            return result;
         }
 
         self.prepare_rollback_snapshot(self.ir as u16);

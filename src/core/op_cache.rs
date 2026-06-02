@@ -875,7 +875,7 @@ impl CpuCore {
     }
 
     #[inline]
-    fn decoded_simple_op(
+    pub(crate) fn decoded_simple_op(
         &mut self,
         pc: u32,
         opcode: u16,
