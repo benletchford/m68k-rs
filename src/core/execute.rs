@@ -3,8 +3,9 @@
 //! Implements the fetch-decode-execute cycle.
 
 use super::cpu::{CpuCore, SFLAG_SET};
-use super::decode::dispatch_instruction;
+use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
+use super::op_cache::CachedRunResult;
 use super::types::StepResult;
 
 /// Stop level constants.
@@ -16,6 +17,20 @@ pub const RUN_MODE_NORMAL: u32 = 0;
 pub const RUN_MODE_BERR_AERR_RESET: u32 = 1;
 
 impl CpuCore {
+    #[inline]
+    fn prepare_rollback_snapshot(&mut self, opcode: u16) {
+        if needs_rollback_snapshot(opcode) {
+            self.dar_save = self.dar;
+            self.sr_save = self.get_sr();
+        } else if (self.t1_flag | self.t0_flag) != 0 {
+            // Trace checks still need the pre-instruction SR. Simple no-fault instructions do
+            // not need the D/A rollback snapshot.
+            self.sr_save = self.get_sr();
+        } else {
+            self.sr_save = 0;
+        }
+    }
+
     /// Execute instructions for the given number of cycles.
     ///
     /// Returns the number of cycles actually consumed.
@@ -49,25 +64,39 @@ impl CpuCore {
 
         // Main execution loop
         while self.cycles_remaining > 0 {
-            // Save previous PC
-            self.ppc = self.pc;
+            let opcode = if self.can_run_decoded_simple_ops() {
+                match self.execute_decoded_simple_run(bus) {
+                    CachedRunResult::Ran => continue,
+                    CachedRunResult::Fault => {
+                        self.run_mode = RUN_MODE_NORMAL;
+                        continue;
+                    }
+                    CachedRunResult::Miss(opcode) => opcode,
+                }
+            } else {
+                // Save previous PC
+                self.ppc = self.pc;
 
-            // Save D/A registers for bus error recovery
-            self.dar_save = self.dar;
-            // Save SR for bus/address error recovery
-            self.sr_save = self.get_sr();
+                // Fetch opcode
+                let opcode = self.read_opcode_16(bus);
 
-            // Fetch opcode
-            self.ir = self.read_imm_16(bus) as u32;
+                // If a bus/address error occurred during fetch, the exception is already taken.
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    self.run_mode = RUN_MODE_NORMAL;
+                    continue;
+                }
+                self.ir = opcode as u32;
+                opcode
+            };
 
-            // If a bus/address error occurred during fetch, the exception is already taken.
-            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                self.run_mode = RUN_MODE_NORMAL;
-                continue;
+            if self.ir != opcode as u32 {
+                self.ir = opcode as u32;
             }
 
+            self.prepare_rollback_snapshot(opcode);
+
             // Dispatch instruction
-            let result = dispatch_instruction(self, bus, self.ir as u16);
+            let result = dispatch_instruction(self, bus, opcode);
 
             // Auto-take all trap exceptions, extract cycles
             use crate::core::types::InternalStepResult;
@@ -128,14 +157,14 @@ impl CpuCore {
         }
 
         self.ppc = self.pc;
-        self.dar_save = self.dar;
-        self.sr_save = self.get_sr();
-        self.ir = self.read_imm_16(bus) as u32;
+        self.ir = self.read_opcode_16(bus) as u32;
 
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
             self.run_mode = RUN_MODE_NORMAL;
             return StepResult::Ok { cycles: 0 };
         }
+
+        self.prepare_rollback_snapshot(self.ir as u16);
 
         let result = dispatch_instruction(self, bus, self.ir as u16);
 
@@ -214,14 +243,14 @@ impl CpuCore {
         }
 
         self.ppc = self.pc;
-        self.dar_save = self.dar;
-        self.sr_save = self.get_sr();
-        self.ir = self.read_imm_16(bus) as u32;
+        self.ir = self.read_opcode_16(bus) as u32;
 
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
             self.run_mode = RUN_MODE_NORMAL;
             return StepResult::Ok { cycles: 0 };
         }
+
+        self.prepare_rollback_snapshot(self.ir as u16);
 
         let result = dispatch_instruction(self, bus, self.ir as u16);
 

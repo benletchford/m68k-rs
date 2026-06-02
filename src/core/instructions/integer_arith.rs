@@ -428,7 +428,7 @@ impl CpuCore {
     }
 
     /// Set flags for CMP (no X flag).
-    fn set_cmp_flags(&mut self, src: u32, dst: u32, result: u32, size: Size) {
+    pub(crate) fn set_cmp_flags(&mut self, src: u32, dst: u32, result: u32, size: Size) {
         let msb = size.msb_mask();
         let mask = size.mask();
         let r = result & mask;

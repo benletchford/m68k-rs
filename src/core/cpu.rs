@@ -4,6 +4,7 @@
 
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::memory::{AddressBus, BusFaultKind};
+use super::op_cache::{DECODED_OP_CACHE_SIZE, DecodedOpCacheEntry};
 use super::types::CpuType;
 
 /// Flag constants for SR bits.
@@ -181,6 +182,8 @@ pub struct CpuCore {
     pub cycles_remaining: i32,
     /// Initial cycles for timeslice
     pub initial_cycles: i32,
+    /// Direct-mapped cache for decoded one-word no-fault operations.
+    pub(crate) decoded_op_cache: Vec<Option<DecodedOpCacheEntry>>,
 
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
@@ -272,6 +275,7 @@ impl CpuCore {
             iacr1: 0,
             cycles_remaining: 0,
             initial_cycles: 0,
+            decoded_op_cache: vec![None; DECODED_OP_CACHE_SIZE],
             sst_m68000_compat: false,
         };
         cpu.set_cpu_type(CpuType::M68000);
@@ -291,6 +295,7 @@ impl CpuCore {
             cpu_type,
             CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
         );
+        self.clear_decoded_op_cache();
         match cpu_type {
             CpuType::M68000 => {
                 self.address_mask = 0x00FFFFFF;
@@ -639,6 +644,22 @@ impl CpuCore {
         self.run_mode = RUN_MODE_BERR_AERR_RESET;
     }
 
+    /// Trigger an address error before the current instruction has had any side effects.
+    pub(crate) fn trigger_address_error_no_rollback<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        address: u32,
+        write: bool,
+        instruction: bool,
+    ) {
+        if self.faulted() {
+            return;
+        }
+
+        let _ = self.exception_address_error(bus, address, write, instruction);
+        self.run_mode = RUN_MODE_BERR_AERR_RESET;
+    }
+
     /// Trigger a bus error and mark the current instruction as faulted so that subsequent EA
     /// resolution/memory operations become no-ops.
     pub(crate) fn trigger_bus_error<B: AddressBus>(
@@ -655,6 +676,22 @@ impl CpuCore {
         // Roll back any partially-applied register side effects from the faulting instruction.
         self.set_sr_noint_nosp(self.sr_save);
         self.dar = self.dar_save;
+        let _ = self.exception_bus_error(bus, address, write, instruction);
+        self.run_mode = RUN_MODE_BERR_AERR_RESET;
+    }
+
+    /// Trigger a bus error before the current instruction has had any side effects.
+    pub(crate) fn trigger_bus_error_no_rollback<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        address: u32,
+        write: bool,
+        instruction: bool,
+    ) {
+        if self.faulted() {
+            return;
+        }
+
         let _ = self.exception_bus_error(bus, address, write, instruction);
         self.run_mode = RUN_MODE_BERR_AERR_RESET;
     }
@@ -924,6 +961,33 @@ impl CpuCore {
         match fault.kind {
             MmuFaultKind::BusError => {
                 self.trigger_bus_error(bus, fault.address, write, instruction)
+            }
+            MmuFaultKind::ConfigurationError => {
+                let _ = self.take_exception(bus, vector::MMU_CONFIGURATION_ERROR);
+                self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            }
+            MmuFaultKind::IllegalOperation => {
+                let _ = self.take_exception(bus, vector::MMU_ILLEGAL_OPERATION_ERROR);
+                self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            }
+            MmuFaultKind::AccessLevelViolation => {
+                let _ = self.take_exception(bus, vector::MMU_ACCESS_LEVEL_VIOLATION_ERROR);
+                self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            }
+        }
+    }
+
+    pub(crate) fn handle_mmu_fetch_fault<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        fault: crate::mmu::MmuFault,
+    ) {
+        use crate::core::exceptions::vector;
+        use crate::mmu::MmuFaultKind;
+
+        match fault.kind {
+            MmuFaultKind::BusError => {
+                self.trigger_bus_error_no_rollback(bus, fault.address, false, true)
             }
             MmuFaultKind::ConfigurationError => {
                 let _ = self.take_exception(bus, vector::MMU_CONFIGURATION_ERROR);

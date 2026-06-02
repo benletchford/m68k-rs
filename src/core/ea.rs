@@ -308,6 +308,46 @@ impl CpuCore {
         }
     }
 
+    /// Fetch an opcode word and advance PC.
+    ///
+    /// Opcode fetch happens before the current instruction can mutate CPU state, so fetch faults
+    /// must not restore the previous instruction's rollback snapshot.
+    #[inline]
+    pub(crate) fn read_opcode_16<B: AddressBus>(&mut self, bus: &mut B) -> u16 {
+        let addr = self.pc;
+        if (addr & 1) != 0 {
+            self.trigger_address_error_no_rollback(bus, addr, false, true);
+            return 0;
+        }
+        let mut addr = self.address(addr);
+        if self.has_pmmu && self.pmmu_enabled {
+            match crate::mmu::translate_address(
+                self,
+                bus,
+                addr,
+                /*write=*/ false,
+                self.is_supervisor(),
+                /*instruction=*/ true,
+            ) {
+                Ok(p) => addr = self.address(p),
+                Err(f) => {
+                    self.handle_mmu_fetch_fault(bus, f);
+                    return 0;
+                }
+            }
+        }
+        match bus.try_read_word(addr) {
+            Ok(v) => {
+                self.pc = self.pc.wrapping_add(2);
+                v
+            }
+            Err(_) => {
+                self.trigger_bus_error_no_rollback(bus, addr, false, true);
+                0
+            }
+        }
+    }
+
     /// Read immediate 32-bit value and advance PC.
     #[inline]
     pub fn read_imm_32<B: AddressBus>(&mut self, bus: &mut B) -> u32 {

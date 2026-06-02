@@ -6,6 +6,7 @@ use super::cpu::CpuCore;
 use super::ea::{AddressingMode, EaResult};
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::memory::AddressBus;
+use super::op_cache::DecodedSimpleOp;
 use super::types::{CpuType, InternalStepResult, Size};
 
 // ============================================================================
@@ -50,6 +51,23 @@ pub(crate) const ILLEGAL_SENTINEL: i32 = -1_000_300;
 // Main Dispatch
 // ============================================================================
 
+/// Returns whether the opcode may need full register/SR rollback state.
+///
+/// This intentionally recognizes only simple one-word no-fault instructions. Anything with
+/// extension words, memory/device access, privilege checks, or broad decode ambiguity stays on
+/// the conservative rollback path.
+#[inline]
+pub(crate) fn needs_rollback_snapshot(opcode: u16) -> bool {
+    !is_simple_no_fault_opcode(opcode)
+}
+
+#[inline]
+fn is_simple_no_fault_opcode(opcode: u16) -> bool {
+    // Use the most permissive CPU type so no-side-effect opcodes that are illegal on older CPUs
+    // (currently EXTB.L) can still skip full rollback snapshots before taking the exception.
+    DecodedSimpleOp::decode(CpuType::M68040, opcode).is_some()
+}
+
 /// Dispatch an instruction based on its opcode.
 ///
 /// Returns an `InternalStepResult` which includes trap variants for internal handling.
@@ -58,6 +76,10 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     bus: &mut B,
     opcode: u16,
 ) -> InternalStepResult {
+    if let Some(cycles) = dispatch_decoded_simple_fast(cpu, opcode) {
+        return InternalStepResult::Ok { cycles };
+    }
+
     // Get the top 4 bits for group dispatch
     let group = (opcode >> 12) & 0xF;
 
@@ -110,6 +132,11 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     // Fallback: should not happen (all negative cycles should match a
     // sentinel), but return Ok to match previous behaviour.
     InternalStepResult::Ok { cycles }
+}
+
+#[inline]
+fn dispatch_decoded_simple_fast(cpu: &mut CpuCore, opcode: u16) -> Option<i32> {
+    DecodedSimpleOp::decode(cpu.cpu_type, opcode).map(|op| op.execute(cpu))
 }
 
 // ============================================================================

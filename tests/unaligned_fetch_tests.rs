@@ -1,5 +1,5 @@
-use m68k::{CpuCore, CpuType, StepResult};
 use m68k::core::memory::AddressBus;
+use m68k::{CpuCore, CpuType, StepResult};
 
 struct TestBus {
     memory: [u8; 0x10000],
@@ -7,7 +7,9 @@ struct TestBus {
 
 impl TestBus {
     fn new() -> Self {
-        Self { memory: [0; 0x10000] }
+        Self {
+            memory: [0; 0x10000],
+        }
     }
 
     fn write_word_at(&mut self, addr: u32, value: u16) {
@@ -121,5 +123,37 @@ fn test_odd_pc_fetch_triggers_address_error_on_68020() {
     assert_eq!(
         cpu.pc, 0x0200,
         "68020 should take address error on odd instruction fetch"
+    );
+}
+
+#[test]
+fn test_odd_pc_fetch_after_register_only_instruction_does_not_restore_stale_snapshot() {
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68010);
+    let mut bus = TestBus::new();
+
+    bus.write_long_at(0x00, 0x1000);
+    bus.write_long_at(0x04, 0x0100);
+    bus.write_long_at(0x0C, 0x0200);
+    bus.write_word_at(0x0100, 0x7001); // MOVEQ #1,D0
+
+    cpu.reset(&mut bus);
+    cpu.pc = 0x0100;
+    cpu.set_sr(0x2700);
+    cpu.set_d(0, 0xDEAD_BEEF);
+
+    let result = cpu.step(&mut bus);
+    assert!(matches!(result, StepResult::Ok { .. }));
+    assert_eq!(cpu.d(0), 1);
+
+    cpu.pc = 0x0103;
+    let result = cpu.step(&mut bus);
+
+    assert!(matches!(result, StepResult::Ok { .. }));
+    assert_eq!(cpu.pc, 0x0200);
+    assert_eq!(
+        cpu.d(0),
+        1,
+        "opcode-fetch faults must not restore stale rollback state"
     );
 }
