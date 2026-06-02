@@ -1,6 +1,6 @@
 [package]
 name = "m68k"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 license = "MIT"
 description = "A safe Rust M68000 family CPU emulator"
@@ -8,6 +8,16 @@ exclude = ["tests/**/*"]
 
 [dependencies]
 
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+cranelift-codegen = "0.132.0"
+cranelift-frontend = "0.132.0"
+cranelift-jit = "0.132.0"
+cranelift-module = "0.132.0"
+
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+[[bench]]
+name = "microbench"
+harness = false

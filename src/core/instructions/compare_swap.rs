@@ -90,7 +90,9 @@ impl CpuCore {
             self.exec_cmp(size, mem2, dc2_val);
         }
 
-        if (dc1_val & size.mask()) == (mem1 & size.mask()) && (dc2_val & size.mask()) == (mem2 & size.mask()) {
+        if (dc1_val & size.mask()) == (mem1 & size.mask())
+            && (dc2_val & size.mask()) == (mem2 & size.mask())
+        {
             // Both comparisons succeeded: swap in update registers.
             let v1 = self.d(du1) & size.mask();
             let v2 = self.d(du2) & size.mask();
@@ -157,5 +159,3 @@ fn write_d_sized(old: u32, value: u32, size: Size) -> u32 {
         Size::Long => value,
     }
 }
-
-

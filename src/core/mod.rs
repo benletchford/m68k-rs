@@ -15,4 +15,5 @@ pub mod op_cache;
 pub mod registers;
 pub mod status;
 pub mod timing;
+pub mod trace_jit;
 pub mod types;

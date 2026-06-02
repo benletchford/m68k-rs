@@ -1,15 +1,26 @@
-use m68k::core::memory::AddressBus;
+use m68k::core::memory::{AddressBus, InstructionCacheBus, LinearMemoryBus};
 use m68k::{CpuCore, CpuType};
 
 struct TestBus {
     memory: [u8; 0x10000],
+    instruction_version: u64,
+    instruction_invalidations: usize,
+    last_instruction_invalidation: Option<(u32, u32)>,
 }
 
 impl TestBus {
     fn new() -> Self {
         Self {
             memory: [0; 0x10000],
+            instruction_version: 1,
+            instruction_invalidations: 0,
+            last_instruction_invalidation: None,
         }
+    }
+
+    fn reset_instruction_invalidations(&mut self) {
+        self.instruction_invalidations = 0;
+        self.last_instruction_invalidation = None;
     }
 
     fn write_word_at(&mut self, addr: u32, value: u16) {
@@ -67,6 +78,18 @@ impl AddressBus for TestBus {
         self.memory[addr + 1] = bytes[1];
         self.memory[addr + 2] = bytes[2];
         self.memory[addr + 3] = bytes[3];
+    }
+}
+
+impl InstructionCacheBus for TestBus {
+    fn instruction_cache_version(&mut self, _address: u32) -> Option<u64> {
+        Some(self.instruction_version)
+    }
+
+    fn invalidate_instruction_cache(&mut self, address: u32, len: u32) {
+        self.instruction_invalidations += 1;
+        self.last_instruction_invalidation = Some((address, len));
+        self.instruction_version = self.instruction_version.wrapping_add(1);
     }
 }
 
@@ -139,6 +162,108 @@ fn execute_decoded_short_branch_loop_observes_modified_opcode() {
     assert_eq!(cycles, 14);
     assert_eq!(cpu.d(0), 0);
     assert_eq!(cpu.pc, 0x0100);
+}
+
+#[test]
+fn execute_trace_jit_loop_observes_modified_opcode_after_warmup() {
+    let mut bus = TestBus::new();
+    let mut cpu = boot_cpu(&mut bus);
+
+    bus.write_word_at(0x0100, 0x5280); // ADDQ.L #1,D0
+    bus.write_word_at(0x0102, 0x60FC); // BRA.S -4
+
+    let cycles = cpu.execute(&mut bus, 140);
+    assert_eq!(cycles, 140);
+    assert_eq!(cpu.d(0), 10);
+    assert_eq!(cpu.pc, 0x0100);
+
+    bus.write_word_at(0x0100, 0x5380); // SUBQ.L #1,D0
+
+    let cycles = cpu.execute(&mut bus, 14);
+    assert_eq!(cycles, 14);
+    assert_eq!(cpu.d(0), 9);
+    assert_eq!(cpu.pc, 0x0100);
+}
+
+#[test]
+fn execute_trace_jit_dbra_loop_runs_to_counter_expiration() {
+    let mut bus = TestBus::new();
+    let mut cpu = boot_cpu(&mut bus);
+
+    bus.write_word_at(0x0100, 0x5280); // ADDQ.L #1,D0
+    bus.write_word_at(0x0102, 0x51C9); // DBRA D1,-4
+    bus.write_word_at(0x0104, 0xFFFC);
+
+    cpu.set_d(1, 4);
+
+    let cycles = cpu.execute(&mut bus, 74);
+
+    assert_eq!(cycles, 74);
+    assert_eq!(cpu.d(0), 5);
+    assert_eq!(cpu.d(1) & 0xFFFF, 0xFFFF);
+    assert_eq!(cpu.pc, 0x0106);
+}
+
+#[test]
+fn execute_trace_jit_conditional_branch_uses_jitted_word_flags() {
+    let mut bus = TestBus::new();
+    let mut cpu = boot_cpu(&mut bus);
+
+    bus.write_word_at(0x0100, 0x5340); // SUBQ.W #1,D0
+    bus.write_word_at(0x0102, 0x66FC); // BNE.S -4
+
+    cpu.set_d(0, 0x1234_0003);
+
+    let cycles = cpu.execute(&mut bus, 40);
+
+    assert_eq!(cycles, 40);
+    assert_eq!(cpu.d(0), 0x1234_0000);
+    assert!(cpu.flag_z());
+    assert_eq!(cpu.pc, 0x0104);
+}
+
+#[test]
+fn instruction_cache_bus_versions_can_be_invalidated() {
+    let mut bus = TestBus::new();
+    bus.reset_instruction_invalidations();
+
+    assert_eq!(bus.instruction_cache_version(0x0100), Some(1));
+
+    bus.invalidate_instruction_cache(0x0100, 2);
+    assert_eq!(bus.instruction_invalidations, 1);
+    assert_eq!(bus.last_instruction_invalidation, Some((0x0100, 2)));
+    assert_eq!(bus.instruction_cache_version(0x0100), Some(2));
+
+    bus.invalidate_instruction_cache(0x0103, 1);
+    assert_eq!(bus.instruction_invalidations, 2);
+    assert_eq!(bus.last_instruction_invalidation, Some((0x0103, 1)));
+
+    bus.invalidate_instruction_cache(0x0104, 4);
+    assert_eq!(bus.instruction_invalidations, 3);
+    assert_eq!(bus.last_instruction_invalidation, Some((0x0104, 4)));
+}
+
+#[test]
+fn linear_memory_bus_wraps_and_versions_instruction_memory() {
+    let mut bus = LinearMemoryBus::new(8);
+
+    assert_eq!(bus.instruction_cache_version(0), Some(1));
+
+    bus.write_long(6, 0x1122_3344);
+    assert_eq!(bus.read_byte(6), 0x11);
+    assert_eq!(bus.read_byte(7), 0x22);
+    assert_eq!(bus.read_byte(0), 0x33);
+    assert_eq!(bus.read_byte(1), 0x44);
+    assert_eq!(bus.read_long(6), 0x1122_3344);
+
+    let version = bus.instruction_cache_version(0).unwrap();
+    assert!(version > 1);
+
+    bus.load(7, &[0xAA, 0xBB, 0xCC]);
+    assert_eq!(bus.read_byte(7), 0xAA);
+    assert_eq!(bus.read_byte(0), 0xBB);
+    assert_eq!(bus.read_byte(1), 0xCC);
+    assert!(bus.instruction_cache_version(0).unwrap() > version);
 }
 
 #[test]

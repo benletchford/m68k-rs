@@ -10,6 +10,8 @@
 use super::cpu::CpuCore;
 use super::execute::{RUN_MODE_BERR_AERR_RESET, RUN_MODE_NORMAL};
 use super::memory::AddressBus;
+use super::trace_jit;
+use super::trace_jit::{JitAddrOp, JitBinaryOp, JitBitOp, JitDirectReg, JitTraceOp, JitUnaryOp};
 use super::types::{CpuType, Size};
 
 pub(crate) const DECODED_OP_CACHE_SIZE: usize = 4096;
@@ -286,6 +288,87 @@ impl DecodedSimpleOp {
         }
 
         None
+    }
+
+    #[inline]
+    pub(crate) fn to_jit_trace_op(self) -> Option<JitTraceOp> {
+        match self {
+            Self::Nop => Some(JitTraceOp::Nop),
+            Self::MoveReg { src, dst, size } => Some(JitTraceOp::MoveReg {
+                src: jit_direct_reg(src),
+                dst: jit_direct_reg(dst),
+                size,
+            }),
+            Self::Moveq { reg, data } => Some(JitTraceOp::Moveq { reg, data }),
+            Self::UnaryDataReg { op, reg, size } => Some(JitTraceOp::UnaryDataReg {
+                op: jit_unary_op(op),
+                reg,
+                size,
+            }),
+            Self::Swap { reg } => Some(JitTraceOp::Swap { reg }),
+            Self::Ext { reg, size } => Some(JitTraceOp::Ext { reg, size }),
+            Self::Extb { reg } => Some(JitTraceOp::Extb { reg }),
+            Self::AddqSubqReg {
+                reg,
+                data,
+                size,
+                is_sub,
+            } => Some(JitTraceOp::AddqSubqReg {
+                reg,
+                data,
+                size,
+                is_sub,
+            }),
+            Self::AddqSubqAddr { reg, data, is_sub } => {
+                Some(JitTraceOp::AddqSubqAddr { reg, data, is_sub })
+            }
+            Self::BinaryDataReg {
+                op,
+                src,
+                dst,
+                size,
+                cycles,
+            } => Some(JitTraceOp::BinaryDataReg {
+                op: jit_binary_op(op),
+                src: jit_direct_reg(src),
+                dst,
+                size,
+                cycles,
+            }),
+            Self::AddrDataReg { op, src, dst, size } => Some(JitTraceOp::AddrDataReg {
+                op: jit_addr_op(op),
+                src: jit_direct_reg(src),
+                dst,
+                size,
+            }),
+            Self::AddSubxReg {
+                src,
+                dst,
+                size,
+                is_sub,
+            } => Some(JitTraceOp::AddSubxReg {
+                src,
+                dst,
+                size,
+                is_sub,
+            }),
+            Self::BitReg { op, bit_reg, dst } => Some(JitTraceOp::BitReg {
+                op: jit_bit_op(op),
+                bit_reg,
+                dst,
+            }),
+            Self::Exg { opcode } => Some(JitTraceOp::Exg { opcode }),
+            Self::SccDataReg { condition, reg } => Some(JitTraceOp::SccDataReg { condition, reg }),
+            Self::BranchShort {
+                condition,
+                displacement,
+            } => Some(JitTraceOp::Branch {
+                condition,
+                displacement: displacement as i32,
+                length: 2,
+            }),
+            _ => None,
+        }
     }
 
     #[inline]
@@ -750,8 +833,19 @@ impl CpuCore {
         bus: &mut B,
     ) -> CachedRunResult {
         let cpu_type = self.cpu_type;
+        let mut trace_probe_enabled = trace_jit::has_trace_candidates();
 
         while self.cycles_remaining > 0 {
+            if trace_probe_enabled
+                && let Some(result) = trace_jit::try_execute_trace(self, bus, cpu_type)
+            {
+                match result {
+                    CachedRunResult::Ran => continue,
+                    CachedRunResult::Fault => return CachedRunResult::Fault,
+                    CachedRunResult::Miss(opcode) => return CachedRunResult::Miss(opcode),
+                }
+            }
+
             self.ppc = self.pc;
             let opcode = self.read_opcode_16(bus);
             if self.run_mode == RUN_MODE_BERR_AERR_RESET {
@@ -762,7 +856,18 @@ impl CpuCore {
             let Some(op) = self.decoded_simple_op(self.ppc, opcode, cpu_type) else {
                 return CachedRunResult::Miss(opcode);
             };
+            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+                Some(self.ppc)
+            } else {
+                None
+            };
             let cycles = op.execute(self);
+            if let Some(branch_pc) = branch_pc
+                && self.pc <= branch_pc
+            {
+                trace_jit::record_trace_target(self.pc, cpu_type);
+                trace_probe_enabled = true;
+            }
             self.cycles_remaining -= cycles;
         }
 
@@ -827,6 +932,56 @@ fn direct_reg(mode: u16, reg: u16) -> Option<DirectReg> {
         0 => Some(DirectReg::Data(reg as u8)),
         1 => Some(DirectReg::Addr(reg as u8)),
         _ => None,
+    }
+}
+
+#[inline]
+fn jit_direct_reg(reg: DirectReg) -> JitDirectReg {
+    match reg {
+        DirectReg::Data(reg) => JitDirectReg::Data(reg),
+        DirectReg::Addr(reg) => JitDirectReg::Addr(reg),
+    }
+}
+
+#[inline]
+fn jit_unary_op(op: UnaryOp) -> JitUnaryOp {
+    match op {
+        UnaryOp::Clr => JitUnaryOp::Clr,
+        UnaryOp::Neg => JitUnaryOp::Neg,
+        UnaryOp::Negx => JitUnaryOp::Negx,
+        UnaryOp::Not => JitUnaryOp::Not,
+        UnaryOp::Tst => JitUnaryOp::Tst,
+    }
+}
+
+#[inline]
+fn jit_binary_op(op: BinaryOp) -> JitBinaryOp {
+    match op {
+        BinaryOp::Add => JitBinaryOp::Add,
+        BinaryOp::Sub => JitBinaryOp::Sub,
+        BinaryOp::And => JitBinaryOp::And,
+        BinaryOp::Or => JitBinaryOp::Or,
+        BinaryOp::Eor => JitBinaryOp::Eor,
+        BinaryOp::Cmp => JitBinaryOp::Cmp,
+    }
+}
+
+#[inline]
+fn jit_addr_op(op: AddrOp) -> JitAddrOp {
+    match op {
+        AddrOp::Adda => JitAddrOp::Adda,
+        AddrOp::Suba => JitAddrOp::Suba,
+        AddrOp::Cmpa => JitAddrOp::Cmpa,
+    }
+}
+
+#[inline]
+fn jit_bit_op(op: BitOp) -> JitBitOp {
+    match op {
+        BitOp::Test => JitBitOp::Test,
+        BitOp::Change => JitBitOp::Change,
+        BitOp::Clear => JitBitOp::Clear,
+        BitOp::Set => JitBitOp::Set,
     }
 }
 

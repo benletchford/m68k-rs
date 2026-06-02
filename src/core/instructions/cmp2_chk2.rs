@@ -118,5 +118,3 @@ impl CpuCore {
         12
     }
 }
-
-

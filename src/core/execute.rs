@@ -6,6 +6,7 @@ use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
 use super::op_cache::CachedRunResult;
+use super::trace_jit;
 use super::types::StepResult;
 
 /// Stop level constants.
@@ -117,6 +118,10 @@ impl CpuCore {
             if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                 self.run_mode = RUN_MODE_NORMAL;
                 continue;
+            }
+
+            if self.pc <= self.ppc {
+                trace_jit::record_trace_target(self.pc, self.cpu_type);
             }
 
             // Check for trace exception (T1 flag set before instruction)
