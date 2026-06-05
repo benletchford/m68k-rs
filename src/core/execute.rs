@@ -50,8 +50,74 @@ impl CpuCore {
         {
             trace_jit::record_trace_target(self.pc, self.cpu_type);
         }
+        #[cfg(target_family = "wasm")]
+        {
+            self.last_step_was_decoded_simple = true;
+        }
 
         Some(StepResult::Ok { cycles })
+    }
+
+    /// Execute up to `max_instructions` decoded simple instructions while PC remains in range.
+    ///
+    /// This is intended for HLE runners that still need normal `step()` trap dispatch. The method
+    /// stops before the first non-simple opcode and restores PC to that opcode so the caller can
+    /// run the existing single-step path unchanged.
+    pub fn step_decoded_simple_batch_in_range<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_instructions: usize,
+        min_pc: u32,
+        max_pc_exclusive: u32,
+    ) -> (usize, i32) {
+        let mut instructions = 0usize;
+        let mut cycles_total = 0i32;
+        #[cfg(target_family = "wasm")]
+        {
+            self.last_step_was_decoded_simple = false;
+        }
+
+        while instructions < max_instructions && self.can_run_decoded_simple_ops() {
+            let pc = self.pc;
+            if pc < min_pc || pc >= max_pc_exclusive {
+                break;
+            }
+
+            self.ppc = pc;
+            let opcode = self.read_opcode_16(bus);
+            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                self.run_mode = RUN_MODE_NORMAL;
+                break;
+            }
+            self.ir = opcode as u32;
+
+            let Some(op) = self.decoded_simple_op(self.ppc, opcode, self.cpu_type) else {
+                self.pc = pc;
+                self.ppc = pc;
+                break;
+            };
+
+            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+                Some(self.ppc)
+            } else {
+                None
+            };
+            let cycles = op.execute(self);
+            if let Some(branch_pc) = branch_pc
+                && self.pc <= branch_pc
+            {
+                trace_jit::record_trace_target(self.pc, self.cpu_type);
+            }
+
+            instructions += 1;
+            cycles_total += cycles;
+            #[cfg(target_family = "wasm")]
+            {
+                self.last_step_was_decoded_simple = true;
+            }
+        }
+
+        (instructions, cycles_total)
     }
 
     /// Execute instructions for the given number of cycles.
@@ -180,9 +246,17 @@ impl CpuCore {
         use crate::core::types::{InternalStepResult, StepResult};
 
         if self.stopped != 0 {
+            #[cfg(target_family = "wasm")]
+            {
+                self.last_step_was_decoded_simple = false;
+            }
             return StepResult::Stopped;
         }
 
+        #[cfg(target_family = "wasm")]
+        {
+            self.last_step_was_decoded_simple = false;
+        }
         self.ppc = self.pc;
         self.ir = self.read_opcode_16(bus) as u32;
 
@@ -270,9 +344,17 @@ impl CpuCore {
         use crate::core::types::{InternalStepResult, StepResult};
 
         if self.stopped != 0 {
+            #[cfg(target_family = "wasm")]
+            {
+                self.last_step_was_decoded_simple = false;
+            }
             return StepResult::Stopped;
         }
 
+        #[cfg(target_family = "wasm")]
+        {
+            self.last_step_was_decoded_simple = false;
+        }
         self.ppc = self.pc;
         self.ir = self.read_opcode_16(bus) as u32;
 

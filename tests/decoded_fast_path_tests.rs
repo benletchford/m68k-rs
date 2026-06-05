@@ -1,5 +1,5 @@
 use m68k::core::memory::{AddressBus, InstructionCacheBus, LinearMemoryBus};
-use m68k::{CpuCore, CpuType};
+use m68k::{CpuCore, CpuType, StepResult};
 
 struct TestBus {
     memory: [u8; 0x10000],
@@ -162,6 +162,43 @@ fn execute_decoded_short_branch_loop_observes_modified_opcode() {
     assert_eq!(cycles, 14);
     assert_eq!(cpu.d(0), 0);
     assert_eq!(cpu.pc, 0x0100);
+}
+
+#[test]
+fn decoded_simple_batch_stops_before_non_simple_opcode() {
+    let mut bus = TestBus::new();
+    let mut cpu = boot_cpu(&mut bus);
+
+    bus.write_word_at(0x0100, 0x7001); // MOVEQ #1,D0
+    bus.write_word_at(0x0102, 0x5280); // ADDQ.L #1,D0
+    bus.write_word_at(0x0104, 0xA975); // A-line trap
+
+    let (instructions, cycles) = cpu.step_decoded_simple_batch_in_range(&mut bus, 8, 0x60, 0x10000);
+
+    assert_eq!(instructions, 2);
+    assert!(cycles > 0);
+    assert_eq!(cpu.d(0), 2);
+    assert_eq!(cpu.pc, 0x0104);
+
+    assert_eq!(cpu.step(&mut bus), StepResult::AlineTrap { opcode: 0xA975 });
+    assert_eq!(cpu.pc, 0x0106);
+}
+
+#[test]
+fn decoded_simple_batch_obeys_pc_range() {
+    let mut bus = TestBus::new();
+    let mut cpu = boot_cpu(&mut bus);
+
+    bus.write_word_at(0x0100, 0x7001); // MOVEQ #1,D0
+    bus.write_word_at(0x0102, 0x7202); // MOVEQ #2,D1
+
+    let (instructions, cycles) = cpu.step_decoded_simple_batch_in_range(&mut bus, 8, 0x60, 0x0102);
+
+    assert_eq!(instructions, 1);
+    assert!(cycles > 0);
+    assert_eq!(cpu.d(0), 1);
+    assert_eq!(cpu.d(1), 0);
+    assert_eq!(cpu.pc, 0x0102);
 }
 
 #[test]

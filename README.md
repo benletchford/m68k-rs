@@ -179,6 +179,19 @@ Use **`step_with_hle_handler()`** when implementing a high-level emulator (like 
 
 This emulator has been rigorously validated against multiple industry-standard test suites to ensure correctness:
 
+### Local Benchmarks
+
+Use the local benchmark suite when tuning the CPU core instead of launching full game harnesses in `systemless-mono`:
+
+```bash
+cargo bench --bench microbench
+cargo bench --bench microbench -- --quick
+M68K_BENCH_FILTER=trap cargo bench --bench microbench -- --quick
+M68K_BENCH_SCALE=0.1 cargo bench --bench microbench
+```
+
+The benchmark covers raw `execute()` throughput, Systemless-shaped `step()` runner loops, host bookkeeping, DBRA loops, A-line HLE traps, inline trap fast paths, and decoded batching around traps across plain, linear, and mapped bus shapes.
+
 ### SingleStepTests (m68000)
 
 The [SingleStepTests](https://github.com/SingleStepTests/m68000) project provides exhaustive per-instruction test vectors derived from real hardware and cycle-accurate emulators. Our test suite runs **all 101 instruction categories** with thousands of test cases each, covering:
