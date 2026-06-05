@@ -304,6 +304,33 @@ fn linear_memory_bus_wraps_and_versions_instruction_memory() {
 }
 
 #[test]
+fn repeated_linear_addq_uses_last_instruction_flags() {
+    let mut bus = LinearMemoryBus::new(0x10000);
+    bus.write_long_at(0x00, 0x1000);
+    bus.write_long_at(0x04, 0x0100);
+    bus.write_word_at(0x0100, 0x5240); // ADDQ.W #1,D0
+    bus.write_word_at(0x0102, 0x5240); // ADDQ.W #1,D0
+    bus.write_word_at(0x0104, 0x5240); // ADDQ.W #1,D0
+
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68000);
+    cpu.reset(&mut bus);
+    cpu.set_sr(0x2700);
+    cpu.set_d(0, 0x1234_FFFE);
+
+    let cycles = cpu.execute(&mut bus, 12);
+
+    assert_eq!(cycles, 12);
+    assert_eq!(cpu.pc, 0x0106);
+    assert_eq!(cpu.d(0), 0x1234_0001);
+    assert!(!cpu.flag_z());
+    assert!(!cpu.flag_n());
+    assert!(!cpu.flag_v());
+    assert!(!cpu.flag_c());
+    assert!(!cpu.flag_x());
+}
+
+#[test]
 fn execute_decoded_dynamic_bit_register_ops_match_interpreter_semantics() {
     let mut bus = TestBus::new();
     let mut cpu = boot_cpu(&mut bus);

@@ -853,7 +853,9 @@ impl CpuCore {
             }
             self.ir = opcode as u32;
 
-            let Some(op) = self.decoded_simple_op(self.ppc, opcode, cpu_type) else {
+            let Some((op, pc_cache_hit)) =
+                self.decoded_simple_op_lookup(self.ppc, opcode, cpu_type)
+            else {
                 return CachedRunResult::Miss(opcode);
             };
             let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
@@ -869,6 +871,14 @@ impl CpuCore {
                 trace_probe_enabled = true;
             }
             self.cycles_remaining -= cycles;
+
+            if self.cycles_remaining > 0
+                && !pc_cache_hit
+                && !matches!(op, DecodedSimpleOp::BranchShort { .. })
+                && !(self.has_pmmu && self.pmmu_enabled)
+            {
+                self.execute_repeated_decoded_simple(bus, opcode, op);
+            }
         }
 
         CachedRunResult::Ran
@@ -881,23 +891,105 @@ impl CpuCore {
         opcode: u16,
         cpu_type: CpuType,
     ) -> Option<DecodedSimpleOp> {
+        self.decoded_simple_op_lookup(pc, opcode, cpu_type)
+            .map(|(op, _)| op)
+    }
+
+    #[inline]
+    pub(crate) fn decoded_simple_op_lookup(
+        &mut self,
+        pc: u32,
+        opcode: u16,
+        cpu_type: CpuType,
+    ) -> Option<(DecodedSimpleOp, bool)> {
         let idx = decoded_op_cache_index(pc);
         if let Some(entry) = self.decoded_op_cache[idx]
             && entry.pc == pc
             && entry.opcode == opcode
             && entry.cpu_type == cpu_type
         {
-            return Some(entry.op);
+            return Some((entry.op, true));
         }
 
         let op = DecodedSimpleOp::decode(cpu_type, opcode)?;
+
         self.decoded_op_cache[idx] = Some(DecodedOpCacheEntry {
             pc,
             opcode,
             cpu_type,
             op,
         });
-        Some(op)
+        Some((op, false))
+    }
+
+    #[inline]
+    fn execute_repeated_decoded_simple<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+        op: DecodedSimpleOp,
+    ) {
+        let max_extra = (self.cycles_remaining as usize).div_ceil(4);
+        let extra = bus.matching_instruction_words(self.address(self.pc), opcode, max_extra);
+        if extra == 0 {
+            return;
+        }
+
+        match op {
+            DecodedSimpleOp::Nop
+            | DecodedSimpleOp::Moveq { .. }
+            | DecodedSimpleOp::MoveReg { .. } => {
+                self.advance_repeated_simple(extra, 4);
+            }
+            DecodedSimpleOp::AddqSubqAddr { reg, data, is_sub } => {
+                let idx = 8 + reg as usize;
+                let delta = data.wrapping_mul(extra as u32);
+                self.dar[idx] = if is_sub {
+                    self.dar[idx].wrapping_sub(delta)
+                } else {
+                    self.dar[idx].wrapping_add(delta)
+                };
+                self.advance_repeated_simple(extra, 4);
+            }
+            DecodedSimpleOp::AddqSubqReg {
+                reg,
+                data,
+                size,
+                is_sub,
+            } => {
+                let reg = reg as usize;
+                let mask = size.mask();
+                let current = self.dar[reg] & mask;
+                let extra = extra as u32;
+                let before_last_delta = data.wrapping_mul(extra.saturating_sub(1));
+                let before_last = if is_sub {
+                    current.wrapping_sub(before_last_delta) & mask
+                } else {
+                    current.wrapping_add(before_last_delta) & mask
+                };
+                let result = if is_sub {
+                    before_last.wrapping_sub(data)
+                } else {
+                    before_last.wrapping_add(data)
+                };
+                if is_sub {
+                    self.set_sub_flags(data, before_last, result, size);
+                } else {
+                    self.set_add_flags(data, before_last, result, size);
+                }
+                self.dar[reg] = (self.dar[reg] & !mask) | (result & mask);
+                self.advance_repeated_simple(extra as usize, 4);
+            }
+            _ => {}
+        }
+    }
+
+    #[inline]
+    fn advance_repeated_simple(&mut self, instructions: usize, cycles_per_instruction: i32) {
+        let byte_len = (instructions as u32).wrapping_mul(2);
+        self.ppc = self.pc.wrapping_add(byte_len).wrapping_sub(2);
+        self.pc = self.pc.wrapping_add(byte_len);
+        self.cycles_remaining -= (instructions as i32) * cycles_per_instruction;
     }
 }
 

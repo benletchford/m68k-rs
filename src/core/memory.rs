@@ -64,6 +64,20 @@ pub trait AddressBus {
         0xFFFF_FFFF
     }
     fn reset_devices(&mut self) {}
+
+    /// Return how many consecutive instruction words starting at `address` equal `opcode`.
+    ///
+    /// The default is conservative. RAM-backed buses may override this to let batch execution
+    /// retire simple repeated opcodes without refetching and decoding every word.
+    #[inline]
+    fn matching_instruction_words(
+        &mut self,
+        _address: u32,
+        _opcode: u16,
+        _max_words: usize,
+    ) -> usize {
+        0
+    }
 }
 
 /// Optional companion trait for buses that can version instruction-visible memory.
@@ -261,6 +275,27 @@ impl AddressBus for LinearMemoryBus {
     #[inline]
     fn read_immediate_long(&mut self, address: u32) -> u32 {
         self.read_long(address)
+    }
+
+    #[inline]
+    fn matching_instruction_words(&mut self, address: u32, opcode: u16, max_words: usize) -> usize {
+        if max_words == 0 || (address & 1) != 0 {
+            return 0;
+        }
+
+        let mut count = 0usize;
+        let mut addr = address;
+        while count < max_words {
+            let idx = self.index(addr);
+            let word = ((self.read_index(idx) as u16) << 8)
+                | self.read_index(self.index(addr.wrapping_add(1))) as u16;
+            if word != opcode {
+                break;
+            }
+            count += 1;
+            addr = addr.wrapping_add(2);
+        }
+        count
     }
 }
 

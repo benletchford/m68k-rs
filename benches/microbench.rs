@@ -92,6 +92,25 @@ impl AddressBus for PlainBenchBus {
         self.memory[(addr + 2) & (MEM_SIZE - 1)] = bytes[2];
         self.memory[(addr + 3) & (MEM_SIZE - 1)] = bytes[3];
     }
+
+    fn matching_instruction_words(&mut self, address: u32, opcode: u16, max_words: usize) -> usize {
+        if max_words == 0 || (address & 1) != 0 {
+            return 0;
+        }
+
+        let mut count = 0usize;
+        let mut addr = (address as usize) & (MEM_SIZE - 1);
+        while count < max_words {
+            let word =
+                u16::from_be_bytes([self.memory[addr], self.memory[(addr + 1) & (MEM_SIZE - 1)]]);
+            if word != opcode {
+                break;
+            }
+            count += 1;
+            addr = (addr + 2) & (MEM_SIZE - 1);
+        }
+        count
+    }
 }
 
 struct MappedBenchBus {
@@ -117,6 +136,17 @@ impl BenchBus for MappedBenchBus {
             mask: 0x0040_0000 - 1,
             slow_path_reads: 0,
         }
+    }
+
+    fn filled(opcode: u16) -> Self
+    where
+        Self: Sized,
+    {
+        let mut bus = Self::new();
+        for addr in (0..bus.memory.len()).step_by(2) {
+            bus.write_word_at(addr as u32, opcode);
+        }
+        bus
     }
 
     fn write_word_at(&mut self, address: u32, value: u16) {
@@ -164,6 +194,25 @@ impl AddressBus for MappedBenchBus {
         self.memory[(idx + 1) & self.mask] = bytes[1];
         self.memory[(idx + 2) & self.mask] = bytes[2];
         self.memory[(idx + 3) & self.mask] = bytes[3];
+    }
+
+    fn matching_instruction_words(&mut self, address: u32, opcode: u16, max_words: usize) -> usize {
+        if max_words == 0 || (address & 1) != 0 {
+            return 0;
+        }
+
+        let mut count = 0usize;
+        let mut addr = address;
+        while count < max_words {
+            let idx = self.index(addr);
+            let word = u16::from_be_bytes([self.memory[idx], self.memory[(idx + 1) & self.mask]]);
+            if word != opcode {
+                break;
+            }
+            count += 1;
+            addr = addr.wrapping_add(2);
+        }
+        count
     }
 }
 
