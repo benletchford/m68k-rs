@@ -19,81 +19,6 @@ pub const RUN_MODE_BERR_AERR_RESET: u32 = 1;
 
 impl CpuCore {
     #[inline]
-    fn fast_intercept_result(&self, opcode: u16) -> Option<StepResult> {
-        match opcode {
-            0x4AFC => Some(StepResult::IllegalInstruction { opcode }),
-            0x4E40..=0x4E4F => Some(StepResult::TrapInstruction {
-                trap_num: (opcode & 0xF) as u8,
-            }),
-            0x4848..=0x484F => Some(StepResult::Breakpoint {
-                bp_num: (opcode & 7) as u8,
-            }),
-            _ if (opcode >> 12) == 0xA => Some(StepResult::AlineTrap { opcode }),
-            _ if (opcode >> 12) == 0xF && self.is_pre_68020 => {
-                Some(StepResult::FlineTrap { opcode })
-            }
-            _ => None,
-        }
-    }
-
-    #[inline]
-    fn prepare_intercept_trace_snapshot(&mut self) {
-        if (self.t1_flag | self.t0_flag) != 0 {
-            self.sr_save = self.get_sr();
-        } else {
-            self.sr_save = 0;
-        }
-    }
-
-    #[inline]
-    fn hle_intercept_cycles<B: AddressBus, T: super::types::HleHandler>(
-        &mut self,
-        bus: &mut B,
-        handler: &mut T,
-        result: StepResult,
-    ) -> i32 {
-        match result {
-            StepResult::AlineTrap { opcode } => {
-                if handler.handle_aline(self, bus, opcode) {
-                    0
-                } else {
-                    self.take_aline_exception(bus)
-                }
-            }
-            StepResult::FlineTrap { opcode } => {
-                if handler.handle_fline(self, bus, opcode) {
-                    0
-                } else {
-                    self.take_fline_exception(bus)
-                }
-            }
-            StepResult::TrapInstruction { trap_num } => {
-                if handler.handle_trap(self, bus, trap_num) {
-                    0
-                } else {
-                    self.take_trap_exception(bus, trap_num)
-                }
-            }
-            StepResult::Breakpoint { bp_num } => {
-                if handler.handle_breakpoint(self, bus, bp_num) {
-                    0
-                } else {
-                    self.take_bkpt_exception(bus)
-                }
-            }
-            StepResult::IllegalInstruction { opcode } => {
-                if handler.handle_illegal(self, bus, opcode) {
-                    0
-                } else {
-                    self.take_illegal_exception(bus)
-                }
-            }
-            StepResult::Ok { cycles } => cycles,
-            StepResult::Stopped => 0,
-        }
-    }
-
-    #[inline]
     fn prepare_rollback_snapshot(&mut self, opcode: u16) {
         if needs_rollback_snapshot(opcode) {
             self.dar_save = self.dar;
@@ -125,74 +50,8 @@ impl CpuCore {
         {
             trace_jit::record_trace_target(self.pc, self.cpu_type);
         }
-        #[cfg(target_family = "wasm")]
-        {
-            self.last_step_was_decoded_simple = true;
-        }
 
         Some(StepResult::Ok { cycles })
-    }
-
-    /// Execute up to `max_instructions` decoded simple instructions while PC remains in range.
-    ///
-    /// This is intended for HLE runners that still need normal `step()` trap dispatch. The method
-    /// stops before the first non-simple opcode and restores PC to that opcode so the caller can
-    /// run the existing single-step path unchanged.
-    pub fn step_decoded_simple_batch_in_range<B: AddressBus>(
-        &mut self,
-        bus: &mut B,
-        max_instructions: usize,
-        min_pc: u32,
-        max_pc_exclusive: u32,
-    ) -> (usize, i32) {
-        let mut instructions = 0usize;
-        let mut cycles_total = 0i32;
-        #[cfg(target_family = "wasm")]
-        {
-            self.last_step_was_decoded_simple = false;
-        }
-
-        while instructions < max_instructions && self.can_run_decoded_simple_ops() {
-            let pc = self.pc;
-            if pc < min_pc || pc >= max_pc_exclusive {
-                break;
-            }
-
-            self.ppc = pc;
-            let opcode = self.read_opcode_16(bus);
-            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                self.run_mode = RUN_MODE_NORMAL;
-                break;
-            }
-            self.ir = opcode as u32;
-
-            let Some(op) = self.decoded_simple_op(self.ppc, opcode, self.cpu_type) else {
-                self.pc = pc;
-                self.ppc = pc;
-                break;
-            };
-
-            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
-                Some(self.ppc)
-            } else {
-                None
-            };
-            let cycles = op.execute(self);
-            if let Some(branch_pc) = branch_pc
-                && self.pc <= branch_pc
-            {
-                trace_jit::record_trace_target(self.pc, self.cpu_type);
-            }
-
-            instructions += 1;
-            cycles_total += cycles;
-            #[cfg(target_family = "wasm")]
-            {
-                self.last_step_was_decoded_simple = true;
-            }
-        }
-
-        (instructions, cycles_total)
     }
 
     /// Execute instructions for the given number of cycles.
@@ -321,17 +180,9 @@ impl CpuCore {
         use crate::core::types::{InternalStepResult, StepResult};
 
         if self.stopped != 0 {
-            #[cfg(target_family = "wasm")]
-            {
-                self.last_step_was_decoded_simple = false;
-            }
             return StepResult::Stopped;
         }
 
-        #[cfg(target_family = "wasm")]
-        {
-            self.last_step_was_decoded_simple = false;
-        }
         self.ppc = self.pc;
         self.ir = self.read_opcode_16(bus) as u32;
 
@@ -341,11 +192,6 @@ impl CpuCore {
         }
 
         if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
-            return result;
-        }
-
-        if let Some(result) = self.fast_intercept_result(self.ir as u16) {
-            self.prepare_intercept_trace_snapshot();
             return result;
         }
 
@@ -424,17 +270,9 @@ impl CpuCore {
         use crate::core::types::{InternalStepResult, StepResult};
 
         if self.stopped != 0 {
-            #[cfg(target_family = "wasm")]
-            {
-                self.last_step_was_decoded_simple = false;
-            }
             return StepResult::Stopped;
         }
 
-        #[cfg(target_family = "wasm")]
-        {
-            self.last_step_was_decoded_simple = false;
-        }
         self.ppc = self.pc;
         self.ir = self.read_opcode_16(bus) as u32;
 
@@ -445,29 +283,6 @@ impl CpuCore {
 
         if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
             return result;
-        }
-
-        if let Some(result) = self.fast_intercept_result(self.ir as u16) {
-            self.prepare_intercept_trace_snapshot();
-            let cycles = self.hle_intercept_cycles(bus, handler, result);
-
-            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                self.run_mode = RUN_MODE_NORMAL;
-                return StepResult::Ok { cycles };
-            }
-
-            if !self.sst_m68000_compat && self.check_trace() {
-                let trace_cycles = self.exception_trace(bus);
-                return StepResult::Ok {
-                    cycles: cycles + trace_cycles,
-                };
-            }
-
-            if self.int_level > 0 {
-                self.check_and_service_interrupts(bus);
-            }
-
-            return StepResult::Ok { cycles };
         }
 
         self.prepare_rollback_snapshot(self.ir as u16);

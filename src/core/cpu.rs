@@ -184,9 +184,6 @@ pub struct CpuCore {
     pub initial_cycles: i32,
     /// Direct-mapped cache for decoded one-word no-fault operations.
     pub(crate) decoded_op_cache: Vec<Option<DecodedOpCacheEntry>>,
-    /// True when the most recent single-step/batch retired a decoded simple operation.
-    #[cfg(target_family = "wasm")]
-    pub(crate) last_step_was_decoded_simple: bool,
 
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
@@ -279,8 +276,6 @@ impl CpuCore {
             cycles_remaining: 0,
             initial_cycles: 0,
             decoded_op_cache: vec![None; DECODED_OP_CACHE_SIZE],
-            #[cfg(target_family = "wasm")]
-            last_step_was_decoded_simple: false,
             sst_m68000_compat: false,
         };
         cpu.set_cpu_type(CpuType::M68000);
@@ -291,18 +286,6 @@ impl CpuCore {
     #[inline]
     pub fn set_sst_m68000_compat(&mut self, on: bool) {
         self.sst_m68000_compat = on;
-    }
-
-    #[cfg(target_family = "wasm")]
-    #[inline]
-    pub fn last_step_was_decoded_simple(&self) -> bool {
-        self.last_step_was_decoded_simple
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    #[inline]
-    pub fn last_step_was_decoded_simple(&self) -> bool {
-        false
     }
 
     /// Set CPU type and configure appropriate masks/timing.
