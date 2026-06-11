@@ -5,7 +5,9 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::{CachedRunResult, DecodedSimpleOp};
+use super::op_cache::CachedRunResult;
+#[cfg(not(target_family = "wasm"))]
+use super::op_cache::DecodedSimpleOp;
 use super::trace_jit;
 use super::types::StepResult;
 
@@ -39,16 +41,17 @@ impl CpuCore {
         }
 
         let op = self.decoded_simple_op(self.ppc, opcode, self.cpu_type)?;
+        #[cfg(not(target_family = "wasm"))]
         let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
             Some(self.ppc)
         } else {
             None
         };
         let cycles = op.execute(self);
+        #[cfg(not(target_family = "wasm"))]
         if let Some(branch_pc) = branch_pc
             && self.pc <= branch_pc
         {
-            #[cfg(not(target_family = "wasm"))]
             trace_jit::record_trace_target(self.pc, self.cpu_type);
         }
 
