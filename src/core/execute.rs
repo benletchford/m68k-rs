@@ -48,6 +48,7 @@ impl CpuCore {
         if let Some(branch_pc) = branch_pc
             && self.pc <= branch_pc
         {
+            #[cfg(not(target_family = "wasm"))]
             trace_jit::record_trace_target(self.pc, self.cpu_type);
         }
 
