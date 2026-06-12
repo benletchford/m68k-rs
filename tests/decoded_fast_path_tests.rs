@@ -1,5 +1,5 @@
 use m68k::core::memory::{AddressBus, InstructionCacheBus, LinearMemoryBus};
-use m68k::{CpuCore, CpuType};
+use m68k::{CpuCore, CpuType, StepResult};
 
 struct TestBus {
     memory: [u8; 0x10000],
@@ -126,6 +126,32 @@ fn execute_decoded_register_run_matches_interpreter_semantics() {
     assert_eq!(cpu.d(2), 5);
     assert!(!cpu.flag_z());
     assert!(!cpu.flag_n());
+}
+
+#[test]
+fn move_long_postincrement_to_postincrement_copies_and_updates_flags() {
+    let mut bus = TestBus::new();
+    let mut cpu = boot_cpu(&mut bus);
+
+    bus.write_word_at(0x0100, 0x22D8); // MOVE.L (A0)+,(A1)+
+    bus.write_long_at(0x2000, 0x8000_0001);
+    cpu.set_a(0, 0x2000);
+    cpu.set_a(1, 0x3000);
+
+    let cycles = match cpu.step(&mut bus) {
+        StepResult::Ok { cycles } => cycles,
+        other => panic!("unexpected step result: {other:?}"),
+    };
+
+    assert_eq!(cycles, 4);
+    assert_eq!(cpu.pc, 0x0102);
+    assert_eq!(cpu.a(0), 0x2004);
+    assert_eq!(cpu.a(1), 0x3004);
+    assert_eq!(bus.read_long(0x3000), 0x8000_0001);
+    assert!(cpu.flag_n());
+    assert!(!cpu.flag_z());
+    assert!(!cpu.flag_v());
+    assert!(!cpu.flag_c());
 }
 
 #[test]

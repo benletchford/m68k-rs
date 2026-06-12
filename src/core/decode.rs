@@ -263,6 +263,10 @@ fn dispatch_move<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16, siz
     let dst_reg = ((opcode >> 9) & 7) as u8;
     let dst_mode = ((opcode >> 6) & 7) as u8;
 
+    if size == Size::Long && src_mode == 3 && dst_mode == 3 {
+        return exec_move_l_postinc_to_postinc(cpu, bus, src_reg as usize, dst_reg as usize);
+    }
+
     let src = AddressingMode::decode(src_mode, src_reg);
     let dst = AddressingMode::decode(dst_mode, dst_reg);
 
@@ -281,6 +285,25 @@ fn dispatch_move<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16, siz
         }
         _ => illegal_instruction(cpu, bus),
     }
+}
+
+#[inline]
+fn exec_move_l_postinc_to_postinc<B: AddressBus>(
+    cpu: &mut CpuCore,
+    bus: &mut B,
+    src_reg: usize,
+    dst_reg: usize,
+) -> i32 {
+    let src_addr = cpu.dar[8 + src_reg];
+    let value = cpu.read_32(bus, src_addr);
+    cpu.dar[8 + src_reg] = src_addr.wrapping_add(4);
+
+    let dst_addr = cpu.dar[8 + dst_reg];
+    cpu.write_32(bus, dst_addr, value);
+    cpu.dar[8 + dst_reg] = dst_addr.wrapping_add(4);
+
+    cpu.set_logic_flags(value, Size::Long);
+    4
 }
 
 fn dispatch_moveq(cpu: &mut CpuCore, opcode: u16) -> i32 {
