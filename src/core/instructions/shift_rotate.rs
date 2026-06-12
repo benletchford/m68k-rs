@@ -62,22 +62,27 @@ impl CpuCore {
         let msb = size.msb_mask();
         let bits = size.bits();
 
-        // Sign extend
         let sign = value & msb;
-        let mut result = value & mask;
-        let mut last_bit = 0u32;
-
-        for _ in 0..shift.min(bits as u32) {
-            last_bit = result & 1;
-            result = (result >> 1) | sign;
-        }
+        let value = value & mask;
+        let result = if shift >= bits as u32 {
+            if sign != 0 { mask } else { 0 }
+        } else if sign != 0 {
+            (value >> shift) | (mask << (bits as u32 - shift))
+        } else {
+            value >> shift
+        } & mask;
+        let last_bit = if shift >= bits as u32 {
+            sign
+        } else {
+            value & (1u32 << (shift - 1))
+        };
 
         self.c_flag = if last_bit != 0 { CFLAG_SET } else { 0 };
         self.x_flag = self.c_flag;
         self.v_flag = 0; // ASR never sets overflow
-        self.set_logic_flags_nv(result & mask, size);
+        self.set_logic_flags_nv(result, size);
 
-        (result & mask, 6 + 2 * shift as i32)
+        (result, 6 + 2 * shift as i32)
     }
 
     /// Execute LSL (Logical Shift Left).
@@ -167,12 +172,13 @@ impl CpuCore {
             steps = bits;
         }
 
-        let mut result = value & mask;
-        let mut carry = 0u32;
-        for _ in 0..steps {
-            carry = (result >> (bits - 1)) & 1;
-            result = ((result << 1) & mask) | carry;
-        }
+        let value = value & mask;
+        let carry = (value >> (bits - steps)) & 1;
+        let result = if steps == bits {
+            value
+        } else {
+            ((value << steps) | (value >> (bits - steps))) & mask
+        };
 
         self.c_flag = if carry != 0 { CFLAG_SET } else { 0 };
         self.v_flag = 0;
@@ -185,7 +191,6 @@ impl CpuCore {
     pub fn exec_ror(&mut self, size: Size, shift: u32, value: u32) -> (u32, i32) {
         let bits = size.bits() as u32;
         let mask = size.mask();
-        let msb = size.msb_mask();
         let cnt = shift & 63;
 
         if cnt == 0 {
@@ -202,12 +207,13 @@ impl CpuCore {
             steps = bits;
         }
 
-        let mut result = value & mask;
-        let mut carry = 0u32;
-        for _ in 0..steps {
-            carry = result & 1;
-            result = (result >> 1) | (if carry != 0 { msb } else { 0 });
-        }
+        let value = value & mask;
+        let carry = (value >> (steps - 1)) & 1;
+        let result = if steps == bits {
+            value
+        } else {
+            ((value >> steps) | (value << (bits - steps))) & mask
+        };
 
         self.c_flag = if carry != 0 { CFLAG_SET } else { 0 };
         self.v_flag = 0;

@@ -147,6 +147,15 @@ pub(crate) enum JitTraceOp {
         condition: u8,
         reg: u8,
     },
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    ShiftReg {
+        reg: u8,
+        size: Size,
+        count_or_reg: u8,
+        count_is_register: bool,
+        direction: u8,
+        op: u8,
+    },
     Swap {
         reg: u8,
     },
@@ -519,6 +528,18 @@ impl JitTraceOp {
             Self::BitReg { .. } => 8,
             Self::Exg { .. } => 6,
             Self::SccDataReg { .. } => 4,
+            Self::ShiftReg {
+                count_or_reg,
+                count_is_register,
+                ..
+            } => {
+                if count_is_register {
+                    132
+                } else {
+                    let count = if count_or_reg == 0 { 8 } else { count_or_reg };
+                    6 + 2 * count as i32
+                }
+            }
             Self::Branch { .. } => 10,
             Self::Dbcc { .. } => 14,
         }
@@ -841,6 +862,37 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             };
             portable_write_data_reg(cpu, reg, Size::Byte, value);
             4
+        }
+        JitTraceOp::ShiftReg {
+            reg,
+            size,
+            count_or_reg,
+            count_is_register,
+            direction,
+            op: shift_op,
+        } => {
+            let shift = if count_is_register {
+                cpu.dar[count_or_reg as usize] & 63
+            } else {
+                let count = count_or_reg as u32;
+                if count == 0 { 8 } else { count }
+            };
+            let reg = reg as usize;
+            let value = cpu.dar[reg] & size.mask();
+            let (result, cycles) = match (shift_op, direction) {
+                (0, 0) => cpu.exec_asr(size, shift, value),
+                (0, 1) => cpu.exec_asl(size, shift, value),
+                (1, 0) => cpu.exec_lsr(size, shift, value),
+                (1, 1) => cpu.exec_lsl(size, shift, value),
+                (2, 0) => cpu.exec_roxr(size, shift, value),
+                (2, 1) => cpu.exec_roxl(size, shift, value),
+                (3, 0) => cpu.exec_ror(size, shift, value),
+                (3, 1) => cpu.exec_rol(size, shift, value),
+                _ => unreachable!(),
+            };
+            let mask = size.mask();
+            cpu.dar[reg] = (cpu.dar[reg] & !mask) | result;
+            cycles
         }
         JitTraceOp::Branch {
             condition,
@@ -1169,6 +1221,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             write_data_reg_sized(builder, cpu, reg, Size::Byte, value);
             cycles_const(builder, 4)
         }
+        JitTraceOp::ShiftReg { .. } => unreachable!("ShiftReg traces are wasm-only"),
         JitTraceOp::Branch {
             condition,
             displacement,
@@ -1823,5 +1876,31 @@ mod portable_tests {
         assert_eq!(cpu.pc, 0x0104);
         assert_eq!(cpu.ppc, 0x0102);
         assert_eq!(cpu.ir, 0x66FC);
+    }
+
+    #[test]
+    fn portable_trace_executes_register_shift() {
+        let mut cpu = cpu();
+        cpu.set_d(0, 0x8000_0001);
+        let ops = [TraceBuildOp {
+            opcode: 0xE188,
+            extension: None,
+            pc: 0x0100,
+            op: JitTraceOp::ShiftReg {
+                reg: 0,
+                size: Size::Long,
+                count_or_reg: 0,
+                count_is_register: false,
+                direction: 1,
+                op: 1,
+            },
+        }];
+
+        let cycles = execute_portable_trace(&mut cpu, &ops);
+
+        assert_eq!(cycles, 22);
+        assert_eq!(cpu.d(0), 0x0000_0100);
+        assert_eq!(cpu.ppc, 0x0100);
+        assert_eq!(cpu.ir, 0xE188);
     }
 }

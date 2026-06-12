@@ -359,6 +359,31 @@ impl DecodedSimpleOp {
             }),
             Self::Exg { opcode } => Some(JitTraceOp::Exg { opcode }),
             Self::SccDataReg { condition, reg } => Some(JitTraceOp::SccDataReg { condition, reg }),
+            Self::ShiftReg {
+                reg,
+                size,
+                count_or_reg,
+                count_is_register,
+                direction,
+                op,
+            } => {
+                #[cfg(target_family = "wasm")]
+                {
+                    Some(JitTraceOp::ShiftReg {
+                        reg,
+                        size,
+                        count_or_reg,
+                        count_is_register,
+                        direction,
+                        op,
+                    })
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let _ = (reg, size, count_or_reg, count_is_register, direction, op);
+                    None
+                }
+            }
             Self::BranchShort {
                 condition,
                 displacement,
