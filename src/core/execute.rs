@@ -58,74 +58,6 @@ impl CpuCore {
         Some(StepResult::Ok { cycles })
     }
 
-    #[inline]
-    fn try_execute_extension_control_flow_step<B: AddressBus>(
-        &mut self,
-        bus: &mut B,
-        opcode: u16,
-    ) -> Option<StepResult> {
-        if !self.can_run_decoded_simple_ops() {
-            return None;
-        }
-
-        match opcode >> 12 {
-            0x5 if ((opcode >> 6) & 3) == 3 && ((opcode >> 3) & 7) == 1 => {
-                let condition = ((opcode >> 8) & 0xF) as u8;
-                let reg = (opcode & 7) as usize;
-                let counter = self.d(reg) as u16;
-                let disp = self.read_imm_16(bus) as i16;
-                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                    self.run_mode = RUN_MODE_NORMAL;
-                    return Some(StepResult::Ok { cycles: 50 });
-                }
-
-                let cycles = if !self.test_condition(condition) {
-                    let new_counter = counter.wrapping_sub(1);
-                    self.set_d(reg, (self.d(reg) & 0xFFFF0000) | new_counter as u32);
-                    if new_counter != 0xFFFF {
-                        self.pc = (self.pc as i32).wrapping_add(disp as i32 - 2) as u32;
-                        #[cfg(not(target_family = "wasm"))]
-                        if self.pc <= self.ppc {
-                            trace_jit::record_trace_target(self.pc, self.cpu_type);
-                        }
-                        10
-                    } else {
-                        14
-                    }
-                } else {
-                    12
-                };
-                Some(StepResult::Ok { cycles })
-            }
-            0x6 if (opcode & 0xFF) == 0 => {
-                let condition = ((opcode >> 8) & 0xF) as u8;
-                if condition == 1 {
-                    return None;
-                }
-                let base_pc = self.pc;
-                let disp = self.read_imm_16(bus) as i16 as i32;
-                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                    self.run_mode = RUN_MODE_NORMAL;
-                    return Some(StepResult::Ok { cycles: 10 });
-                }
-
-                let cycles = if condition == 0 || self.test_condition(condition) {
-                    self.change_of_flow = true;
-                    self.pc = (base_pc as i32).wrapping_add(disp) as u32;
-                    #[cfg(not(target_family = "wasm"))]
-                    if self.pc <= self.ppc {
-                        trace_jit::record_trace_target(self.pc, self.cpu_type);
-                    }
-                    10
-                } else {
-                    12
-                };
-                Some(StepResult::Ok { cycles })
-            }
-            _ => None,
-        }
-    }
-
     /// Execute instructions for the given number of cycles.
     ///
     /// Returns the number of cycles actually consumed.
@@ -261,10 +193,6 @@ impl CpuCore {
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
             self.run_mode = RUN_MODE_NORMAL;
             return StepResult::Ok { cycles: 0 };
-        }
-
-        if let Some(result) = self.try_execute_extension_control_flow_step(bus, self.ir as u16) {
-            return result;
         }
 
         if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
