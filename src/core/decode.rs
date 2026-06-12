@@ -76,10 +76,6 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     bus: &mut B,
     opcode: u16,
 ) -> InternalStepResult {
-    if let Some(cycles) = dispatch_decoded_simple_fast(cpu, opcode) {
-        return InternalStepResult::Ok { cycles };
-    }
-
     // Get the top 4 bits for group dispatch
     let group = (opcode >> 12) & 0xF;
 
@@ -132,11 +128,6 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     // Fallback: should not happen (all negative cycles should match a
     // sentinel), but return Ok to match previous behaviour.
     InternalStepResult::Ok { cycles }
-}
-
-#[inline]
-fn dispatch_decoded_simple_fast(cpu: &mut CpuCore, opcode: u16) -> Option<i32> {
-    DecodedSimpleOp::decode(cpu.cpu_type, opcode).map(|op| op.execute(cpu))
 }
 
 // ============================================================================
