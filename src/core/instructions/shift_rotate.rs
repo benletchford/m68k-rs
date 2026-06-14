@@ -3,16 +3,28 @@
 //! ASL, ASR, LSL, LSR, ROL, ROR, ROXL, ROXR
 
 use crate::core::cpu::{CFLAG_SET, CpuCore};
-use crate::core::types::Size;
+use crate::core::types::{CpuType, Size};
 
 impl CpuCore {
+    /// Register shift/rotate base cost. On the 68000 a long operation needs two
+    /// extra clocks (base 8 vs 6 for byte/word); the variable part is `2 * count`
+    /// on top. Other sizes and CPU types keep the base of 6.
+    #[inline]
+    fn shift_rot_base(&self, size: Size) -> i32 {
+        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+            8
+        } else {
+            6
+        }
+    }
+
     /// Execute ASL (Arithmetic Shift Left).
     pub fn exec_asl(&mut self, size: Size, shift: u32, value: u32) -> (u32, i32) {
         let shift = shift & 63;
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, 6);
+            return (value, self.shift_rot_base(size));
         }
 
         let mask = size.mask();
@@ -46,7 +58,7 @@ impl CpuCore {
         self.v_flag = if overflow { 0x80 } else { 0 };
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * shift as i32)
+        (result, self.shift_rot_base(size) + 2 * shift as i32)
     }
 
     /// Execute ASR (Arithmetic Shift Right).
@@ -55,7 +67,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, 6);
+            return (value, self.shift_rot_base(size));
         }
 
         let mask = size.mask();
@@ -82,7 +94,7 @@ impl CpuCore {
         self.v_flag = 0; // ASR never sets overflow
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * shift as i32)
+        (result, self.shift_rot_base(size) + 2 * shift as i32)
     }
 
     /// Execute LSL (Logical Shift Left).
@@ -91,7 +103,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, 6);
+            return (value, self.shift_rot_base(size));
         }
 
         let mask = size.mask();
@@ -114,7 +126,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * shift as i32)
+        (result, self.shift_rot_base(size) + 2 * shift as i32)
     }
 
     /// Execute LSR (Logical Shift Right).
@@ -123,7 +135,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, 6);
+            return (value, self.shift_rot_base(size));
         }
 
         let mask = size.mask();
@@ -147,7 +159,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * shift as i32)
+        (result, self.shift_rot_base(size) + 2 * shift as i32)
     }
 
     /// Execute ROL (Rotate Left).
@@ -162,7 +174,7 @@ impl CpuCore {
             self.c_flag = 0;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, 6);
+            return (result, self.shift_rot_base(size));
         }
 
         // Counts that are multiples of operand size still perform a full cycle
@@ -184,7 +196,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * cnt as i32)
+        (result, self.shift_rot_base(size) + 2 * cnt as i32)
     }
 
     /// Execute ROR (Rotate Right).
@@ -199,7 +211,7 @@ impl CpuCore {
             self.c_flag = 0;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, 6);
+            return (result, self.shift_rot_base(size));
         }
 
         let mut steps = cnt % bits;
@@ -219,28 +231,30 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * cnt as i32)
+        (result, self.shift_rot_base(size) + 2 * cnt as i32)
     }
 
     /// Execute ROXL (Rotate Left through X).
     pub fn exec_roxl(&mut self, size: Size, shift: u32, value: u32) -> (u32, i32) {
         let bits = size.bits() as u32;
         let mask = size.mask();
-        let shift = shift % (bits + 1);
+        // Timing counts the full shift count; the rotation itself repeats every
+        // (bits + 1) positions because X participates as an extra bit.
+        let steps = shift % (bits + 1);
 
-        if shift == 0 {
+        if steps == 0 {
             let result = value & mask;
-            // No rotation occurs; X is unaffected. C mirrors X; V cleared; N/Z from result.
+            // No net rotation; X is unaffected. C mirrors X; V cleared; N/Z from result.
             self.c_flag = self.x_flag;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, 6);
+            return (result, self.shift_rot_base(size) + 2 * shift as i32);
         }
 
         let mut result = value & mask;
         let mut x = if self.x_flag != 0 { 1u32 } else { 0 };
 
-        for _ in 0..shift {
+        for _ in 0..steps {
             let carry = (result >> (bits - 1)) & 1;
             result = ((result << 1) | x) & mask;
             x = carry;
@@ -251,7 +265,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * shift as i32)
+        (result, self.shift_rot_base(size) + 2 * shift as i32)
     }
 
     /// Execute ROXR (Rotate Right through X).
@@ -259,21 +273,23 @@ impl CpuCore {
         let bits = size.bits() as u32;
         let mask = size.mask();
         let msb = size.msb_mask();
-        let shift = shift % (bits + 1);
+        // Timing counts the full shift count; the rotation itself repeats every
+        // (bits + 1) positions because X participates as an extra bit.
+        let steps = shift % (bits + 1);
 
-        if shift == 0 {
+        if steps == 0 {
             let result = value & mask;
-            // No rotation occurs; X is unaffected. C mirrors X; V cleared; N/Z from result.
+            // No net rotation; X is unaffected. C mirrors X; V cleared; N/Z from result.
             self.c_flag = self.x_flag;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, 6);
+            return (result, self.shift_rot_base(size) + 2 * shift as i32);
         }
 
         let mut result = value & mask;
         let mut x = if self.x_flag != 0 { 1u32 } else { 0 };
 
-        for _ in 0..shift {
+        for _ in 0..steps {
             let carry = result & 1;
             result = (result >> 1) | (if x != 0 { msb } else { 0 });
             x = carry;
@@ -284,7 +300,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, 6 + 2 * shift as i32)
+        (result, self.shift_rot_base(size) + 2 * shift as i32)
     }
 
     /// Helper: set N and Z flags only (V already set by caller).
