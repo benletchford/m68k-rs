@@ -69,6 +69,20 @@ fn divs_overflow_paths_are_short() {
 }
 
 #[test]
+fn divs_sign_adjustment_matches_register_direct_fixtures() {
+    let mut bus = LinearMemoryBus::new(0x100);
+    let mut c = cpu(CpuType::M68000);
+    // SingleStepTests DIVS fixture 036: positive dividend / positive divisor.
+    c.set_d(0, 0x462A_588A);
+    c.set_d(1, 0x7F67_5925);
+    assert_eq!(c.exec_divs(&mut bus, src_dn(1), 0), 130);
+    // SingleStepTests DIVS fixture 070: negative dividend / positive divisor.
+    c.set_d(0, 0xA0D3_273D);
+    c.set_d(1, 0x8E8C_7902);
+    assert_eq!(c.exec_divs(&mut bus, src_dn(1), 0), 142);
+}
+
+#[test]
 fn flat_timing_retained_off_the_68000() {
     let mut bus = LinearMemoryBus::new(0x100);
     let mut c = cpu(CpuType::M68020);
