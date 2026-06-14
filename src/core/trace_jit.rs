@@ -1898,7 +1898,7 @@ mod portable_tests {
 
         let cycles = execute_portable_trace(&mut cpu, &ops);
 
-        assert_eq!(cycles, 22);
+        assert_eq!(cycles, 24);
         assert_eq!(cpu.d(0), 0x0000_0100);
         assert_eq!(cpu.ppc, 0x0100);
         assert_eq!(cpu.ir, 0xE188);

@@ -11,7 +11,11 @@ impl CpuCore {
     /// on top. Other sizes and CPU types keep the base of 6.
     #[inline]
     fn shift_rot_base(&self, size: Size) -> i32 {
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(
+            self.cpu_type,
+            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
+        ) && size == Size::Long
+        {
             8
         } else {
             6
