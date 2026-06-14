@@ -36,6 +36,15 @@ fn long_shift_base_unchanged_on_68020() {
 }
 
 #[test]
+fn long_shift_base_is_eight_on_68010_family() {
+    for kind in [CpuType::M68010, CpuType::SCC68070] {
+        let mut c = cpu(kind);
+        assert_eq!(c.exec_asl(Size::Long, 1, 0x1).1, 10);
+        assert_eq!(c.exec_asl(Size::Word, 1, 0x1).1, 8);
+    }
+}
+
+#[test]
 fn roxl_roxr_timing_counts_full_shift() {
     let mut c = cpu(CpuType::M68000);
     // A word ROXL by 17 rotates through 17 positions; 17 mod (16 + 1) == 0, so
