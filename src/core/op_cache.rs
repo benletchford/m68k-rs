@@ -21,7 +21,23 @@ pub(crate) struct DecodedOpCacheEntry {
     pc: u32,
     opcode: u16,
     cpu_type: CpuType,
-    op: DecodedSimpleOp,
+    op: CachedOp,
+}
+
+/// Cached decode verdict for one opcode word.
+///
+/// `Complex` is a cached negative: memory-heavy code revisits the same
+/// PCs constantly, so remembering a rejection is as valuable as
+/// remembering a hit.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CachedOp {
+    /// Register-only one-word op — runs on every fast path, exact cycles.
+    Simple(DecodedSimpleOp),
+    /// Memory-operand op — runs only in the instruction-budgeted batch
+    /// loop when a fastmem window is active (no cycle accounting).
+    Mem(super::mem_ops::DecodedMemOp),
+    /// Neither: full dispatch.
+    Complex,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -118,7 +134,7 @@ pub(crate) enum DirectReg {
     Addr(u8),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnaryOp {
     Clr,
     Neg,
@@ -127,7 +143,7 @@ pub(crate) enum UnaryOp {
     Tst,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BinaryOp {
     Add,
     Sub,
@@ -137,14 +153,14 @@ pub(crate) enum BinaryOp {
     Cmp,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AddrOp {
     Adda,
     Suba,
     Cmpa,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BitOp {
     Test,
     Change,
@@ -870,18 +886,31 @@ impl CpuCore {
     pub(crate) fn execute_decoded_simple_run<B: AddressBus>(
         &mut self,
         bus: &mut B,
+        probe_on_entry: bool,
     ) -> CachedRunResult {
         let cpu_type = self.cpu_type;
-        let mut trace_probe_enabled = trace_jit::has_trace_candidates();
+        // Traces can only start at recorded backward-branch targets, so
+        // probing the (thread-local) trace cache is pointless while
+        // control flows forward. Probe on entry and after every backward
+        // branch; straight-line code skips the TLS hit entirely. A
+        // forward jump into a compiled loop pays at most one interpreted
+        // iteration before the closing branch re-arms the probe.
+        let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
 
         while self.cycles_remaining > 0 {
-            if trace_probe_enabled
-                && let Some((result, _instructions)) = trace_jit::try_execute_trace(self, bus, cpu_type)
-            {
-                match result {
-                    CachedRunResult::Ran => continue,
-                    CachedRunResult::Fault => return CachedRunResult::Fault,
-                    CachedRunResult::Miss(opcode) => return CachedRunResult::Miss(opcode),
+            if probe {
+                probe = false;
+                if let Some((result, _instructions)) =
+                    trace_jit::try_execute_trace(self, bus, cpu_type)
+                {
+                    match result {
+                        CachedRunResult::Ran => {
+                            probe = true;
+                            continue;
+                        }
+                        CachedRunResult::Fault => return CachedRunResult::Fault,
+                        CachedRunResult::Miss(opcode) => return CachedRunResult::Miss(opcode),
+                    }
                 }
             }
 
@@ -905,7 +934,7 @@ impl CpuCore {
                 && self.pc <= branch_pc
             {
                 trace_jit::record_trace_target(self.pc, cpu_type);
-                trace_probe_enabled = true;
+                probe = true;
             }
             self.cycles_remaining -= cycles;
         }
@@ -931,52 +960,91 @@ impl CpuCore {
         budget: u32,
         watch_pcs: &[u32],
         retired: &mut u32,
+        probe_on_entry: bool,
     ) -> BatchInnerExit {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
         let mut remaining = budget;
-        let mut trace_probe_enabled = trace_jit::has_trace_candidates();
+        // See `execute_decoded_simple_run`: probe the trace cache only on
+        // entry and after backward branches, never per instruction.
+        let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
 
         while remaining > 0 {
-            if trace_probe_enabled
-                && remaining >= trace_jit::TRACE_MAX_OPS as u32
-                && let Some((result, instructions)) = trace_jit::try_execute_trace(self, bus, cpu_type)
-            {
-                match result {
-                    CachedRunResult::Ran => {
-                        remaining -= instructions;
-                        *retired += instructions;
-                        if watch && watch_pcs.contains(&self.pc) {
-                            return BatchInnerExit::Watched(self.pc);
+            if probe && remaining >= trace_jit::TRACE_MAX_OPS as u32 {
+                probe = false;
+                if let Some((result, instructions)) =
+                    trace_jit::try_execute_trace(self, bus, cpu_type)
+                {
+                    match result {
+                        CachedRunResult::Ran => {
+                            remaining -= instructions;
+                            *retired += instructions;
+                            if watch && watch_pcs.contains(&self.pc) {
+                                return BatchInnerExit::Watched(self.pc);
+                            }
+                            probe = true;
+                            continue;
                         }
-                        continue;
+                        CachedRunResult::Fault => return BatchInnerExit::Fault,
+                        CachedRunResult::Miss(opcode) => return BatchInnerExit::Miss(opcode),
                     }
-                    CachedRunResult::Fault => return BatchInnerExit::Fault,
-                    CachedRunResult::Miss(opcode) => return BatchInnerExit::Miss(opcode),
                 }
             }
 
             self.ppc = self.pc;
-            let opcode = self.read_opcode_16(bus);
-            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                return BatchInnerExit::Fault;
-            }
+            let opcode = if self.fm_len != 0 && (self.pc & 1) == 0 {
+                // Fetch through the fastmem window: one bounds check
+                // instead of a bus call. Odd/out-of-window PCs take the
+                // normal fetch path (and its address-error handling).
+                let off = self.address(self.pc).wrapping_sub(self.fm_base);
+                if off <= self.fm_len - 2 {
+                    let opcode = unsafe {
+                        let p = (self.fm_ptr as *const u8).add(off as usize);
+                        u16::from_be_bytes([*p, *p.add(1)])
+                    };
+                    self.pc = self.pc.wrapping_add(2);
+                    opcode
+                } else {
+                    let opcode = self.read_opcode_16(bus);
+                    if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                        return BatchInnerExit::Fault;
+                    }
+                    opcode
+                }
+            } else {
+                let opcode = self.read_opcode_16(bus);
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    return BatchInnerExit::Fault;
+                }
+                opcode
+            };
             self.ir = opcode as u32;
 
-            let Some(op) = self.decoded_simple_op(self.ppc, opcode, cpu_type) else {
-                return BatchInnerExit::Miss(opcode);
-            };
-            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
-                Some(self.ppc)
-            } else {
-                None
-            };
-            let _cycles = op.execute(self);
-            if let Some(branch_pc) = branch_pc
-                && self.pc <= branch_pc
-            {
-                trace_jit::record_trace_target(self.pc, cpu_type);
-                trace_probe_enabled = true;
+            match self.cached_decode(self.ppc, opcode, cpu_type) {
+                CachedOp::Simple(op) => {
+                    let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+                        Some(self.ppc)
+                    } else {
+                        None
+                    };
+                    let _cycles = op.execute(self);
+                    if let Some(branch_pc) = branch_pc
+                        && self.pc <= branch_pc
+                    {
+                        trace_jit::record_trace_target(self.pc, cpu_type);
+                        probe = true;
+                    }
+                }
+                CachedOp::Mem(op) => {
+                    if !super::mem_ops::execute_mem_op(self, op) {
+                        return BatchInnerExit::Miss(opcode);
+                    }
+                    if self.pc <= self.ppc {
+                        trace_jit::record_trace_target(self.pc, cpu_type);
+                        probe = true;
+                    }
+                }
+                CachedOp::Complex => return BatchInnerExit::Miss(opcode),
             }
             remaining -= 1;
             *retired += 1;
@@ -995,23 +1063,40 @@ impl CpuCore {
         opcode: u16,
         cpu_type: CpuType,
     ) -> Option<DecodedSimpleOp> {
+        match self.cached_decode(pc, opcode, cpu_type) {
+            CachedOp::Simple(op) => Some(op),
+            // Mem ops need rollback/fault handling on the cycle-exact
+            // paths, so they dispatch like any complex op there.
+            CachedOp::Mem(_) | CachedOp::Complex => None,
+        }
+    }
+
+    /// Cache-backed decode used by every fast path.
+    #[inline]
+    pub(crate) fn cached_decode(&mut self, pc: u32, opcode: u16, cpu_type: CpuType) -> CachedOp {
         let idx = decoded_op_cache_index(pc);
         if let Some(entry) = self.decoded_op_cache[idx]
             && entry.pc == pc
             && entry.opcode == opcode
             && entry.cpu_type == cpu_type
         {
-            return Some(entry.op);
+            return entry.op;
         }
 
-        let op = DecodedSimpleOp::decode(cpu_type, opcode)?;
+        let op = match DecodedSimpleOp::decode(cpu_type, opcode) {
+            Some(op) => CachedOp::Simple(op),
+            None => match super::mem_ops::DecodedMemOp::decode(cpu_type, opcode) {
+                Some(op) => CachedOp::Mem(op),
+                None => CachedOp::Complex,
+            },
+        };
         self.decoded_op_cache[idx] = Some(DecodedOpCacheEntry {
             pc,
             opcode,
             cpu_type,
             op,
         });
-        Some(op)
+        op
     }
 }
 
@@ -1114,7 +1199,7 @@ fn write_data_reg(cpu: &mut CpuCore, reg: usize, size: Size, value: u32) {
 }
 
 #[inline]
-fn is_pre_68020(cpu_type: CpuType) -> bool {
+pub(crate) fn is_pre_68020(cpu_type: CpuType) -> bool {
     matches!(
         cpu_type,
         CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070

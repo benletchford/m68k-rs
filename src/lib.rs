@@ -11,7 +11,7 @@ pub mod mmu;
 
 // Re-export commonly used types from core
 pub use core::cpu::CpuCore;
-pub use core::memory::{AddressBus, LinearMemoryBus};
+pub use core::memory::{AddressBus, FastMem, LinearMemoryBus};
 pub use core::types::{
     BatchExit, BatchResult, CpuType, HleHandler, NoOpHleHandler, Size, StepResult,
 };

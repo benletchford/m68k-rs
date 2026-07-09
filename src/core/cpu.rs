@@ -185,6 +185,14 @@ pub struct CpuCore {
     /// Direct-mapped cache for decoded one-word no-fault operations.
     pub(crate) decoded_op_cache: Vec<Option<DecodedOpCacheEntry>>,
 
+    // ========== Fastmem window (batch execution only) ==========
+    // Captured from `AddressBus::fast_mem` on entry to `run_batch` and
+    // cleared on exit; zero `fm_len` disables all fastmem paths. Stored
+    // as a usize (not a pointer) so `CpuCore` stays `Send`.
+    pub(crate) fm_ptr: usize,
+    pub(crate) fm_base: u32,
+    pub(crate) fm_len: u32,
+
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
     pub sst_m68000_compat: bool,
@@ -232,6 +240,9 @@ impl CpuCore {
             int_mask: 0x0700, // Mask all interrupts
             int_level: 0,
             stopped: 0,
+            fm_ptr: 0,
+            fm_base: 0,
+            fm_len: 0,
             change_of_flow: false,
             pref_addr: 0,
             pref_data: 0,

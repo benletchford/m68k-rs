@@ -11,6 +11,7 @@ pub mod execute;
 pub mod instructions;
 pub mod interrupts;
 pub mod memory;
+pub(crate) mod mem_ops;
 pub mod op_cache;
 pub mod registers;
 pub mod status;

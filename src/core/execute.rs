@@ -34,12 +34,19 @@ impl CpuCore {
         }
     }
 
+    /// Unconditional snapshot for paths where the opcode is already known
+    /// not to be a simple op (a decoded-op-cache miss). Skips
+    /// `needs_rollback_snapshot`, which would re-run the full simple-op
+    /// decode just to conclude the same thing.
+    #[inline]
+    fn prepare_rollback_snapshot_full(&mut self) {
+        self.dar_save = self.dar;
+        self.sr_save = self.get_sr();
+    }
+
+    /// Caller must have checked [`CpuCore::can_run_decoded_simple_ops`].
     #[inline]
     fn try_execute_decoded_simple_step(&mut self, opcode: u16) -> Option<StepResult> {
-        if !self.can_run_decoded_simple_ops() {
-            return None;
-        }
-
         let op = self.decoded_simple_op(self.ppc, opcode, self.cpu_type)?;
         #[cfg(not(target_family = "wasm"))]
         let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
@@ -90,15 +97,21 @@ impl CpuCore {
         }
 
         // Main execution loop
+        let mut probe_on_entry = true;
         while self.cycles_remaining > 0 {
+            let mut known_complex = false;
             let opcode = if self.can_run_decoded_simple_ops() {
-                match self.execute_decoded_simple_run(bus) {
+                match self.execute_decoded_simple_run(bus, probe_on_entry) {
                     CachedRunResult::Ran => continue,
                     CachedRunResult::Fault => {
                         self.run_mode = RUN_MODE_NORMAL;
+                        probe_on_entry = true;
                         continue;
                     }
-                    CachedRunResult::Miss(opcode) => opcode,
+                    CachedRunResult::Miss(opcode) => {
+                        known_complex = true;
+                        opcode
+                    }
                 }
             } else {
                 // Save previous PC
@@ -110,6 +123,7 @@ impl CpuCore {
                 // If a bus/address error occurred during fetch, the exception is already taken.
                 if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                     self.run_mode = RUN_MODE_NORMAL;
+                    probe_on_entry = true;
                     continue;
                 }
                 self.ir = opcode as u32;
@@ -120,7 +134,11 @@ impl CpuCore {
                 self.ir = opcode as u32;
             }
 
-            self.prepare_rollback_snapshot(opcode);
+            if known_complex {
+                self.prepare_rollback_snapshot_full();
+            } else {
+                self.prepare_rollback_snapshot(opcode);
+            }
 
             // Dispatch instruction
             let result = dispatch_instruction(self, bus, opcode);
@@ -143,10 +161,15 @@ impl CpuCore {
             // and jumped to the handler. Skip trace/interrupt checks for the faulting instruction.
             if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                 self.run_mode = RUN_MODE_NORMAL;
+                probe_on_entry = true;
                 continue;
             }
 
-            if self.pc <= self.ppc {
+            // Only a backward branch can land on a (potential) trace head,
+            // so straight-line dispatches re-enter the fast loop without a
+            // trace-cache probe.
+            probe_on_entry = self.pc <= self.ppc;
+            if probe_on_entry {
                 trace_jit::record_trace_target(self.pc, self.cpu_type);
             }
 
@@ -203,6 +226,30 @@ impl CpuCore {
         max_instructions: u32,
         watch_pcs: &[u32],
     ) -> BatchResult {
+        // Capture the bus's fastmem window for the duration of this batch.
+        // Never with an active MMU: fastmem addresses are physical.
+        if !(self.has_pmmu && self.pmmu_enabled)
+            && let Some(fm) = bus.fast_mem()
+            && fm.len >= 4
+            && !fm.ptr.is_null()
+        {
+            self.fm_ptr = fm.ptr as usize;
+            self.fm_base = fm.base;
+            self.fm_len = fm.len;
+        }
+        let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
+        self.fm_ptr = 0;
+        self.fm_base = 0;
+        self.fm_len = 0;
+        result
+    }
+
+    fn run_batch_inner<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_instructions: u32,
+        watch_pcs: &[u32],
+    ) -> BatchResult {
         use crate::core::types::InternalStepResult;
 
         if self.stopped != 0 {
@@ -217,6 +264,7 @@ impl CpuCore {
         self.cycles_remaining = i32::MAX / 2;
 
         let mut retired: u32 = 0;
+        let mut probe_on_entry = true;
 
         loop {
             if retired >= max_instructions {
@@ -226,12 +274,14 @@ impl CpuCore {
                 };
             }
 
+            let mut known_complex = false;
             let opcode = if self.can_run_decoded_simple_ops() {
                 match self.run_decoded_simple_batch(
                     bus,
                     max_instructions - retired,
                     watch_pcs,
                     &mut retired,
+                    probe_on_entry,
                 ) {
                     BatchInnerExit::Budget => {
                         return BatchResult {
@@ -247,15 +297,20 @@ impl CpuCore {
                     }
                     BatchInnerExit::Fault => {
                         self.run_mode = RUN_MODE_NORMAL;
+                        probe_on_entry = true;
                         continue;
                     }
-                    BatchInnerExit::Miss(opcode) => opcode,
+                    BatchInnerExit::Miss(opcode) => {
+                        known_complex = true;
+                        opcode
+                    }
                 }
             } else {
                 self.ppc = self.pc;
                 let opcode = self.read_opcode_16(bus);
                 if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                     self.run_mode = RUN_MODE_NORMAL;
+                    probe_on_entry = true;
                     continue;
                 }
                 self.ir = opcode as u32;
@@ -266,9 +321,22 @@ impl CpuCore {
                 self.ir = opcode as u32;
             }
 
-            self.prepare_rollback_snapshot(opcode);
+            if known_complex {
+                self.prepare_rollback_snapshot_full();
+            } else {
+                self.prepare_rollback_snapshot(opcode);
+            }
 
             let result = dispatch_instruction(self, bus, opcode);
+
+            // A dispatched instruction may have enabled the MMU
+            // (PMOVE/MOVEC); fastmem addresses are physical, so drop the
+            // window as soon as translation turns on.
+            if self.fm_len != 0 && self.has_pmmu && self.pmmu_enabled {
+                self.fm_ptr = 0;
+                self.fm_base = 0;
+                self.fm_len = 0;
+            }
 
             let exit = match result {
                 InternalStepResult::Ok { .. } => None,
@@ -297,8 +365,13 @@ impl CpuCore {
             // for the faulting instruction (mirrors `execute`).
             if self.run_mode == RUN_MODE_BERR_AERR_RESET {
                 self.run_mode = RUN_MODE_NORMAL;
+                probe_on_entry = true;
             } else {
-                if self.pc <= self.ppc {
+                // Mirrors `execute`: only backward branches can reach a
+                // trace head, so straight-line dispatches re-enter the
+                // fast loop without a trace-cache probe.
+                probe_on_entry = self.pc <= self.ppc;
+                if probe_on_entry {
                     trace_jit::record_trace_target(self.pc, self.cpu_type);
                 }
 
@@ -351,11 +424,16 @@ impl CpuCore {
             return StepResult::Ok { cycles: 0 };
         }
 
-        if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
-            return result;
+        if self.can_run_decoded_simple_ops() {
+            if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
+                return result;
+            }
+            // The decoded-op cache just said this is not a simple op;
+            // snapshot without re-running the simple-op decode.
+            self.prepare_rollback_snapshot_full();
+        } else {
+            self.prepare_rollback_snapshot(self.ir as u16);
         }
-
-        self.prepare_rollback_snapshot(self.ir as u16);
 
         let result = dispatch_instruction(self, bus, self.ir as u16);
 
@@ -441,11 +519,16 @@ impl CpuCore {
             return StepResult::Ok { cycles: 0 };
         }
 
-        if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
-            return result;
+        if self.can_run_decoded_simple_ops() {
+            if let Some(result) = self.try_execute_decoded_simple_step(self.ir as u16) {
+                return result;
+            }
+            // The decoded-op cache just said this is not a simple op;
+            // snapshot without re-running the simple-op decode.
+            self.prepare_rollback_snapshot_full();
+        } else {
+            self.prepare_rollback_snapshot(self.ir as u16);
         }
-
-        self.prepare_rollback_snapshot(self.ir as u16);
 
         let result = dispatch_instruction(self, bus, self.ir as u16);
 

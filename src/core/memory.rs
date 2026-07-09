@@ -14,6 +14,40 @@ pub struct BusFault {
     pub address: u32,
 }
 
+/// A contiguous guest-RAM window the CPU may access directly ("fastmem").
+///
+/// Returned by [`AddressBus::fast_mem`]. The window lets the batch
+/// execution path ([`CpuCore::run_batch`](crate::CpuCore::run_batch))
+/// fetch opcodes and execute memory-operand instructions without a bus
+/// call per access.
+///
+/// # Contract
+///
+/// For every guest address `a` in `[base, base + len)`, and for the whole
+/// duration of the `run_batch` call that captured the window:
+///
+/// - `ptr[a - base]` holds the same byte the bus would return from
+///   `read_byte(a)`, stored big-endian for multi-byte values (i.e. the
+///   window is the bus's actual backing RAM, not a copy);
+/// - reads and writes through `ptr` have **no side effects** — no MMIO,
+///   no watchpoints, no dirty tracking, no mirroring — and are fully
+///   interchangeable with the `read_*`/`write_*` methods;
+/// - the pointer stays valid and the backing storage is not moved or
+///   resized, even across interleaved `AddressBus` method calls.
+///
+/// Buses with any interception (tracers, watchpoints, MMIO in range)
+/// must return `None` from `fast_mem` while that interception is active.
+/// `len` must be at least 4 bytes; smaller windows are ignored.
+#[derive(Debug, Clone, Copy)]
+pub struct FastMem {
+    /// Host pointer to the byte backing guest address `base`.
+    pub ptr: *mut u8,
+    /// First guest address covered by the window.
+    pub base: u32,
+    /// Window length in bytes.
+    pub len: u32,
+}
+
 pub trait AddressBus {
     fn read_byte(&mut self, address: u32) -> u8;
     fn read_word(&mut self, address: u32) -> u16;
@@ -64,6 +98,19 @@ pub trait AddressBus {
         0xFFFF_FFFF
     }
     fn reset_devices(&mut self) {}
+
+    /// Expose a direct window into contiguous, side-effect-free guest RAM.
+    ///
+    /// See [`FastMem`] for the exact contract. Returning `Some` lets
+    /// [`CpuCore::run_batch`](crate::CpuCore::run_batch) execute
+    /// memory-operand instructions and opcode fetches without a bus call
+    /// per access — typically a large speedup for memory-heavy guest
+    /// code. The default returns `None` (no fast path); cycle-accurate
+    /// entry points (`execute`/`step`) never use the window either way.
+    #[inline]
+    fn fast_mem(&mut self) -> Option<FastMem> {
+        None
+    }
 }
 
 /// Optional companion trait for buses that can version instruction-visible memory.

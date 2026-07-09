@@ -434,3 +434,583 @@ fn batch_matches_step_semantics_on_memory_program() {
         assert_eq!(bus_a.read_word(addr), bus_b.read_word(addr));
     }
 }
+
+// ============================================================================
+// Fastmem (AddressBus::fast_mem) coverage
+// ============================================================================
+
+/// Flat big-endian RAM bus that exposes a (configurable) fastmem window.
+/// Length must be a power of two; out-of-range accesses wrap like
+/// `LinearMemoryBus`, so the fallback path stays deterministic.
+struct FastRamBus {
+    mem: Vec<u8>,
+    fm_base: u32,
+    fm_len: u32,
+}
+
+impl FastRamBus {
+    fn new(size: usize) -> Self {
+        assert!(size.is_power_of_two());
+        Self {
+            mem: vec![0; size],
+            fm_base: 0,
+            fm_len: size as u32,
+        }
+    }
+
+    fn load(&mut self, addr: u32, bytes: &[u8]) {
+        self.mem[addr as usize..addr as usize + bytes.len()].copy_from_slice(bytes);
+    }
+
+    #[inline]
+    fn idx(&self, addr: u32) -> usize {
+        (addr as usize) & (self.mem.len() - 1)
+    }
+}
+
+impl AddressBus for FastRamBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.mem[self.idx(address)]
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        ((self.read_byte(address) as u16) << 8) | self.read_byte(address.wrapping_add(1)) as u16
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        ((self.read_word(address) as u32) << 16) | self.read_word(address.wrapping_add(2)) as u32
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        let i = self.idx(address);
+        self.mem[i] = value;
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.write_byte(address, (value >> 8) as u8);
+        self.write_byte(address.wrapping_add(1), value as u8);
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.write_word(address, (value >> 16) as u16);
+        self.write_word(address.wrapping_add(2), value as u16);
+    }
+    fn fast_mem(&mut self) -> Option<m68k::FastMem> {
+        if self.fm_len == 0 {
+            return None;
+        }
+        Some(m68k::FastMem {
+            ptr: unsafe { self.mem.as_mut_ptr().add(self.fm_base as usize) },
+            base: self.fm_base,
+            len: self.fm_len,
+        })
+    }
+}
+
+fn cpu_020_at(pc: u32) -> CpuCore {
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68020);
+    cpu.pc = pc;
+    cpu.set_sr(0x2700);
+    cpu.set_a(7, 0x9000);
+    cpu
+}
+
+fn assemble(words: &[u16]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(words.len() * 2);
+    for w in words {
+        bytes.extend_from_slice(&w.to_be_bytes());
+    }
+    bytes
+}
+
+/// Run `words` at 0x1000 to the A-line sentinel with step() (bus without
+/// fastmem) and with run_batch() (bus with fastmem); assert identical
+/// counts, registers, SR, PC, and memory.
+fn assert_fastmem_matches_step(
+    label: &str,
+    words: &[u16],
+    cpu_type: CpuType,
+    setup: impl Fn(&mut CpuCore),
+) {
+    let bytes = assemble(words);
+
+    let mk_cpu = |pc: u32| {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(cpu_type);
+        cpu.pc = pc;
+        cpu.set_sr(0x2700);
+        cpu.set_a(7, 0x9000);
+        setup(&mut cpu);
+        cpu
+    };
+
+    let mut bus_a = FastRamBus::new(0x20000);
+    bus_a.fm_len = 0; // step() reference: no fastmem anywhere
+    bus_a.load(0x1000, &bytes);
+    let mut cpu_a = mk_cpu(0x1000);
+    let mut steps: u64 = 0;
+    loop {
+        match cpu_a.step(&mut bus_a) {
+            m68k::StepResult::Ok { .. } => steps += 1,
+            m68k::StepResult::AlineTrap { .. } => break,
+            other => panic!("{label}: unexpected step result {other:?}"),
+        }
+        assert!(steps < 10_000_000, "{label}: step run diverged");
+    }
+
+    let mut bus_b = FastRamBus::new(0x20000);
+    bus_b.load(0x1000, &bytes);
+    let mut cpu_b = mk_cpu(0x1000);
+    let mut batched: u64 = 0;
+    loop {
+        let result = cpu_b.run_batch(&mut bus_b, 65_536, &[]);
+        batched += result.instructions as u64;
+        match result.exit {
+            BatchExit::BudgetExhausted => continue,
+            BatchExit::AlineTrap { .. } => break,
+            other => panic!("{label}: unexpected batch exit {other:?}"),
+        }
+        }
+
+    assert_eq!(steps, batched, "{label}: instruction count");
+    assert_eq!(cpu_a.pc, cpu_b.pc, "{label}: pc");
+    assert_eq!(cpu_a.get_sr(), cpu_b.get_sr(), "{label}: sr");
+    for i in 0..8 {
+        assert_eq!(cpu_a.d(i), cpu_b.d(i), "{label}: D{i}");
+        assert_eq!(cpu_a.a(i), cpu_b.a(i), "{label}: A{i}");
+    }
+    assert_eq!(bus_a.mem, bus_b.mem, "{label}: memory contents");
+}
+
+#[test]
+fn fastmem_move_and_alu_addressing_modes() {
+    // Deterministic pass over every fastmem EA family:
+    // (An), (An)+, -(An), d16(An), d8(An,Xn), abs.W, abs.L, d16(PC), #imm.
+    let words: &[u16] = &[
+        0x203C, 0x1234, 0x5678, // MOVE.L #$12345678,D0
+        0x2A7C, 0x0001, 0x4000, // MOVEA.L #$14000,A5
+        0x2ABC, 0xCAFE, 0xBABE, // MOVE.L #$CAFEBABE,(A5)
+        0x2015, // MOVE.L (A5),D0
+        0x3B40, 0x0010, // MOVE.W D0,$10(A5)
+        0x102D, 0x0011, // MOVE.B $11(A5),D0
+        0x2B80, 0x5820, // MOVE.L D0,($20,A5,D5.W*2)  (D5=0)
+        0x31C0, 0x4100, // MOVE.W D0,($4100).W
+        0x23C0, 0x0001, 0x4208, // MOVE.L D0,($14208).L
+        0x303A, 0xFFEE, // MOVE.W (d16,PC),D0  (reads earlier code)
+        0x2A9B, // MOVE.L (A3)+,(A5)
+        0x2B23, // MOVE.L -(A3),-(A5)... wait predec dst uses A5
+        0xD095, // ADD.L (A5),D0
+        0x957C, 0x0002, // SUBA.W #2,A2... (see below)
+        0x0685, 0x0000, 0x0100, // ADDI.L #$100,D5
+        0x0C6D, 0x0042, 0x0010, // CMPI.W #$42,$10(A5)
+        0x4A2D, 0x0011, // TST.B $11(A5)
+        0x422D, 0x0013, // CLR.B $13(A5)
+        0x446D, 0x0010, // NEG.W $10(A5)
+        0x466D, 0x0010, // NOT.W $10(A5)
+        0x5255, // ADDQ.W #1,(A5)
+        0x5395, // SUBQ.L #1,(A5)
+        0x0815, 0x0003, // BTST #3,(A5)
+        0x08D5, 0x0002, // BSET #2,(A5)
+        0x0895, 0x0001, // BCLR #1,(A5)
+        0x0855, 0x0000, // BCHG #0,(A5)
+        0x03D5, // BSET D1,(A5)
+        0xB50D, // CMPM.B (A5)+,(A2)+
+        0xA000, // sentinel
+    ];
+    assert_fastmem_matches_step("modes", words, CpuType::M68020, |cpu| {
+        cpu.set_a(3, 0x15000);
+        cpu.set_a(2, 0x14800);
+        cpu.set_d(5, 0);
+        cpu.set_d(1, 5);
+    });
+}
+
+#[test]
+fn fastmem_control_flow_ops() {
+    // LEA/PEA/MOVEA/JSR(abs.L)/BSR.W/RTS/JMP(abs.L) against step().
+    let words: &[u16] = &[
+        // 0x1000
+        0x41F8, 0x4000, // LEA ($4000).W,A0
+        0x43E8, 0x0200, // LEA $200(A0),A1
+        0x4869, 0x0100, // PEA $100(A1)
+        0x245F, // MOVEA.L (A7)+,A2
+        0x4EB9, 0x0000, 0x1024, // JSR ($1024).L
+        0x6100, 0x0012, // BSR.W +0x12 (to 0x1028)
+        0x6106, // BSR.S +6 (to 0x101C+... see layout)
+        0x4EF9, 0x0000, 0x102C, // JMP ($102C).L
+        // 0x1024: subroutine 1
+        0x5280, // ADDQ.L #1,D0
+        0x4E75, // RTS
+        // 0x1028: subroutine 2
+        0x5281, // ADDQ.L #1,D1
+        0x4E75, // RTS
+        // 0x102C: done
+        0xA000, // sentinel
+    ];
+    // Note: the BSR.S at 0x1016 targets 0x101E which lands mid-JMP — so
+    // give it a real target instead: rebuild with explicit layout below.
+    let _ = words;
+
+    let words: &[u16] = &[
+        // 0x1000
+        0x41F8, 0x4000, // LEA ($4000).W,A0            ; 0x1000
+        0x43E8, 0x0200, // LEA $200(A0),A1             ; 0x1004
+        0x4869, 0x0100, // PEA $100(A1)                ; 0x1008
+        0x245F, //        MOVEA.L (A7)+,A2             ; 0x100C
+        0x4EB9, 0x0000, 0x1020, // JSR ($1020).L       ; 0x100E
+        0x6100, 0x000C, // BSR.W +0xC (-> 0x1022+... ) ; 0x1014 -> 0x1016+0xC=0x1022? base=0x1016, +0xC=0x1022... target 0x1024
+        0x4EF9, 0x0000, 0x1028, // JMP ($1028).L       ; 0x1018
+        0x4E71, // NOP (padding)                       ; 0x101E
+        // 0x1020: subroutine 1
+        0x5280, // ADDQ.L #1,D0
+        0x4E75, // RTS                                 ; 0x1022
+        // 0x1024: subroutine 2
+        0x5281, // ADDQ.L #1,D1
+        0x4E75, // RTS                                 ; 0x1026
+        // 0x1028: done
+        0xA000, // sentinel
+    ];
+    assert_fastmem_matches_step("control", words, CpuType::M68020, |_| {});
+}
+
+#[test]
+fn fastmem_a7_byte_quirk() {
+    // Byte pushes/pops through A7 move SP by 2, and the byte lives at
+    // the *low* address of the word slot.
+    let words: &[u16] = &[
+        0x7041, // MOVEQ #$41,D0
+        0x1F00, // MOVE.B D0,-(A7)
+        0x1F3C, 0x0042, // MOVE.B #$42,-(A7)
+        0x121F, // MOVE.B (A7)+,D1
+        0x141F, // MOVE.B (A7)+,D2
+        0xA000, // sentinel
+    ];
+    assert_fastmem_matches_step("a7-byte", words, CpuType::M68020, |_| {});
+    assert_fastmem_matches_step("a7-byte-68000", words, CpuType::M68000, |_| {});
+}
+
+#[test]
+fn fastmem_68000_alignment_faults_match_step() {
+    // Odd word/long accesses raise a 68000 address error; the fastmem
+    // path must fall back so the exception frame matches step() exactly.
+    // (Vectors are zero-filled, so both sides jump to PC 0 and execute
+    // whatever's there; run a bounded number of instructions and compare.)
+    let words: &[u16] = &[
+        0x2A7C, 0x0001, 0x4001, // MOVEA.L #$14001,A5 (odd)
+        0x3A80, // MOVE.W D0,(A5)  -> address error
+        0x4E71, // NOP (skipped via exception)
+        0xA000,
+    ];
+    let bytes = assemble(words);
+
+    let mut bus_a = FastRamBus::new(0x20000);
+    bus_a.fm_len = 0;
+    bus_a.load(0x1000, &bytes);
+    let mut cpu_a = cpu_at(0x1000); // 68000
+    for _ in 0..4 {
+        let _ = cpu_a.step(&mut bus_a);
+    }
+
+    let mut bus_b = FastRamBus::new(0x20000);
+    bus_b.load(0x1000, &bytes);
+    let mut cpu_b = cpu_at(0x1000);
+    let mut executed = 0;
+    while executed < 4 {
+        let result = cpu_b.run_batch(&mut bus_b, 4 - executed, &[]);
+        executed += result.instructions;
+        match result.exit {
+            BatchExit::BudgetExhausted => {}
+            // The faulting instruction isn't counted by the batch loop's
+            // fault path; step() counts it as an executed step. Just stop
+            // on any other exit and compare state below.
+            other => panic!("unexpected exit {other:?}"),
+        }
+    }
+
+    assert_eq!(cpu_a.pc, cpu_b.pc, "pc after address error");
+    assert_eq!(cpu_a.get_sr(), cpu_b.get_sr(), "sr after address error");
+    assert_eq!(cpu_a.a(7), cpu_b.a(7), "sp after address error");
+    assert_eq!(bus_a.mem, bus_b.mem, "memory after address error");
+}
+
+#[test]
+fn fastmem_partial_window_falls_back_outside() {
+    // Window covers only [0x10000, 0x18000); code at 0x1000 and a low
+    // absolute write are both outside it and must use the bus path.
+    let words: &[u16] = &[
+        0x31FC, 0x1111, 0x4000, // MOVE.W #$1111,($4000).W   (outside window)
+        0x33FC, 0x2222, 0x0001, 0x4000, // MOVE.W #$2222,($14000).L (inside)
+        0x3038, 0x4000, // MOVE.W ($4000).W,D0
+        0x3239, 0x0001, 0x4000, // MOVE.W ($14000).L,D1
+        0xA000,
+    ];
+    let bytes = assemble(words);
+
+    let mut bus_a = FastRamBus::new(0x20000);
+    bus_a.fm_len = 0;
+    bus_a.load(0x1000, &bytes);
+    let mut cpu_a = cpu_020_at(0x1000);
+    loop {
+        match cpu_a.step(&mut bus_a) {
+            m68k::StepResult::Ok { .. } => {}
+            m68k::StepResult::AlineTrap { .. } => break,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+
+    let mut bus_b = FastRamBus::new(0x20000);
+    bus_b.fm_base = 0x10000;
+    bus_b.fm_len = 0x8000;
+    bus_b.load(0x1000, &bytes);
+    let mut cpu_b = cpu_020_at(0x1000);
+    loop {
+        let result = cpu_b.run_batch(&mut bus_b, 1000, &[]);
+        match result.exit {
+            BatchExit::BudgetExhausted => continue,
+            BatchExit::AlineTrap { .. } => break,
+            other => panic!("unexpected batch exit {other:?}"),
+        }
+    }
+
+    assert_eq!(cpu_a.d(0), cpu_b.d(0));
+    assert_eq!(cpu_a.d(1), cpu_b.d(1));
+    assert_eq!(cpu_a.d(0) & 0xFFFF, 0x1111);
+    assert_eq!(cpu_a.d(1) & 0xFFFF, 0x2222);
+    assert_eq!(bus_a.mem, bus_b.mem);
+}
+
+#[test]
+fn fastmem_differential_fuzz_memory_ops() {
+    // Differential fuzz between step() (no fastmem) and run_batch() with
+    // a fastmem window, over random DBRA loops whose bodies mix register
+    // ops with every fastmem memory-op family. A0-A5 point into a data
+    // zone well away from the code; ops that would send addresses
+    // wandering (MOVEA/ADDA/LEA from memory) are exercised by the
+    // deterministic tests above instead.
+    let mut seed: u64 = 0xFA57_3E31_2345_6789;
+    let mut rng = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed
+    };
+
+    for program_index in 0..300 {
+        let mut r = || rng() as u32;
+        let dreg = |v: u32| (v % 6) as u16; // D0-D5
+        let areg = |v: u32| (v % 6) as u16; // A0-A5
+        let size2 = |v: u32| (v % 3) as u16;
+        // Memory EA (mode,reg) in the safe data zone; returns (mode<<3)|reg
+        // plus any extension words. d16 kept within ±0x1000 of the zone.
+        let mut mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
+            match r() % 5 {
+                0 => (2 << 3) | areg(r()), // (An)
+                1 => (3 << 3) | areg(r()), // (An)+
+                2 => (4 << 3) | areg(r()), // -(An)
+                3 => {
+                    exts.push((r() % 0x2000) as i16 as u16 & 0x1FFF); // 0..0x1FFF
+                    (5 << 3) | areg(r())
+                }
+                _ => {
+                    // (d8,An,Am.W/L[*scale]) — address-register index only,
+                    // masked to the zone-safe low bits at setup.
+                    let idx = 8 | (areg(r()) as u32); // An as index
+                    let long = (r() % 2) << 11;
+                    let scale = (r() % 4) << 9;
+                    exts.push(
+                        ((idx as u16) << 12)
+                            | (long as u16)
+                            | (scale as u16)
+                            | ((r() % 0x80) as u16),
+                    );
+                    (6 << 3) | areg(r())
+                }
+            }
+        };
+
+        let mut words: Vec<u16> = Vec::new();
+        let iterations = (r() % 60) as u16;
+        words.push(0x7C00 | (iterations & 0x3F)); // MOVEQ #it,D6
+        let loop_start = words.len();
+        for _ in 0..12 {
+            let mut exts: Vec<u16> = Vec::new();
+            let op = match r() % 12 {
+                0 => {
+                    // MOVE.size mem→Dn
+                    let base = [0x1000u16, 0x3000, 0x2000][(r() % 3) as usize];
+                    let ea = mem_ea(&mut r, &mut exts);
+                    base | (dreg(r()) << 9) | ea
+                }
+                1 => {
+                    // MOVE.size Dn→mem
+                    let base = [0x1000u16, 0x3000, 0x2000][(r() % 3) as usize];
+                    let ea = mem_ea(&mut r, &mut exts);
+                    let dst_mode = (ea >> 3) & 7;
+                    let dst_reg = ea & 7;
+                    base | (dst_reg << 9) | (dst_mode << 6) | dreg(r())
+                }
+                2 => {
+                    // MOVE.size mem→mem
+                    let base = [0x1000u16, 0x3000, 0x2000][(r() % 3) as usize];
+                    let src = mem_ea(&mut r, &mut exts);
+                    let mut dst_exts: Vec<u16> = Vec::new();
+                    let dst = mem_ea(&mut r, &mut dst_exts);
+                    exts.extend_from_slice(&dst_exts);
+                    base | ((dst & 7) << 9) | (((dst >> 3) & 7) << 6) | src
+                }
+                3 => {
+                    // ALU mem→Dn
+                    let group = [0xD000u16, 0x9000, 0xC000, 0x8000, 0xB000][(r() % 5) as usize];
+                    let ea = mem_ea(&mut r, &mut exts);
+                    group | (dreg(r()) << 9) | (size2(r()) << 6) | ea
+                }
+                4 => {
+                    // ALU Dn→mem (ADD/SUB/AND/OR/EOR)
+                    let group = [0xD100u16, 0x9100, 0xC100, 0x8100, 0xB100][(r() % 5) as usize];
+                    let ea = mem_ea(&mut r, &mut exts);
+                    group | (dreg(r()) << 9) | (size2(r()) << 6) | ea
+                }
+                5 => {
+                    // ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm → Dn or mem
+                    let op = [0x0600u16, 0x0400, 0x0200, 0x0000, 0x0A00, 0x0C00]
+                        [(r() % 6) as usize];
+                    let size = size2(r());
+                    let ea = if r() % 2 == 0 {
+                        dreg(r())
+                    } else {
+                        mem_ea(&mut r, &mut exts)
+                    };
+                    let imm_exts: Vec<u16> = if size == 2 {
+                        vec![(r() & 0xFFFF) as u16, (r() & 0xFFFF) as u16]
+                    } else {
+                        vec![(r() & 0xFFFF) as u16]
+                    };
+                    // Immediate words come before the EA extension words.
+                    let mut all = imm_exts;
+                    all.extend_from_slice(&exts);
+                    exts = all;
+                    op | (size << 6) | ea
+                }
+                6 => {
+                    // ADDQ/SUBQ #q,mem
+                    let sub = if r() % 2 == 0 { 0x0100 } else { 0 };
+                    let ea = mem_ea(&mut r, &mut exts);
+                    0x5000 | sub | (((r() % 8) as u16) << 9) | (size2(r()) << 6) | ea
+                }
+                7 => {
+                    // TST/CLR/NEG/NOT mem
+                    let unary = [0x4A00u16, 0x4200, 0x4400, 0x4600][(r() % 4) as usize];
+                    let ea = mem_ea(&mut r, &mut exts);
+                    unary | (size2(r()) << 6) | ea
+                }
+                8 => {
+                    // BTST/BCHG/BCLR/BSET (Dn or #imm) on mem
+                    let ea = mem_ea(&mut r, &mut exts);
+                    if r() % 2 == 0 {
+                        0x0100 | (dreg(r()) << 9) | (((r() % 4) as u16) << 6) | ea
+                    } else {
+                        let mut all = vec![(r() % 8) as u16];
+                        all.extend_from_slice(&exts);
+                        exts = all;
+                        0x0800 | (((r() % 4) as u16) << 6) | ea
+                    }
+                }
+                9 => {
+                    // CMPM.size (Ay)+,(Ax)+
+                    0xB108 | (areg(r()) << 9) | (size2(r()) << 6) | areg(r())
+                }
+                10 => {
+                    // CMPA.W/L mem,An
+                    let ea = mem_ea(&mut r, &mut exts);
+                    let long = if r() % 2 == 0 { 0x0100 } else { 0 };
+                    0xB0C0 | long | (areg(r()) << 9) | ea
+                }
+                _ => {
+                    // Register filler: MOVEQ
+                    0x7000 | (dreg(r()) << 9) | (r() & 0xFF) as u16
+                }
+            };
+            words.push(op);
+            words.extend_from_slice(&exts);
+        }
+        let body_bytes = (words.len() - loop_start) * 2;
+        words.push(0x51CE); // DBRA D6
+        words.push((-(body_bytes as i32) - 2) as i16 as u16);
+        words.push(0xA000);
+
+        let bytes = assemble(&words);
+
+        // A0-A5 spread across the data zone; D0-D5 random data.
+        let init_a: Vec<u32> = (0..6).map(|i| 0x12000 + i * 0x800 + (r() % 0x400)).collect();
+        let init_d: Vec<u32> = (0..6).map(|_| r()).collect();
+        let init_ccr = (r() & 0x1F) as u16;
+        let mut fill: Vec<u8> = Vec::with_capacity(0x10000);
+        for _ in 0..0x4000 {
+            fill.extend_from_slice(&r().to_be_bytes());
+        }
+        let setup = |cpu: &mut CpuCore| {
+            for i in 0..6 {
+                cpu.set_d(i, init_d[i]);
+                cpu.set_a(i, init_a[i]);
+            }
+            cpu.set_sr(0x2700 | init_ccr);
+        };
+
+        let mut bus_a = FastRamBus::new(0x40000);
+        bus_a.fm_len = 0;
+        bus_a.load(0x1000, &bytes);
+        bus_a.load(0x10000, &fill);
+        let mut cpu_a = cpu_020_at(0x1000);
+        setup(&mut cpu_a);
+        let mut steps: u64 = 0;
+        let mut timed_out = false;
+        loop {
+            match cpu_a.step(&mut bus_a) {
+                m68k::StepResult::Ok { .. } => steps += 1,
+                m68k::StepResult::AlineTrap { .. } => break,
+                other => panic!("program {program_index}: unexpected step result {other:?} (words={words:04X?})"),
+            }
+            if steps >= 2_000_000 {
+                timed_out = true;
+                break;
+            }
+        }
+        if timed_out {
+            // A stray write corrupted the loop; skip rather than hang.
+            continue;
+        }
+
+        let mut bus_b = FastRamBus::new(0x40000);
+        bus_b.load(0x1000, &bytes);
+        bus_b.load(0x10000, &fill);
+        let mut cpu_b = cpu_020_at(0x1000);
+        setup(&mut cpu_b);
+        let mut batched: u64 = 0;
+        loop {
+            let result = cpu_b.run_batch(&mut bus_b, 100_000, &[]);
+            batched += result.instructions as u64;
+            match result.exit {
+                BatchExit::BudgetExhausted => {
+                    assert!(
+                        batched < steps + 200_000,
+                        "program {program_index}: batch ran past step count (words={words:04X?})"
+                    );
+                }
+                BatchExit::AlineTrap { .. } => break,
+                other => panic!("program {program_index}: unexpected batch exit {other:?} (words={words:04X?})"),
+            }
+        }
+
+        assert_eq!(steps, batched, "program {program_index}: instruction count (words={words:04X?})");
+        assert_eq!(cpu_a.pc, cpu_b.pc, "program {program_index}: pc (words={words:04X?})");
+        assert_eq!(
+            cpu_a.get_sr(),
+            cpu_b.get_sr(),
+            "program {program_index}: sr (words={words:04X?})"
+        );
+        for i in 0..8 {
+            assert_eq!(cpu_a.d(i), cpu_b.d(i), "program {program_index}: D{i} (words={words:04X?})");
+            assert_eq!(cpu_a.a(i), cpu_b.a(i), "program {program_index}: A{i} (words={words:04X?})");
+        }
+        assert_eq!(
+            bus_a.mem, bus_b.mem,
+            "program {program_index}: memory diverged (words={words:04X?})"
+        );
+    }
+}
