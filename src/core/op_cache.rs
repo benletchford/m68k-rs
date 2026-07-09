@@ -158,6 +158,20 @@ pub(crate) enum CachedRunResult {
     Fault,
 }
 
+/// Result of the instruction-budgeted fast loop used by `run_batch`.
+pub(crate) enum BatchInnerExit {
+    /// The remaining instruction budget hit zero.
+    Budget,
+    /// Execution reached a PC in the caller's watch list.
+    Watched(u32),
+    /// A bus/address error was taken during fetch or trace execution.
+    Fault,
+    /// The instruction at the current PC is not a cached simple op;
+    /// the opcode has been fetched (`ppc`/`ir` are set) and full
+    /// dispatch should handle it.
+    Miss(u16),
+}
+
 impl DecodedSimpleOp {
     #[inline]
     pub(crate) fn decode(cpu_type: CpuType, opcode: u16) -> Option<Self> {
@@ -862,7 +876,7 @@ impl CpuCore {
 
         while self.cycles_remaining > 0 {
             if trace_probe_enabled
-                && let Some(result) = trace_jit::try_execute_trace(self, bus, cpu_type)
+                && let Some((result, _instructions)) = trace_jit::try_execute_trace(self, bus, cpu_type)
             {
                 match result {
                     CachedRunResult::Ran => continue,
@@ -897,6 +911,81 @@ impl CpuCore {
         }
 
         CachedRunResult::Ran
+    }
+
+    /// Instruction-budgeted variant of `execute_decoded_simple_run` for
+    /// [`CpuCore::run_batch`](crate::CpuCore::run_batch).
+    ///
+    /// Differences from the cycle-budgeted loop:
+    /// - `budget` counts retired instructions, and `*retired` is
+    ///   incremented in place so the caller keeps an exact count even
+    ///   when JIT traces retire many instructions per call.
+    /// - Traces are only attempted while at least `TRACE_MAX_OPS`
+    ///   instructions of budget remain, so a trace can never overshoot
+    ///   the budget.
+    /// - After every retired instruction (or trace), the new PC is
+    ///   checked against `watch_pcs`.
+    pub(crate) fn run_decoded_simple_batch<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        budget: u32,
+        watch_pcs: &[u32],
+        retired: &mut u32,
+    ) -> BatchInnerExit {
+        let cpu_type = self.cpu_type;
+        let watch = !watch_pcs.is_empty();
+        let mut remaining = budget;
+        let mut trace_probe_enabled = trace_jit::has_trace_candidates();
+
+        while remaining > 0 {
+            if trace_probe_enabled
+                && remaining >= trace_jit::TRACE_MAX_OPS as u32
+                && let Some((result, instructions)) = trace_jit::try_execute_trace(self, bus, cpu_type)
+            {
+                match result {
+                    CachedRunResult::Ran => {
+                        remaining -= instructions;
+                        *retired += instructions;
+                        if watch && watch_pcs.contains(&self.pc) {
+                            return BatchInnerExit::Watched(self.pc);
+                        }
+                        continue;
+                    }
+                    CachedRunResult::Fault => return BatchInnerExit::Fault,
+                    CachedRunResult::Miss(opcode) => return BatchInnerExit::Miss(opcode),
+                }
+            }
+
+            self.ppc = self.pc;
+            let opcode = self.read_opcode_16(bus);
+            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                return BatchInnerExit::Fault;
+            }
+            self.ir = opcode as u32;
+
+            let Some(op) = self.decoded_simple_op(self.ppc, opcode, cpu_type) else {
+                return BatchInnerExit::Miss(opcode);
+            };
+            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+                Some(self.ppc)
+            } else {
+                None
+            };
+            let _cycles = op.execute(self);
+            if let Some(branch_pc) = branch_pc
+                && self.pc <= branch_pc
+            {
+                trace_jit::record_trace_target(self.pc, cpu_type);
+                trace_probe_enabled = true;
+            }
+            remaining -= 1;
+            *retired += 1;
+            if watch && watch_pcs.contains(&self.pc) {
+                return BatchInnerExit::Watched(self.pc);
+            }
+        }
+
+        BatchInnerExit::Budget
     }
 
     #[inline]

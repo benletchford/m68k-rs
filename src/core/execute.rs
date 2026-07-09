@@ -5,11 +5,11 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::CachedRunResult;
+use super::op_cache::{BatchInnerExit, CachedRunResult};
 #[cfg(not(target_family = "wasm"))]
 use super::op_cache::DecodedSimpleOp;
 use super::trace_jit;
-use super::types::StepResult;
+use super::types::{BatchExit, BatchResult, StepResult};
 
 /// Stop level constants.
 pub const STOP_LEVEL_STOP: u32 = 1;
@@ -169,6 +169,162 @@ impl CpuCore {
 
         // Return cycles consumed
         self.initial_cycles - self.cycles_remaining
+    }
+
+    /// Execute up to `max_instructions` instructions, returning on the first
+    /// interesting event.
+    ///
+    /// This is the fast path for High-Level Emulation embedders that would
+    /// otherwise call [`step`](Self::step) in a loop: the whole batch runs
+    /// inside the decoded-op cache / trace-JIT inner loop, and control only
+    /// returns to the caller when it has something to do:
+    ///
+    /// - a trap the embedder wants to intercept (A-line/F-line/TRAP/BKPT/
+    ///   illegal — surfaced exactly like [`step`](Self::step), never taken
+    ///   as a hardware exception),
+    /// - the CPU stopping (STOP instruction),
+    /// - execution reaching a PC listed in `watch_pcs`, or
+    /// - the instruction budget running out.
+    ///
+    /// Watch semantics: `watch_pcs` is checked after every retired
+    /// instruction, *before* the instruction at the new PC executes. The
+    /// entry PC is intentionally **not** checked, so a caller that resumes
+    /// from a watched PC does not loop forever; keep the list short (it is
+    /// scanned linearly).
+    ///
+    /// Unlike [`execute`](Self::execute), this entry point is
+    /// instruction-budgeted and does not maintain cycle accounting
+    /// (`cycles_remaining` is clobbered). Trace exceptions are taken
+    /// internally and pending interrupts are serviced between instructions,
+    /// matching [`step`](Self::step) semantics.
+    pub fn run_batch<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_instructions: u32,
+        watch_pcs: &[u32],
+    ) -> BatchResult {
+        use crate::core::types::InternalStepResult;
+
+        if self.stopped != 0 {
+            return BatchResult {
+                instructions: 0,
+                exit: BatchExit::Stopped,
+            };
+        }
+
+        // The trace JIT's headroom guard compares against `cycles_remaining`;
+        // give it a budget that can never gate a trace in this mode.
+        self.cycles_remaining = i32::MAX / 2;
+
+        let mut retired: u32 = 0;
+
+        loop {
+            if retired >= max_instructions {
+                return BatchResult {
+                    instructions: retired,
+                    exit: BatchExit::BudgetExhausted,
+                };
+            }
+
+            let opcode = if self.can_run_decoded_simple_ops() {
+                match self.run_decoded_simple_batch(
+                    bus,
+                    max_instructions - retired,
+                    watch_pcs,
+                    &mut retired,
+                ) {
+                    BatchInnerExit::Budget => {
+                        return BatchResult {
+                            instructions: retired,
+                            exit: BatchExit::BudgetExhausted,
+                        };
+                    }
+                    BatchInnerExit::Watched(pc) => {
+                        return BatchResult {
+                            instructions: retired,
+                            exit: BatchExit::WatchedPc { pc },
+                        };
+                    }
+                    BatchInnerExit::Fault => {
+                        self.run_mode = RUN_MODE_NORMAL;
+                        continue;
+                    }
+                    BatchInnerExit::Miss(opcode) => opcode,
+                }
+            } else {
+                self.ppc = self.pc;
+                let opcode = self.read_opcode_16(bus);
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    self.run_mode = RUN_MODE_NORMAL;
+                    continue;
+                }
+                self.ir = opcode as u32;
+                opcode
+            };
+
+            if self.ir != opcode as u32 {
+                self.ir = opcode as u32;
+            }
+
+            self.prepare_rollback_snapshot(opcode);
+
+            let result = dispatch_instruction(self, bus, opcode);
+
+            let exit = match result {
+                InternalStepResult::Ok { .. } => None,
+                InternalStepResult::AlineTrap { opcode } => Some(BatchExit::AlineTrap { opcode }),
+                InternalStepResult::FlineTrap { opcode } => Some(BatchExit::FlineTrap { opcode }),
+                InternalStepResult::TrapInstruction { trap_num } => {
+                    Some(BatchExit::TrapInstruction { trap_num })
+                }
+                InternalStepResult::Breakpoint { bp_num } => {
+                    Some(BatchExit::Breakpoint { bp_num })
+                }
+                InternalStepResult::IllegalInstruction { opcode } => {
+                    Some(BatchExit::IllegalInstruction { opcode })
+                }
+            };
+            if let Some(exit) = exit {
+                return BatchResult {
+                    instructions: retired,
+                    exit,
+                };
+            }
+            retired += 1;
+
+            // A bus/address error mid-instruction already built the exception
+            // frame and jumped to the handler; skip trace/interrupt checks
+            // for the faulting instruction (mirrors `execute`).
+            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                self.run_mode = RUN_MODE_NORMAL;
+            } else {
+                if self.pc <= self.ppc {
+                    trace_jit::record_trace_target(self.pc, self.cpu_type);
+                }
+
+                if !self.sst_m68000_compat && self.check_trace() {
+                    let _ = self.exception_trace(bus);
+                }
+
+                if self.int_level > 0 {
+                    self.check_and_service_interrupts(bus);
+                }
+            }
+
+            if self.stopped != 0 {
+                return BatchResult {
+                    instructions: retired,
+                    exit: BatchExit::Stopped,
+                };
+            }
+
+            if !watch_pcs.is_empty() && watch_pcs.contains(&self.pc) {
+                return BatchResult {
+                    instructions: retired,
+                    exit: BatchExit::WatchedPc { pc: self.pc },
+                };
+            }
+        }
     }
 
     /// Execute a single instruction.

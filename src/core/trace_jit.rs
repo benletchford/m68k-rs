@@ -29,7 +29,7 @@ use std::mem::{offset_of, size_of, transmute};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 const TRACE_CACHE_SIZE: usize = 4096;
-const TRACE_MAX_OPS: usize = 16;
+pub(crate) const TRACE_MAX_OPS: usize = 16;
 const TRACE_HOT_THRESHOLD: u8 = 2;
 
 #[cfg(not(target_family = "wasm"))]
@@ -245,12 +245,17 @@ impl TraceJit {
         }
     }
 
+    /// Attempt to execute a compiled trace at the current PC.
+    ///
+    /// On `CachedRunResult::Ran`, the returned count is the number of
+    /// guest instructions the trace retired (every op in the trace runs
+    /// exactly once per call). The count is 0 for `Fault`/`Miss`.
     fn try_execute<B: AddressBus>(
         &mut self,
         cpu: &mut CpuCore,
         bus: &mut B,
         cpu_type: CpuType,
-    ) -> Option<CachedRunResult> {
+    ) -> Option<(CachedRunResult, u32)> {
         #[cfg(not(target_family = "wasm"))]
         self.module.as_ref()?;
 
@@ -270,12 +275,12 @@ impl TraceJit {
             }
 
             let mut miss = None;
-            for op in &trace.ops {
+            for (index, op) in trace.ops.iter().enumerate() {
                 let addr = cpu.address(op.pc);
                 match bus.try_read_word(addr) {
                     Ok(opcode) if opcode == op.opcode => {}
                     Ok(opcode) => {
-                        miss = Some((op.pc, opcode));
+                        miss = Some((index, op.pc, opcode));
                         break;
                     }
                     Err(_) => return None,
@@ -286,7 +291,7 @@ impl TraceJit {
                     match bus.try_read_word(addr) {
                         Ok(extension) if extension == expected => {}
                         Ok(_) => {
-                            miss = Some((op.pc, op.opcode));
+                            miss = Some((index, op.pc, op.opcode));
                             break;
                         }
                         Err(_) => return None,
@@ -294,20 +299,29 @@ impl TraceJit {
                 }
             }
 
-            if let Some((ppc, opcode)) = miss {
+            if let Some((index, ppc, opcode)) = miss {
                 self.slots[idx] = TraceSlot::Empty;
+                if index > 0 {
+                    // Instruction memory changed mid-trace. Nothing has
+                    // executed yet (validation precedes the trace call),
+                    // so consuming the changed opcode here would silently
+                    // skip the still-valid ops before it. Leave PC at the
+                    // trace head and let the caller re-decode from there.
+                    return None;
+                }
                 cpu.ppc = ppc;
                 cpu.ir = opcode as u32;
                 cpu.pc = cpu.ppc.wrapping_add(2);
-                return Some(CachedRunResult::Miss(opcode));
+                return Some((CachedRunResult::Miss(opcode), 0));
             }
 
+            let instructions = trace.ops.len() as u32;
             #[cfg(not(target_family = "wasm"))]
             let cycles = unsafe { (trace.func)(cpu as *mut CpuCore) };
             #[cfg(target_family = "wasm")]
             let cycles = execute_portable_trace(cpu, &trace.ops);
             cpu.cycles_remaining -= cycles;
-            return Some(CachedRunResult::Ran);
+            return Some((CachedRunResult::Ran, instructions));
         }
 
         match &mut self.slots[idx] {
@@ -479,11 +493,13 @@ impl TraceJit {
     }
 }
 
+/// Attempt to execute a compiled trace at the current PC. See
+/// [`TraceJit::try_execute`] for the meaning of the returned count.
 pub(crate) fn try_execute_trace<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
     cpu_type: CpuType,
-) -> Option<CachedRunResult> {
+) -> Option<(CachedRunResult, u32)> {
     if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
         return None;
     }
@@ -1579,6 +1595,17 @@ fn extend_flag_value(builder: &mut FunctionBuilder<'_>, cpu: Value) -> Value {
 }
 
 #[cfg(not(target_family = "wasm"))]
+/// Logical NOT for the 0/1 booleans produced by `icmp`.
+///
+/// `bnot` is bitwise and must not be used here: `bnot(0x01) == 0xFE`,
+/// which is still non-zero and therefore still "true" to `select`/`brif`.
+/// Flipping the low bit keeps the value a canonical 0/1 boolean.
+#[cfg(not(target_family = "wasm"))]
+fn not_bool(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
+    builder.ins().bxor_imm(value, 1)
+}
+
+#[cfg(not(target_family = "wasm"))]
 fn emit_condition(builder: &mut FunctionBuilder<'_>, cpu: Value, cond: u8) -> Value {
     let c = flag_is_set(builder, cpu, offset_of!(CpuCore, c_flag));
     let z = flag_is_zero_set(builder, cpu);
@@ -1589,28 +1616,28 @@ fn emit_condition(builder: &mut FunctionBuilder<'_>, cpu: Value, cond: u8) -> Va
         0x0 => bool_const(builder, true),
         0x1 => bool_const(builder, false),
         0x2 => {
-            let not_c = builder.ins().bnot(c);
-            let not_z = builder.ins().bnot(z);
+            let not_c = not_bool(builder, c);
+            let not_z = not_bool(builder, z);
             builder.ins().band(not_c, not_z)
         }
         0x3 => builder.ins().bor(c, z),
-        0x4 => builder.ins().bnot(c),
+        0x4 => not_bool(builder, c),
         0x5 => c,
-        0x6 => builder.ins().bnot(z),
+        0x6 => not_bool(builder, z),
         0x7 => z,
-        0x8 => builder.ins().bnot(v),
+        0x8 => not_bool(builder, v),
         0x9 => v,
-        0xA => builder.ins().bnot(n),
+        0xA => not_bool(builder, n),
         0xB => n,
         0xC => {
             let different = builder.ins().bxor(n, v);
-            builder.ins().bnot(different)
+            not_bool(builder, different)
         }
         0xD => builder.ins().bxor(n, v),
         0xE => {
-            let not_z = builder.ins().bnot(z);
+            let not_z = not_bool(builder, z);
             let different = builder.ins().bxor(n, v);
-            let same = builder.ins().bnot(different);
+            let same = not_bool(builder, different);
             builder.ins().band(not_z, same)
         }
         0xF => {
@@ -1674,7 +1701,7 @@ fn emit_dbcc(
     let stored_dreg = builder.ins().select(condition_true, dreg, updated_dreg);
     store_reg(builder, cpu, JitDirectReg::Data(reg), stored_dreg);
 
-    let false_condition = builder.ins().bnot(condition_true);
+    let false_condition = not_bool(builder, condition_true);
     let not_expired = builder.ins().icmp_imm(IntCC::NotEqual, new_counter, 0xFFFF);
     let false_value = bool_const(builder, false);
     let branch_taken = builder

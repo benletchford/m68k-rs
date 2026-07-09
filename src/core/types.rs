@@ -198,3 +198,45 @@ impl StepResult {
         matches!(self, StepResult::Stopped)
     }
 }
+
+/// Reason a [`CpuCore::run_batch`](crate::CpuCore::run_batch) call returned.
+///
+/// Trap variants surface the same state a corresponding
+/// [`StepResult`] would after `step()`: the program counter has advanced
+/// past the trapping opcode word and `CpuCore::ppc` holds the address of
+/// the trapping instruction itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchExit {
+    /// The instruction budget was fully consumed with no other event.
+    BudgetExhausted,
+    /// The CPU is stopped (STOP instruction executed, or it was already
+    /// stopped on entry — the latter returns with `instructions == 0`).
+    Stopped,
+    /// Execution reached a PC in the caller's watch list. The instruction
+    /// at the watched PC has **not** been executed yet.
+    WatchedPc { pc: u32 },
+    /// A-line trap (0xAxxx opcode).
+    AlineTrap { opcode: u16 },
+    /// F-line trap (0xFxxx opcode).
+    FlineTrap { opcode: u16 },
+    /// TRAP #n instruction.
+    TrapInstruction { trap_num: u8 },
+    /// BKPT #n instruction.
+    Breakpoint { bp_num: u8 },
+    /// Illegal instruction.
+    IllegalInstruction { opcode: u16 },
+}
+
+/// Result of a [`CpuCore::run_batch`](crate::CpuCore::run_batch) call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchResult {
+    /// Number of instructions that fully retired during the batch.
+    ///
+    /// Trapping instructions (A-line/F-line/TRAP/BKPT/illegal) are **not**
+    /// included — the embedder decides how to account for them after
+    /// handling the trap. Instructions that faulted mid-execution (bus or
+    /// address error, exception taken internally) count as one.
+    pub instructions: u32,
+    /// Why the batch returned.
+    pub exit: BatchExit,
+}
