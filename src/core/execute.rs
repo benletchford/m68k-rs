@@ -257,14 +257,16 @@ impl CpuCore {
             };
         }
 
-        // The trace JIT's headroom guard compares against `cycles_remaining`;
-        // give it a budget that can never gate a trace in this mode.
-        self.cycles_remaining = i32::MAX / 2;
-
         let mut retired: u32 = 0;
         let mut probe_on_entry = true;
 
         loop {
+            // The trace JIT's headroom guard compares against
+            // `cycles_remaining`; keep it topped up so it can never gate a
+            // trace in this instruction-budgeted mode (traces decrement it
+            // as they run).
+            self.cycles_remaining = i32::MAX / 2;
+
             if retired >= max_instructions {
                 return BatchResult {
                     instructions: retired,

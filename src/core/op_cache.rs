@@ -899,7 +899,7 @@ impl CpuCore {
             if probe {
                 probe = false;
                 if let Some((result, _instructions)) =
-                    trace_jit::try_execute_trace(self, bus, cpu_type)
+                    trace_jit::try_execute_trace(self, bus, cpu_type, u32::MAX, false)
                 {
                     match result {
                         CachedRunResult::Ran => {
@@ -970,7 +970,7 @@ impl CpuCore {
             if probe && remaining >= trace_jit::TRACE_MAX_OPS as u32 {
                 probe = false;
                 if let Some((result, instructions)) =
-                    trace_jit::try_execute_trace(self, bus, cpu_type)
+                    trace_jit::try_execute_trace(self, bus, cpu_type, remaining, watch)
                 {
                     match result {
                         CachedRunResult::Ran => {

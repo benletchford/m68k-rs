@@ -191,6 +191,11 @@ struct CompiledTrace {
     /// a fastmem window instead of per-op bus reads.
     code: Vec<u8>,
     max_cycles: i32,
+    /// The final branch's taken-target is the trace head, so the trace is
+    /// a whole loop iteration and can be re-run (budget permitting)
+    /// without re-validating: register-only ops cannot modify code, and
+    /// nothing observable happens between iterations.
+    self_loop: bool,
     #[cfg(not(target_family = "wasm"))]
     func: TraceFn,
 }
@@ -255,13 +260,21 @@ impl TraceJit {
     /// Attempt to execute a compiled trace at the current PC.
     ///
     /// On `CachedRunResult::Ran`, the returned count is the number of
-    /// guest instructions the trace retired (every op in the trace runs
-    /// exactly once per call). The count is 0 for `Fault`/`Miss`.
+    /// guest instructions the trace retired. The count is 0 for
+    /// `Fault`/`Miss`.
+    ///
+    /// A self-looping trace (one whose closing branch targets its own
+    /// head) may run many iterations per call: up to `instr_budget`
+    /// retired instructions, always within the CPU's remaining cycle
+    /// budget, and only one iteration when `single_iter` is set (callers
+    /// that must observe the PC between iterations, e.g. watchpoints).
     fn try_execute<B: AddressBus>(
         &mut self,
         cpu: &mut CpuCore,
         bus: &mut B,
         cpu_type: CpuType,
+        instr_budget: u32,
+        single_iter: bool,
     ) -> Option<(CachedRunResult, u32)> {
         #[cfg(not(target_family = "wasm"))]
         self.module.as_ref()?;
@@ -349,13 +362,37 @@ impl TraceJit {
                 return Some((CachedRunResult::Miss(opcode), 0));
             }
 
-            let instructions = trace.ops.len() as u32;
-            #[cfg(not(target_family = "wasm"))]
-            let cycles = unsafe { (trace.func)(cpu as *mut CpuCore) };
-            #[cfg(target_family = "wasm")]
-            let cycles = execute_portable_trace(cpu, &trace.ops);
-            cpu.cycles_remaining -= cycles;
-            return Some((CachedRunResult::Ran, instructions));
+            let ops_len = trace.ops.len() as u32;
+            // How many whole iterations fit in both budgets. The guards
+            // above ensure at least one; the instruction budget is the
+            // caller's (u32::MAX on the cycle-budgeted paths).
+            let max_iters = if single_iter || !trace.self_loop {
+                1
+            } else {
+                let by_instrs = (instr_budget / ops_len).max(1);
+                let by_cycles = (cpu.cycles_remaining / trace.max_cycles).max(1) as u32;
+                by_instrs.min(by_cycles)
+            };
+
+            let mut cycles_total = 0i32;
+            let mut iters = 0u32;
+            loop {
+                #[cfg(not(target_family = "wasm"))]
+                let cycles = unsafe { (trace.func)(cpu as *mut CpuCore) };
+                #[cfg(target_family = "wasm")]
+                let cycles = execute_portable_trace(cpu, &trace.ops);
+                cycles_total += cycles;
+                iters += 1;
+                // Re-entering the (already validated) loop head is the only
+                // continue condition; register-only ops cannot fault, take
+                // exceptions, or modify code, so nothing needs re-checking
+                // between iterations.
+                if iters >= max_iters || cpu.pc != pc {
+                    break;
+                }
+            }
+            cpu.cycles_remaining -= cycles_total;
+            return Some((CachedRunResult::Ran, iters * ops_len));
         }
 
         match &mut self.slots[idx] {
@@ -462,7 +499,11 @@ impl TraceJit {
         }
         debug_assert_eq!(code.len() as u32, pc.wrapping_sub(start_pc));
 
-        self.compile_ops(start_pc, cpu_type, &ops, code, max_cycles)
+        let self_loop = ops
+            .last()
+            .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
+
+        self.compile_ops(start_pc, cpu_type, &ops, code, max_cycles, self_loop)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -473,6 +514,7 @@ impl TraceJit {
         ops: &[TraceBuildOp],
         code: Vec<u8>,
         max_cycles: i32,
+        self_loop: bool,
     ) -> Option<CompiledTrace> {
         let module = self.module.as_mut()?;
         let ptr_ty = module.target_config().pointer_type();
@@ -527,6 +569,7 @@ impl TraceJit {
             ops: ops.to_vec(),
             code,
             max_cycles,
+            self_loop,
             func,
         })
     }
@@ -539,6 +582,7 @@ impl TraceJit {
         ops: &[TraceBuildOp],
         code: Vec<u8>,
         max_cycles: i32,
+        self_loop: bool,
     ) -> Option<CompiledTrace> {
         Some(CompiledTrace {
             pc: start_pc,
@@ -546,22 +590,26 @@ impl TraceJit {
             ops: ops.to_vec(),
             code,
             max_cycles,
+            self_loop,
         })
     }
 }
 
 /// Attempt to execute a compiled trace at the current PC. See
-/// [`TraceJit::try_execute`] for the meaning of the returned count.
+/// [`TraceJit::try_execute`] for the meaning of the returned count and of
+/// `instr_budget`/`single_iter`.
 pub(crate) fn try_execute_trace<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
     cpu_type: CpuType,
+    instr_budget: u32,
+    single_iter: bool,
 ) -> Option<(CachedRunResult, u32)> {
     if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
         return None;
     }
 
-    TRACE_JIT.with_borrow_mut(|jit| jit.try_execute(cpu, bus, cpu_type))
+    TRACE_JIT.with_borrow_mut(|jit| jit.try_execute(cpu, bus, cpu_type, instr_budget, single_iter))
 }
 
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
@@ -643,6 +691,19 @@ impl JitTraceOp {
 
     fn ends_trace(self) -> bool {
         matches!(self, Self::Branch { .. } | Self::Dbcc { .. })
+    }
+
+    /// The PC a taken closing branch at `pc` jumps to, if this op is one.
+    fn taken_target(self, pc: u32) -> Option<u32> {
+        match self {
+            Self::Branch { displacement, .. } => {
+                Some((pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32)
+            }
+            Self::Dbcc { displacement, .. } => {
+                Some((pc.wrapping_add(2) as i32).wrapping_add(displacement as i32) as u32)
+            }
+            _ => None,
+        }
     }
 
     fn length(self) -> u8 {
