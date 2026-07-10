@@ -49,6 +49,13 @@ impl AddressBus for FlatBus {
 fn build_memory(workload: &str) -> Vec<u8> {
     let mut memory = vec![0u8; MEM_SIZE];
     match workload {
+        "callret" => {
+            let words: &[u16] = &[0x5280, 0x6104, 0x60FA, 0x4E71, 0x4E75];
+            for (i, w) in words.iter().enumerate() {
+                let a = 0x1000 + i * 2;
+                memory[a..a + 2].copy_from_slice(&w.to_be_bytes());
+            }
+        }
         "memcpy" => {
             let words: &[u16] = &[
                 0x41F9, 0x0000, 0x8000, // LEA $8000.L,A0
@@ -101,7 +108,11 @@ fn main() {
         "interp" => {
             let mut bus = FlatBus { memory };
             let used = cpu.execute(&mut bus, 15_000_000);
-            println!("interp {workload}: used={used} d0={} d1={}", cpu.d(0), cpu.d(1));
+            println!(
+                "interp {workload}: used={used} d0={} d1={}",
+                cpu.d(0),
+                cpu.d(1)
+            );
         }
         "batch" => {
             let mut bus = LinearMemoryBus::from_vec(memory);

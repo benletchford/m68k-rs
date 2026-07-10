@@ -295,9 +295,9 @@ fn test_pmove_full_mmu_setup_sequence() {
     // Instruction stream at 0x0200:
     // 1. PMOVE (0x2000).L, CRP — opcode F039, ext 4C00
     let pc = 0x0200u32;
-    bus.write_word_at(pc, 0xF039);      // coprocessor, EA = (xxx).L
-    bus.write_word_at(pc + 2, 0x4C00);  // CRP, to reg
-    bus.write_long_at(pc + 4, 0x2000);  // absolute long address
+    bus.write_word_at(pc, 0xF039); // coprocessor, EA = (xxx).L
+    bus.write_word_at(pc + 2, 0x4C00); // CRP, to reg
+    bus.write_long_at(pc + 4, 0x2000); // absolute long address
 
     // 2. PMOVE (0x2008).L, TC — opcode F039, ext 4000
     bus.write_word_at(pc + 8, 0xF039);

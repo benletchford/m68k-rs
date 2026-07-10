@@ -5,9 +5,9 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::{BatchInnerExit, CachedRunResult};
 #[cfg(not(target_family = "wasm"))]
 use super::op_cache::DecodedSimpleOp;
+use super::op_cache::{BatchInnerExit, CachedRunResult};
 use super::trace_jit;
 use super::types::{BatchExit, BatchResult, StepResult};
 
@@ -345,9 +345,7 @@ impl CpuCore {
                 InternalStepResult::TrapInstruction { trap_num } => {
                     Some(BatchExit::TrapInstruction { trap_num })
                 }
-                InternalStepResult::Breakpoint { bp_num } => {
-                    Some(BatchExit::Breakpoint { bp_num })
-                }
+                InternalStepResult::Breakpoint { bp_num } => Some(BatchExit::Breakpoint { bp_num }),
                 InternalStepResult::IllegalInstruction { opcode } => {
                     Some(BatchExit::IllegalInstruction { opcode })
                 }

@@ -566,7 +566,7 @@ fn assert_fastmem_matches_step(
             BatchExit::AlineTrap { .. } => break,
             other => panic!("{label}: unexpected batch exit {other:?}"),
         }
-        }
+    }
 
     assert_eq!(steps, batched, "{label}: instruction count");
     assert_eq!(cpu_a.pc, cpu_b.pc, "{label}: pc");
@@ -654,7 +654,8 @@ fn fastmem_control_flow_ops() {
         0x4869, 0x0100, // PEA $100(A1)                ; 0x1008
         0x245F, //        MOVEA.L (A7)+,A2             ; 0x100C
         0x4EB9, 0x0000, 0x1020, // JSR ($1020).L       ; 0x100E
-        0x6100, 0x000C, // BSR.W +0xC (-> 0x1022+... ) ; 0x1014 -> 0x1016+0xC=0x1022? base=0x1016, +0xC=0x1022... target 0x1024
+        0x6100,
+        0x000C, // BSR.W +0xC (-> 0x1022+... ) ; 0x1014 -> 0x1016+0xC=0x1022? base=0x1016, +0xC=0x1022... target 0x1024
         0x4EF9, 0x0000, 0x1028, // JMP ($1028).L       ; 0x1018
         0x4E71, // NOP (padding)                       ; 0x101E
         // 0x1020: subroutine 1
@@ -868,8 +869,8 @@ fn fastmem_differential_fuzz_memory_ops() {
                 }
                 5 => {
                     // ADDI/SUBI/ANDI/ORI/EORI/CMPI #imm → Dn or mem
-                    let op = [0x0600u16, 0x0400, 0x0200, 0x0000, 0x0A00, 0x0C00]
-                        [(r() % 6) as usize];
+                    let op =
+                        [0x0600u16, 0x0400, 0x0200, 0x0000, 0x0A00, 0x0C00][(r() % 6) as usize];
                     let size = size2(r());
                     let ea = if r() % 2 == 0 {
                         dreg(r())
@@ -937,7 +938,9 @@ fn fastmem_differential_fuzz_memory_ops() {
         let bytes = assemble(&words);
 
         // A0-A5 spread across the data zone; D0-D5 random data.
-        let init_a: Vec<u32> = (0..6).map(|i| 0x12000 + i * 0x800 + (r() % 0x400)).collect();
+        let init_a: Vec<u32> = (0..6)
+            .map(|i| 0x12000 + i * 0x800 + (r() % 0x400))
+            .collect();
         let init_d: Vec<u32> = (0..6).map(|_| r()).collect();
         let init_ccr = (r() & 0x1F) as u16;
         let mut fill: Vec<u8> = Vec::with_capacity(0x10000);
@@ -964,7 +967,9 @@ fn fastmem_differential_fuzz_memory_ops() {
             match cpu_a.step(&mut bus_a) {
                 m68k::StepResult::Ok { .. } => steps += 1,
                 m68k::StepResult::AlineTrap { .. } => break,
-                other => panic!("program {program_index}: unexpected step result {other:?} (words={words:04X?})"),
+                other => panic!(
+                    "program {program_index}: unexpected step result {other:?} (words={words:04X?})"
+                ),
             }
             if steps >= 2_000_000 {
                 timed_out = true;
@@ -993,20 +998,36 @@ fn fastmem_differential_fuzz_memory_ops() {
                     );
                 }
                 BatchExit::AlineTrap { .. } => break,
-                other => panic!("program {program_index}: unexpected batch exit {other:?} (words={words:04X?})"),
+                other => panic!(
+                    "program {program_index}: unexpected batch exit {other:?} (words={words:04X?})"
+                ),
             }
         }
 
-        assert_eq!(steps, batched, "program {program_index}: instruction count (words={words:04X?})");
-        assert_eq!(cpu_a.pc, cpu_b.pc, "program {program_index}: pc (words={words:04X?})");
+        assert_eq!(
+            steps, batched,
+            "program {program_index}: instruction count (words={words:04X?})"
+        );
+        assert_eq!(
+            cpu_a.pc, cpu_b.pc,
+            "program {program_index}: pc (words={words:04X?})"
+        );
         assert_eq!(
             cpu_a.get_sr(),
             cpu_b.get_sr(),
             "program {program_index}: sr (words={words:04X?})"
         );
         for i in 0..8 {
-            assert_eq!(cpu_a.d(i), cpu_b.d(i), "program {program_index}: D{i} (words={words:04X?})");
-            assert_eq!(cpu_a.a(i), cpu_b.a(i), "program {program_index}: A{i} (words={words:04X?})");
+            assert_eq!(
+                cpu_a.d(i),
+                cpu_b.d(i),
+                "program {program_index}: D{i} (words={words:04X?})"
+            );
+            assert_eq!(
+                cpu_a.a(i),
+                cpu_b.a(i),
+                "program {program_index}: A{i} (words={words:04X?})"
+            );
         }
         assert_eq!(
             bus_a.mem, bus_b.mem,

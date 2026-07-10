@@ -346,8 +346,8 @@ impl TraceJit {
                 self.slots[idx] = TraceSlot::Empty;
                 // The trace at this target is gone; re-arm the per-CPU
                 // filters so the loop can be re-recorded and re-probed.
-                cpu.trace_record_skip = TRACE_PC_NONE;
-                cpu.trace_probe_skip = TRACE_PC_NONE;
+                cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+                cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
                 if index > 0 {
                     // Instruction memory changed mid-trace. Nothing has
                     // executed yet (validation precedes the trace call),
@@ -412,7 +412,7 @@ impl TraceJit {
             } if *rejected_pc == pc && *rejected_type == cpu_type => {
                 // Known-uncompilable target: tell the loop to stop probing
                 // it (note_backward_branch consults this filter).
-                cpu.trace_probe_skip = pc;
+                push_probe_skip(cpu, pc);
                 return None;
             }
             _ => {
@@ -422,7 +422,7 @@ impl TraceJit {
 
         let Some(trace) = self.compile_trace(cpu, bus, pc, cpu_type) else {
             self.slots[idx] = TraceSlot::Rejected { pc, cpu_type };
-            cpu.trace_probe_skip = pc;
+            push_probe_skip(cpu, pc);
             return None;
         };
 
@@ -627,13 +627,15 @@ pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
 #[inline]
 pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool {
     let pc = cpu.pc;
-    if cpu.trace_probe_skip == pc {
+    if cpu.trace_probe_skip.contains(&pc) {
         // Known-uncompilable target: recording is a no-op and probing
         // cannot succeed.
         return false;
     }
-    if cpu.trace_record_skip != pc {
-        cpu.trace_record_skip = pc;
+    if !cpu.trace_record_skip.contains(&pc) {
+        let at = (cpu.trace_record_skip_at & 3) as usize;
+        cpu.trace_record_skip[at] = pc;
+        cpu.trace_record_skip_at = cpu.trace_record_skip_at.wrapping_add(1);
         record_trace_target(pc, cpu_type);
     }
     true
@@ -641,6 +643,15 @@ pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool
 
 pub(crate) fn has_trace_candidates() -> bool {
     TRACE_JIT_HAS_CANDIDATES.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn push_probe_skip(cpu: &mut CpuCore, pc: u32) {
+    if !cpu.trace_probe_skip.contains(&pc) {
+        let at = (cpu.trace_probe_skip_at & 3) as usize;
+        cpu.trace_probe_skip[at] = pc;
+        cpu.trace_probe_skip_at = cpu.trace_probe_skip_at.wrapping_add(1);
+    }
 }
 
 impl JitTraceOp {

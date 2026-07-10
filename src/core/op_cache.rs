@@ -869,7 +869,7 @@ impl CpuCore {
     /// results depend on it); self-modifying code cannot stale the table.
     #[inline]
     pub(crate) fn clear_decoded_op_cache(&mut self) {
-        self.decode_table = Vec::new();
+        self.decode_table = None;
     }
 
     #[inline]
@@ -1074,12 +1074,20 @@ impl CpuCore {
     #[inline]
     pub(crate) fn cached_decode(&mut self, opcode: u16, cpu_type: CpuType) -> CachedOp {
         debug_assert_eq!(cpu_type, self.cpu_type);
-        if self.decode_table.is_empty() {
-            // Lazily allocated so cores that only ever run the plain
-            // interpreter paths do not pay for it up front.
-            self.decode_table = vec![CachedOp::Unknown; DECODE_TABLE_SIZE];
-        }
-        let entry = self.decode_table[opcode as usize];
+        let table = match &mut self.decode_table {
+            Some(table) => table,
+            None => {
+                // Lazily allocated so cores that only ever run the plain
+                // interpreter paths do not pay for it up front.
+                let table: Box<[CachedOp]> = vec![CachedOp::Unknown; DECODE_TABLE_SIZE].into();
+                let table: Box<[CachedOp; DECODE_TABLE_SIZE]> = table
+                    .try_into()
+                    .expect("table has DECODE_TABLE_SIZE entries");
+                self.decode_table.insert(table)
+            }
+        };
+        // `u16` index into a 1<<16 array: no bounds check.
+        let entry = table[opcode as usize];
         if !matches!(entry, CachedOp::Unknown) {
             return entry;
         }
@@ -1091,7 +1099,7 @@ impl CpuCore {
                 None => CachedOp::Complex,
             },
         };
-        self.decode_table[opcode as usize] = op;
+        table[opcode as usize] = op;
         op
     }
 }
