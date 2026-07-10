@@ -57,21 +57,22 @@ from a shared cloud container (x86-64, gcc 13 `-O3` for Musashi, rustc
 
 | workload | Musashi (MIPS) | m68k-rs execute (MIPS) | m68k-rs run_batch (MIPS) |
 |---|---:|---:|---:|
-| linear NOP | 246.7 | 127.1 | 159.8 |
-| linear MOVEQ | 124.0 | 115.1 | 143.3 |
-| linear ADDQ.L | 123.8 | 79.4 | 81.9 |
-| loop ADDQ/BRA | 141.3 | 478.4 | 457.9 |
-| loop TST/BNE | 196.3 | 513.2 | 504.0 |
-| loop reg mix | 148.8 | 569.1 | 576.9 |
-| memcpy 4KB | 89.5 | 34.8 | 51.8 |
-| call/return | 124.9 | 54.6 | 72.8 |
+| linear NOP | 246.7 | 129.2 | 116.2 |
+| linear MOVEQ | 123.0 | 112.6 | 107.1 |
+| linear ADDQ.L | 124.3 | 79.9 | 77.1 |
+| loop ADDQ/BRA | 142.5 | 420.3 | 428.2 |
+| loop TST/BNE | 197.6 | 464.5 | 470.7 |
+| loop reg mix | 149.1 | 574.7 | 514.2 |
+| memcpy 4KB | 91.4 | 35.8 | 184.6 |
+| call/return | 127.6 | 56.5 | 73.9 |
 
-Backward-branch loops run 2.3–4.8x Musashi (the trace JIT compiles and
-re-runs them natively); straight-line and memory-copy workloads sit at
-0.4–1.2x. When this harness was first built the picture was very different
-(m68k-rs at 0.25–0.5x on nearly everything) — the harness directly drove the
-optimizations that closed the gap, so keep it honest when changing the fast
-paths: the state gates catch divergence immediately.
+Hot loops — including memory-copy loops — run 2–4x Musashi (the trace JIT
+compiles them, memory operands included, and iterates natively);
+straight-line code and call/return sit at 0.5–0.9x. When this harness was
+first built the picture was very different (m68k-rs at 0.25–0.5x on nearly
+everything) — the harness directly drove the optimizations that closed the
+gap, so keep it honest when changing the fast paths: the state gates catch
+divergence immediately.
 
 The run also reports cycle-accounting divergences from Musashi's timing
 model (which matches the M68000UM tables for these instructions), e.g.
