@@ -1,0 +1,19 @@
+[package]
+name = "m68k-benchmarks"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Head-to-head benchmarks of m68k-rs against other 68k emulator cores"
+
+[dependencies]
+m68k = { path = ".." }
+
+[build-dependencies]
+cc = "1"
+
+# Standalone: not a member of the parent crate's (non-)workspace.
+[workspace]
+
+[[bin]]
+name = "compare"
+path = "src/main.rs"

@@ -247,6 +247,12 @@ m68k/
 
 The emulator is designed for correctness first, with performance as a secondary goal. Typical use cases (classic computer emulation, game console emulation) run at many multiples of original hardware speed on modern CPUs.
 
+A head-to-head benchmark harness against [Musashi](https://github.com/kstenerud/Musashi) lives in [`benchmarks/`](benchmarks/) — it runs identical 68000 workloads on both cores over the same flat memory, cross-checks final CPU/memory state, and reports instruction throughput plus any cycle-accounting divergences:
+
+```sh
+cd benchmarks && cargo run --release
+```
+
 ## License
 
 MIT License - see [LICENSE](LICENSE) for details.
