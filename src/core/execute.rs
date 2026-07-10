@@ -47,7 +47,7 @@ impl CpuCore {
     /// Caller must have checked [`CpuCore::can_run_decoded_simple_ops`].
     #[inline]
     fn try_execute_decoded_simple_step(&mut self, opcode: u16) -> Option<StepResult> {
-        let op = self.decoded_simple_op(self.ppc, opcode, self.cpu_type)?;
+        let op = self.decoded_simple_op(opcode, self.cpu_type)?;
         #[cfg(not(target_family = "wasm"))]
         let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
             Some(self.ppc)
@@ -59,7 +59,7 @@ impl CpuCore {
         if let Some(branch_pc) = branch_pc
             && self.pc <= branch_pc
         {
-            trace_jit::record_trace_target(self.pc, self.cpu_type);
+            let _ = trace_jit::note_backward_branch(self, self.cpu_type);
         }
 
         Some(StepResult::Ok { cycles })
@@ -168,10 +168,8 @@ impl CpuCore {
             // Only a backward branch can land on a (potential) trace head,
             // so straight-line dispatches re-enter the fast loop without a
             // trace-cache probe.
-            probe_on_entry = self.pc <= self.ppc;
-            if probe_on_entry {
-                trace_jit::record_trace_target(self.pc, self.cpu_type);
-            }
+            probe_on_entry =
+                self.pc <= self.ppc && trace_jit::note_backward_branch(self, self.cpu_type);
 
             // Check for trace exception (T1 flag set before instruction)
             if self.check_trace() {
@@ -370,10 +368,8 @@ impl CpuCore {
                 // Mirrors `execute`: only backward branches can reach a
                 // trace head, so straight-line dispatches re-enter the
                 // fast loop without a trace-cache probe.
-                probe_on_entry = self.pc <= self.ppc;
-                if probe_on_entry {
-                    trace_jit::record_trace_target(self.pc, self.cpu_type);
-                }
+                probe_on_entry =
+                    self.pc <= self.ppc && trace_jit::note_backward_branch(self, self.cpu_type);
 
                 if !self.sst_m68000_compat && self.check_trace() {
                     let _ = self.exception_trace(bus);

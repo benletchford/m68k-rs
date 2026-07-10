@@ -32,6 +32,9 @@ const TRACE_CACHE_SIZE: usize = 4096;
 pub(crate) const TRACE_MAX_OPS: usize = 16;
 const TRACE_HOT_THRESHOLD: u8 = 2;
 
+/// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
+pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
+
 #[cfg(not(target_family = "wasm"))]
 type TraceFn = unsafe extern "C" fn(*mut CpuCore) -> i32;
 
@@ -183,6 +186,10 @@ struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
     ops: Vec<TraceBuildOp>,
+    /// The exact instruction bytes the trace was compiled from (ops are
+    /// contiguous from `pc`). Lets validation be a single compare against
+    /// a fastmem window instead of per-op bus reads.
+    code: Vec<u8>,
     max_cycles: i32,
     #[cfg(not(target_family = "wasm"))]
     func: TraceFn,
@@ -274,33 +281,60 @@ impl TraceJit {
                 return None;
             }
 
-            let mut miss = None;
-            for (index, op) in trace.ops.iter().enumerate() {
-                let addr = cpu.address(op.pc);
-                match bus.try_read_word(addr) {
-                    Ok(opcode) if opcode == op.opcode => {}
-                    Ok(opcode) => {
-                        miss = Some((index, op.pc, opcode));
-                        break;
+            // Fast validation: when a fastmem window covers the whole
+            // trace, one slice compare against the live instruction bytes
+            // replaces per-op bus reads. (SMC through the window is still
+            // caught: we compare the actual RAM.)
+            let mut validated = false;
+            if cpu.fm_len != 0 {
+                let n = trace.code.len() as u32;
+                let off = cpu.address(pc).wrapping_sub(cpu.fm_base);
+                if n <= cpu.fm_len && off <= cpu.fm_len - n {
+                    let live = unsafe {
+                        std::slice::from_raw_parts(
+                            (cpu.fm_ptr as *const u8).add(off as usize),
+                            n as usize,
+                        )
+                    };
+                    if live == trace.code.as_slice() {
+                        validated = true;
                     }
-                    Err(_) => return None,
                 }
+            }
 
-                if let Some(expected) = op.extension {
-                    let addr = cpu.address(op.pc.wrapping_add(2));
+            let mut miss = None;
+            if !validated {
+                for (index, op) in trace.ops.iter().enumerate() {
+                    let addr = cpu.address(op.pc);
                     match bus.try_read_word(addr) {
-                        Ok(extension) if extension == expected => {}
-                        Ok(_) => {
-                            miss = Some((index, op.pc, op.opcode));
+                        Ok(opcode) if opcode == op.opcode => {}
+                        Ok(opcode) => {
+                            miss = Some((index, op.pc, opcode));
                             break;
                         }
                         Err(_) => return None,
+                    }
+
+                    if let Some(expected) = op.extension {
+                        let addr = cpu.address(op.pc.wrapping_add(2));
+                        match bus.try_read_word(addr) {
+                            Ok(extension) if extension == expected => {}
+                            Ok(_) => {
+                                miss = Some((index, op.pc, op.opcode));
+                                break;
+                            }
+                            Err(_) => return None,
+                        }
                     }
                 }
             }
 
             if let Some((index, ppc, opcode)) = miss {
                 self.slots[idx] = TraceSlot::Empty;
+                // The trace at this target is gone; re-arm the per-CPU
+                // filters so the loop can be re-recorded and re-probed.
+                cpu.trace_record_skip = TRACE_PC_NONE;
+                cpu.trace_probe_skip = TRACE_PC_NONE;
                 if index > 0 {
                     // Instruction memory changed mid-trace. Nothing has
                     // executed yet (validation precedes the trace call),
@@ -335,6 +369,15 @@ impl TraceJit {
                     return None;
                 }
             }
+            TraceSlot::Rejected {
+                pc: rejected_pc,
+                cpu_type: rejected_type,
+            } if *rejected_pc == pc && *rejected_type == cpu_type => {
+                // Known-uncompilable target: tell the loop to stop probing
+                // it (note_backward_branch consults this filter).
+                cpu.trace_probe_skip = pc;
+                return None;
+            }
             _ => {
                 return None;
             }
@@ -342,6 +385,7 @@ impl TraceJit {
 
         let Some(trace) = self.compile_trace(cpu, bus, pc, cpu_type) else {
             self.slots[idx] = TraceSlot::Rejected { pc, cpu_type };
+            cpu.trace_probe_skip = pc;
             return None;
         };
 
@@ -409,7 +453,16 @@ impl TraceJit {
             return None;
         }
 
-        self.compile_ops(start_pc, cpu_type, &ops, max_cycles)
+        let mut code = Vec::with_capacity(ops.len() * 4);
+        for op in &ops {
+            code.extend_from_slice(&op.opcode.to_be_bytes());
+            if let Some(extension) = op.extension {
+                code.extend_from_slice(&extension.to_be_bytes());
+            }
+        }
+        debug_assert_eq!(code.len() as u32, pc.wrapping_sub(start_pc));
+
+        self.compile_ops(start_pc, cpu_type, &ops, code, max_cycles)
     }
 
     #[cfg(not(target_family = "wasm"))]
@@ -418,6 +471,7 @@ impl TraceJit {
         start_pc: u32,
         cpu_type: CpuType,
         ops: &[TraceBuildOp],
+        code: Vec<u8>,
         max_cycles: i32,
     ) -> Option<CompiledTrace> {
         let module = self.module.as_mut()?;
@@ -471,6 +525,7 @@ impl TraceJit {
             pc: start_pc,
             cpu_type,
             ops: ops.to_vec(),
+            code,
             max_cycles,
             func,
         })
@@ -482,12 +537,14 @@ impl TraceJit {
         start_pc: u32,
         cpu_type: CpuType,
         ops: &[TraceBuildOp],
+        code: Vec<u8>,
         max_cycles: i32,
     ) -> Option<CompiledTrace> {
         Some(CompiledTrace {
             pc: start_pc,
             cpu_type,
             ops: ops.to_vec(),
+            code,
             max_cycles,
         })
     }
@@ -509,6 +566,29 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
 
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
     TRACE_JIT.with_borrow_mut(|jit| jit.record_trace_target(pc, cpu_type));
+}
+
+/// Note that execution just took a backward branch to `cpu.pc` (a potential
+/// trace head) and return whether the caller should probe the trace cache.
+///
+/// This is the cheap front door to the thread-local trace state: tight
+/// loops hit their branch target every iteration, so re-recording it (a
+/// no-op) and re-probing known-rejected targets are filtered out with two
+/// per-CPU compares before any TLS access. `TraceJit::try_execute` re-arms
+/// the filters whenever it invalidates or rejects a trace.
+#[inline]
+pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool {
+    let pc = cpu.pc;
+    if cpu.trace_probe_skip == pc {
+        // Known-uncompilable target: recording is a no-op and probing
+        // cannot succeed.
+        return false;
+    }
+    if cpu.trace_record_skip != pc {
+        cpu.trace_record_skip = pc;
+        record_trace_target(pc, cpu_type);
+    }
+    true
 }
 
 pub(crate) fn has_trace_candidates() -> bool {

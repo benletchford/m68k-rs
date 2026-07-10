@@ -17,3 +17,7 @@ cc = "1"
 [[bin]]
 name = "compare"
 path = "src/main.rs"
+
+# Line-level attribution for callgrind/perf runs of the profile helper.
+[profile.release]
+debug = true

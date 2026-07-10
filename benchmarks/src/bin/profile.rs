@@ -1,13 +1,18 @@
-//! Scratch profiling target: runs the memcpy workload on the m68k-rs
-//! interpreter only, small budget, for use under callgrind.
+//! Scratch profiling target for use under valgrind --tool=callgrind.
+//!
+//! Usage: profile <interp|batch> <memcpy|nop|addqbra>
+//!
+//! Runs one workload on one m68k-rs engine with a budget sized for
+//! callgrind's ~50x slowdown.
 
-use m68k::{AddressBus, CpuCore, CpuType};
+use m68k::{AddressBus, CpuCore, CpuType, LinearMemoryBus};
 
 struct FlatBus {
     memory: Vec<u8>,
 }
 
-const MEM_MASK: usize = 0xFF_FFFF;
+const MEM_SIZE: usize = 0x100_0000;
+const MEM_MASK: usize = MEM_SIZE - 1;
 
 impl AddressBus for FlatBus {
     fn read_byte(&mut self, address: u32) -> u8 {
@@ -41,28 +46,73 @@ impl AddressBus for FlatBus {
     }
 }
 
-fn main() {
-    let words: &[u16] = &[
-        0x41F9, 0x0000, 0x8000, // LEA $8000.L,A0
-        0x43F9, 0x0001, 0x0000, // LEA $10000.L,A1
-        0x303C, 0x03FF, // MOVE.W #$03FF,D0
-        0x22D8, // MOVE.L (A0)+,(A1)+
-        0x51C8, 0xFFFC, // DBRA D0,-4
-        0x5241, // ADDQ.W #1,D1
-        0x60E6, // BRA.S -26
-    ];
-    let mut bus = FlatBus {
-        memory: vec![0; 0x100_0000],
-    };
-    for (i, w) in words.iter().enumerate() {
-        let a = 0x1000 + i * 2;
-        bus.memory[a..a + 2].copy_from_slice(&w.to_be_bytes());
+fn build_memory(workload: &str) -> Vec<u8> {
+    let mut memory = vec![0u8; MEM_SIZE];
+    match workload {
+        "memcpy" => {
+            let words: &[u16] = &[
+                0x41F9, 0x0000, 0x8000, // LEA $8000.L,A0
+                0x43F9, 0x0001, 0x0000, // LEA $10000.L,A1
+                0x303C, 0x03FF, // MOVE.W #$03FF,D0
+                0x22D8, // MOVE.L (A0)+,(A1)+
+                0x51C8, 0xFFFC, // DBRA D0,-4
+                0x5241, // ADDQ.W #1,D1
+                0x60E6, // BRA.S -26
+            ];
+            for (i, w) in words.iter().enumerate() {
+                let a = 0x1000 + i * 2;
+                memory[a..a + 2].copy_from_slice(&w.to_be_bytes());
+            }
+        }
+        "addqbra" => {
+            let words: &[u16] = &[0x5280, 0x60FC];
+            for (i, w) in words.iter().enumerate() {
+                let a = 0x1000 + i * 2;
+                memory[a..a + 2].copy_from_slice(&w.to_be_bytes());
+            }
+        }
+        "nop" => {
+            for chunk in memory.chunks_exact_mut(2) {
+                chunk.copy_from_slice(&0x4E71u16.to_be_bytes());
+            }
+        }
+        other => panic!("unknown workload {other}"),
     }
+    memory
+}
+
+fn fresh_cpu() -> CpuCore {
     let mut cpu = CpuCore::new();
     cpu.set_cpu_type(CpuType::M68000);
     cpu.set_sr(0x2700);
     cpu.pc = 0x1000;
     cpu.set_a(7, 0x0080_0000);
-    let used = cpu.execute(&mut bus, 15_000_000);
-    println!("used={used} d1={}", cpu.d(1));
+    cpu
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mode = args.get(1).map(String::as_str).unwrap_or("interp");
+    let workload = args.get(2).map(String::as_str).unwrap_or("memcpy");
+    let memory = build_memory(workload);
+    let mut cpu = fresh_cpu();
+
+    match mode {
+        "interp" => {
+            let mut bus = FlatBus { memory };
+            let used = cpu.execute(&mut bus, 15_000_000);
+            println!("interp {workload}: used={used} d0={} d1={}", cpu.d(0), cpu.d(1));
+        }
+        "batch" => {
+            let mut bus = LinearMemoryBus::from_vec(memory);
+            let result = cpu.run_batch(&mut bus, 2_000_000, &[]);
+            println!(
+                "batch {workload}: retired={} d0={} d1={}",
+                result.instructions,
+                cpu.d(0),
+                cpu.d(1)
+            );
+        }
+        other => panic!("unknown mode {other}"),
+    }
 }

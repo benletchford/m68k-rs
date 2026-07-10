@@ -4,7 +4,7 @@
 
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::memory::{AddressBus, BusFaultKind};
-use super::op_cache::{DECODED_OP_CACHE_SIZE, DecodedOpCacheEntry};
+use super::op_cache::CachedOp;
 use super::types::CpuType;
 
 /// Flag constants for SR bits.
@@ -182,8 +182,10 @@ pub struct CpuCore {
     pub cycles_remaining: i32,
     /// Initial cycles for timeslice
     pub initial_cycles: i32,
-    /// Direct-mapped cache for decoded one-word no-fault operations.
-    pub(crate) decoded_op_cache: Vec<Option<DecodedOpCacheEntry>>,
+    /// Opcode-indexed decode table (lazily allocated, one entry per
+    /// possible opcode word). Dropped when `cpu_type` changes; immune to
+    /// self-modifying code since the fetched opcode itself is the index.
+    pub(crate) decode_table: Vec<CachedOp>,
 
     // ========== Fastmem window (batch execution only) ==========
     // Captured from `AddressBus::fast_mem` on entry to `run_batch` and
@@ -192,6 +194,16 @@ pub struct CpuCore {
     pub(crate) fm_ptr: usize,
     pub(crate) fm_base: u32,
     pub(crate) fm_len: u32,
+
+    // ========== Trace-JIT hot-loop filters ==========
+    // Both hold a PC or `TRACE_PC_NONE`. They keep tight loops from paying
+    // a thread-local + cache-slot probe on every backward branch:
+    // `trace_record_skip` is the most recently recorded trace target
+    // (re-recording it is a no-op), and `trace_probe_skip` is a target the
+    // JIT has rejected (probing it can't succeed). The trace JIT resets
+    // them when it invalidates a trace, so eviction can't wedge them.
+    pub(crate) trace_record_skip: u32,
+    pub(crate) trace_probe_skip: u32,
 
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
@@ -243,6 +255,8 @@ impl CpuCore {
             fm_ptr: 0,
             fm_base: 0,
             fm_len: 0,
+            trace_record_skip: super::trace_jit::TRACE_PC_NONE,
+            trace_probe_skip: super::trace_jit::TRACE_PC_NONE,
             change_of_flow: false,
             pref_addr: 0,
             pref_data: 0,
@@ -286,7 +300,7 @@ impl CpuCore {
             iacr1: 0,
             cycles_remaining: 0,
             initial_cycles: 0,
-            decoded_op_cache: vec![None; DECODED_OP_CACHE_SIZE],
+            decode_table: Vec::new(),
             sst_m68000_compat: false,
         };
         cpu.set_cpu_type(CpuType::M68000);

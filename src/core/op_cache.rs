@@ -14,23 +14,21 @@ use super::trace_jit;
 use super::trace_jit::{JitAddrOp, JitBinaryOp, JitBitOp, JitDirectReg, JitTraceOp, JitUnaryOp};
 use super::types::{CpuType, Size};
 
-pub(crate) const DECODED_OP_CACHE_SIZE: usize = 4096;
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct DecodedOpCacheEntry {
-    pc: u32,
-    opcode: u16,
-    cpu_type: CpuType,
-    op: CachedOp,
-}
+/// Number of entries in the opcode-indexed decode table: one per possible
+/// opcode word. Decode depends only on `(opcode, cpu_type)`, so the table
+/// can never go stale from self-modifying code — the fetched opcode itself
+/// is the index.
+pub(crate) const DECODE_TABLE_SIZE: usize = 1 << 16;
 
 /// Cached decode verdict for one opcode word.
 ///
 /// `Complex` is a cached negative: memory-heavy code revisits the same
-/// PCs constantly, so remembering a rejection is as valuable as
+/// opcodes constantly, so remembering a rejection is as valuable as
 /// remembering a hit.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum CachedOp {
+    /// Not decoded yet (table sentinel).
+    Unknown,
     /// Register-only one-word op — runs on every fast path, exact cycles.
     Simple(DecodedSimpleOp),
     /// Memory-operand op — runs only in the instruction-budgeted batch
@@ -867,11 +865,11 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
 }
 
 impl CpuCore {
+    /// Drop the decode table. Only needed when `cpu_type` changes (decode
+    /// results depend on it); self-modifying code cannot stale the table.
     #[inline]
     pub(crate) fn clear_decoded_op_cache(&mut self) {
-        for entry in self.decoded_op_cache.iter_mut() {
-            *entry = None;
-        }
+        self.decode_table = Vec::new();
     }
 
     #[inline]
@@ -921,7 +919,7 @@ impl CpuCore {
             }
             self.ir = opcode as u32;
 
-            let Some(op) = self.decoded_simple_op(self.ppc, opcode, cpu_type) else {
+            let Some(op) = self.decoded_simple_op(opcode, cpu_type) else {
                 return CachedRunResult::Miss(opcode);
             };
             let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
@@ -933,8 +931,7 @@ impl CpuCore {
             if let Some(branch_pc) = branch_pc
                 && self.pc <= branch_pc
             {
-                trace_jit::record_trace_target(self.pc, cpu_type);
-                probe = true;
+                probe = trace_jit::note_backward_branch(self, cpu_type);
             }
             self.cycles_remaining -= cycles;
         }
@@ -1020,7 +1017,8 @@ impl CpuCore {
             };
             self.ir = opcode as u32;
 
-            match self.cached_decode(self.ppc, opcode, cpu_type) {
+            match self.cached_decode(opcode, cpu_type) {
+                CachedOp::Unknown => unreachable!("cached_decode never returns Unknown"),
                 CachedOp::Simple(op) => {
                     let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
                         Some(self.ppc)
@@ -1031,8 +1029,7 @@ impl CpuCore {
                     if let Some(branch_pc) = branch_pc
                         && self.pc <= branch_pc
                     {
-                        trace_jit::record_trace_target(self.pc, cpu_type);
-                        probe = true;
+                        probe = trace_jit::note_backward_branch(self, cpu_type);
                     }
                 }
                 CachedOp::Mem(op) => {
@@ -1040,8 +1037,7 @@ impl CpuCore {
                         return BatchInnerExit::Miss(opcode);
                     }
                     if self.pc <= self.ppc {
-                        trace_jit::record_trace_target(self.pc, cpu_type);
-                        probe = true;
+                        probe = trace_jit::note_backward_branch(self, cpu_type);
                     }
                 }
                 CachedOp::Complex => return BatchInnerExit::Miss(opcode),
@@ -1059,28 +1055,33 @@ impl CpuCore {
     #[inline]
     pub(crate) fn decoded_simple_op(
         &mut self,
-        pc: u32,
         opcode: u16,
         cpu_type: CpuType,
     ) -> Option<DecodedSimpleOp> {
-        match self.cached_decode(pc, opcode, cpu_type) {
+        match self.cached_decode(opcode, cpu_type) {
             CachedOp::Simple(op) => Some(op),
             // Mem ops need rollback/fault handling on the cycle-exact
             // paths, so they dispatch like any complex op there.
-            CachedOp::Mem(_) | CachedOp::Complex => None,
+            CachedOp::Unknown | CachedOp::Mem(_) | CachedOp::Complex => None,
         }
     }
 
-    /// Cache-backed decode used by every fast path.
+    /// Table-backed decode used by every fast path: a direct load indexed
+    /// by the opcode word, filled on first sight of each opcode value.
+    ///
+    /// `cpu_type` must be the core's current type (the table is dropped on
+    /// type changes).
     #[inline]
-    pub(crate) fn cached_decode(&mut self, pc: u32, opcode: u16, cpu_type: CpuType) -> CachedOp {
-        let idx = decoded_op_cache_index(pc);
-        if let Some(entry) = self.decoded_op_cache[idx]
-            && entry.pc == pc
-            && entry.opcode == opcode
-            && entry.cpu_type == cpu_type
-        {
-            return entry.op;
+    pub(crate) fn cached_decode(&mut self, opcode: u16, cpu_type: CpuType) -> CachedOp {
+        debug_assert_eq!(cpu_type, self.cpu_type);
+        if self.decode_table.is_empty() {
+            // Lazily allocated so cores that only ever run the plain
+            // interpreter paths do not pay for it up front.
+            self.decode_table = vec![CachedOp::Unknown; DECODE_TABLE_SIZE];
+        }
+        let entry = self.decode_table[opcode as usize];
+        if !matches!(entry, CachedOp::Unknown) {
+            return entry;
         }
 
         let op = match DecodedSimpleOp::decode(cpu_type, opcode) {
@@ -1090,19 +1091,9 @@ impl CpuCore {
                 None => CachedOp::Complex,
             },
         };
-        self.decoded_op_cache[idx] = Some(DecodedOpCacheEntry {
-            pc,
-            opcode,
-            cpu_type,
-            op,
-        });
+        self.decode_table[opcode as usize] = op;
         op
     }
-}
-
-#[inline]
-pub(crate) fn decoded_op_cache_index(pc: u32) -> usize {
-    ((pc >> 1) as usize) & (DECODED_OP_CACHE_SIZE - 1)
 }
 
 #[inline]
