@@ -1035,3 +1035,117 @@ fn fastmem_differential_fuzz_memory_ops() {
         );
     }
 }
+
+// ============================================================================
+// Memory-op JIT traces (MoveMem): hot loops with memory operands compile
+// into traces that loop natively. Everything must match step() exactly.
+// ============================================================================
+
+/// Fill 64 longs at $2000 with a changing pattern, then copy them to $3000
+/// with the classic `MOVE.L (A0)+,(A1)+ / DBRA` inner loop. Both loops run
+/// hot enough to compile and iterate inside the JIT.
+#[test]
+fn mem_trace_memcpy_loop_matches_step() {
+    let words = &[
+        0x20C2, // $1000: MOVE.L D2,(A0)+      (fill loop)
+        0x5282, // $1002: ADDQ.L #1,D2
+        0x51C8, 0xFFFA, // $1004: DBRA D0,$1000
+        0x41F8, 0x2000, // $1008: LEA $2000.W,A0
+        0x43F8, 0x3000, // $100C: LEA $3000.W,A1
+        0x703F, // $1010: MOVEQ #63,D0
+        0x22D8, // $1012: MOVE.L (A0)+,(A1)+   (copy loop)
+        0x51C8, 0xFFFC, // $1014: DBRA D0,$1012
+        0xA000, // $1018: sentinel
+    ];
+    assert_fastmem_matches_step("mem-trace memcpy", words, CpuType::M68000, |cpu| {
+        cpu.set_a(0, 0x2000);
+        cpu.set_d(0, 63);
+        cpu.set_d(2, 0xDEAD_0001);
+    });
+}
+
+/// Backward word copy with pre-decrement on both sides.
+#[test]
+fn mem_trace_predec_copy_matches_step() {
+    let words = &[
+        0x20C2, // $1000: MOVE.L D2,(A0)+      (fill loop)
+        0x5482, // $1002: ADDQ.L #2,D2
+        0x51C8, 0xFFFA, // $1004: DBRA D0,$1000
+        0x41F8, 0x2100, // $1008: LEA $2100.W,A0 (end of source)
+        0x43F8, 0x3100, // $100C: LEA $3100.W,A1 (end of dest)
+        0x707F, // $1010: MOVEQ #127,D0
+        0x3320, // $1012: MOVE.W -(A0),-(A1)   (copy loop)
+        0x51C8, 0xFFFC, // $1014: DBRA D0,$1012
+        0xA000, // $1018: sentinel
+    ];
+    assert_fastmem_matches_step("mem-trace predec", words, CpuType::M68000, |cpu| {
+        cpu.set_a(0, 0x2000);
+        cpu.set_d(0, 63);
+        cpu.set_d(2, 0xBEEF_0001);
+    });
+}
+
+/// A hot copy loop whose stores eventually sweep over its own code. The
+/// trace must bail before the overlapping store commits so the modified
+/// instructions take effect exactly when the interpreter would see them.
+#[test]
+fn mem_trace_store_into_own_code_matches_step() {
+    let words = &[
+        0x20C2, // $1000: MOVE.L D2,(A0)+
+        0x51C8, 0xFFFC, // $1002: DBRA D0,$1000
+        0xA000, // $1006: sentinel (never reached by fall-through)
+    ];
+    assert_fastmem_matches_step("mem-trace smc", words, CpuType::M68000, |cpu| {
+        // Stores start below the code and cross it after 64 iterations,
+        // overwriting the loop with NOP + A-line — which must then execute.
+        cpu.set_a(0, 0x0F00);
+        cpu.set_d(0, 200);
+        cpu.set_d(2, 0x4E71_A000);
+    });
+}
+
+/// MOVE.L (A0)+,(A0)+ in a hot loop: the destination EA must observe the
+/// source post-increment on the same register.
+#[test]
+fn mem_trace_same_register_pair_matches_step() {
+    let words = &[
+        0x20C2, // $1000: MOVE.L D2,(A0)+      (fill so the copy reads data)
+        0x5282, // $1002: ADDQ.L #1,D2
+        0x51C8, 0xFFFA, // $1004: DBRA D0,$1000
+        0x41F8, 0x2000, // $1008: LEA $2000.W,A0
+        0x701F, // $100C: MOVEQ #31,D0
+        0x20D8, // $100E: MOVE.L (A0)+,(A0)+   (copy every other long forward)
+        0x51C8, 0xFFFC, // $1010: DBRA D0,$100E
+        0xA000, // $1014: sentinel
+    ];
+    assert_fastmem_matches_step("mem-trace same-reg", words, CpuType::M68000, |cpu| {
+        cpu.set_a(0, 0x2000);
+        cpu.set_d(0, 63);
+        cpu.set_d(2, 0xCAFE_0001);
+    });
+}
+
+/// Odd source address on a 68000: the trace bails and full dispatch takes
+/// the address error, identically to step().
+#[test]
+fn mem_trace_unaligned_matches_step_on_68020() {
+    // On the 68020 unaligned accesses are legal; run an odd-address copy
+    // loop hot so the trace path handles it (bail + interpreter, or
+    // window access) with results identical to step().
+    let words = &[
+        0x20C2, // $1000: MOVE.L D2,(A0)+
+        0x5282, // $1002: ADDQ.L #1,D2
+        0x51C8, 0xFFFA, // $1004: DBRA D0,$1000
+        0x41F8, 0x2001, // $1008: LEA $2001.W,A0 (odd)
+        0x43F8, 0x3001, // $100C: LEA $3001.W,A1 (odd)
+        0x701F, // $1010: MOVEQ #31,D0
+        0x22D8, // $1012: MOVE.L (A0)+,(A1)+
+        0x51C8, 0xFFFC, // $1014: DBRA D0,$1012
+        0xA000, // $1018: sentinel
+    ];
+    assert_fastmem_matches_step("mem-trace unaligned-020", words, CpuType::M68020, |cpu| {
+        cpu.set_a(0, 0x2000);
+        cpu.set_d(0, 63);
+        cpu.set_d(2, 0x0BAD_0001);
+    });
+}

@@ -234,6 +234,11 @@ impl CpuCore {
             self.fm_ptr = fm.ptr as usize;
             self.fm_base = fm.base;
             self.fm_len = fm.len;
+            // Memory traces are skipped (and probe-filtered) while no
+            // window is active; with the window up they can run, so
+            // re-arm the trace filters.
+            self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+            self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
         let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
         self.fm_ptr = 0;
