@@ -53,26 +53,27 @@ cargo run --release -- --disasm     # print the workloads' disassembly and exit
 
 One machine, one snapshot — run it on your own hardware. These numbers are
 from a shared cloud container (x86-64, gcc 13 `-O3` for Musashi, rustc
-`opt-level=3` for m68k-rs), median of 5 runs:
+`opt-level=3` for m68k-rs), median of 3 runs:
 
 | workload | Musashi (MIPS) | m68k-rs execute (MIPS) | m68k-rs run_batch (MIPS) |
 |---|---:|---:|---:|
-| linear NOP | 246.7 | 129.2 | 116.2 |
-| linear MOVEQ | 123.0 | 112.6 | 107.1 |
-| linear ADDQ.L | 124.3 | 79.9 | 77.1 |
-| loop ADDQ/BRA | 142.5 | 420.3 | 428.2 |
-| loop TST/BNE | 197.6 | 464.5 | 470.7 |
-| loop reg mix | 149.1 | 574.7 | 514.2 |
-| memcpy 4KB | 91.4 | 35.8 | 184.6 |
-| call/return | 127.6 | 56.5 | 73.9 |
+| linear NOP | 291.3 | 233.0 | 231.9 |
+| linear MOVEQ | 115.8 | 190.3 | 201.7 |
+| linear ADDQ.L | 120.0 | 117.2 | 116.8 |
+| loop ADDQ/BRA | 172.7 | 503.7 | 500.9 |
+| loop TST/BNE | 196.0 | 538.2 | 542.6 |
+| loop reg mix | 147.1 | 777.2 | 775.5 |
+| memcpy 4KB | 110.1 | 298.9 | 301.7 |
+| call/return | 145.2 | 582.1 | 584.2 |
 
-Hot loops — including memory-copy loops — run 2–4x Musashi (the trace JIT
-compiles them, memory operands included, and iterates natively);
-straight-line code and call/return sit at 0.5–0.9x. When this harness was
-first built the picture was very different (m68k-rs at 0.25–0.5x on nearly
-everything) — the harness directly drove the optimizations that closed the
-gap, so keep it honest when changing the fast paths: the state gates catch
-divergence immediately.
+Hot loops — memory copies and call/return included — run 2.7–5.3x Musashi
+(the trace JIT compiles them, memory operands and one level of BSR/RTS
+included, and iterates natively); dense linear code is at parity or better,
+with pure-NOP dispatch the one remaining synthetic gap (0.8x). When this
+harness was first built the picture was very different (m68k-rs at
+0.25–0.5x on nearly everything) — the harness directly drove the
+optimizations that closed the gap, so keep it honest when changing the fast
+paths: the state gates catch divergence immediately.
 
 The run also cross-checks cycle accounting between the two cores. This
 originally exposed large 68000 timing gaps in m68k-rs (e.g. `ADDQ.L #1,Dn`
