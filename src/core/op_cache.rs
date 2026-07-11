@@ -963,21 +963,36 @@ impl CpuCore {
             }
             self.ir = opcode as u32;
 
-            let Some(op) = self.decoded_simple_op(opcode, cpu_type) else {
-                return CachedRunResult::Miss(opcode);
-            };
-            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
-                Some(self.ppc)
-            } else {
-                None
-            };
-            let cycles = op.execute(self);
-            if let Some(branch_pc) = branch_pc
-                && self.pc <= branch_pc
-            {
-                probe = trace_jit::note_backward_branch(self, cpu_type);
+            match self.cached_decode(opcode, cpu_type) {
+                CachedOp::Simple(op) => {
+                    let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+                        Some(self.ppc)
+                    } else {
+                        None
+                    };
+                    let cycles = op.execute(self);
+                    if let Some(branch_pc) = branch_pc
+                        && self.pc <= branch_pc
+                    {
+                        probe = trace_jit::note_backward_branch(self, cpu_type);
+                    }
+                    self.cycles_remaining -= cycles;
+                }
+                // Memory-operand ops run against the fastmem window with
+                // exact cycle charging (`execute` only captures a window on
+                // 68000/68010, where `mem_op_cycles` matches dispatch).
+                CachedOp::Mem(op) if self.fm_len != 0 => {
+                    if !super::mem_ops::execute_mem_op(self, op) {
+                        return CachedRunResult::Miss(opcode);
+                    }
+                    let cycles = super::mem_ops::mem_op_cycles(self, op, self.ppc);
+                    if self.pc <= self.ppc {
+                        probe = trace_jit::note_backward_branch(self, cpu_type);
+                    }
+                    self.cycles_remaining -= cycles;
+                }
+                _ => return CachedRunResult::Miss(opcode),
             }
-            self.cycles_remaining -= cycles;
         }
 
         CachedRunResult::Ran

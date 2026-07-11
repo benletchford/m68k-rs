@@ -6,9 +6,11 @@ use crate::engine::{Engine, EngineState};
 use crate::workloads::{self, CODE_BASE, MEM_SIZE, SSP, Workload};
 use m68k::{AddressBus, BatchExit, CpuCore, CpuType, LinearMemoryBus};
 
-/// Flat mask-and-index bus with no fastmem window: the interpreter engine
-/// uses this so `execute` pays one (inlined) bus call per access, matching
-/// the shape of Musashi's memory interface.
+/// Flat mask-and-index bus with no fastmem window. Kept for reference runs;
+/// the interpreter engine now uses `LinearMemoryBus` (the crate's stock
+/// bus), whose fastmem window the cycle-accurate `execute` can also use on
+/// 68000/68010 — each core runs with its own canonical memory interface.
+#[allow(dead_code)]
 struct FlatBus {
     memory: Vec<u8>,
 }
@@ -70,19 +72,17 @@ fn fresh_cpu(w: &Workload) -> CpuCore {
     cpu
 }
 
-/// m68k-rs cycle-accurate interpreter on a plain bus.
+/// m68k-rs cycle-accurate interpreter on the crate's stock bus.
 pub struct NativeInterp {
     cpu: CpuCore,
-    bus: FlatBus,
+    bus: LinearMemoryBus,
 }
 
 impl NativeInterp {
     pub fn new() -> Self {
         Self {
             cpu: CpuCore::new(),
-            bus: FlatBus {
-                memory: vec![0; MEM_SIZE],
-            },
+            bus: LinearMemoryBus::new(MEM_SIZE),
         }
     }
 }
@@ -93,10 +93,11 @@ impl Engine for NativeInterp {
     }
 
     fn load_workload(&mut self, w: &Workload) {
-        self.bus.memory = workloads::build_image(w);
+        let mut image = workloads::build_image(w);
         if let Some(patch) = workloads::post_reset_patch(w) {
-            self.bus.memory[0..8].copy_from_slice(&patch);
+            image[0..8].copy_from_slice(&patch);
         }
+        self.bus = LinearMemoryBus::from_vec(image);
         self.cpu = fresh_cpu(w);
     }
 
@@ -122,7 +123,7 @@ impl Engine for NativeInterp {
     fn state(&mut self) -> EngineState {
         EngineState {
             d: std::array::from_fn(|i| self.cpu.d(i)),
-            mem_hash: workloads::fnv1a(&self.bus.memory),
+            mem_hash: workloads::fnv1a(self.bus.as_slice()),
         }
     }
 }

@@ -1481,3 +1481,203 @@ fn apply_binary_to_reg(
         }
     }
 }
+
+// ============================================================================
+// Cycle accounting for window-executed ops (68000/68010 model)
+// ============================================================================
+
+/// M68000UM Table 8-2 by [`FastEa`] form.
+#[inline]
+fn fast_ea_time(ea: FastEa, size: Size) -> i32 {
+    let long = size == Size::Long;
+    match ea {
+        FastEa::DataReg(_) | FastEa::AddrReg(_) => 0,
+        FastEa::AnInd(_) | FastEa::AnPostInc(_) => {
+            if long { 8 } else { 4 }
+        }
+        FastEa::AnPreDec(_) => {
+            if long { 10 } else { 6 }
+        }
+        FastEa::AnDisp(_) | FastEa::AbsW | FastEa::PcDisp => {
+            if long { 12 } else { 8 }
+        }
+        FastEa::AnIndex(_) | FastEa::PcIndex => {
+            if long { 14 } else { 10 }
+        }
+        FastEa::AbsL => {
+            if long { 16 } else { 12 }
+        }
+        FastEa::Imm => {
+            if long { 8 } else { 4 }
+        }
+    }
+}
+
+/// MOVE destination-side time (M68000UM Table 8-3, decomposed).
+#[inline]
+fn fast_move_dst_time(ea: FastEa, size: Size) -> i32 {
+    let long = size == Size::Long;
+    match ea {
+        FastEa::DataReg(_) | FastEa::AddrReg(_) => 0,
+        FastEa::AnInd(_) | FastEa::AnPostInc(_) | FastEa::AnPreDec(_) => {
+            if long { 8 } else { 4 }
+        }
+        FastEa::AnDisp(_) | FastEa::AbsW => {
+            if long { 12 } else { 8 }
+        }
+        FastEa::AnIndex(_) => {
+            if long { 14 } else { 10 }
+        }
+        FastEa::AbsL => {
+            if long { 16 } else { 12 }
+        }
+        // Not legal MOVE destinations.
+        FastEa::PcDisp | FastEa::PcIndex | FastEa::Imm => 0,
+    }
+}
+
+/// Standard `<ea> op Dn` base (byte/word 4; long 6, or 8 from a register or
+/// immediate operand).
+#[inline]
+fn fast_er_base(ea: FastEa, size: Size, long_footnote: bool) -> i32 {
+    if size != Size::Long {
+        4
+    } else if long_footnote
+        && matches!(ea, FastEa::DataReg(_) | FastEa::AddrReg(_) | FastEa::Imm)
+    {
+        8
+    } else {
+        6
+    }
+}
+
+/// Exact 68000/68010 cycles for a window-executed [`DecodedMemOp`],
+/// evaluated *after* the op ran (`ppc` = its address; dynamic branch
+/// outcomes are recovered from the PC and the untouched flags). Must match
+/// what full dispatch charges for the same instruction — the SingleStepTests
+/// suite enforces dispatch against real hardware, and the
+/// window-vs-plain-bus equivalence tests bridge the two paths.
+pub(crate) fn mem_op_cycles(cpu: &CpuCore, op: DecodedMemOp, ppc: u32) -> i32 {
+    match op {
+        DecodedMemOp::Move { size, src, dst } => {
+            if matches!(dst, FastEa::AddrReg(_)) {
+                4 + fast_ea_time(src, size)
+            } else {
+                4 + fast_ea_time(src, size) + fast_move_dst_time(dst, size)
+            }
+        }
+        DecodedMemOp::AluToReg { op, size, src, .. } => {
+            fast_er_base(src, size, op != BinaryOp::Cmp) + fast_ea_time(src, size)
+        }
+        DecodedMemOp::AluToMem { size, dst, .. } => {
+            (if size == Size::Long { 12 } else { 8 }) + fast_ea_time(dst, size)
+        }
+        DecodedMemOp::AluAddr { op, size, src, .. } => match op {
+            AddrOp::Cmpa => 6 + fast_ea_time(src, size),
+            AddrOp::Adda | AddrOp::Suba => {
+                let base = if size == Size::Long {
+                    fast_er_base(src, size, true)
+                } else {
+                    8
+                };
+                base + fast_ea_time(src, size)
+            }
+        },
+        DecodedMemOp::AluImm { op, size, dst } => {
+            let long = size == Size::Long;
+            if matches!(dst, FastEa::DataReg(_)) {
+                match (op == BinaryOp::Cmp, long) {
+                    (true, true) => 14,
+                    (true, false) => 8,
+                    (false, true) => 16,
+                    (false, false) => 8,
+                }
+            } else {
+                let base = match (op == BinaryOp::Cmp, long) {
+                    (true, true) => 12,
+                    (true, false) => 8,
+                    (false, true) => 20,
+                    (false, false) => 12,
+                };
+                base + fast_ea_time(dst, size)
+            }
+        }
+        DecodedMemOp::AddqSubq { size, ea, .. } => {
+            let long = size == Size::Long;
+            if matches!(ea, FastEa::DataReg(_)) {
+                if long { 8 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + fast_ea_time(ea, size)
+            }
+        }
+        DecodedMemOp::Tst { size, ea } => 4 + fast_ea_time(ea, size),
+        DecodedMemOp::Clr { size, ea }
+        | DecodedMemOp::Neg { size, ea }
+        | DecodedMemOp::Not { size, ea } => {
+            let long = size == Size::Long;
+            if matches!(ea, FastEa::DataReg(_)) {
+                if long { 6 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + fast_ea_time(ea, size)
+            }
+        }
+        DecodedMemOp::BitMem { op, bit, ea } => {
+            let base = match op {
+                BitOp::Test => {
+                    if matches!(ea, FastEa::Imm) {
+                        6
+                    } else {
+                        4
+                    }
+                }
+                _ => 8,
+            };
+            let static_extra = if matches!(bit, BitSource::Imm) { 4 } else { 0 };
+            base + static_extra + fast_ea_time(ea, Size::Byte)
+        }
+        DecodedMemOp::CmpM { size, .. } => {
+            if size == Size::Long { 20 } else { 12 }
+        }
+        DecodedMemOp::Lea { ea, .. } => match ea {
+            FastEa::AnInd(_) => 4,
+            FastEa::AnDisp(_) | FastEa::AbsW | FastEa::PcDisp => 8,
+            FastEa::AnIndex(_) | FastEa::PcIndex | FastEa::AbsL => 12,
+            _ => 4,
+        },
+        DecodedMemOp::Pea { ea } => match ea {
+            FastEa::AnInd(_) => 12,
+            FastEa::AnDisp(_) | FastEa::AbsW | FastEa::PcDisp => 16,
+            FastEa::AnIndex(_) | FastEa::PcIndex | FastEa::AbsL => 20,
+            _ => 12,
+        },
+        DecodedMemOp::Jmp { ea } => match ea {
+            FastEa::AnInd(_) => 8,
+            FastEa::AnDisp(_) | FastEa::AbsW | FastEa::PcDisp => 10,
+            FastEa::AnIndex(_) | FastEa::PcIndex => 14,
+            FastEa::AbsL => 12,
+            _ => 8,
+        },
+        DecodedMemOp::Jsr { ea } => match ea {
+            FastEa::AnInd(_) => 16,
+            FastEa::AnDisp(_) | FastEa::AbsW | FastEa::PcDisp => 18,
+            FastEa::AnIndex(_) | FastEa::PcIndex => 22,
+            FastEa::AbsL => 20,
+            _ => 16,
+        },
+        DecodedMemOp::Rts => 16,
+        DecodedMemOp::Bsr { .. } => 18,
+        DecodedMemOp::BranchWord { .. } => {
+            // Taken branches land away from the fall-through address.
+            if cpu.pc != ppc.wrapping_add(4) { 10 } else { 12 }
+        }
+        DecodedMemOp::Dbcc { condition, .. } => {
+            if cpu.pc != ppc.wrapping_add(4) {
+                10 // branch taken
+            } else if cpu.test_condition(condition) {
+                12 // condition true: no decrement, fall through
+            } else {
+                14 // counter expired
+            }
+        }
+    }
+}
