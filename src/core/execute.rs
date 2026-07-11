@@ -5,9 +5,9 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::{BatchInnerExit, CachedRunResult};
 #[cfg(not(target_family = "wasm"))]
 use super::op_cache::DecodedSimpleOp;
+use super::op_cache::{BatchInnerExit, CachedRunResult};
 use super::trace_jit;
 use super::types::{BatchExit, BatchResult, StepResult};
 
@@ -47,7 +47,7 @@ impl CpuCore {
     /// Caller must have checked [`CpuCore::can_run_decoded_simple_ops`].
     #[inline]
     fn try_execute_decoded_simple_step(&mut self, opcode: u16) -> Option<StepResult> {
-        let op = self.decoded_simple_op(self.ppc, opcode, self.cpu_type)?;
+        let op = self.decoded_simple_op(opcode, self.cpu_type)?;
         #[cfg(not(target_family = "wasm"))]
         let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
             Some(self.ppc)
@@ -59,7 +59,7 @@ impl CpuCore {
         if let Some(branch_pc) = branch_pc
             && self.pc <= branch_pc
         {
-            trace_jit::record_trace_target(self.pc, self.cpu_type);
+            let _ = trace_jit::note_backward_branch(self, self.cpu_type);
         }
 
         Some(StepResult::Ok { cycles })
@@ -168,10 +168,8 @@ impl CpuCore {
             // Only a backward branch can land on a (potential) trace head,
             // so straight-line dispatches re-enter the fast loop without a
             // trace-cache probe.
-            probe_on_entry = self.pc <= self.ppc;
-            if probe_on_entry {
-                trace_jit::record_trace_target(self.pc, self.cpu_type);
-            }
+            probe_on_entry =
+                self.pc <= self.ppc && trace_jit::note_backward_branch(self, self.cpu_type);
 
             // Check for trace exception (T1 flag set before instruction)
             if self.check_trace() {
@@ -236,6 +234,11 @@ impl CpuCore {
             self.fm_ptr = fm.ptr as usize;
             self.fm_base = fm.base;
             self.fm_len = fm.len;
+            // Memory traces are skipped (and probe-filtered) while no
+            // window is active; with the window up they can run, so
+            // re-arm the trace filters.
+            self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+            self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
         let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
         self.fm_ptr = 0;
@@ -259,14 +262,16 @@ impl CpuCore {
             };
         }
 
-        // The trace JIT's headroom guard compares against `cycles_remaining`;
-        // give it a budget that can never gate a trace in this mode.
-        self.cycles_remaining = i32::MAX / 2;
-
         let mut retired: u32 = 0;
         let mut probe_on_entry = true;
 
         loop {
+            // The trace JIT's headroom guard compares against
+            // `cycles_remaining`; keep it topped up so it can never gate a
+            // trace in this instruction-budgeted mode (traces decrement it
+            // as they run).
+            self.cycles_remaining = i32::MAX / 2;
+
             if retired >= max_instructions {
                 return BatchResult {
                     instructions: retired,
@@ -345,9 +350,7 @@ impl CpuCore {
                 InternalStepResult::TrapInstruction { trap_num } => {
                     Some(BatchExit::TrapInstruction { trap_num })
                 }
-                InternalStepResult::Breakpoint { bp_num } => {
-                    Some(BatchExit::Breakpoint { bp_num })
-                }
+                InternalStepResult::Breakpoint { bp_num } => Some(BatchExit::Breakpoint { bp_num }),
                 InternalStepResult::IllegalInstruction { opcode } => {
                     Some(BatchExit::IllegalInstruction { opcode })
                 }
@@ -370,10 +373,8 @@ impl CpuCore {
                 // Mirrors `execute`: only backward branches can reach a
                 // trace head, so straight-line dispatches re-enter the
                 // fast loop without a trace-cache probe.
-                probe_on_entry = self.pc <= self.ppc;
-                if probe_on_entry {
-                    trace_jit::record_trace_target(self.pc, self.cpu_type);
-                }
+                probe_on_entry =
+                    self.pc <= self.ppc && trace_jit::note_backward_branch(self, self.cpu_type);
 
                 if !self.sst_m68000_compat && self.check_trace() {
                     let _ = self.exception_trace(bus);

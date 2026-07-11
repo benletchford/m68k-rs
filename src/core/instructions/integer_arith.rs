@@ -56,7 +56,7 @@ impl CpuCore {
         if let AddressingMode::AddressDirect(reg) = mode {
             let reg = reg as usize;
             self.set_a(reg, self.a(reg).wrapping_add(data));
-            return 4;
+            return if self.is_pre_68020 { 8 } else { 4 };
         }
 
         // Resolve EA once: postinc/predec have side effects and must not be applied twice.
@@ -64,7 +64,16 @@ impl CpuCore {
         let dst = self.read_resolved_ea(bus, ea, size);
         let (result, _) = self.exec_add::<B>(bus, size, data, dst);
         self.write_resolved_ea(bus, ea, size, result);
-        4
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 8 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + self.ea_time(mode, size)
+            }
+        } else {
+            4
+        }
     }
 
     /// Execute ADDX instruction.
@@ -136,7 +145,7 @@ impl CpuCore {
         if let AddressingMode::AddressDirect(reg) = mode {
             let reg = reg as usize;
             self.set_a(reg, self.a(reg).wrapping_sub(data));
-            return 4;
+            return if self.is_pre_68020 { 8 } else { 4 };
         }
 
         // Resolve EA once: postinc/predec have side effects and must not be applied twice.
@@ -144,7 +153,16 @@ impl CpuCore {
         let dst = self.read_resolved_ea(bus, ea, size);
         let (result, _) = self.exec_sub::<B>(bus, size, data, dst);
         self.write_resolved_ea(bus, ea, size, result);
-        4
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 8 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + self.ea_time(mode, size)
+            }
+        } else {
+            4
+        }
     }
 
     /// Execute SUBX instruction.
@@ -218,7 +236,16 @@ impl CpuCore {
         self.not_z_flag = 0;
         self.v_flag = 0;
         self.c_flag = 0;
-        4
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 6 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + self.ea_time(mode, size)
+            }
+        } else {
+            4
+        }
     }
 
     /// Execute NEG instruction.
@@ -240,7 +267,16 @@ impl CpuCore {
             return 50;
         }
         self.set_sub_flags(src, 0, result, size);
-        4
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 6 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + self.ea_time(mode, size)
+            }
+        } else {
+            4
+        }
     }
 
     /// Execute NEGX instruction.
@@ -260,7 +296,16 @@ impl CpuCore {
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
             return 50;
         }
-        4
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 6 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + self.ea_time(mode, size)
+            }
+        } else {
+            4
+        }
     }
 
     /// Execute NOT instruction.
@@ -282,7 +327,16 @@ impl CpuCore {
             return 50;
         }
         self.set_logic_flags(result, size);
-        4
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 6 } else { 4 }
+            } else {
+                (if long { 12 } else { 8 }) + self.ea_time(mode, size)
+            }
+        } else {
+            4
+        }
     }
 
     /// Execute EXT instruction.
@@ -322,7 +376,7 @@ impl CpuCore {
             return 50;
         }
         self.set_logic_flags(value, size);
-        4
+        4 + self.ea_time(mode, size)
     }
 
     /// Set flags for ADD operation.
@@ -500,7 +554,19 @@ impl CpuCore {
         self.c_flag = 0;
 
         if val < 0 || val > limit {
-            return self.exception_chk(bus);
+            // SST: the upper-bound trap path costs 38+ea on the 68000; the
+            // negative-value path costs 40+ea. Checked in this order, so a
+            // value above a negative bound takes the cheaper path even
+            // though it is itself negative. (~200 SST cases with negative
+            // bounds still disagree by 2 cycles; the exact microcode rule
+            // is unclear, and this is already closer than Musashi's flat
+            // 40+ea.)
+            let adjust = if self.is_pre_68020 && val > limit {
+                2
+            } else {
+                0
+            };
+            return self.exception_chk(bus) - adjust;
         }
 
         // Successful CHK consumes 10 cycles on 68000 (approx)

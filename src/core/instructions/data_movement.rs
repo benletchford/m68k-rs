@@ -28,8 +28,7 @@ impl CpuCore {
         // Set flags
         self.set_logic_flags(value, size);
 
-        // Cycles vary by addressing mode
-        4
+        4 + self.ea_time(src_mode, size) + self.move_dst_time(dst_mode, size)
     }
 
     /// Execute MOVEA instruction.
@@ -52,7 +51,7 @@ impl CpuCore {
         };
 
         self.set_a(dst_reg, value);
-        4
+        4 + self.ea_time(src_mode, size)
     }
 
     /// Execute LEA instruction.
@@ -67,7 +66,11 @@ impl CpuCore {
         // Get effective address (don't read from it)
         let ea = self.get_ea_address(bus, src_mode, Size::Long);
         self.set_a(dst_reg, ea);
-        4
+        if self.is_pre_68020 {
+            crate::core::timing::lea_ea_cycles_68000(src_mode)
+        } else {
+            4
+        }
     }
 
     /// Execute PEA instruction.
@@ -76,7 +79,11 @@ impl CpuCore {
     pub fn exec_pea<B: AddressBus>(&mut self, bus: &mut B, src_mode: AddressingMode) -> i32 {
         let ea = self.get_ea_address(bus, src_mode, Size::Long);
         self.push_32(bus, ea);
-        12
+        if self.is_pre_68020 {
+            crate::core::timing::pea_cycles_68000(src_mode)
+        } else {
+            12
+        }
     }
 
     /// Execute EXG instruction.
@@ -217,7 +224,12 @@ impl CpuCore {
             }
         }
 
-        8 + count * if size == Size::Long { 8 } else { 4 }
+        let extra = if self.is_pre_68020 {
+            crate::core::timing::movem_ea_extra_68000(mode)
+        } else {
+            0
+        };
+        8 + extra + count * if size == Size::Long { 8 } else { 4 }
     }
 
     /// Execute MOVEM instruction (memory to register).
@@ -279,7 +291,12 @@ impl CpuCore {
             }
         }
 
-        12 + count * if size == Size::Long { 8 } else { 4 }
+        let extra = if self.is_pre_68020 {
+            crate::core::timing::movem_ea_extra_68000(mode)
+        } else {
+            0
+        };
+        12 + extra + count * if size == Size::Long { 8 } else { 4 }
     }
 
     /// Execute SWAP instruction.

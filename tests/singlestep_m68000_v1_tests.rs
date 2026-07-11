@@ -95,6 +95,9 @@ struct BinTest {
     initial: BinState,
     final_: BinState,
     has_addr_error_txn: bool,
+    /// Total clock periods the real 68000 spent on this instruction
+    /// (from the fixture's bus-transaction record).
+    num_cycles: u32,
 }
 
 fn read_u8(bytes: &[u8], ptr: &mut usize) -> Result<u8, String> {
@@ -181,9 +184,9 @@ fn read_state(bytes: &[u8], ptr: &mut usize) -> Result<BinState, String> {
     })
 }
 
-fn read_transactions(bytes: &[u8], ptr: &mut usize) -> Result<bool, String> {
+fn read_transactions(bytes: &[u8], ptr: &mut usize) -> Result<(bool, u32), String> {
     let _num_bytes = read_block_header(bytes, ptr, MAGIC_TXNS)?;
-    let _num_cycles = read_u32_le(bytes, ptr)?;
+    let num_cycles = read_u32_le(bytes, ptr)?;
     let num_transactions = read_u32_le(bytes, ptr)? as usize;
     let mut has_addr_error = false;
     for _ in 0..num_transactions {
@@ -204,7 +207,7 @@ fn read_transactions(bytes: &[u8], ptr: &mut usize) -> Result<bool, String> {
         let _uds = read_u32_le(bytes, ptr)?;
         let _lds = read_u32_le(bytes, ptr)?;
     }
-    Ok(has_addr_error)
+    Ok((has_addr_error, num_cycles))
 }
 
 fn read_test(bytes: &[u8], ptr: &mut usize) -> Result<BinTest, String> {
@@ -212,12 +215,13 @@ fn read_test(bytes: &[u8], ptr: &mut usize) -> Result<BinTest, String> {
     let name = read_name(bytes, ptr)?;
     let initial = read_state(bytes, ptr)?;
     let final_ = read_state(bytes, ptr)?;
-    let has_addr_error_txn = read_transactions(bytes, ptr)?;
+    let (has_addr_error_txn, num_cycles) = read_transactions(bytes, ptr)?;
     Ok(BinTest {
         name,
         initial,
         final_,
         has_addr_error_txn,
+        num_cycles,
     })
 }
 
@@ -247,9 +251,55 @@ fn fixture_root_v1() -> PathBuf {
         .join("v1")
 }
 
+fn audit_cycles() -> bool {
+    std::env::var("M68K_SST_AUDIT_CYCLES").is_ok_and(|v| v == "1")
+}
+
+fn is_chk_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|f| f.to_string_lossy().starts_with("CHK"))
+}
+
+/// Cycle-audit accumulator for one fixture file.
+#[derive(Default)]
+struct CycleAudit {
+    checked: u64,
+    mismatched: u64,
+    /// (expected - got) delta histogram keyed by delta, with one example each.
+    by_delta: std::collections::BTreeMap<i64, (u64, String)>,
+}
+
+impl CycleAudit {
+    fn record(&mut self, opcode: u16, name: &str, expected: u32, got: i32) {
+        self.checked += 1;
+        let delta = expected as i64 - got as i64;
+        if delta != 0 {
+            self.mismatched += 1;
+            let entry = self
+                .by_delta
+                .entry(delta)
+                .or_insert_with(|| (0, format!("{name} [{opcode:04X}] exp {expected} got {got}")));
+            entry.0 += 1;
+        }
+    }
+
+    fn report(&self, path: &Path) {
+        let file = path.file_name().map(|f| f.to_string_lossy().into_owned());
+        let file = file.as_deref().unwrap_or("?");
+        eprintln!(
+            "[cycle-audit] {file}: {}/{} mismatched",
+            self.mismatched, self.checked
+        );
+        for (delta, (count, example)) in &self.by_delta {
+            eprintln!("[cycle-audit]   delta {delta:+}: {count} cases, e.g. {example}");
+        }
+    }
+}
+
 fn run_one_file(path: &Path) {
     let tests = load_test_file(path).unwrap();
     let mut failures: Vec<String> = Vec::new();
+    let mut audit = CycleAudit::default();
 
     for (idx, t) in tests.iter().enumerate() {
         // Build memory from initial (byte pieces).
@@ -267,9 +317,34 @@ fn run_one_file(path: &Path) {
 
         // Execute one instruction (HLE handler falls back to exceptions)
         let mut hle = m68k::NoOpHleHandler;
-        let _result = cpu.step_with_hle_handler(&mut bus, &mut hle);
+        let result = cpu.step_with_hle_handler(&mut bus, &mut hle);
 
         let ctx = format!("{}[{}] {}", path.display(), idx, t.name);
+
+        // Compare cycle counts against the fixture's real-hardware clock
+        // count. Enforced by default; M68K_SST_AUDIT_CYCLES=1 switches to a
+        // report-only summary (useful when burning down divergences).
+        // CHK's trap paths are exempt: ~200 negative-bound cases disagree
+        // by 2 clocks and the exact microcode rule is not yet understood
+        // (see exec_chk).
+        if !t.has_addr_error_txn
+            && let m68k::StepResult::Ok { cycles } = result
+        {
+            if audit_cycles() {
+                audit.record(opcode, &t.name, t.num_cycles, cycles);
+            } else if cycles as i64 != t.num_cycles as i64 && !is_chk_file(path) {
+                failures.push(format!(
+                    "{}[{idx}] {}: cycles: expected {}, got {cycles}",
+                    path.display(),
+                    t.name,
+                    t.num_cycles
+                ));
+                if failures.len() >= 25 {
+                    break;
+                }
+                continue;
+            }
+        }
 
         if std::env::var("M68K_SST_DEBUG_CASE")
             .ok()
@@ -425,6 +500,10 @@ fn run_one_file(path: &Path) {
                 break;
             }
         }
+    }
+
+    if audit_cycles() {
+        audit.report(path);
     }
 
     if !failures.is_empty() {

@@ -1,5 +1,5 @@
-use m68k::{CpuCore, CpuType, NoOpHleHandler, StepResult};
 use m68k::core::memory::AddressBus;
+use m68k::{CpuCore, CpuType, NoOpHleHandler, StepResult};
 
 struct TestBus {
     memory: [u8; 0x10000],
@@ -7,7 +7,9 @@ struct TestBus {
 
 impl TestBus {
     fn new() -> Self {
-        Self { memory: [0; 0x10000] }
+        Self {
+            memory: [0; 0x10000],
+        }
     }
 
     fn write_word_at(&mut self, addr: u32, value: u16) {
@@ -91,7 +93,10 @@ fn test_odd_pc_fetch_triggers_address_error_with_hle_step() {
     let result = cpu.step_with_hle_handler(&mut bus, &mut hle);
 
     assert!(matches!(result, StepResult::Ok { .. }));
-    assert_eq!(cpu.run_mode, 0, "run_mode should be reset after address error");
+    assert_eq!(
+        cpu.run_mode, 0,
+        "run_mode should be reset after address error"
+    );
     assert_eq!(
         cpu.pc, 0x0200,
         "HLE step should take address error on odd instruction fetch"

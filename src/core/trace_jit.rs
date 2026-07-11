@@ -14,7 +14,8 @@ use super::types::{CpuType, Size};
 use cranelift_codegen::Context;
 #[cfg(not(target_family = "wasm"))]
 use cranelift_codegen::ir::{
-    AbiParam, Function, InstBuilder, MemFlags, UserFuncName, Value, condcodes::IntCC, types,
+    AbiParam, Block, Function, InstBuilder, MemFlags, Type, UserFuncName, Value, condcodes::IntCC,
+    types,
 };
 #[cfg(not(target_family = "wasm"))]
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -32,8 +33,14 @@ const TRACE_CACHE_SIZE: usize = 4096;
 pub(crate) const TRACE_MAX_OPS: usize = 16;
 const TRACE_HOT_THRESHOLD: u8 = 2;
 
+/// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
+pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
+
 #[cfg(not(target_family = "wasm"))]
-type TraceFn = unsafe extern "C" fn(*mut CpuCore) -> i32;
+/// Compiled trace entry point. Returns `(ops_retired << 32) | cycles`:
+/// a full pass retires every op; a mem-op bail retires a prefix and sets
+/// `cpu.pc` to the first un-executed instruction.
+type TraceFn = unsafe extern "C" fn(*mut CpuCore) -> u64;
 
 static TRACE_JIT_HAS_CANDIDATES: AtomicBool = AtomicBool::new(false);
 
@@ -45,6 +52,37 @@ thread_local! {
 pub(crate) enum JitDirectReg {
     Data(u8),
     Addr(u8),
+}
+
+/// Effective-address forms allowed in memory trace ops. All are one-word
+/// (no extension), so the trace's code bytes stay contiguous and cheap to
+/// validate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JitEa {
+    Data(u8),
+    Addr(u8),
+    /// (An)
+    Ind(u8),
+    /// (An)+
+    PostInc(u8),
+    /// -(An)
+    PreDec(u8),
+}
+
+impl JitEa {
+    fn is_mem(self) -> bool {
+        matches!(self, Self::Ind(_) | Self::PostInc(_) | Self::PreDec(_))
+    }
+}
+
+/// Post-inc/pre-dec step: byte accesses through A7 keep the stack pointer
+/// even (matches `mem_ops::ea_step`).
+fn jit_ea_step(size: Size, reg: u8) -> u32 {
+    if size == Size::Byte && reg == 7 {
+        2
+    } else {
+        size.bytes()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +207,16 @@ pub(crate) enum JitTraceOp {
         reg: u8,
         displacement: i16,
     },
+    /// MOVE/MOVEA with at least one register-indirect operand, executed
+    /// against the fastmem window (`dst == Addr` is MOVEA). Traces
+    /// containing this op only run while a window is active; every access
+    /// is bounds/alignment/self-modification checked and bails to the
+    /// interpreter mid-trace with nothing from this op committed.
+    MoveMem {
+        size: Size,
+        src: JitEa,
+        dst: JitEa,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -183,7 +231,28 @@ struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
     ops: Vec<TraceBuildOp>,
+    /// The exact instruction bytes the trace was compiled from (ops are
+    /// contiguous from `pc`). Lets validation be a single compare against
+    /// a fastmem window instead of per-op bus reads.
+    code: Vec<u8>,
     max_cycles: i32,
+    /// The final branch's taken-target is the trace head, so the trace is
+    /// a whole loop iteration and can be re-run (budget permitting)
+    /// without re-validating: trace stores that would touch code bail out
+    /// before committing, and nothing observable happens between
+    /// iterations.
+    self_loop: bool,
+    /// Contains `MoveMem` ops: only executable while a fastmem window is
+    /// active (i.e. inside `run_batch`).
+    needs_window: bool,
+    /// Address-masked range of the trace's code bytes; trace stores into
+    /// this range bail so self-modification is observed like the
+    /// interpreter would. Baked into the compiled function on native
+    /// targets; read at execution time by the portable path.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    code_start: u32,
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    code_end: u32,
     #[cfg(not(target_family = "wasm"))]
     func: TraceFn,
 }
@@ -248,13 +317,21 @@ impl TraceJit {
     /// Attempt to execute a compiled trace at the current PC.
     ///
     /// On `CachedRunResult::Ran`, the returned count is the number of
-    /// guest instructions the trace retired (every op in the trace runs
-    /// exactly once per call). The count is 0 for `Fault`/`Miss`.
+    /// guest instructions the trace retired. The count is 0 for
+    /// `Fault`/`Miss`.
+    ///
+    /// A self-looping trace (one whose closing branch targets its own
+    /// head) may run many iterations per call: up to `instr_budget`
+    /// retired instructions, always within the CPU's remaining cycle
+    /// budget, and only one iteration when `single_iter` is set (callers
+    /// that must observe the PC between iterations, e.g. watchpoints).
     fn try_execute<B: AddressBus>(
         &mut self,
         cpu: &mut CpuCore,
         bus: &mut B,
         cpu_type: CpuType,
+        instr_budget: u32,
+        single_iter: bool,
     ) -> Option<(CachedRunResult, u32)> {
         #[cfg(not(target_family = "wasm"))]
         self.module.as_ref()?;
@@ -270,37 +347,72 @@ impl TraceJit {
             && trace.pc == pc
             && trace.cpu_type == cpu_type
         {
+            if trace.needs_window && cpu.fm_len == 0 {
+                // Memory traces only run against a fastmem window (i.e.
+                // inside run_batch). Stop this cycle-budgeted caller from
+                // probing the target again; run_batch clears the filter on
+                // entry so the trace still runs there.
+                push_probe_skip(cpu, pc);
+                return None;
+            }
             if cpu.cycles_remaining < trace.max_cycles {
                 return None;
             }
 
-            let mut miss = None;
-            for (index, op) in trace.ops.iter().enumerate() {
-                let addr = cpu.address(op.pc);
-                match bus.try_read_word(addr) {
-                    Ok(opcode) if opcode == op.opcode => {}
-                    Ok(opcode) => {
-                        miss = Some((index, op.pc, opcode));
-                        break;
+            // Fast validation: when a fastmem window covers the whole
+            // trace, one slice compare against the live instruction bytes
+            // replaces per-op bus reads. (SMC through the window is still
+            // caught: we compare the actual RAM.)
+            let mut validated = false;
+            if cpu.fm_len != 0 {
+                let n = trace.code.len() as u32;
+                let off = cpu.address(pc).wrapping_sub(cpu.fm_base);
+                if n <= cpu.fm_len && off <= cpu.fm_len - n {
+                    let live = unsafe {
+                        std::slice::from_raw_parts(
+                            (cpu.fm_ptr as *const u8).add(off as usize),
+                            n as usize,
+                        )
+                    };
+                    if live == trace.code.as_slice() {
+                        validated = true;
                     }
-                    Err(_) => return None,
                 }
+            }
 
-                if let Some(expected) = op.extension {
-                    let addr = cpu.address(op.pc.wrapping_add(2));
+            let mut miss = None;
+            if !validated {
+                for (index, op) in trace.ops.iter().enumerate() {
+                    let addr = cpu.address(op.pc);
                     match bus.try_read_word(addr) {
-                        Ok(extension) if extension == expected => {}
-                        Ok(_) => {
-                            miss = Some((index, op.pc, op.opcode));
+                        Ok(opcode) if opcode == op.opcode => {}
+                        Ok(opcode) => {
+                            miss = Some((index, op.pc, opcode));
                             break;
                         }
                         Err(_) => return None,
+                    }
+
+                    if let Some(expected) = op.extension {
+                        let addr = cpu.address(op.pc.wrapping_add(2));
+                        match bus.try_read_word(addr) {
+                            Ok(extension) if extension == expected => {}
+                            Ok(_) => {
+                                miss = Some((index, op.pc, op.opcode));
+                                break;
+                            }
+                            Err(_) => return None,
+                        }
                     }
                 }
             }
 
             if let Some((index, ppc, opcode)) = miss {
                 self.slots[idx] = TraceSlot::Empty;
+                // The trace at this target is gone; re-arm the per-CPU
+                // filters so the loop can be re-recorded and re-probed.
+                cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+                cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
                 if index > 0 {
                     // Instruction memory changed mid-trace. Nothing has
                     // executed yet (validation precedes the trace call),
@@ -315,13 +427,54 @@ impl TraceJit {
                 return Some((CachedRunResult::Miss(opcode), 0));
             }
 
-            let instructions = trace.ops.len() as u32;
-            #[cfg(not(target_family = "wasm"))]
-            let cycles = unsafe { (trace.func)(cpu as *mut CpuCore) };
-            #[cfg(target_family = "wasm")]
-            let cycles = execute_portable_trace(cpu, &trace.ops);
-            cpu.cycles_remaining -= cycles;
-            return Some((CachedRunResult::Ran, instructions));
+            let ops_len = trace.ops.len() as u32;
+            // How many whole iterations fit in both budgets. The guards
+            // above ensure at least one; the instruction budget is the
+            // caller's (u32::MAX on the cycle-budgeted paths).
+            let max_iters = if single_iter || !trace.self_loop {
+                1
+            } else {
+                let by_instrs = (instr_budget / ops_len).max(1);
+                let by_cycles = (cpu.cycles_remaining / trace.max_cycles).max(1) as u32;
+                by_instrs.min(by_cycles)
+            };
+
+            let mut cycles_total = 0i64;
+            let mut retired = 0u32;
+            let mut full_iters = 0u32;
+            loop {
+                #[cfg(not(target_family = "wasm"))]
+                let packed = unsafe { (trace.func)(cpu as *mut CpuCore) };
+                #[cfg(target_family = "wasm")]
+                let packed =
+                    execute_portable_trace(cpu, &trace.ops, trace.code_start, trace.code_end);
+                cycles_total += (packed as u32) as i64;
+                let ops_done = (packed >> 32) as u32;
+                retired += ops_done;
+                if ops_done < ops_len {
+                    // A mem op bailed mid-trace (window/alignment miss or a
+                    // store into code). PC points at the un-executed op;
+                    // the interpreter takes over from there.
+                    break;
+                }
+                full_iters += 1;
+                // Re-entering the (already validated) loop head is the only
+                // continue condition; trace ops cannot fault or take
+                // exceptions, and stores that would touch code bail before
+                // committing, so nothing needs re-checking between
+                // iterations.
+                if full_iters >= max_iters || cpu.pc != pc {
+                    break;
+                }
+            }
+            cpu.cycles_remaining -= i32::try_from(cycles_total).unwrap_or(i32::MAX);
+            if retired == 0 {
+                // The very first op bailed: nothing executed. Fall back to
+                // the interpreter so the offending instruction makes
+                // progress through full dispatch.
+                return None;
+            }
+            return Some((CachedRunResult::Ran, retired));
         }
 
         match &mut self.slots[idx] {
@@ -335,6 +488,15 @@ impl TraceJit {
                     return None;
                 }
             }
+            TraceSlot::Rejected {
+                pc: rejected_pc,
+                cpu_type: rejected_type,
+            } if *rejected_pc == pc && *rejected_type == cpu_type => {
+                // Known-uncompilable target: tell the loop to stop probing
+                // it (note_backward_branch consults this filter).
+                push_probe_skip(cpu, pc);
+                return None;
+            }
             _ => {
                 return None;
             }
@@ -342,6 +504,7 @@ impl TraceJit {
 
         let Some(trace) = self.compile_trace(cpu, bus, pc, cpu_type) else {
             self.slots[idx] = TraceSlot::Rejected { pc, cpu_type };
+            push_probe_skip(cpu, pc);
             return None;
         };
 
@@ -409,22 +572,68 @@ impl TraceJit {
             return None;
         }
 
-        self.compile_ops(start_pc, cpu_type, &ops, max_cycles)
+        let mut code = Vec::with_capacity(ops.len() * 4);
+        for op in &ops {
+            code.extend_from_slice(&op.opcode.to_be_bytes());
+            if let Some(extension) = op.extension {
+                code.extend_from_slice(&extension.to_be_bytes());
+            }
+        }
+        debug_assert_eq!(code.len() as u32, pc.wrapping_sub(start_pc));
+
+        let self_loop = ops
+            .last()
+            .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
+
+        let needs_window = ops
+            .iter()
+            .any(|op| matches!(op.op, JitTraceOp::MoveMem { .. }));
+
+        // Address-masked code range, used by the store-overlap (SMC) bail
+        // checks. Reject the exotic case of a trace wrapping the address
+        // space so the range stays a simple interval.
+        let code_start = start_pc & cpu.address_mask;
+        let code_end = code_start as u64 + code.len() as u64;
+        if code_end > cpu.address_mask as u64 + 1 {
+            return None;
+        }
+        let code_end = code_end as u32;
+
+        self.compile_ops(CompileParams {
+            start_pc,
+            cpu_type,
+            ops: &ops,
+            code,
+            max_cycles,
+            self_loop,
+            needs_window,
+            code_start,
+            code_end,
+            aligned_only: cpu.is_pre_68020,
+            address_mask: cpu.address_mask,
+        })
     }
 
     #[cfg(not(target_family = "wasm"))]
-    fn compile_ops(
-        &mut self,
-        start_pc: u32,
-        cpu_type: CpuType,
-        ops: &[TraceBuildOp],
-        max_cycles: i32,
-    ) -> Option<CompiledTrace> {
+    fn compile_ops(&mut self, params: CompileParams<'_>) -> Option<CompiledTrace> {
+        let CompileParams {
+            start_pc,
+            cpu_type,
+            ops,
+            code,
+            max_cycles,
+            self_loop,
+            needs_window,
+            code_start,
+            code_end,
+            aligned_only,
+            address_mask,
+        } = params;
         let module = self.module.as_mut()?;
         let ptr_ty = module.target_config().pointer_type();
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr_ty));
-        sig.returns.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(types::I64));
 
         let name = format!("m68k_trace_{}", self.next_func);
         self.next_func = self.next_func.wrapping_add(1);
@@ -440,10 +649,61 @@ impl TraceJit {
             builder.append_block_params_for_function_params(block);
             let cpu_ptr = builder.block_params(block)[0];
 
+            // Window state is constant for the whole `run_batch` call that
+            // executes this trace; load it once.
+            let mem_env = if needs_window {
+                let fm_ptr = builder.ins().load(
+                    ptr_ty,
+                    MemFlags::trusted(),
+                    cpu_ptr,
+                    offset_of!(CpuCore, fm_ptr) as i32,
+                );
+                let fm_base = load_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, fm_base));
+                let fm_len = load_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, fm_len));
+                Some(MemEnv {
+                    fm_ptr,
+                    fm_ptr_ty: ptr_ty,
+                    fm_base,
+                    fm_len,
+                    address_mask,
+                    aligned_only,
+                    code_start,
+                    code_end,
+                })
+            } else {
+                None
+            };
+
+            let mut bails: Vec<BailReq> = Vec::new();
+            let mut cycles_before: i64 = 0;
             let mut cycles_value = builder.ins().iconst(types::I32, 0);
-            for op in ops {
-                let op_cycles = emit_jit_op(&mut builder, cpu_ptr, *op);
+            for (index, op) in ops.iter().enumerate() {
+                let op_cycles = if let JitTraceOp::MoveMem { size, src, dst } = op.op {
+                    let env = mem_env.as_ref().expect("MoveMem implies a window env");
+                    emit_move_mem(
+                        &mut builder,
+                        cpu_ptr,
+                        MoveMemOp {
+                            pc: op.pc,
+                            size,
+                            src,
+                            dst,
+                        },
+                        env,
+                        &mut bails,
+                        BailAt {
+                            ops_before: index as u32,
+                            cycles_before,
+                        },
+                    )
+                } else {
+                    emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only)
+                };
                 cycles_value = builder.ins().iadd(cycles_value, op_cycles);
+                // Exact for every op that can precede a bail (MoveMem and
+                // register ops have constant cycles; only the closing
+                // branch is dynamic, and nothing bails after it).
+                cycles_before += op.op.max_cycles() as i64;
             }
 
             if let Some(last) = ops.last() {
@@ -456,7 +716,24 @@ impl TraceJit {
                 );
             }
 
-            builder.ins().return_(&[cycles_value]);
+            // Success: all ops retired. Pack (ops_retired << 32) | cycles.
+            let cycles64 = builder.ins().uextend(types::I64, cycles_value);
+            let ops_len = builder.ins().iconst(types::I64, (ops.len() as i64) << 32);
+            let packed = builder.ins().bor(cycles64, ops_len);
+            builder.ins().return_(&[packed]);
+
+            // Bail exits: set PC to the un-executed op, return the ops and
+            // (constant) cycles retired before it.
+            for bail in bails {
+                builder.switch_to_block(bail.block);
+                store_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, pc), bail.pc);
+                let packed = builder.ins().iconst(
+                    types::I64,
+                    ((bail.at.ops_before as i64) << 32) | bail.at.cycles_before,
+                );
+                builder.ins().return_(&[packed]);
+            }
+
             builder.seal_all_blocks();
             builder.finalize();
         }
@@ -471,48 +748,106 @@ impl TraceJit {
             pc: start_pc,
             cpu_type,
             ops: ops.to_vec(),
+            code,
             max_cycles,
+            self_loop,
+            needs_window,
+            code_start,
+            code_end,
             func,
         })
     }
 
     #[cfg(target_family = "wasm")]
-    fn compile_ops(
-        &mut self,
-        start_pc: u32,
-        cpu_type: CpuType,
-        ops: &[TraceBuildOp],
-        max_cycles: i32,
-    ) -> Option<CompiledTrace> {
+    fn compile_ops(&mut self, params: CompileParams<'_>) -> Option<CompiledTrace> {
         Some(CompiledTrace {
-            pc: start_pc,
-            cpu_type,
-            ops: ops.to_vec(),
-            max_cycles,
+            pc: params.start_pc,
+            cpu_type: params.cpu_type,
+            ops: params.ops.to_vec(),
+            code: params.code,
+            max_cycles: params.max_cycles,
+            self_loop: params.self_loop,
+            needs_window: params.needs_window,
+            code_start: params.code_start,
+            code_end: params.code_end,
         })
     }
 }
 
+/// Everything `compile_ops` needs, gathered by `compile_trace`.
+struct CompileParams<'a> {
+    start_pc: u32,
+    cpu_type: CpuType,
+    ops: &'a [TraceBuildOp],
+    code: Vec<u8>,
+    max_cycles: i32,
+    self_loop: bool,
+    needs_window: bool,
+    code_start: u32,
+    code_end: u32,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    aligned_only: bool,
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    address_mask: u32,
+}
+
 /// Attempt to execute a compiled trace at the current PC. See
-/// [`TraceJit::try_execute`] for the meaning of the returned count.
+/// [`TraceJit::try_execute`] for the meaning of the returned count and of
+/// `instr_budget`/`single_iter`.
 pub(crate) fn try_execute_trace<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
     cpu_type: CpuType,
+    instr_budget: u32,
+    single_iter: bool,
 ) -> Option<(CachedRunResult, u32)> {
     if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
         return None;
     }
 
-    TRACE_JIT.with_borrow_mut(|jit| jit.try_execute(cpu, bus, cpu_type))
+    TRACE_JIT.with_borrow_mut(|jit| jit.try_execute(cpu, bus, cpu_type, instr_budget, single_iter))
 }
 
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
     TRACE_JIT.with_borrow_mut(|jit| jit.record_trace_target(pc, cpu_type));
 }
 
+/// Note that execution just took a backward branch to `cpu.pc` (a potential
+/// trace head) and return whether the caller should probe the trace cache.
+///
+/// This is the cheap front door to the thread-local trace state: tight
+/// loops hit their branch target every iteration, so re-recording it (a
+/// no-op) and re-probing known-rejected targets are filtered out with two
+/// per-CPU compares before any TLS access. `TraceJit::try_execute` re-arms
+/// the filters whenever it invalidates or rejects a trace.
+#[inline]
+pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool {
+    let pc = cpu.pc;
+    if cpu.trace_probe_skip.contains(&pc) {
+        // Known-uncompilable target: recording is a no-op and probing
+        // cannot succeed.
+        return false;
+    }
+    if !cpu.trace_record_skip.contains(&pc) {
+        let at = (cpu.trace_record_skip_at & 3) as usize;
+        cpu.trace_record_skip[at] = pc;
+        cpu.trace_record_skip_at = cpu.trace_record_skip_at.wrapping_add(1);
+        record_trace_target(pc, cpu_type);
+    }
+    true
+}
+
 pub(crate) fn has_trace_candidates() -> bool {
     TRACE_JIT_HAS_CANDIDATES.load(Ordering::Relaxed)
+}
+
+#[inline]
+fn push_probe_skip(cpu: &mut CpuCore, pc: u32) {
+    if !cpu.trace_probe_skip.contains(&pc) {
+        let at = (cpu.trace_probe_skip_at & 3) as usize;
+        cpu.trace_probe_skip[at] = pc;
+        cpu.trace_probe_skip_at = cpu.trace_probe_skip_at.wrapping_add(1);
+    }
 }
 
 impl JitTraceOp {
@@ -521,19 +856,19 @@ impl JitTraceOp {
             Self::Nop => 4,
             Self::MoveReg { .. } => 4,
             Self::Moveq { .. } => 4,
-            Self::UnaryDataReg { .. } => 4,
+            Self::UnaryDataReg { .. } => 6,
             Self::Swap { .. } => 4,
             Self::Ext { .. } => 4,
             Self::Extb { .. } => 4,
-            Self::AddqSubqReg { .. } => 4,
-            Self::AddqSubqAddr { .. } => 4,
+            Self::AddqSubqReg { .. } => 8,
+            Self::AddqSubqAddr { .. } => 8,
             Self::BinaryDataReg { cycles, .. } => cycles,
             Self::AddrDataReg {
                 op: JitAddrOp::Cmpa,
                 ..
             } => 6,
             Self::AddrDataReg { .. } => 8,
-            Self::AddSubxReg { .. } => 4,
+            Self::AddSubxReg { .. } => 8,
             Self::BitReg {
                 op: JitBitOp::Test, ..
             } => 6,
@@ -542,8 +877,8 @@ impl JitTraceOp {
                 ..
             } => 10,
             Self::BitReg { .. } => 8,
+            Self::SccDataReg { .. } => 6,
             Self::Exg { .. } => 6,
-            Self::SccDataReg { .. } => 4,
             Self::ShiftReg {
                 count_or_reg,
                 count_is_register,
@@ -558,11 +893,51 @@ impl JitTraceOp {
             }
             Self::Branch { .. } => 10,
             Self::Dbcc { .. } => 14,
+            Self::MoveMem { size, src, dst } => {
+                // 4 + source-EA fetch + destination-EA store (M68000UM).
+                let long = size == Size::Long;
+                let src_c = match src {
+                    JitEa::Data(_) | JitEa::Addr(_) => 0,
+                    JitEa::Ind(_) | JitEa::PostInc(_) => {
+                        if long {
+                            8
+                        } else {
+                            4
+                        }
+                    }
+                    JitEa::PreDec(_) => {
+                        if long {
+                            10
+                        } else {
+                            6
+                        }
+                    }
+                };
+                let dst_c = if dst.is_mem() {
+                    if long { 8 } else { 4 }
+                } else {
+                    0
+                };
+                4 + src_c + dst_c
+            }
         }
     }
 
     fn ends_trace(self) -> bool {
         matches!(self, Self::Branch { .. } | Self::Dbcc { .. })
+    }
+
+    /// The PC a taken closing branch at `pc` jumps to, if this op is one.
+    fn taken_target(self, pc: u32) -> Option<u32> {
+        match self {
+            Self::Branch { displacement, .. } => {
+                Some((pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32)
+            }
+            Self::Dbcc { displacement, .. } => {
+                Some((pc.wrapping_add(2) as i32).wrapping_add(displacement as i32) as u32)
+            }
+            _ => None,
+        }
     }
 
     fn length(self) -> u8 {
@@ -585,6 +960,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_branch_word_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_move_mem_trace_op(pc, opcode) {
         return Some(op);
     }
 
@@ -649,21 +1027,217 @@ fn decode_branch_word_trace_op<B: AddressBus>(
     })
 }
 
+/// MOVE/MOVEA (groups 1-3) where both EAs are register or register-indirect
+/// forms — no extension words. At least one side must be memory
+/// (register-to-register MOVEs are simple ops already).
+fn decode_move_mem_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
+    let size = match opcode >> 12 {
+        1 => Size::Byte,
+        2 => Size::Long,
+        3 => Size::Word,
+        _ => return None,
+    };
+    let src = decode_jit_ea((opcode >> 3) & 7, opcode & 7)?;
+    let dst = decode_jit_ea((opcode >> 6) & 7, (opcode >> 9) & 7)?;
+    if !src.is_mem() && !dst.is_mem() {
+        return None;
+    }
+    // MOVEA.B does not exist, and An is not a legal byte source.
+    if size == Size::Byte && (matches!(src, JitEa::Addr(_)) || matches!(dst, JitEa::Addr(_))) {
+        return None;
+    }
+    Some(TraceBuildOp {
+        opcode,
+        extension: None,
+        pc,
+        op: JitTraceOp::MoveMem { size, src, dst },
+    })
+}
+
+fn decode_jit_ea(mode: u16, reg: u16) -> Option<JitEa> {
+    Some(match mode & 7 {
+        0 => JitEa::Data(reg as u8),
+        1 => JitEa::Addr(reg as u8),
+        2 => JitEa::Ind(reg as u8),
+        3 => JitEa::PostInc(reg as u8),
+        4 => JitEa::PreDec(reg as u8),
+        _ => return None,
+    })
+}
+
+/// Interpreted trace execution (wasm and unit tests). Same contract as a
+/// compiled [`TraceFn`]: returns `(ops_retired << 32) | cycles`, and a
+/// mem-op bail sets `pc` to the un-executed op.
 #[cfg(any(target_family = "wasm", test))]
-fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp]) -> i32 {
-    let mut cycles = 0;
-    for op in ops {
-        cycles += execute_portable_op(cpu, *op);
+fn execute_portable_trace(
+    cpu: &mut CpuCore,
+    ops: &[TraceBuildOp],
+    code_start: u32,
+    code_end: u32,
+) -> u64 {
+    let mut cycles: i32 = 0;
+    for (index, op) in ops.iter().enumerate() {
+        match execute_portable_op(cpu, *op, code_start, code_end) {
+            Some(c) => cycles += c,
+            None => {
+                cpu.pc = op.pc;
+                return ((index as u64) << 32) | cycles as u32 as u64;
+            }
+        }
     }
     if let Some(last) = ops.last() {
         cpu.ppc = last.pc;
         cpu.ir = last.opcode as u32;
     }
-    cycles
+    ((ops.len() as u64) << 32) | cycles as u32 as u64
+}
+
+/// Execute one trace op; `None` means a mem-op check failed and nothing
+/// from this op was committed.
+#[cfg(any(target_family = "wasm", test))]
+fn execute_portable_op(
+    cpu: &mut CpuCore,
+    op: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    if let JitTraceOp::MoveMem { size, src, dst } = op.op {
+        return execute_portable_move_mem(cpu, size, src, dst, code_start, code_end);
+    }
+    Some(execute_portable_reg_op(cpu, op))
+}
+
+/// Portable MoveMem, mirroring `emit_move_mem` exactly: all checks before
+/// any commit; window reads/writes via the fastmem scratch fields.
+#[cfg(any(target_family = "wasm", test))]
+fn execute_portable_move_mem(
+    cpu: &mut CpuCore,
+    size: Size,
+    src: JitEa,
+    dst: JitEa,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let bytes = size.bytes();
+    let aligned_only = cpu.is_pre_68020;
+    let locate = |cpu: &CpuCore, raw: u32| -> Option<u32> {
+        if aligned_only && size != Size::Byte && (raw & 1) != 0 {
+            return None;
+        }
+        if cpu.fm_len == 0 {
+            return None;
+        }
+        let off = (raw & cpu.address_mask).wrapping_sub(cpu.fm_base);
+        if off <= cpu.fm_len - bytes {
+            Some(off)
+        } else {
+            None
+        }
+    };
+    let read = |cpu: &CpuCore, off: u32| -> u32 {
+        unsafe {
+            let p = (cpu.fm_ptr as *const u8).add(off as usize);
+            match size {
+                Size::Byte => *p as u32,
+                Size::Word => u16::from_be_bytes([*p, *p.add(1)]) as u32,
+                Size::Long => u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)]),
+            }
+        }
+    };
+
+    let mut staged: Option<(usize, u32)> = None;
+    let value = match src {
+        JitEa::Data(r) => cpu.dar[r as usize] & size.mask(),
+        JitEa::Addr(r) => cpu.dar[8 + r as usize] & size.mask(),
+        JitEa::Ind(r) => read(cpu, locate(cpu, cpu.dar[8 + r as usize])?),
+        JitEa::PostInc(r) => {
+            let a = cpu.dar[8 + r as usize];
+            let off = locate(cpu, a)?;
+            staged = Some((8 + r as usize, a.wrapping_add(jit_ea_step(size, r))));
+            read(cpu, off)
+        }
+        JitEa::PreDec(r) => {
+            let a = cpu.dar[8 + r as usize].wrapping_sub(jit_ea_step(size, r));
+            let off = locate(cpu, a)?;
+            staged = Some((8 + r as usize, a));
+            read(cpu, off)
+        }
+    };
+
+    let dst_base = |cpu: &CpuCore, r: u8| match staged {
+        Some((idx, v)) if idx == 8 + r as usize => v,
+        _ => cpu.dar[8 + r as usize],
+    };
+
+    match dst {
+        JitEa::Data(r) => {
+            if let Some((idx, v)) = staged {
+                cpu.dar[idx] = v;
+            }
+            let mask = size.mask();
+            cpu.dar[r as usize] = (cpu.dar[r as usize] & !mask) | value;
+            cpu.set_logic_flags(value, size);
+        }
+        JitEa::Addr(r) => {
+            if let Some((idx, v)) = staged {
+                cpu.dar[idx] = v;
+            }
+            cpu.dar[8 + r as usize] = if size == Size::Word {
+                value as u16 as i16 as i32 as u32
+            } else {
+                value
+            };
+        }
+        JitEa::Ind(r) | JitEa::PostInc(r) | JitEa::PreDec(r) => {
+            let base = dst_base(cpu, r);
+            let (addr, new_reg) = match dst {
+                JitEa::Ind(_) => (base, None),
+                JitEa::PostInc(_) => (base, Some(base.wrapping_add(jit_ea_step(size, r)))),
+                JitEa::PreDec(_) => {
+                    let a = base.wrapping_sub(jit_ea_step(size, r));
+                    (a, Some(a))
+                }
+                _ => unreachable!(),
+            };
+            let off = locate(cpu, addr)?;
+            let masked = addr & cpu.address_mask;
+            // Self-modification guard, as in the compiled version.
+            if masked < code_end && masked.wrapping_add(bytes) > code_start {
+                return None;
+            }
+            if let Some((idx, v)) = staged {
+                cpu.dar[idx] = v;
+            }
+            if let Some(v) = new_reg {
+                cpu.dar[8 + r as usize] = v;
+            }
+            unsafe {
+                let p = (cpu.fm_ptr as *mut u8).add(off as usize);
+                match size {
+                    Size::Byte => *p = value as u8,
+                    Size::Word => {
+                        let b = (value as u16).to_be_bytes();
+                        *p = b[0];
+                        *p.add(1) = b[1];
+                    }
+                    Size::Long => {
+                        let b = value.to_be_bytes();
+                        *p = b[0];
+                        *p.add(1) = b[1];
+                        *p.add(2) = b[2];
+                        *p.add(3) = b[3];
+                    }
+                }
+            }
+            cpu.set_logic_flags(value, size);
+        }
+    }
+
+    Some(JitTraceOp::MoveMem { size, src, dst }.max_cycles())
 }
 
 #[cfg(any(target_family = "wasm", test))]
-fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
+fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
     match op.op {
         JitTraceOp::Nop => 4,
         JitTraceOp::Moveq { reg, data } => {
@@ -726,7 +1300,11 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                     cpu.set_logic_flags(src, size);
                 }
             }
-            4
+            if cpu.is_pre_68020 && size == Size::Long && unary_op != JitUnaryOp::Tst {
+                6
+            } else {
+                4
+            }
         }
         JitTraceOp::Swap { reg } => cpu.exec_swap(reg as usize),
         JitTraceOp::Ext { reg, size } => cpu.exec_ext(size, reg as usize),
@@ -750,7 +1328,11 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 result & mask
             };
             cpu.dar[reg] = (cpu.dar[reg] & !mask) | result;
-            4
+            if cpu.is_pre_68020 && size == Size::Long {
+                8
+            } else {
+                4
+            }
         }
         JitTraceOp::AddqSubqAddr { reg, data, is_sub } => {
             let reg = 8 + reg as usize;
@@ -759,7 +1341,7 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             } else {
                 cpu.dar[reg].wrapping_add(data)
             };
-            4
+            if cpu.is_pre_68020 { 8 } else { 4 }
         }
         JitTraceOp::BinaryDataReg {
             op: binary_op,
@@ -845,7 +1427,11 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 cpu.exec_addx(size, src_value, dst_value)
             };
             portable_write_data_reg(cpu, dst as u8, size, result);
-            4
+            if cpu.is_pre_68020 && size == Size::Long {
+                8
+            } else {
+                4
+            }
         }
         JitTraceOp::BitReg { op, bit_reg, dst } => {
             let bit = cpu.dar[bit_reg as usize] & 31;
@@ -853,19 +1439,32 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             let dst = dst as usize;
             let value = cpu.dar[dst];
             cpu.not_z_flag = if value & mask != 0 { 1 } else { 0 };
+            let hi_bit_extra = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
             match op {
                 JitBitOp::Test => 6,
                 JitBitOp::Change => {
                     cpu.dar[dst] = value ^ mask;
-                    8
+                    if cpu.is_pre_68020 {
+                        6 + hi_bit_extra
+                    } else {
+                        8
+                    }
                 }
                 JitBitOp::Clear => {
                     cpu.dar[dst] = value & !mask;
-                    10
+                    if cpu.is_pre_68020 {
+                        8 + hi_bit_extra
+                    } else {
+                        10
+                    }
                 }
                 JitBitOp::Set => {
                     cpu.dar[dst] = value | mask;
-                    8
+                    if cpu.is_pre_68020 {
+                        6 + hi_bit_extra
+                    } else {
+                        8
+                    }
                 }
             }
         }
@@ -877,7 +1476,7 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 0
             };
             portable_write_data_reg(cpu, reg, Size::Byte, value);
-            4
+            if cpu.is_pre_68020 && value != 0 { 6 } else { 4 }
         }
         JitTraceOp::ShiftReg {
             reg,
@@ -947,6 +1546,9 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 12
             }
         }
+        JitTraceOp::MoveMem { .. } => {
+            unreachable!("MoveMem is handled by execute_portable_move_mem")
+        }
     }
 }
 
@@ -966,7 +1568,12 @@ fn portable_write_data_reg(cpu: &mut CpuCore, reg: u8, size: Size, value: u32) {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) -> Value {
+fn emit_jit_op(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    op: TraceBuildOp,
+    pre020: bool,
+) -> Value {
     let trace_pc = op.pc;
     match op.op {
         JitTraceOp::Nop => cycles_const(builder, 4),
@@ -1030,7 +1637,12 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
                     set_logic_flags(builder, cpu, value, size);
                 }
             }
-            cycles_const(builder, 4)
+            let cycles = if pre020 && size == Size::Long && unary_op != JitUnaryOp::Tst {
+                6
+            } else {
+                4
+            };
+            cycles_const(builder, cycles)
         }
         JitTraceOp::Swap { reg } => {
             let value = load_reg(builder, cpu, JitDirectReg::Data(reg));
@@ -1084,7 +1696,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             } else {
                 set_add_flags(builder, cpu, src, dst, result, size);
             }
-            cycles_const(builder, 4)
+            cycles_const(builder, if pre020 && size == Size::Long { 8 } else { 4 })
         }
         JitTraceOp::AddqSubqAddr { reg, data, is_sub } => {
             let dst_reg = JitDirectReg::Addr(reg);
@@ -1096,7 +1708,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
                 builder.ins().iadd(dst, src)
             };
             store_reg(builder, cpu, dst_reg, result);
-            cycles_const(builder, 4)
+            cycles_const(builder, if pre020 { 8 } else { 4 })
         }
         JitTraceOp::BinaryDataReg {
             op: binary_op,
@@ -1187,7 +1799,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
                 emit_addx(builder, cpu, src_value, dst_value, size)
             };
             write_data_reg_sized(builder, cpu, dst, size, result);
-            cycles_const(builder, 4)
+            cycles_const(builder, if pre020 && size == Size::Long { 8 } else { 4 })
         }
         JitTraceOp::BitReg { op, bit_reg, dst } => {
             let bit = load_reg(builder, cpu, JitDirectReg::Data(bit_reg));
@@ -1198,23 +1810,36 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             let tested = builder.ins().band(value, mask);
             let not_z = flag_from_nonzero(builder, tested, 1);
             store_value_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), not_z);
+            // Pre-020: base cycles + 2 when the (dynamic) bit number is >= 16.
+            let dyn_cycles = |builder: &mut FunctionBuilder<'_>, base: i32, legacy: i32| {
+                if pre020 {
+                    let hi = builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bit, 16);
+                    let with_extra = cycles_const(builder, base + 2);
+                    let base = cycles_const(builder, base);
+                    builder.ins().select(hi, with_extra, base)
+                } else {
+                    cycles_const(builder, legacy)
+                }
+            };
             match op {
                 JitBitOp::Test => cycles_const(builder, 6),
                 JitBitOp::Change => {
                     let result = builder.ins().bxor(value, mask);
                     store_reg(builder, cpu, JitDirectReg::Data(dst), result);
-                    cycles_const(builder, 8)
+                    dyn_cycles(builder, 6, 8)
                 }
                 JitBitOp::Clear => {
                     let inverted = builder.ins().bxor_imm(mask, -1);
                     let result = builder.ins().band(value, inverted);
                     store_reg(builder, cpu, JitDirectReg::Data(dst), result);
-                    cycles_const(builder, 10)
+                    dyn_cycles(builder, 8, 10)
                 }
                 JitBitOp::Set => {
                     let result = builder.ins().bor(value, mask);
                     store_reg(builder, cpu, JitDirectReg::Data(dst), result);
-                    cycles_const(builder, 8)
+                    dyn_cycles(builder, 6, 8)
                 }
             }
         }
@@ -1235,9 +1860,16 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             let false_value = iconst_u32(builder, 0);
             let value = builder.ins().select(condition, true_value, false_value);
             write_data_reg_sized(builder, cpu, reg, Size::Byte, value);
-            cycles_const(builder, 4)
+            if pre020 {
+                let taken = cycles_const(builder, 6);
+                let not_taken = cycles_const(builder, 4);
+                builder.ins().select(condition, taken, not_taken)
+            } else {
+                cycles_const(builder, 4)
+            }
         }
         JitTraceOp::ShiftReg { .. } => unreachable!("ShiftReg traces are wasm-only"),
+        JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
         JitTraceOp::Branch {
             condition,
             displacement,
@@ -1249,6 +1881,271 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             displacement,
         } => emit_dbcc(builder, cpu, trace_pc, condition, reg, displacement),
     }
+}
+
+/// Window/bounds context shared by all mem ops in one trace function.
+#[cfg(not(target_family = "wasm"))]
+struct MemEnv {
+    fm_ptr: Value,
+    fm_ptr_ty: Type,
+    fm_base: Value,
+    fm_len: Value,
+    address_mask: u32,
+    aligned_only: bool,
+    code_start: u32,
+    code_end: u32,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+struct BailAt {
+    ops_before: u32,
+    cycles_before: i64,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct BailReq {
+    block: Block,
+    pc: u32,
+    at: BailAt,
+}
+
+#[cfg(not(target_family = "wasm"))]
+struct MoveMemOp {
+    pc: u32,
+    size: Size,
+    src: JitEa,
+    dst: JitEa,
+}
+
+/// Branch to `bail` when `bad` holds; continue emitting in a fresh block.
+#[cfg(not(target_family = "wasm"))]
+fn branch_guard(builder: &mut FunctionBuilder<'_>, bail: Block, bad: Value) {
+    let cont = builder.create_block();
+    builder.ins().brif(bad, bail, &[], cont, &[]);
+    builder.switch_to_block(cont);
+}
+
+/// Alignment + window-range checks for an access of `size` at raw address
+/// `addr`. Returns `(window_offset, masked_address)`; branches to `bail`
+/// on any miss.
+#[cfg(not(target_family = "wasm"))]
+fn checked_window_off(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    bail: Block,
+    addr: Value,
+    size: Size,
+) -> (Value, Value) {
+    if env.aligned_only && size != Size::Byte {
+        let low = builder.ins().band_imm(addr, 1);
+        let bad = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
+        branch_guard(builder, bail, bad);
+    }
+    let masked = builder.ins().band_imm(addr, env.address_mask as i64);
+    let off = builder.ins().isub(masked, env.fm_base);
+    let limit = builder.ins().iadd_imm(env.fm_len, -(size.bytes() as i64));
+    let bad = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+    branch_guard(builder, bail, bad);
+    (off, masked)
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn window_host_addr(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value) -> Value {
+    let off_ptr = if env.fm_ptr_ty == types::I32 {
+        off
+    } else {
+        builder.ins().uextend(env.fm_ptr_ty, off)
+    };
+    builder.ins().iadd(env.fm_ptr, off_ptr)
+}
+
+/// Big-endian sized load from the window; result is a zero-extended I32.
+#[cfg(not(target_family = "wasm"))]
+fn window_load(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value, size: Size) -> Value {
+    let addr = window_host_addr(builder, env, off);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+    match size {
+        Size::Byte => {
+            let v = builder.ins().load(types::I8, flags, addr, 0);
+            builder.ins().uextend(types::I32, v)
+        }
+        Size::Word => {
+            let v = builder.ins().load(types::I16, flags, addr, 0);
+            let v = builder.ins().bswap(v);
+            builder.ins().uextend(types::I32, v)
+        }
+        Size::Long => {
+            let v = builder.ins().load(types::I32, flags, addr, 0);
+            builder.ins().bswap(v)
+        }
+    }
+}
+
+/// Big-endian sized store of (sized) `value` into the window.
+#[cfg(not(target_family = "wasm"))]
+fn window_store(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    off: Value,
+    size: Size,
+    value: Value,
+) {
+    let addr = window_host_addr(builder, env, off);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+    match size {
+        Size::Byte => {
+            let v = builder.ins().ireduce(types::I8, value);
+            builder.ins().store(flags, v, addr, 0);
+        }
+        Size::Word => {
+            let v = builder.ins().ireduce(types::I16, value);
+            let v = builder.ins().bswap(v);
+            builder.ins().store(flags, v, addr, 0);
+        }
+        Size::Long => {
+            let v = builder.ins().bswap(value);
+            builder.ins().store(flags, v, addr, 0);
+        }
+    }
+}
+
+/// Emit a MOVE/MOVEA with memory operands. All alignment/window/code-overlap
+/// checks run before anything commits; each check branches to a bail block
+/// that sets `pc = op.pc` and returns the ops retired before this one, so a
+/// bailing instruction re-executes through full dispatch.
+#[cfg(not(target_family = "wasm"))]
+fn emit_move_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    op: MoveMemOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: op.pc,
+        at,
+    });
+    let size = op.size;
+
+    let load_an =
+        |builder: &mut FunctionBuilder<'_>, r: u8| load_reg(builder, cpu, JitDirectReg::Addr(r));
+
+    // Resolve the source: its value plus any staged post-inc/pre-dec
+    // register update (not committed until every check has passed).
+    let mut staged: Option<(u8, Value)> = None; // (An index, new value)
+    let value = match op.src {
+        JitEa::Data(r) => {
+            let v = load_reg(builder, cpu, JitDirectReg::Data(r));
+            mask_value(builder, v, size)
+        }
+        JitEa::Addr(r) => {
+            let v = load_an(builder, r);
+            mask_value(builder, v, size)
+        }
+        JitEa::Ind(r) => {
+            let a = load_an(builder, r);
+            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            window_load(builder, env, off, size)
+        }
+        JitEa::PostInc(r) => {
+            let a = load_an(builder, r);
+            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            let next = builder.ins().iadd_imm(a, jit_ea_step(size, r) as i64);
+            staged = Some((r, next));
+            window_load(builder, env, off, size)
+        }
+        JitEa::PreDec(r) => {
+            let a0 = load_an(builder, r);
+            let a = builder.ins().iadd_imm(a0, -(jit_ea_step(size, r) as i64));
+            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            staged = Some((r, a));
+            window_load(builder, env, off, size)
+        }
+    };
+
+    // A destination base register must observe a same-register source
+    // adjustment (e.g. `MOVE.L (A0)+,(A0)+`).
+    let dst_base = |builder: &mut FunctionBuilder<'_>, r: u8| match staged {
+        Some((sr, v)) if sr == r => v,
+        _ => load_an(builder, r),
+    };
+    let commit_staged = |builder: &mut FunctionBuilder<'_>| {
+        if let Some((r, v)) = staged {
+            store_reg(builder, cpu, JitDirectReg::Addr(r), v);
+        }
+    };
+
+    match op.dst {
+        JitEa::Data(r) => {
+            commit_staged(builder);
+            write_data_reg_sized(builder, cpu, r, size, value);
+            set_logic_flags(builder, cpu, value, size);
+        }
+        JitEa::Addr(r) => {
+            // MOVEA: sign-extend word, no flags.
+            commit_staged(builder);
+            let v = if size == Size::Word {
+                sign_extend_word(builder, value)
+            } else {
+                value
+            };
+            store_reg(builder, cpu, JitDirectReg::Addr(r), v);
+        }
+        JitEa::Ind(r) | JitEa::PostInc(r) | JitEa::PreDec(r) => {
+            let base = dst_base(builder, r);
+            let (addr, new_reg) = match op.dst {
+                JitEa::Ind(_) => (base, None),
+                JitEa::PostInc(_) => {
+                    let next = builder.ins().iadd_imm(base, jit_ea_step(size, r) as i64);
+                    (base, Some(next))
+                }
+                JitEa::PreDec(_) => {
+                    let a = builder.ins().iadd_imm(base, -(jit_ea_step(size, r) as i64));
+                    (a, Some(a))
+                }
+                _ => unreachable!(),
+            };
+            let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+
+            // Self-modification guard: a store overlapping this trace's
+            // own code bails (before committing) so the interpreter
+            // re-runs it and the next fetch sees the new bytes.
+            let lt_end =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedLessThan, masked, env.code_end as i64);
+            let past = builder.ins().iadd_imm(masked, size.bytes() as i64);
+            let gt_start =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThan, past, env.code_start as i64);
+            let bad = builder.ins().band(lt_end, gt_start);
+            branch_guard(builder, bail, bad);
+
+            commit_staged(builder);
+            if let Some(v) = new_reg {
+                store_reg(builder, cpu, JitDirectReg::Addr(r), v);
+            }
+            window_store(builder, env, off, size, value);
+            set_logic_flags(builder, cpu, value, size);
+        }
+    }
+
+    cycles_const(
+        builder,
+        JitTraceOp::MoveMem {
+            size,
+            src: op.src,
+            dst: op.dst,
+        }
+        .max_cycles(),
+    )
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -1831,6 +2728,127 @@ mod portable_tests {
         cpu
     }
 
+    /// Wire a byte buffer up as the CPU's fastmem window at guest base 0.
+    fn attach_window(cpu: &mut CpuCore, mem: &mut [u8]) {
+        cpu.fm_ptr = mem.as_mut_ptr() as usize;
+        cpu.fm_base = 0;
+        cpu.fm_len = mem.len() as u32;
+    }
+
+    /// `MOVE.L (A0)+,(A1)+ ; DBRA D0` at $0100 — the memcpy inner loop.
+    fn move_mem_loop_ops() -> [TraceBuildOp; 2] {
+        [
+            TraceBuildOp {
+                opcode: 0x22D8,
+                extension: None,
+                pc: 0x0100,
+                op: JitTraceOp::MoveMem {
+                    size: Size::Long,
+                    src: JitEa::PostInc(0),
+                    dst: JitEa::PostInc(1),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x51C8,
+                extension: Some(0xFFFC),
+                pc: 0x0102,
+                op: JitTraceOp::Dbcc {
+                    condition: 1,
+                    reg: 0,
+                    displacement: -4,
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn portable_move_mem_copies_through_window() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x200..0x204].copy_from_slice(&0xDEADBEEFu32.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x200);
+        cpu.set_a(1, 0x300);
+        cpu.set_d(0, 5);
+
+        let ops = move_mem_loop_ops();
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0106);
+
+        assert_eq!((packed >> 32) as u32, 2, "both ops retired");
+        assert_eq!(&mem[0x300..0x304], &0xDEADBEEFu32.to_be_bytes());
+        assert_eq!(cpu.a(0), 0x204);
+        assert_eq!(cpu.a(1), 0x304);
+        assert_eq!(cpu.d(0), 4, "DBRA decremented");
+        assert_eq!(cpu.pc, 0x0100, "DBRA branched back to the head");
+    }
+
+    #[test]
+    fn portable_move_mem_bails_outside_window_with_nothing_committed() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x00FF_F000); // masked address beyond the window
+        cpu.set_a(1, 0x300);
+        cpu.set_d(0, 5);
+
+        let ops = move_mem_loop_ops();
+        cpu.pc = 0x0104;
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0106);
+
+        assert_eq!((packed >> 32) as u32, 0, "nothing retired");
+        assert_eq!(packed as u32, 0, "no cycles charged");
+        assert_eq!(cpu.pc, 0x0100, "pc points at the bailing op");
+        assert_eq!(cpu.a(0), 0x00FF_F000, "no post-increment committed");
+        assert_eq!(cpu.d(0), 5);
+    }
+
+    #[test]
+    fn portable_move_mem_bails_on_store_into_own_code() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x200..0x204].copy_from_slice(&0x4E714E71u32.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x200);
+        cpu.set_a(1, 0x0102); // store would overwrite the trace's DBRA
+        cpu.set_d(0, 5);
+
+        let ops = move_mem_loop_ops();
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0106);
+
+        assert_eq!((packed >> 32) as u32, 0, "store into code bails");
+        assert_eq!(cpu.pc, 0x0100);
+        assert_eq!(cpu.a(0), 0x200, "source post-increment not committed");
+        assert_eq!(&mem[0x102..0x106], &[0u8; 4], "no store happened");
+    }
+
+    #[test]
+    fn portable_move_mem_same_register_postinc_pair() {
+        // MOVE.W (A0)+,(A0)+ — destination must see the incremented A0.
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x200..0x202].copy_from_slice(&0xBEEFu16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x200);
+
+        let op = TraceBuildOp {
+            opcode: 0x30D8,
+            extension: None,
+            pc: 0x0100,
+            op: JitTraceOp::MoveMem {
+                size: Size::Word,
+                src: JitEa::PostInc(0),
+                dst: JitEa::PostInc(0),
+            },
+        };
+        // Single-op traces never compile, but the executor semantics are
+        // shared; drive the op directly.
+        let cycles = execute_portable_op(&mut cpu, op, 0x0100, 0x0102);
+
+        assert!(cycles.is_some());
+        assert_eq!(&mem[0x202..0x204], &0xBEEFu16.to_be_bytes());
+        assert_eq!(cpu.a(0), 0x204);
+    }
+
     #[test]
     fn portable_trace_executes_unconditional_loop_iteration() {
         let mut cpu = cpu();
@@ -1858,9 +2876,11 @@ mod portable_tests {
             },
         ];
 
-        let cycles = execute_portable_trace(&mut cpu, &ops);
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0100 + ops.len() as u32 * 2);
+        let cycles = packed as u32 as i32;
+        assert_eq!((packed >> 32) as u32, ops.len() as u32);
 
-        assert_eq!(cycles, 14);
+        assert_eq!(cycles, 18);
         assert_eq!(cpu.d(0), 1);
         assert_eq!(cpu.pc, 0x0100);
         assert_eq!(cpu.ppc, 0x0102);
@@ -1895,7 +2915,9 @@ mod portable_tests {
             },
         ];
 
-        let cycles = execute_portable_trace(&mut cpu, &ops);
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0100 + ops.len() as u32 * 2);
+        let cycles = packed as u32 as i32;
+        assert_eq!((packed >> 32) as u32, ops.len() as u32);
 
         assert_eq!(cycles, 12);
         assert_eq!(cpu.d(0), 0);
@@ -1923,7 +2945,9 @@ mod portable_tests {
             },
         }];
 
-        let cycles = execute_portable_trace(&mut cpu, &ops);
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0100 + ops.len() as u32 * 2);
+        let cycles = packed as u32 as i32;
+        assert_eq!((packed >> 32) as u32, ops.len() as u32);
 
         assert_eq!(cycles, 24);
         assert_eq!(cpu.d(0), 0x0000_0100);

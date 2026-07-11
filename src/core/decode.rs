@@ -134,6 +134,48 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
 // Group F: Coprocessor / FPU (68040: 0xF2xx/0xF3xx)
 // ============================================================================
 
+/// `<ea> op Dn` timing: M68000UM standard-instruction base plus EA time on
+/// 68000/68010; the legacy flat value on later types.
+#[inline]
+fn std_er_cycles(
+    cpu: &CpuCore,
+    mode: AddressingMode,
+    size: Size,
+    long_footnote: bool,
+    legacy: i32,
+) -> i32 {
+    if cpu.is_pre_68020 {
+        cpu.std_er_base(mode, size, long_footnote) + cpu.ea_time(mode, size)
+    } else {
+        legacy
+    }
+}
+
+/// `Dn op <ea>` (read-modify-write) timing.
+#[inline]
+fn std_re_cycles(cpu: &CpuCore, mode: AddressingMode, size: Size, legacy: i32) -> i32 {
+    if cpu.is_pre_68020 {
+        (if size == Size::Long { 12 } else { 8 }) + cpu.ea_time(mode, size)
+    } else {
+        legacy
+    }
+}
+
+/// ADDA/SUBA timing: word 8+ea; long 6+ea (8+ea from register/immediate).
+#[inline]
+fn adda_cycles(cpu: &CpuCore, mode: AddressingMode, size: Size, legacy: i32) -> i32 {
+    if cpu.is_pre_68020 {
+        let base = if size == Size::Long {
+            cpu.std_er_base(mode, size, true)
+        } else {
+            8
+        };
+        base + cpu.ea_time(mode, size)
+    } else {
+        legacy
+    }
+}
+
 fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) -> i32 {
     // Musashi patterns:
     // - 040fpu0: 1111 0010 ........  (0xF2xx) -> m68040_fpu_op0
@@ -303,7 +345,7 @@ fn exec_move_l_postinc_to_postinc<B: AddressBus>(
     cpu.dar[8 + dst_reg] = dst_addr.wrapping_add(4);
 
     cpu.set_logic_flags(value, Size::Long);
-    4
+    if cpu.is_pre_68020 { 20 } else { 4 }
 }
 
 fn dispatch_moveq(cpu: &mut CpuCore, opcode: u16) -> i32 {
@@ -493,7 +535,17 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let dst = cpu.read_resolved_ea(bus, ea, size);
             let (result, _) = cpu.exec_sub(bus, size, imm, dst);
             cpu.write_resolved_ea(bus, ea, size, result);
-            if size == Size::Long { 16 } else { 8 } // Standard 68000 timing approximation
+            if cpu.is_pre_68020 {
+                if matches!(mode, AddressingMode::DataDirect(_)) {
+                    if size == Size::Long { 16 } else { 8 }
+                } else {
+                    (if size == Size::Long { 20 } else { 12 }) + cpu.ea_time(mode, size)
+                }
+            } else if size == Size::Long {
+                16
+            } else {
+                8
+            }
         }
         0x6 => {
             // ADDI: 0000 0110 ss eee eee
@@ -514,7 +566,15 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let dst = cpu.read_resolved_ea(bus, ea, size);
             let (result, cycles) = cpu.exec_add(bus, size, imm, dst);
             cpu.write_resolved_ea(bus, ea, size, result);
-            cycles + if size == Size::Long { 8 } else { 4 }
+            if cpu.is_pre_68020 {
+                if matches!(mode, AddressingMode::DataDirect(_)) {
+                    if size == Size::Long { 16 } else { 8 }
+                } else {
+                    (if size == Size::Long { 20 } else { 12 }) + cpu.ea_time(mode, size)
+                }
+            } else {
+                cycles + if size == Size::Long { 8 } else { 4 }
+            }
         }
         // EORI.B #<data>,CCR : 0x0A3C
         // EORI.W #<data>,SR  : 0x0A7C
@@ -534,7 +594,16 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                 return 50;
             }
-            cpu.exec_cmp(size, imm, dst)
+            let legacy = cpu.exec_cmp(size, imm, dst);
+            if cpu.is_pre_68020 {
+                if matches!(mode, AddressingMode::DataDirect(_)) {
+                    if size == Size::Long { 14 } else { 8 }
+                } else {
+                    (if size == Size::Long { 12 } else { 8 }) + cpu.ea_time(mode, size)
+                }
+            } else {
+                legacy
+            }
         }
         _ => {
             // Bit operations: BTST, BCHG, BCLR, BSET
@@ -551,13 +620,19 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.read_imm_16(bus) as u32
                 };
 
-                match bit_op {
-                    0 => cpu.exec_btst(bus, bit_num, ea),
-                    1 => cpu.exec_bchg(bus, bit_num, ea),
-                    2 => cpu.exec_bclr(bus, bit_num, ea),
-                    3 => cpu.exec_bset(bus, bit_num, ea),
-                    _ => illegal_instruction(cpu, bus),
-                }
+                let static_extra = if opcode & 0x100 == 0 && cpu.is_pre_68020 {
+                    4
+                } else {
+                    0
+                };
+                static_extra
+                    + match bit_op {
+                        0 => cpu.exec_btst(bus, bit_num, ea),
+                        1 => cpu.exec_bchg(bus, bit_num, ea),
+                        2 => cpu.exec_bclr(bus, bit_num, ea),
+                        3 => cpu.exec_bset(bus, bit_num, ea),
+                        _ => illegal_instruction(cpu, bus),
+                    }
             } else {
                 illegal_instruction(cpu, bus)
             }
@@ -604,7 +679,11 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
         let sr = cpu.get_sr() as u32;
         cpu.write_ea(bus, mode, Size::Word, sr);
-        return if mode.is_register_direct() { 6 } else { 8 };
+        return if mode.is_register_direct() {
+            6
+        } else {
+            8 + cpu.ea_time(mode, Size::Word)
+        };
     }
 
     // 68010+ MOVE from CCR: 0100 0010 11 mmm rrr (0x42C0..0x42FF)
@@ -616,7 +695,11 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
         let ccr = cpu.get_ccr() as u32;
         cpu.write_ea(bus, mode, Size::Word, ccr);
-        return if mode.is_register_direct() { 6 } else { 8 };
+        return if mode.is_register_direct() {
+            6
+        } else {
+            8 + cpu.ea_time(mode, Size::Word)
+        };
     }
 
     // CHK (68000: opmode=110 for CHK.W). Note: opmode=111 overlaps with LEA on 68000.
@@ -625,7 +708,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         if let Some(mode) = AddressingMode::decode(ea_mode, ea_reg) {
             let size = Size::Word;
             let bound = cpu.read_ea(bus, mode, size);
-            return cpu.exec_chk(bus, size, bound, dst_reg);
+            return cpu.exec_chk(bus, size, bound, dst_reg) + cpu.ea_time(mode, size);
         } else {
             return illegal_instruction(cpu, bus);
         }
@@ -857,7 +940,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         return 50;
                     }
                     cpu.set_ccr(value);
-                    12
+                    12 + cpu.ea_time(mode, Size::Word)
                 }
                 0x4 => {
                     // NEG
@@ -876,7 +959,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         return 50;
                     }
                     cpu.set_sr(value as u16);
-                    12
+                    12 + cpu.ea_time(mode, Size::Word)
                 }
                 0x6 => {
                     // NOT
@@ -972,14 +1055,22 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.change_of_flow = true;
                     cpu.push_32(bus, cpu.pc);
                     cpu.pc = addr;
-                    16
+                    if cpu.is_pre_68020 {
+                        crate::core::timing::jsr_cycles_68000(mode)
+                    } else {
+                        16
+                    }
                 }
                 _ if (opcode & 0xFFC0) == 0x4EC0 => {
                     // JMP: 0100 1110 11 mmm rrr
                     let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
                     cpu.change_of_flow = true;
                     cpu.pc = cpu.get_ea_address(bus, mode, Size::Long);
-                    8
+                    if cpu.is_pre_68020 {
+                        crate::core::timing::jmp_cycles_68000(mode)
+                    } else {
+                        8
+                    }
                 }
                 _ if (opcode & 0xF1C0) == 0x41C0 => {
                     // LEA: 0100 rrr 111 mmm rrr
@@ -1121,7 +1212,11 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 0x00
             };
             cpu.write_ea(bus, mode, Size::Byte, value);
-            if mode.is_register_direct() { 4 } else { 8 }
+            if mode.is_register_direct() {
+                if cpu.is_pre_68020 && value != 0 { 6 } else { 4 }
+            } else {
+                8 + cpu.ea_time(mode, Size::Byte)
+            }
         }
     } else {
         // ADDQ or SUBQ
@@ -1207,7 +1302,7 @@ fn dispatch_group_8<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             }
             let (result, _) = cpu.exec_or(bus, size, src, cpu.d(reg));
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            4
+            std_er_cycles(cpu, mode, size, true, 4)
         }
         4..=6 => {
             // Check for SBCD first (pattern: 1000 xxx1 0000 0yyy for Dn or 1000 xxx1 0000 1yyy for -(An))
@@ -1251,18 +1346,18 @@ fn dispatch_group_8<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 }
                 let (result, _) = cpu.exec_or(bus, size, cpu.d(reg), dst);
                 cpu.write_resolved_ea(bus, ea, size, result);
-                8
+                std_re_cycles(cpu, mode, size, 8)
             }
         }
         3 => {
             // DIVU <ea>, Dn
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
-            cpu.exec_divu(bus, mode, reg)
+            cpu.exec_divu(bus, mode, reg) + cpu.ea_time(mode, Size::Word)
         }
         7 => {
             // DIVS <ea>, Dn
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
-            cpu.exec_divs(bus, mode, reg)
+            cpu.exec_divs(bus, mode, reg) + cpu.ea_time(mode, Size::Word)
         }
         _ => illegal_instruction(cpu, bus),
     }
@@ -1283,14 +1378,15 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let dst = cpu.d(reg) & size.mask(); // Mask to operation size
             let (result, _) = cpu.exec_sub(bus, size, src, dst);
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            4
+            std_er_cycles(cpu, mode, size, true, 4)
         }
         3 | 7 => {
             // SUBA
             let size = if op_mode == 3 { Size::Word } else { Size::Long };
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
             let src = cpu.read_ea(bus, mode, size);
-            cpu.exec_suba(bus, size, src, reg)
+            let legacy = cpu.exec_suba(bus, size, src, reg);
+            adda_cycles(cpu, mode, size, legacy)
         }
         4..=6 => {
             // SUB Dn, <ea> or SUBX
@@ -1301,7 +1397,11 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let dst = cpu.d(reg) & size.mask();
                 let result = cpu.exec_subx(size, src, dst);
                 cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-                4
+                if cpu.is_pre_68020 && size == Size::Long {
+                    8
+                } else {
+                    4
+                }
             } else if ea_mode == 1 {
                 // SUBX -(Am), -(An) - predecrement
                 // Use proper predecrement semantics (A7 byte alignment) by resolving as -(An).
@@ -1333,7 +1433,11 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                18
+                if cpu.is_pre_68020 && size == Size::Long {
+                    30
+                } else {
+                    18
+                }
             } else {
                 // SUB Dn, <ea>
                 let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
@@ -1342,7 +1446,7 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let dst = cpu.read_resolved_ea(bus, ea, size);
                 let (result, _) = cpu.exec_sub(bus, size, src, dst);
                 cpu.write_resolved_ea(bus, ea, size, result);
-                8
+                std_re_cycles(cpu, mode, size, 8)
             }
         }
         _ => illegal_instruction(cpu, bus),
@@ -1364,7 +1468,8 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                 return 50;
             }
-            cpu.exec_cmp(size, src, cpu.d(reg))
+            let legacy = cpu.exec_cmp(size, src, cpu.d(reg));
+            std_er_cycles(cpu, mode, size, false, legacy)
         }
         3 | 7 => {
             // CMPA
@@ -1374,7 +1479,12 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                 return 50;
             }
-            cpu.exec_cmpa(size, src, reg)
+            let legacy = cpu.exec_cmpa(size, src, reg);
+            if cpu.is_pre_68020 {
+                6 + cpu.ea_time(mode, size)
+            } else {
+                legacy
+            }
         }
         4..=6 => {
             // EOR or CMPM
@@ -1393,7 +1503,12 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                cpu.exec_cmp(size, src_val, dst_val)
+                let legacy = cpu.exec_cmp(size, src_val, dst_val);
+                if cpu.is_pre_68020 {
+                    if size == Size::Long { 20 } else { 12 }
+                } else {
+                    legacy
+                }
             } else {
                 // EOR Dn, <ea>
                 let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
@@ -1408,7 +1523,11 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     return 50;
                 }
                 cpu.set_logic_flags(result, size);
-                8
+                if cpu.is_pre_68020 && matches!(mode, AddressingMode::DataDirect(_)) {
+                    if size == Size::Long { 8 } else { 4 }
+                } else {
+                    std_re_cycles(cpu, mode, size, 8)
+                }
             }
         }
         _ => illegal_instruction(cpu, bus),
@@ -1429,7 +1548,7 @@ fn dispatch_group_c<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let src = cpu.read_ea(bus, mode, size);
             let (result, _) = cpu.exec_and(bus, size, src, cpu.d(reg));
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            4
+            std_er_cycles(cpu, mode, size, true, 4)
         }
         4..=6 => {
             // Check for ABCD first (pattern: 1100 xxx1 0000 0yyy for Dn or 1100 xxx1 0000 1yyy for -(An))
@@ -1456,19 +1575,19 @@ fn dispatch_group_c<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     let dst = cpu.read_resolved_ea(bus, ea, size);
                     let (result, _) = cpu.exec_and(bus, size, cpu.d(reg), dst);
                     cpu.write_resolved_ea(bus, ea, size, result);
-                    8
+                    std_re_cycles(cpu, mode, size, 8)
                 }
             }
         }
         3 => {
             // MULU <ea>, Dn
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
-            cpu.exec_mulu(bus, mode, reg)
+            cpu.exec_mulu(bus, mode, reg) + cpu.ea_time(mode, Size::Word)
         }
         7 => {
             // MULS <ea>, Dn
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
-            cpu.exec_muls(bus, mode, reg)
+            cpu.exec_muls(bus, mode, reg) + cpu.ea_time(mode, Size::Word)
         }
         _ => illegal_instruction(cpu, bus),
     }
@@ -1489,14 +1608,15 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let dst = cpu.d(reg) & size.mask(); // Mask to operation size
             let (result, _) = cpu.exec_add(bus, size, src, dst);
             cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-            4
+            std_er_cycles(cpu, mode, size, true, 4)
         }
         3 | 7 => {
             // ADDA
             let size = if op_mode == 3 { Size::Word } else { Size::Long };
             let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
             let src = cpu.read_ea(bus, mode, size);
-            cpu.exec_adda(bus, size, src, reg)
+            let legacy = cpu.exec_adda(bus, size, src, reg);
+            adda_cycles(cpu, mode, size, legacy)
         }
         4..=6 => {
             // ADD Dn, <ea> or ADDX
@@ -1507,7 +1627,11 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let dst = cpu.d(reg) & size.mask();
                 let result = cpu.exec_addx(size, src, dst);
                 cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
-                4
+                if cpu.is_pre_68020 && size == Size::Long {
+                    8
+                } else {
+                    4
+                }
             } else if ea_mode == 1 {
                 // ADDX -(Am), -(An)
                 // Use proper predecrement semantics (A7 byte alignment) by resolving as -(An).
@@ -1539,7 +1663,11 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                18
+                if cpu.is_pre_68020 && size == Size::Long {
+                    30
+                } else {
+                    18
+                }
             } else {
                 // ADD Dn, <ea>
                 let mode = AddressingMode::decode(ea_mode, ea_reg).unwrap();
@@ -1548,7 +1676,7 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let dst = cpu.read_resolved_ea(bus, ea, size);
                 let (result, _) = cpu.exec_add(bus, size, src, dst);
                 cpu.write_resolved_ea(bus, ea, size, result);
-                8
+                std_re_cycles(cpu, mode, size, 8)
             }
         }
         _ => illegal_instruction(cpu, bus),
@@ -1597,7 +1725,11 @@ fn dispatch_group_e<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             _ => return illegal_instruction(cpu, bus),
         };
         cpu.write_resolved_ea(bus, ea, Size::Word, result);
-        cycles + 4
+        if cpu.is_pre_68020 {
+            8 + cpu.ea_time(mode, Size::Word)
+        } else {
+            cycles + 4
+        }
     } else {
         // Register shift/rotate
         let size = decode_size_00((opcode >> 6) & 3);
