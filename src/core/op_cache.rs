@@ -424,7 +424,7 @@ impl DecodedSimpleOp {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn execute(self, cpu: &mut CpuCore) -> i32 {
         match self {
             Self::Nop => 4,
@@ -938,6 +938,13 @@ impl CpuCore {
         // forward jump into a compiled loop pays at most one interpreted
         // iteration before the closing branch re-arms the probe.
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
+        // The window and address mask never change inside this loop;
+        // locals keep them in registers across the `&mut self` calls
+        // below, which would otherwise force a reload every iteration.
+        let fm_ptr = self.fm_ptr as *const u8;
+        let fm_base = self.fm_base;
+        let fm_len = self.fm_len;
+        let address_mask = self.address_mask;
 
         while self.cycles_remaining > 0 {
             if probe {
@@ -957,27 +964,66 @@ impl CpuCore {
             }
 
             self.ppc = self.pc;
-            let opcode = self.read_opcode_16(bus);
-            if self.run_mode == RUN_MODE_BERR_AERR_RESET {
-                return CachedRunResult::Fault;
-            }
+            let opcode = if fm_len != 0 && (self.pc & 1) == 0 {
+                // Fetch through the fastmem window: one bounds check
+                // instead of a bus call. The window is only armed when the
+                // MMU cannot remap, so this matches `read_opcode_16` for
+                // aligned in-window PCs; everything else (odd PCs and
+                // their address errors included) takes the normal path.
+                let off = (self.pc & address_mask).wrapping_sub(fm_base);
+                if off <= fm_len - 2 {
+                    let opcode = unsafe {
+                        let p = fm_ptr.add(off as usize);
+                        u16::from_be_bytes([*p, *p.add(1)])
+                    };
+                    self.pc = self.pc.wrapping_add(2);
+                    opcode
+                } else {
+                    let opcode = self.read_opcode_16(bus);
+                    if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                        return CachedRunResult::Fault;
+                    }
+                    opcode
+                }
+            } else {
+                let opcode = self.read_opcode_16(bus);
+                if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                    return CachedRunResult::Fault;
+                }
+                opcode
+            };
             self.ir = opcode as u32;
 
-            let Some(op) = self.decoded_simple_op(opcode, cpu_type) else {
-                return CachedRunResult::Miss(opcode);
-            };
-            let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
-                Some(self.ppc)
-            } else {
-                None
-            };
-            let cycles = op.execute(self);
-            if let Some(branch_pc) = branch_pc
-                && self.pc <= branch_pc
-            {
-                probe = trace_jit::note_backward_branch(self, cpu_type);
+            match self.cached_decode(opcode, cpu_type) {
+                CachedOp::Simple(op) => {
+                    let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
+                        Some(self.ppc)
+                    } else {
+                        None
+                    };
+                    let cycles = op.execute(self);
+                    if let Some(branch_pc) = branch_pc
+                        && self.pc <= branch_pc
+                    {
+                        probe = trace_jit::note_backward_branch(self, cpu_type);
+                    }
+                    self.cycles_remaining -= cycles;
+                }
+                // Memory-operand ops run against the fastmem window with
+                // exact cycle charging (`execute` only captures a window on
+                // 68000/68010, where `mem_op_cycles` matches dispatch).
+                CachedOp::Mem(op) if fm_len != 0 => {
+                    if !super::mem_ops::execute_mem_op(self, op) {
+                        return CachedRunResult::Miss(opcode);
+                    }
+                    let cycles = super::mem_ops::mem_op_cycles(self, op, self.ppc);
+                    if self.pc <= self.ppc {
+                        probe = trace_jit::note_backward_branch(self, cpu_type);
+                    }
+                    self.cycles_remaining -= cycles;
+                }
+                _ => return CachedRunResult::Miss(opcode),
             }
-            self.cycles_remaining -= cycles;
         }
 
         CachedRunResult::Ran
@@ -1006,6 +1052,13 @@ impl CpuCore {
         let cpu_type = self.cpu_type;
         let watch = !watch_pcs.is_empty();
         let mut remaining = budget;
+        // The window and address mask never change inside this loop;
+        // locals keep them in registers across the `&mut self` calls
+        // below, which would otherwise force a reload every iteration.
+        let fm_ptr = self.fm_ptr as *const u8;
+        let fm_base = self.fm_base;
+        let fm_len = self.fm_len;
+        let address_mask = self.address_mask;
         // See `execute_decoded_simple_run`: probe the trace cache only on
         // entry and after backward branches, never per instruction.
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
@@ -1031,16 +1084,15 @@ impl CpuCore {
                     }
                 }
             }
-
             self.ppc = self.pc;
-            let opcode = if self.fm_len != 0 && (self.pc & 1) == 0 {
+            let opcode = if fm_len != 0 && (self.pc & 1) == 0 {
                 // Fetch through the fastmem window: one bounds check
                 // instead of a bus call. Odd/out-of-window PCs take the
                 // normal fetch path (and its address-error handling).
-                let off = self.address(self.pc).wrapping_sub(self.fm_base);
-                if off <= self.fm_len - 2 {
+                let off = (self.pc & address_mask).wrapping_sub(fm_base);
+                if off <= fm_len - 2 {
                     let opcode = unsafe {
-                        let p = (self.fm_ptr as *const u8).add(off as usize);
+                        let p = fm_ptr.add(off as usize);
                         u16::from_be_bytes([*p, *p.add(1)])
                     };
                     self.pc = self.pc.wrapping_add(2);
@@ -1064,24 +1116,11 @@ impl CpuCore {
             match self.cached_decode(opcode, cpu_type) {
                 CachedOp::Unknown => unreachable!("cached_decode never returns Unknown"),
                 CachedOp::Simple(op) => {
-                    let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
-                        Some(self.ppc)
-                    } else {
-                        None
-                    };
                     let _cycles = op.execute(self);
-                    if let Some(branch_pc) = branch_pc
-                        && self.pc <= branch_pc
-                    {
-                        probe = trace_jit::note_backward_branch(self, cpu_type);
-                    }
                 }
                 CachedOp::Mem(op) => {
                     if !super::mem_ops::execute_mem_op(self, op) {
                         return BatchInnerExit::Miss(opcode);
-                    }
-                    if self.pc <= self.ppc {
-                        probe = trace_jit::note_backward_branch(self, cpu_type);
                     }
                 }
                 CachedOp::Complex => return BatchInnerExit::Miss(opcode),
@@ -1090,6 +1129,12 @@ impl CpuCore {
             *retired += 1;
             if watch && watch_pcs.contains(&self.pc) {
                 return BatchInnerExit::Watched(self.pc);
+            }
+            // Only taken backward branches move PC at or below the fetch
+            // address (a forward wrap of the 32-bit PC also trips this;
+            // the spurious probe is harmless).
+            if self.pc <= self.ppc {
+                probe = trace_jit::note_backward_branch(self, cpu_type);
             }
         }
 

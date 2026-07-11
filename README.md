@@ -251,18 +251,22 @@ Correctness comes first — including cycle accuracy, see above — but m68k-rs 
 - **`execute`/`step`** — the cycle-exact interpreter, backed by an opcode-indexed decode table and a trace JIT (Cranelift) that compiles hot backward-branch loops and runs them natively with exact cycle accounting.
 - **`run_batch`** — an instruction-budgeted fast path for HLE embedders. Buses that expose a contiguous RAM window (`AddressBus::fast_mem`, implemented by `LinearMemoryBus`) additionally get direct-RAM memory operands and JIT-compiled loops that include memory operations, with self-modifying code detected exactly.
 
+The trace JIT follows calls: a hot loop that `BSR`s into a subroutine and returns compiles into a single native trace, with the pushed return address verified on the way back out.
+
 Measured head-to-head against [Musashi](https://github.com/kstenerud/Musashi) (the C core used by MAME) running identical 68000 workloads over the same flat memory, with final register/memory state cross-checked between the cores (one x86-64 machine snapshot; the harness lives on a separate benchmarking branch):
 
 | workload | Musashi | m68k-rs `execute` | m68k-rs `run_batch` |
 |---|---:|---:|---:|
-| tight ALU loop (reg mix) | 142 MIPS | **778 MIPS** | **757 MIPS** |
-| loop ADDQ/BRA | 175 | **504** | **472** |
-| loop TST/BNE | 193 | **536** | **543** |
-| memcpy inner loop | 106 | 48 | **291** |
-| linear ADDQ.L | 120 | 105 | 107 |
-| call/return | 146 | 74 | 80 |
+| tight ALU loop (reg mix) | 147 MIPS | **777 MIPS** | **776 MIPS** |
+| call/return | 145 | **582** | **584** |
+| loop TST/BNE | 196 | **538** | **543** |
+| loop ADDQ/BRA | 173 | **504** | **501** |
+| memcpy inner loop | 110 | **299** | **302** |
+| linear MOVEQ | 116 | **190** | **202** |
+| linear ADDQ.L | 120 | 117 | 117 |
+| linear NOP | 291 | 233 | 232 |
 
-Hot loops — where emulated programs spend their time — run **2.7–5.5× faster than Musashi**; straight-line and call-heavy code currently sits at 0.5–0.9×. At these rates the interpreter emulates a 68000 clocked at roughly 700–950 MHz, cycle-exact — a stock 7.6 MHz Amiga 500 or Sega Genesis runs at ~100× real-time per core.
+Loops and calls — where emulated programs spend their time — run **2.7–5.3× faster than Musashi** on both paths, cycle-exact included; dense linear code is at parity or better, with pure-NOP dispatch the one remaining synthetic gap (0.8×). At these rates the cycle-exact interpreter emulates a 68000 clocked at 0.9–5.4 GHz — a stock 7.6 MHz Amiga 500 or Sega Genesis runs at well over 100× real-time per core.
 
 ## License
 

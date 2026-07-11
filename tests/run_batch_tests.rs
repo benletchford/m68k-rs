@@ -224,7 +224,7 @@ fn batch_matches_step_on_random_register_loops() {
     // loop counter; D7/A6/A7 stay reserved), hot enough for traces to
     // compile. Any divergence in registers, flags, or PC fails with the
     // reproducing seed.
-    let mut seed: u64 = 0x00C0FFEE_5EED_1234;
+    let mut seed: u64 = 0x00C0_FFEE_5EED_1234;
     let mut rng = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -410,17 +410,11 @@ fn batch_matches_step_semantics_on_memory_program() {
     bus_b.load(0x1000, &bytes);
     let mut cpu_b = cpu_at(0x1000);
     let end_pc = 0x1000 + bytes.len() as u32;
-    let mut batched: u32 = 0;
-    loop {
-        let result = cpu_b.run_batch(&mut bus_b, 100_000, &[end_pc]);
-        batched += result.instructions;
-        match result.exit {
-            BatchExit::WatchedPc { pc } => {
-                assert_eq!(pc, end_pc);
-                break;
-            }
-            other => panic!("unexpected batch exit {other:?}"),
-        }
+    let result = cpu_b.run_batch(&mut bus_b, 100_000, &[end_pc]);
+    let batched: u32 = result.instructions;
+    match result.exit {
+        BatchExit::WatchedPc { pc } => assert_eq!(pc, end_pc),
+        other => panic!("unexpected batch exit {other:?}"),
     }
 
     assert_eq!(stepped, batched);
@@ -799,7 +793,7 @@ fn fastmem_differential_fuzz_memory_ops() {
         let size2 = |v: u32| (v % 3) as u16;
         // Memory EA (mode,reg) in the safe data zone; returns (mode<<3)|reg
         // plus any extension words. d16 kept within ±0x1000 of the zone.
-        let mut mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
+        let mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
             match r() % 5 {
                 0 => (2 << 3) | areg(r()), // (An)
                 1 => (3 << 3) | areg(r()), // (An)+
@@ -1148,4 +1142,59 @@ fn mem_trace_unaligned_matches_step_on_68020() {
         cpu.set_d(0, 63);
         cpu.set_d(2, 0x0BAD_0001);
     });
+}
+
+/// The cycle-accurate `execute` may use a fastmem window on 68000/68010;
+/// its consumed cycles and final state must be identical with and without
+/// one. Runs a mixed program (memory MOVEs, ALU-to-memory, calls, a copy
+/// loop) to a fixed cycle budget on both bus configurations.
+#[test]
+fn execute_with_window_matches_execute_without_window() {
+    let words: &[u16] = &[
+        0x41F8, 0x2000, // $1000: LEA $2000.W,A0
+        0x43F8, 0x3000, // $1004: LEA $3000.W,A1
+        0x701F, // $1008: MOVEQ #31,D0
+        0x20C2, // $100A: MOVE.L D2,(A0)+   (fill)
+        0x5282, // $100C: ADDQ.L #1,D2
+        0x51C8, 0xFFFA, // $100E: DBRA D0,$100A
+        0x41F8, 0x2000, // $1012: LEA $2000.W,A0
+        0x701F, // $1016: MOVEQ #31,D0
+        0x2218, // $1018: MOVE.L (A0)+,D1   (read loop)
+        0xD398, 0x51C8, 0xFFFA, // $101A: ADD.L D1,(A0)+ ; DBRA D0,$1018
+        0x6100, 0x0008, // $1020: BSR.W $102A
+        0x4A78, 0x3000, // $1024: TST.W $3000.W
+        0x60D6, // $1028: BRA.S $1000
+        0x4E75, // $102A: RTS
+    ];
+    let bytes = assemble(words);
+
+    let run = |with_window: bool| -> (i32, Vec<u32>, Vec<u8>) {
+        let mut bus = FastRamBus::new(0x20000);
+        if !with_window {
+            bus.fm_len = 0;
+        }
+        bus.load(0x1000, &bytes);
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.pc = 0x1000;
+        cpu.set_sr(0x2700);
+        cpu.set_a(7, 0x9000);
+        let mut used = 0i64;
+        // Several slices so the loop re-enters with warm caches/traces.
+        for _ in 0..8 {
+            used += cpu.execute(&mut bus, 25_000) as i64;
+        }
+        let mut regs: Vec<u32> = (0..8).map(|i| cpu.d(i)).collect();
+        regs.extend((0..8).map(|i| cpu.a(i)));
+        regs.push(cpu.pc);
+        regs.push(cpu.get_sr() as u32);
+        (used as i32, regs, bus.mem)
+    };
+
+    let (used_plain, regs_plain, mem_plain) = run(false);
+    let (used_window, regs_window, mem_window) = run(true);
+
+    assert_eq!(used_plain, used_window, "consumed cycles diverged");
+    assert_eq!(regs_plain, regs_window, "registers diverged");
+    assert_eq!(mem_plain, mem_window, "memory diverged");
 }

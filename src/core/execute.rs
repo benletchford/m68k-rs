@@ -73,6 +73,30 @@ impl CpuCore {
     /// A-line and F-line traps are silently ignored (treated as 0 cycles).
     /// For HLE support, use `step()` and handle `StepResult::AlineTrap`/`FlineTrap`.
     pub fn execute<B: AddressBus>(&mut self, bus: &mut B, num_cycles: i32) -> i32 {
+        // On the 68000/68010 the timing model is exact for window-executed
+        // memory ops, so the cycle-accurate path can use a fastmem window
+        // too. Later types keep their legacy dispatch timings, where the
+        // window fast path would diverge.
+        if self.is_pre_68020
+            && !(self.has_pmmu && self.pmmu_enabled)
+            && let Some(fm) = bus.fast_mem()
+            && fm.len >= 4
+            && !fm.ptr.is_null()
+        {
+            self.fm_ptr = fm.ptr as usize;
+            self.fm_base = fm.base;
+            self.fm_len = fm.len;
+            self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+            self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+        }
+        let used = self.execute_inner(bus, num_cycles);
+        self.fm_ptr = 0;
+        self.fm_base = 0;
+        self.fm_len = 0;
+        used
+    }
+
+    fn execute_inner<B: AddressBus>(&mut self, bus: &mut B, num_cycles: i32) -> i32 {
         // Handle reset cycles
         if self.reset_cycles > 0 {
             let rc = self.reset_cycles as i32;
@@ -142,6 +166,15 @@ impl CpuCore {
 
             // Dispatch instruction
             let result = dispatch_instruction(self, bus, opcode);
+
+            // A dispatched instruction may have enabled the MMU
+            // (PMOVE/MOVEC); fastmem addresses are physical, so drop the
+            // window as soon as translation turns on.
+            if self.fm_len != 0 && self.has_pmmu && self.pmmu_enabled {
+                self.fm_ptr = 0;
+                self.fm_base = 0;
+                self.fm_len = 0;
+            }
 
             // Auto-take all trap exceptions, extract cycles
             use crate::core::types::InternalStepResult;
