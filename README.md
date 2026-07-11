@@ -12,7 +12,7 @@ Strong for both low-level hardware-accurate emulation and high-level emulation (
 
 - **Complete CPU family support**: M68000, M68010, M68020, M68030, M68040, and variants (EC/LC)
 - **Zero dependencies**: Pure Rust with no external runtime dependencies
-- **Safe Rust**: No unsafe code blocks
+- **Memory-safe core**: The interpreter — instruction semantics, decode, exceptions, MMU, FPU — is 100% safe Rust. The optional fast paths (fastmem batch execution and the trace JIT) use a small, contract-documented `unsafe` perimeter, fenced by step-vs-batch equivalence tests
 - **FPU emulation**: Full 68881/68882/68040 floating-point unit support
 - **MMU emulation**: 68030/68040 PMMU with table walks and transparent translation
 - **HLE-ready**: Built-in trap interception for High-Level Emulation

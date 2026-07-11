@@ -74,11 +74,13 @@ everything) — the harness directly drove the optimizations that closed the
 gap, so keep it honest when changing the fast paths: the state gates catch
 divergence immediately.
 
-The run also reports cycle-accounting divergences from Musashi's timing
-model (which matches the M68000UM tables for these instructions), e.g.
-m68k-rs charging 4 cycles for `ADDQ.L #1,Dn` (Musashi: 8) and ~14.4k cycles
-per `memcpy` pass (Musashi: ~30.8k) — see the harness output for the full
-list.
+The run also cross-checks cycle accounting between the two cores. This
+originally exposed large 68000 timing gaps in m68k-rs (e.g. `ADDQ.L #1,Dn`
+charged at 4 cycles instead of 8, memory effective-address time not charged
+at all); those have since been fixed against the SingleStepTests
+real-hardware cycle counts, which the test suite now enforces. The remaining
+`cycles/iteration differ` note is Musashi undercharging `ADD.L Dn,Dn` at 6
+cycles where the M68000UM and SingleStepTests say 8.
 
 ## Extending
 

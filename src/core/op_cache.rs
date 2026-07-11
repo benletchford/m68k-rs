@@ -288,7 +288,7 @@ impl DecodedSimpleOp {
         }
 
         if matches!(group, 0x8 | 0x9 | 0xB | 0xC | 0xD)
-            && let Some(op) = decode_group_alu_reg(opcode)
+            && let Some(op) = decode_group_alu_reg(cpu_type, opcode)
         {
             return Some(op);
         }
@@ -487,7 +487,11 @@ impl DecodedSimpleOp {
                         cpu.set_logic_flags(src, size);
                     }
                 }
-                4
+                if cpu.is_pre_68020 && size == Size::Long && op != UnaryOp::Tst {
+                    6
+                } else {
+                    4
+                }
             }
             Self::Swap { reg } => cpu.exec_swap(reg as usize),
             Self::Ext { reg, size } => cpu.exec_ext(size, reg as usize),
@@ -499,7 +503,7 @@ impl DecodedSimpleOp {
                 } else {
                     cpu.dar[reg] = cpu.dar[reg].wrapping_add(data);
                 }
-                4
+                if cpu.is_pre_68020 { 8 } else { 4 }
             }
             Self::AddqSubqReg {
                 reg,
@@ -520,7 +524,11 @@ impl DecodedSimpleOp {
                     result & mask
                 };
                 cpu.dar[reg] = (cpu.dar[reg] & !mask) | result;
-                4
+                if cpu.is_pre_68020 && size == Size::Long {
+                    8
+                } else {
+                    4
+                }
             }
             Self::BinaryDataReg {
                 op,
@@ -606,7 +614,11 @@ impl DecodedSimpleOp {
                     cpu.exec_addx(size, src, dst_value)
                 };
                 write_data_reg(cpu, dst, size, result);
-                4
+                if cpu.is_pre_68020 && size == Size::Long {
+                    8
+                } else {
+                    4
+                }
             }
             Self::BitReg { op, bit_reg, dst } => {
                 let bit = cpu.dar[bit_reg as usize] & 31;
@@ -614,19 +626,32 @@ impl DecodedSimpleOp {
                 let dst = dst as usize;
                 let value = cpu.dar[dst];
                 cpu.not_z_flag = if value & mask != 0 { 1 } else { 0 };
+                let hi_bit_extra = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
                 match op {
                     BitOp::Test => 6,
                     BitOp::Change => {
                         cpu.dar[dst] = value ^ mask;
-                        8
+                        if cpu.is_pre_68020 {
+                            6 + hi_bit_extra
+                        } else {
+                            8
+                        }
                     }
                     BitOp::Clear => {
                         cpu.dar[dst] = value & !mask;
-                        10
+                        if cpu.is_pre_68020 {
+                            8 + hi_bit_extra
+                        } else {
+                            10
+                        }
                     }
                     BitOp::Set => {
                         cpu.dar[dst] = value | mask;
-                        8
+                        if cpu.is_pre_68020 {
+                            6 + hi_bit_extra
+                        } else {
+                            8
+                        }
                     }
                 }
             }
@@ -646,7 +671,7 @@ impl DecodedSimpleOp {
                     0
                 };
                 write_data_reg(cpu, reg, Size::Byte, value);
-                4
+                if cpu.is_pre_68020 && value != 0 { 6 } else { 4 }
             }
             Self::ShiftReg {
                 reg,
@@ -739,7 +764,22 @@ fn decode_group_4_reg(_cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleOp
 }
 
 #[inline]
-fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
+fn decode_group_alu_reg(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleOp> {
+    // Register-to-register ALU base times (68000/68010): byte/word 4;
+    // long 8 (register/immediate source footnote), except CMP long at 6.
+    let pre020 = is_pre_68020(cpu_type);
+    let alu_cycles = |size_bits: u16, cmp: bool| -> i32 {
+        let long = size_bits == 2;
+        if pre020 {
+            match (long, cmp) {
+                (false, _) => 4,
+                (true, false) => 8,
+                (true, true) => 6,
+            }
+        } else {
+            4
+        }
+    };
     let group = (opcode >> 12) & 0xF;
     let reg = ((opcode >> 9) & 7) as u8;
     let ea_mode = (opcode >> 3) & 7;
@@ -755,7 +795,7 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
                     src: src?,
                     dst: reg,
                     size: decode_size_012(op_mode),
-                    cycles: 4,
+                    cycles: alu_cycles(op_mode, false),
                 })
             } else if op_mode == 4 && ea_mode == 0 {
                 Some(DecodedSimpleOp::BcdReg {
@@ -773,7 +813,7 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
                 src: src?,
                 dst: reg,
                 size: decode_size_012(op_mode),
-                cycles: 4,
+                cycles: alu_cycles(op_mode, false),
             }),
             3 | 7 => Some(DecodedSimpleOp::AddrDataReg {
                 op: AddrOp::Suba,
@@ -795,7 +835,7 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
                 src: src?,
                 dst: reg,
                 size: decode_size_012(op_mode),
-                cycles: 4,
+                cycles: alu_cycles(op_mode, true),
             }),
             3 | 7 => Some(DecodedSimpleOp::AddrDataReg {
                 op: AddrOp::Cmpa,
@@ -808,7 +848,11 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
                 src: DirectReg::Data(reg),
                 dst: ea_reg,
                 size: decode_size_012(op_mode - 4),
-                cycles: 8,
+                cycles: if pre020 {
+                    alu_cycles(op_mode - 4, false)
+                } else {
+                    8
+                },
             }),
             _ => None,
         },
@@ -819,7 +863,7 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
                     src: src?,
                     dst: reg,
                     size: decode_size_012(op_mode),
-                    cycles: 4,
+                    cycles: alu_cycles(op_mode, false),
                 });
             }
 
@@ -844,7 +888,7 @@ fn decode_group_alu_reg(opcode: u16) -> Option<DecodedSimpleOp> {
                 src: src?,
                 dst: reg,
                 size: decode_size_012(op_mode),
-                cycles: 4,
+                cycles: alu_cycles(op_mode, false),
             }),
             3 | 7 => Some(DecodedSimpleOp::AddrDataReg {
                 op: AddrOp::Adda,

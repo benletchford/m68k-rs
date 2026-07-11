@@ -697,7 +697,7 @@ impl TraceJit {
                         },
                     )
                 } else {
-                    emit_jit_op(&mut builder, cpu_ptr, *op)
+                    emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only)
                 };
                 cycles_value = builder.ins().iadd(cycles_value, op_cycles);
                 // Exact for every op that can precede a bail (MoveMem and
@@ -856,19 +856,19 @@ impl JitTraceOp {
             Self::Nop => 4,
             Self::MoveReg { .. } => 4,
             Self::Moveq { .. } => 4,
-            Self::UnaryDataReg { .. } => 4,
+            Self::UnaryDataReg { .. } => 6,
             Self::Swap { .. } => 4,
             Self::Ext { .. } => 4,
             Self::Extb { .. } => 4,
-            Self::AddqSubqReg { .. } => 4,
-            Self::AddqSubqAddr { .. } => 4,
+            Self::AddqSubqReg { .. } => 8,
+            Self::AddqSubqAddr { .. } => 8,
             Self::BinaryDataReg { cycles, .. } => cycles,
             Self::AddrDataReg {
                 op: JitAddrOp::Cmpa,
                 ..
             } => 6,
             Self::AddrDataReg { .. } => 8,
-            Self::AddSubxReg { .. } => 4,
+            Self::AddSubxReg { .. } => 8,
             Self::BitReg {
                 op: JitBitOp::Test, ..
             } => 6,
@@ -877,8 +877,8 @@ impl JitTraceOp {
                 ..
             } => 10,
             Self::BitReg { .. } => 8,
+            Self::SccDataReg { .. } => 6,
             Self::Exg { .. } => 6,
-            Self::SccDataReg { .. } => 4,
             Self::ShiftReg {
                 count_or_reg,
                 count_is_register,
@@ -1300,7 +1300,11 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                     cpu.set_logic_flags(src, size);
                 }
             }
-            4
+            if cpu.is_pre_68020 && size == Size::Long && unary_op != JitUnaryOp::Tst {
+                6
+            } else {
+                4
+            }
         }
         JitTraceOp::Swap { reg } => cpu.exec_swap(reg as usize),
         JitTraceOp::Ext { reg, size } => cpu.exec_ext(size, reg as usize),
@@ -1324,7 +1328,11 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 result & mask
             };
             cpu.dar[reg] = (cpu.dar[reg] & !mask) | result;
-            4
+            if cpu.is_pre_68020 && size == Size::Long {
+                8
+            } else {
+                4
+            }
         }
         JitTraceOp::AddqSubqAddr { reg, data, is_sub } => {
             let reg = 8 + reg as usize;
@@ -1333,7 +1341,7 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             } else {
                 cpu.dar[reg].wrapping_add(data)
             };
-            4
+            if cpu.is_pre_68020 { 8 } else { 4 }
         }
         JitTraceOp::BinaryDataReg {
             op: binary_op,
@@ -1419,7 +1427,11 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 cpu.exec_addx(size, src_value, dst_value)
             };
             portable_write_data_reg(cpu, dst as u8, size, result);
-            4
+            if cpu.is_pre_68020 && size == Size::Long {
+                8
+            } else {
+                4
+            }
         }
         JitTraceOp::BitReg { op, bit_reg, dst } => {
             let bit = cpu.dar[bit_reg as usize] & 31;
@@ -1427,19 +1439,32 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             let dst = dst as usize;
             let value = cpu.dar[dst];
             cpu.not_z_flag = if value & mask != 0 { 1 } else { 0 };
+            let hi_bit_extra = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
             match op {
                 JitBitOp::Test => 6,
                 JitBitOp::Change => {
                     cpu.dar[dst] = value ^ mask;
-                    8
+                    if cpu.is_pre_68020 {
+                        6 + hi_bit_extra
+                    } else {
+                        8
+                    }
                 }
                 JitBitOp::Clear => {
                     cpu.dar[dst] = value & !mask;
-                    10
+                    if cpu.is_pre_68020 {
+                        8 + hi_bit_extra
+                    } else {
+                        10
+                    }
                 }
                 JitBitOp::Set => {
                     cpu.dar[dst] = value | mask;
-                    8
+                    if cpu.is_pre_68020 {
+                        6 + hi_bit_extra
+                    } else {
+                        8
+                    }
                 }
             }
         }
@@ -1451,7 +1476,7 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 0
             };
             portable_write_data_reg(cpu, reg, Size::Byte, value);
-            4
+            if cpu.is_pre_68020 && value != 0 { 6 } else { 4 }
         }
         JitTraceOp::ShiftReg {
             reg,
@@ -1543,7 +1568,12 @@ fn portable_write_data_reg(cpu: &mut CpuCore, reg: u8, size: Size, value: u32) {
 }
 
 #[cfg(not(target_family = "wasm"))]
-fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) -> Value {
+fn emit_jit_op(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    op: TraceBuildOp,
+    pre020: bool,
+) -> Value {
     let trace_pc = op.pc;
     match op.op {
         JitTraceOp::Nop => cycles_const(builder, 4),
@@ -1607,7 +1637,12 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
                     set_logic_flags(builder, cpu, value, size);
                 }
             }
-            cycles_const(builder, 4)
+            let cycles = if pre020 && size == Size::Long && unary_op != JitUnaryOp::Tst {
+                6
+            } else {
+                4
+            };
+            cycles_const(builder, cycles)
         }
         JitTraceOp::Swap { reg } => {
             let value = load_reg(builder, cpu, JitDirectReg::Data(reg));
@@ -1661,7 +1696,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             } else {
                 set_add_flags(builder, cpu, src, dst, result, size);
             }
-            cycles_const(builder, 4)
+            cycles_const(builder, if pre020 && size == Size::Long { 8 } else { 4 })
         }
         JitTraceOp::AddqSubqAddr { reg, data, is_sub } => {
             let dst_reg = JitDirectReg::Addr(reg);
@@ -1673,7 +1708,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
                 builder.ins().iadd(dst, src)
             };
             store_reg(builder, cpu, dst_reg, result);
-            cycles_const(builder, 4)
+            cycles_const(builder, if pre020 { 8 } else { 4 })
         }
         JitTraceOp::BinaryDataReg {
             op: binary_op,
@@ -1764,7 +1799,7 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
                 emit_addx(builder, cpu, src_value, dst_value, size)
             };
             write_data_reg_sized(builder, cpu, dst, size, result);
-            cycles_const(builder, 4)
+            cycles_const(builder, if pre020 && size == Size::Long { 8 } else { 4 })
         }
         JitTraceOp::BitReg { op, bit_reg, dst } => {
             let bit = load_reg(builder, cpu, JitDirectReg::Data(bit_reg));
@@ -1775,23 +1810,36 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             let tested = builder.ins().band(value, mask);
             let not_z = flag_from_nonzero(builder, tested, 1);
             store_value_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), not_z);
+            // Pre-020: base cycles + 2 when the (dynamic) bit number is >= 16.
+            let dyn_cycles = |builder: &mut FunctionBuilder<'_>, base: i32, legacy: i32| {
+                if pre020 {
+                    let hi = builder
+                        .ins()
+                        .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, bit, 16);
+                    let with_extra = cycles_const(builder, base + 2);
+                    let base = cycles_const(builder, base);
+                    builder.ins().select(hi, with_extra, base)
+                } else {
+                    cycles_const(builder, legacy)
+                }
+            };
             match op {
                 JitBitOp::Test => cycles_const(builder, 6),
                 JitBitOp::Change => {
                     let result = builder.ins().bxor(value, mask);
                     store_reg(builder, cpu, JitDirectReg::Data(dst), result);
-                    cycles_const(builder, 8)
+                    dyn_cycles(builder, 6, 8)
                 }
                 JitBitOp::Clear => {
                     let inverted = builder.ins().bxor_imm(mask, -1);
                     let result = builder.ins().band(value, inverted);
                     store_reg(builder, cpu, JitDirectReg::Data(dst), result);
-                    cycles_const(builder, 10)
+                    dyn_cycles(builder, 8, 10)
                 }
                 JitBitOp::Set => {
                     let result = builder.ins().bor(value, mask);
                     store_reg(builder, cpu, JitDirectReg::Data(dst), result);
-                    cycles_const(builder, 8)
+                    dyn_cycles(builder, 6, 8)
                 }
             }
         }
@@ -1812,7 +1860,13 @@ fn emit_jit_op(builder: &mut FunctionBuilder<'_>, cpu: Value, op: TraceBuildOp) 
             let false_value = iconst_u32(builder, 0);
             let value = builder.ins().select(condition, true_value, false_value);
             write_data_reg_sized(builder, cpu, reg, Size::Byte, value);
-            cycles_const(builder, 4)
+            if pre020 {
+                let taken = cycles_const(builder, 6);
+                let not_taken = cycles_const(builder, 4);
+                builder.ins().select(condition, taken, not_taken)
+            } else {
+                cycles_const(builder, 4)
+            }
         }
         JitTraceOp::ShiftReg { .. } => unreachable!("ShiftReg traces are wasm-only"),
         JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
@@ -2826,7 +2880,7 @@ mod portable_tests {
         let cycles = packed as u32 as i32;
         assert_eq!((packed >> 32) as u32, ops.len() as u32);
 
-        assert_eq!(cycles, 14);
+        assert_eq!(cycles, 18);
         assert_eq!(cpu.d(0), 1);
         assert_eq!(cpu.pc, 0x0100);
         assert_eq!(cpu.ppc, 0x0102);

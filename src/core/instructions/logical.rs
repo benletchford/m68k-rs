@@ -38,7 +38,18 @@ impl CpuCore {
         let dst = self.read_resolved_ea(bus, ea, size);
         let (result, _) = self.exec_and::<B>(bus, size, imm, dst);
         self.write_resolved_ea(bus, ea, size, result);
-        if size == Size::Long { 16 } else { 8 }
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 16 } else { 8 }
+            } else {
+                (if long { 20 } else { 12 }) + self.ea_time(mode, size)
+            }
+        } else if size == Size::Long {
+            16
+        } else {
+            8
+        }
     }
 
     /// Execute ANDI to CCR.
@@ -98,7 +109,18 @@ impl CpuCore {
             return 50;
         }
         self.set_logic_flags(result, size);
-        if size == Size::Long { 16 } else { 8 }
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 16 } else { 8 }
+            } else {
+                (if long { 20 } else { 12 }) + self.ea_time(mode, size)
+            }
+        } else if size == Size::Long {
+            16
+        } else {
+            8
+        }
     }
 
     /// Execute ORI to CCR.
@@ -156,7 +178,18 @@ impl CpuCore {
             return 50;
         }
         self.set_logic_flags(result, size);
-        if size == Size::Long { 16 } else { 8 }
+        if self.is_pre_68020 {
+            let long = size == Size::Long;
+            if matches!(mode, AddressingMode::DataDirect(_)) {
+                if long { 16 } else { 8 }
+            } else {
+                (if long { 20 } else { 12 }) + self.ea_time(mode, size)
+            }
+        } else if size == Size::Long {
+            16
+        } else {
+            8
+        }
     }
 
     /// Execute EORI to CCR.
