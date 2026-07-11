@@ -12,7 +12,7 @@ Strong for both low-level hardware-accurate emulation and high-level emulation (
 
 - **Complete CPU family support**: M68000, M68010, M68020, M68030, M68040, and variants (EC/LC)
 - **Zero dependencies**: Pure Rust with no external runtime dependencies
-- **Safe Rust**: No unsafe code blocks
+- **Memory-safe core**: The interpreter — instruction semantics, decode, exceptions, MMU, FPU — is 100% safe Rust. The optional fast paths (fastmem batch execution and the trace JIT) use a small, contract-documented `unsafe` perimeter, fenced by step-vs-batch equivalence tests
 - **FPU emulation**: Full 68881/68882/68040 floating-point unit support
 - **MMU emulation**: 68030/68040 PMMU with table walks and transparent translation
 - **HLE-ready**: Built-in trap interception for High-Level Emulation
@@ -188,6 +188,7 @@ The [SingleStepTests](https://github.com/SingleStepTests/m68000) project provide
 - BCD arithmetic (ABCD, SBCD, NBCD)
 - Multiply/divide overflow handling
 - Exception frame generation
+- **Cycle counts**: 99.92% of the 261,894 fixture cases match the real-hardware clock counts exactly (261,695 of 261,894), and the suite enforces this on every run. The only exception is one 2-clock quirk in CHK's negative-bound trap path (~200 cases, documented in the source). For reference, this is tighter than Musashi, which for example charges `ADD.L Dn,Dn` at 6 cycles where the M68000UM and real hardware measure 8.
 
 ### Musashi Reference Implementation
 
@@ -245,7 +246,23 @@ m68k/
 
 ## Performance
 
-The emulator is designed for correctness first, with performance as a secondary goal. Typical use cases (classic computer emulation, game console emulation) run at many multiples of original hardware speed on modern CPUs.
+Correctness comes first — including cycle accuracy, see above — but m68k-rs is also fast. Two execution paths are provided:
+
+- **`execute`/`step`** — the cycle-exact interpreter, backed by an opcode-indexed decode table and a trace JIT (Cranelift) that compiles hot backward-branch loops and runs them natively with exact cycle accounting.
+- **`run_batch`** — an instruction-budgeted fast path for HLE embedders. Buses that expose a contiguous RAM window (`AddressBus::fast_mem`, implemented by `LinearMemoryBus`) additionally get direct-RAM memory operands and JIT-compiled loops that include memory operations, with self-modifying code detected exactly.
+
+Measured head-to-head against [Musashi](https://github.com/kstenerud/Musashi) (the C core used by MAME) running identical 68000 workloads over the same flat memory, with final register/memory state cross-checked between the cores (one x86-64 machine snapshot; the harness lives on the `claude/m68k-rs-benchmarking-hrj56w` branch):
+
+| workload | Musashi | m68k-rs `execute` | m68k-rs `run_batch` |
+|---|---:|---:|---:|
+| tight ALU loop (reg mix) | 142 MIPS | **778 MIPS** | **757 MIPS** |
+| loop ADDQ/BRA | 175 | **504** | **472** |
+| loop TST/BNE | 193 | **536** | **543** |
+| memcpy inner loop | 106 | 48 | **291** |
+| linear ADDQ.L | 120 | 105 | 107 |
+| call/return | 146 | 74 | 80 |
+
+Hot loops — where emulated programs spend their time — run **2.7–5.5× faster than Musashi**; straight-line and call-heavy code currently sits at 0.5–0.9×. At these rates the interpreter emulates a 68000 clocked at roughly 700–950 MHz, cycle-exact — a stock 7.6 MHz Amiga 500 or Sega Genesis runs at ~100× real-time per core.
 
 ## License
 

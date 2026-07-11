@@ -93,7 +93,11 @@ impl CpuCore {
             // SingleStepTests/MAME fixtures treat NBCD as a BCD subtraction helper.
             let res = self.bcd_sub_sst(dst, 0);
             self.write_resolved_ea(bus, ea, Size::Byte, res);
-            return if is_reg { 6 } else { 8 };
+            return if is_reg {
+                6
+            } else {
+                8 + self.ea_time(mode, Size::Byte)
+            };
         }
         // Match Musashi's NBCD behavior.
         // See `tests/fixtures/Musashi/m68k_in.c` `M68KMAKE_OP(nbcd, 8, ...)`.
@@ -128,7 +132,11 @@ impl CpuCore {
             self.write_resolved_ea(bus, ea, Size::Byte, res);
         }
 
-        if is_reg { 6 } else { 8 }
+        if is_reg {
+            6
+        } else {
+            8 + self.ea_time(mode, Size::Byte)
+        }
     }
 
     // ========== BCD Helpers ==========

@@ -18,7 +18,7 @@
 //!   window check, exactly like bus accesses in the interpreter.
 
 use super::cpu::CpuCore;
-use super::op_cache::{is_pre_68020, AddrOp, BinaryOp, BitOp};
+use super::op_cache::{AddrOp, BinaryOp, BitOp, is_pre_68020};
 use super::types::{CpuType, Size};
 
 /// Effective-address forms the fastmem path understands. Everything else
@@ -245,7 +245,8 @@ fn decode_move(opcode: u16, size: Size) -> Option<DecodedMemOp> {
     let dst = FastEa::decode((opcode >> 6) & 7, (opcode >> 9) & 7)?;
 
     // An as byte source is illegal; MOVEA.B does not exist.
-    if size == Size::Byte && (matches!(src, FastEa::AddrReg(_)) || matches!(dst, FastEa::AddrReg(_)))
+    if size == Size::Byte
+        && (matches!(src, FastEa::AddrReg(_)) || matches!(dst, FastEa::AddrReg(_)))
     {
         return None;
     }
@@ -654,7 +655,213 @@ enum Loc {
     Imm(u32),
 }
 
+/// Specialized MOVE for the register / register-indirect EA forms
+/// (`Dn`/`An`/`(An)`/`(An)+`/`-(An)`) — no extension words, so no
+/// `Ctx`/`Pending` bookkeeping is needed and register adjustments can be
+/// staged in locals. Returns `None` when either EA has another form (the
+/// generic path handles it), `Some(false)` on window/alignment misses
+/// (full dispatch takes over with nothing committed), `Some(true)` when
+/// fully executed.
 #[inline]
+fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) -> Option<bool> {
+    // (addr-register index, staged new value) for post-inc/pre-dec.
+    let mut src_adj: Option<(usize, u32)> = None;
+    let aligned_only = cpu.is_pre_68020;
+
+    // Window offset for an access at `raw`, or an alignment/range miss.
+    let locate = |cpu: &CpuCore, raw: u32| -> Result<usize, ()> {
+        if aligned_only && size != Size::Byte && (raw & 1) != 0 {
+            return Err(());
+        }
+        win.off(cpu.address(raw), size.bytes()).ok_or(())
+    };
+
+    let value = match src {
+        FastEa::DataReg(r) => cpu.dar[r as usize] & size.mask(),
+        FastEa::AddrReg(r) => cpu.dar[8 + r as usize] & size.mask(),
+        FastEa::AnInd(r) => {
+            let Ok(off) = locate(cpu, cpu.dar[8 + r as usize]) else {
+                return Some(false);
+            };
+            win.read(off, size)
+        }
+        FastEa::AnPostInc(r) => {
+            let a = cpu.dar[8 + r as usize];
+            let Ok(off) = locate(cpu, a) else {
+                return Some(false);
+            };
+            src_adj = Some((8 + r as usize, a.wrapping_add(ea_step(size, r))));
+            win.read(off, size)
+        }
+        FastEa::AnPreDec(r) => {
+            let a = cpu.dar[8 + r as usize].wrapping_sub(ea_step(size, r));
+            let Ok(off) = locate(cpu, a) else {
+                return Some(false);
+            };
+            src_adj = Some((8 + r as usize, a));
+            win.read(off, size)
+        }
+        _ => return None,
+    };
+
+    // An address-register base must see a same-register source adjustment
+    // (e.g. `MOVE.L (A0)+,(A0)+`).
+    let addr_base = |cpu: &CpuCore, r: u8| -> u32 {
+        match src_adj {
+            Some((idx, val)) if idx == 8 + r as usize => val,
+            _ => cpu.dar[8 + r as usize],
+        }
+    };
+
+    match dst {
+        FastEa::DataReg(r) => {
+            if let Some((idx, val)) = src_adj {
+                cpu.dar[idx] = val;
+            }
+            let mask = size.mask();
+            let r = r as usize;
+            cpu.dar[r] = (cpu.dar[r] & !mask) | value;
+            cpu.set_logic_flags(value, size);
+        }
+        FastEa::AddrReg(r) => {
+            // MOVEA: sign-extend word, no flags.
+            if let Some((idx, val)) = src_adj {
+                cpu.dar[idx] = val;
+            }
+            cpu.dar[8 + r as usize] = if size == Size::Word {
+                value as u16 as i16 as i32 as u32
+            } else {
+                value
+            };
+        }
+        FastEa::AnInd(r) => {
+            let Ok(off) = locate(cpu, addr_base(cpu, r)) else {
+                return Some(false);
+            };
+            if let Some((idx, val)) = src_adj {
+                cpu.dar[idx] = val;
+            }
+            win.write(off, size, value);
+            cpu.set_logic_flags(value, size);
+        }
+        FastEa::AnPostInc(r) => {
+            let a = addr_base(cpu, r);
+            let Ok(off) = locate(cpu, a) else {
+                return Some(false);
+            };
+            if let Some((idx, val)) = src_adj {
+                cpu.dar[idx] = val;
+            }
+            cpu.dar[8 + r as usize] = a.wrapping_add(ea_step(size, r));
+            win.write(off, size, value);
+            cpu.set_logic_flags(value, size);
+        }
+        FastEa::AnPreDec(r) => {
+            let a = addr_base(cpu, r).wrapping_sub(ea_step(size, r));
+            let Ok(off) = locate(cpu, a) else {
+                return Some(false);
+            };
+            if let Some((idx, val)) = src_adj {
+                cpu.dar[idx] = val;
+            }
+            cpu.dar[8 + r as usize] = a;
+            win.write(off, size, value);
+            cpu.set_logic_flags(value, size);
+        }
+        _ => return None,
+    }
+    Some(true)
+}
+
+/// Specialized DBcc/BSR/RTS/Bcc.W execution: at most one extension word,
+/// no EA resolution, so the `Ctx` plumbing is skipped. Mirrors the generic
+/// arms exactly (which remain the single source of truth for the other
+/// ops). Returns `false` on any window/alignment miss so full dispatch
+/// takes over with nothing committed.
+#[inline]
+fn fast_flow(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> bool {
+    // One extension word at `pc` (the word after the opcode).
+    let read_ext = |cpu: &CpuCore| -> Option<u32> {
+        let off = win.off(cpu.address(cpu.pc), 2)?;
+        Some(win.read(off, Size::Word))
+    };
+
+    match op {
+        DecodedMemOp::Dbcc { condition, reg } => {
+            let Some(disp) = read_ext(cpu) else {
+                return false;
+            };
+            if !cpu.test_condition(condition) {
+                let reg = reg as usize;
+                let counter = (cpu.dar[reg] as u16).wrapping_sub(1);
+                cpu.dar[reg] = (cpu.dar[reg] & 0xFFFF_0000) | counter as u32;
+                if counter != 0xFFFF {
+                    // Displacement is relative to the displacement word.
+                    cpu.pc = (cpu.pc as i32).wrapping_add(disp as u16 as i16 as i32) as u32;
+                    return true;
+                }
+            }
+            cpu.pc = cpu.pc.wrapping_add(2);
+            true
+        }
+        DecodedMemOp::Rts => {
+            let sp = cpu.dar[15];
+            if cpu.is_pre_68020 && (sp & 1) != 0 {
+                return false;
+            }
+            let Some(off) = win.off(cpu.address(sp), 4) else {
+                return false;
+            };
+            let ret = win.read(off, Size::Long);
+            cpu.dar[15] = sp.wrapping_add(4);
+            cpu.change_of_flow = true;
+            cpu.pc = ret;
+            true
+        }
+        DecodedMemOp::Bsr {
+            displacement,
+            length,
+        } => {
+            let base = cpu.pc;
+            let disp = if length == 4 {
+                let Some(v) = read_ext(cpu) else {
+                    return false;
+                };
+                v as u16 as i16 as i32
+            } else {
+                displacement
+            };
+            let ret = base.wrapping_add(length - 2);
+            let sp = cpu.dar[15].wrapping_sub(4);
+            if cpu.is_pre_68020 && (sp & 1) != 0 {
+                return false;
+            }
+            let Some(off) = win.off(cpu.address(sp), 4) else {
+                return false;
+            };
+            win.write(off, Size::Long, ret);
+            cpu.dar[15] = sp;
+            cpu.change_of_flow = true;
+            cpu.pc = (base as i32).wrapping_add(disp) as u32;
+            true
+        }
+        DecodedMemOp::BranchWord { condition } => {
+            let base = cpu.pc;
+            let Some(disp) = read_ext(cpu) else {
+                return false;
+            };
+            if condition == 0 || cpu.test_condition(condition) {
+                cpu.change_of_flow = true;
+                cpu.pc = (base as i32).wrapping_add(disp as u16 as i16 as i32) as u32;
+            } else {
+                cpu.pc = base.wrapping_add(2);
+            }
+            true
+        }
+        _ => unreachable!("fast_flow only handles flow-control ops"),
+    }
+}
+
 fn ea_step(size: Size, reg: u8) -> u32 {
     // Byte accesses through (A7)+ / -(A7) keep the stack pointer even.
     if size == Size::Byte && reg == 7 {
@@ -729,10 +936,7 @@ fn resolve(cpu: &CpuCore, win: Win, ea: FastEa, size: Size, ctx: &mut Ctx) -> Op
             Some(loc)
         }
         FastEa::AnPreDec(r) => {
-            let a = ctx
-                .pending
-                .a(cpu, r)
-                .wrapping_sub(ea_step(size, r));
+            let a = ctx.pending.a(cpu, r).wrapping_sub(ea_step(size, r));
             let loc = mem(cpu, ctx, a)?;
             ctx.pending.push(r, a);
             Some(loc)
@@ -845,6 +1049,27 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     let Some(win) = Win::from_cpu(cpu) else {
         return false;
     };
+
+    // MOVE between registers and register-indirect memory is by far the
+    // hottest mem op (block copies, loads, stores); handle it without the
+    // generic Ctx/Pending resolution machinery. `None` means "not this
+    // shape", falling through to the generic path below.
+    if let DecodedMemOp::Move { size, src, dst } = op
+        && let Some(handled) = fast_move(cpu, win, size, src, dst)
+    {
+        return handled;
+    }
+
+    // Flow-control ops (loop closers, calls, returns) are the other hot
+    // class; they need at most one extension word and no EA resolution.
+    match op {
+        DecodedMemOp::Dbcc { .. }
+        | DecodedMemOp::Bsr { .. }
+        | DecodedMemOp::Rts
+        | DecodedMemOp::BranchWord { .. } => return fast_flow(cpu, win, op),
+        _ => {}
+    }
+
     let mut ctx = Ctx {
         next_ext: cpu.pc,
         pending: Pending::default(),

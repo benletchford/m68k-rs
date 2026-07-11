@@ -1,5 +1,5 @@
-use m68k::{CpuCore, CpuType, NoOpHleHandler, StepResult};
 use m68k::core::memory::AddressBus;
+use m68k::{CpuCore, CpuType, NoOpHleHandler, StepResult};
 
 struct TestBus {
     memory: [u8; 0x10000],
@@ -7,7 +7,9 @@ struct TestBus {
 
 impl TestBus {
     fn new() -> Self {
-        Self { memory: [0; 0x10000] }
+        Self {
+            memory: [0; 0x10000],
+        }
     }
 
     fn write_word_at(&mut self, addr: u32, value: u16) {
