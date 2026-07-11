@@ -224,7 +224,7 @@ fn batch_matches_step_on_random_register_loops() {
     // loop counter; D7/A6/A7 stay reserved), hot enough for traces to
     // compile. Any divergence in registers, flags, or PC fails with the
     // reproducing seed.
-    let mut seed: u64 = 0x00C0FFEE_5EED_1234;
+    let mut seed: u64 = 0x00C0_FFEE_5EED_1234;
     let mut rng = move || {
         seed ^= seed << 13;
         seed ^= seed >> 7;
@@ -410,17 +410,11 @@ fn batch_matches_step_semantics_on_memory_program() {
     bus_b.load(0x1000, &bytes);
     let mut cpu_b = cpu_at(0x1000);
     let end_pc = 0x1000 + bytes.len() as u32;
-    let mut batched: u32 = 0;
-    loop {
-        let result = cpu_b.run_batch(&mut bus_b, 100_000, &[end_pc]);
-        batched += result.instructions;
-        match result.exit {
-            BatchExit::WatchedPc { pc } => {
-                assert_eq!(pc, end_pc);
-                break;
-            }
-            other => panic!("unexpected batch exit {other:?}"),
-        }
+    let result = cpu_b.run_batch(&mut bus_b, 100_000, &[end_pc]);
+    let batched: u32 = result.instructions;
+    match result.exit {
+        BatchExit::WatchedPc { pc } => assert_eq!(pc, end_pc),
+        other => panic!("unexpected batch exit {other:?}"),
     }
 
     assert_eq!(stepped, batched);
@@ -799,7 +793,7 @@ fn fastmem_differential_fuzz_memory_ops() {
         let size2 = |v: u32| (v % 3) as u16;
         // Memory EA (mode,reg) in the safe data zone; returns (mode<<3)|reg
         // plus any extension words. d16 kept within ±0x1000 of the zone.
-        let mut mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
+        let mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
             match r() % 5 {
                 0 => (2 << 3) | areg(r()), // (An)
                 1 => (3 << 3) | areg(r()), // (An)+

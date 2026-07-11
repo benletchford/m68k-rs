@@ -1493,22 +1493,46 @@ fn fast_ea_time(ea: FastEa, size: Size) -> i32 {
     match ea {
         FastEa::DataReg(_) | FastEa::AddrReg(_) => 0,
         FastEa::AnInd(_) | FastEa::AnPostInc(_) => {
-            if long { 8 } else { 4 }
+            if long {
+                8
+            } else {
+                4
+            }
         }
         FastEa::AnPreDec(_) => {
-            if long { 10 } else { 6 }
+            if long {
+                10
+            } else {
+                6
+            }
         }
         FastEa::AnDisp(_) | FastEa::AbsW | FastEa::PcDisp => {
-            if long { 12 } else { 8 }
+            if long {
+                12
+            } else {
+                8
+            }
         }
         FastEa::AnIndex(_) | FastEa::PcIndex => {
-            if long { 14 } else { 10 }
+            if long {
+                14
+            } else {
+                10
+            }
         }
         FastEa::AbsL => {
-            if long { 16 } else { 12 }
+            if long {
+                16
+            } else {
+                12
+            }
         }
         FastEa::Imm => {
-            if long { 8 } else { 4 }
+            if long {
+                8
+            } else {
+                4
+            }
         }
     }
 }
@@ -1520,16 +1544,32 @@ fn fast_move_dst_time(ea: FastEa, size: Size) -> i32 {
     match ea {
         FastEa::DataReg(_) | FastEa::AddrReg(_) => 0,
         FastEa::AnInd(_) | FastEa::AnPostInc(_) | FastEa::AnPreDec(_) => {
-            if long { 8 } else { 4 }
+            if long {
+                8
+            } else {
+                4
+            }
         }
         FastEa::AnDisp(_) | FastEa::AbsW => {
-            if long { 12 } else { 8 }
+            if long {
+                12
+            } else {
+                8
+            }
         }
         FastEa::AnIndex(_) => {
-            if long { 14 } else { 10 }
+            if long {
+                14
+            } else {
+                10
+            }
         }
         FastEa::AbsL => {
-            if long { 16 } else { 12 }
+            if long {
+                16
+            } else {
+                12
+            }
         }
         // Not legal MOVE destinations.
         FastEa::PcDisp | FastEa::PcIndex | FastEa::Imm => 0,
@@ -1542,9 +1582,7 @@ fn fast_move_dst_time(ea: FastEa, size: Size) -> i32 {
 fn fast_er_base(ea: FastEa, size: Size, long_footnote: bool) -> i32 {
     if size != Size::Long {
         4
-    } else if long_footnote
-        && matches!(ea, FastEa::DataReg(_) | FastEa::AddrReg(_) | FastEa::Imm)
-    {
+    } else if long_footnote && matches!(ea, FastEa::DataReg(_) | FastEa::AddrReg(_) | FastEa::Imm) {
         8
     } else {
         6
@@ -1636,7 +1674,11 @@ pub(crate) fn mem_op_cycles(cpu: &CpuCore, op: DecodedMemOp, ppc: u32) -> i32 {
             base + static_extra + fast_ea_time(ea, Size::Byte)
         }
         DecodedMemOp::CmpM { size, .. } => {
-            if size == Size::Long { 20 } else { 12 }
+            if size == Size::Long {
+                20
+            } else {
+                12
+            }
         }
         DecodedMemOp::Lea { ea, .. } => match ea {
             FastEa::AnInd(_) => 4,
@@ -1668,7 +1710,11 @@ pub(crate) fn mem_op_cycles(cpu: &CpuCore, op: DecodedMemOp, ppc: u32) -> i32 {
         DecodedMemOp::Bsr { .. } => 18,
         DecodedMemOp::BranchWord { .. } => {
             // Taken branches land away from the fall-through address.
-            if cpu.pc != ppc.wrapping_add(4) { 10 } else { 12 }
+            if cpu.pc != ppc.wrapping_add(4) {
+                10
+            } else {
+                12
+            }
         }
         DecodedMemOp::Dbcc { condition, .. } => {
             if cpu.pc != ppc.wrapping_add(4) {

@@ -647,10 +647,8 @@ impl TraceJit {
         for &i in &order {
             let op = &ops[i];
             let masked = op.pc & cpu.address_mask;
-            let start_new = match segments.last() {
-                Some(seg) if seg.start + seg.len == masked => false,
-                _ => true,
-            };
+            let start_new =
+                !matches!(segments.last(), Some(seg) if seg.start + seg.len == masked);
             if start_new {
                 segments.push(CodeSegment {
                     start: masked,
@@ -1092,7 +1090,9 @@ fn decode_trace_op<B: AddressBus>(
         });
     }
     // RTS closes an inlined call: verify it returns to the traced site.
-    if opcode == 0x4E75 && let Some(expected) = pending_return {
+    if opcode == 0x4E75
+        && let Some(expected) = pending_return
+    {
         return Some(TraceBuildOp {
             opcode,
             extension: None,
@@ -1204,7 +1204,11 @@ fn decode_jit_ea(mode: u16, reg: u16) -> Option<JitEa> {
 /// compiled [`TraceFn`]: returns `(ops_retired << 32) | cycles`, and a
 /// mem-op bail sets `pc` to the un-executed op.
 #[cfg(any(target_family = "wasm", test))]
-fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], segments: &[CodeSegment]) -> u64 {
+fn execute_portable_trace(
+    cpu: &mut CpuCore,
+    ops: &[TraceBuildOp],
+    segments: &[CodeSegment],
+) -> u64 {
     let mut cycles: i32 = 0;
     for (index, op) in ops.iter().enumerate() {
         match execute_portable_op(cpu, *op, segments) {
