@@ -255,6 +255,18 @@ impl AddressBus for LinearMemoryBus {
         self.read_index(idx)
     }
 
+    /// The whole backing buffer is side-effect-free RAM, so expose it as a
+    /// fastmem window starting at guest address 0. Accesses beyond `len`
+    /// (which the bus methods wrap) simply fall back to the bus.
+    #[inline]
+    fn fast_mem(&mut self) -> Option<FastMem> {
+        Some(FastMem {
+            ptr: self.memory.as_mut_ptr(),
+            base: 0,
+            len: u32::try_from(self.memory.len()).unwrap_or(u32::MAX),
+        })
+    }
+
     #[inline]
     fn read_word(&mut self, address: u32) -> u16 {
         let b0 = self.read_index(self.index(address));

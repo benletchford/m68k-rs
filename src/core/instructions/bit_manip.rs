@@ -27,7 +27,16 @@ impl CpuCore {
         let value = self.read_ea(bus, mode, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
 
-        if size == Size::Long { 6 } else { 4 }
+        if size == Size::Long {
+            6
+        } else {
+            let base = if matches!(mode, AddressingMode::Immediate) {
+                6
+            } else {
+                4
+            };
+            base + self.ea_time(mode, Size::Byte)
+        }
     }
 
     /// Execute BSET instruction.
@@ -51,7 +60,15 @@ impl CpuCore {
         let result = value | (1 << bit);
         self.write_resolved_ea(bus, ea, size, result & size.mask());
 
-        8
+        if size == Size::Long {
+            if self.is_pre_68020 {
+                if bit >= 16 { 8 } else { 6 }
+            } else {
+                8
+            }
+        } else {
+            8 + self.ea_time(mode, Size::Byte)
+        }
     }
 
     /// Execute BCLR instruction.
@@ -75,7 +92,15 @@ impl CpuCore {
         let result = value & !(1 << bit);
         self.write_resolved_ea(bus, ea, size, result & size.mask());
 
-        if size == Size::Long { 10 } else { 8 }
+        if size == Size::Long {
+            if self.is_pre_68020 {
+                if bit >= 16 { 10 } else { 8 }
+            } else {
+                10
+            }
+        } else {
+            8 + self.ea_time(mode, Size::Byte)
+        }
     }
 
     /// Execute BCHG instruction.
@@ -99,7 +124,15 @@ impl CpuCore {
         let result = value ^ (1 << bit);
         self.write_resolved_ea(bus, ea, size, result & size.mask());
 
-        8
+        if size == Size::Long {
+            if self.is_pre_68020 {
+                if bit >= 16 { 8 } else { 6 }
+            } else {
+                8
+            }
+        } else {
+            8 + self.ea_time(mode, Size::Byte)
+        }
     }
 
     /// Execute TAS instruction.
@@ -114,6 +147,10 @@ impl CpuCore {
         let result = value | 0x80;
         self.write_resolved_ea(bus, ea, Size::Byte, result);
 
-        4
+        if self.is_pre_68020 && !mode.is_register_direct() {
+            10 + self.ea_time(mode, Size::Byte)
+        } else {
+            4
+        }
     }
 }
