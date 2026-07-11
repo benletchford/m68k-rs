@@ -24,7 +24,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-m68k = "0.1"
+m68k = "0.2"
 ```
 
 ### Basic Usage
