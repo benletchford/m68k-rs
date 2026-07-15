@@ -1243,9 +1243,12 @@ fn dispatch_group_6<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     // Base is the PC *after the opcode word* (i.e. address of the extension word for .w/.l).
     // This matches 68k branch semantics and keeps short/word/long displacements consistent.
     let base_pc = cpu.pc;
+    // A displacement byte of $FF selects a 32-bit displacement only on the
+    // 68020+ (Bcc.L). The 68000/68010 have no long form and treat $FF as the
+    // ordinary signed byte displacement -1.
     let disp: i32 = if displacement == 0 {
         cpu.read_imm_16(bus) as i16 as i32
-    } else if displacement == 0xFF {
+    } else if displacement == 0xFF && !cpu.is_pre_68020 {
         cpu.read_imm_32(bus) as i32
     } else {
         displacement as i8 as i32
