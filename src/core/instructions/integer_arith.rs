@@ -555,13 +555,16 @@ impl CpuCore {
 
         if val < 0 || val > limit {
             // SST: the upper-bound trap path costs 38+ea on the 68000; the
-            // negative-value path costs 40+ea. Checked in this order, so a
-            // value above a negative bound takes the cheaper path even
-            // though it is itself negative. (~200 SST cases with negative
-            // bounds still disagree by 2 cycles; the exact microcode rule
-            // is unclear, and this is already closer than Musashi's flat
-            // 40+ea.)
-            let adjust = if self.is_pre_68020 && val > limit {
+            // negative-value path costs 40+ea. The microcode runs the
+            // upper-bound comparison first, so a value above the bound takes
+            // the cheaper path even though it is itself negative. That
+            // comparison is a signed subtract: a negative value whose
+            // `Dn - bound` word subtraction overflows looks "above the
+            // bound" to it and also leaves on the cheaper path, even though
+            // the architectural trap condition is Dn < 0.
+            let upper_bound_path = val > limit
+                || (size == Size::Word && (val as i16).checked_sub(limit as i16).is_none());
+            let adjust = if self.is_pre_68020 && upper_bound_path {
                 2
             } else {
                 0
