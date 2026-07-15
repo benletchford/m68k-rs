@@ -255,11 +255,6 @@ fn audit_cycles() -> bool {
     std::env::var("M68K_SST_AUDIT_CYCLES").is_ok_and(|v| v == "1")
 }
 
-fn is_chk_file(path: &Path) -> bool {
-    path.file_name()
-        .is_some_and(|f| f.to_string_lossy().starts_with("CHK"))
-}
-
 /// Cycle-audit accumulator for one fixture file.
 #[derive(Default)]
 struct CycleAudit {
@@ -324,15 +319,12 @@ fn run_one_file(path: &Path) {
         // Compare cycle counts against the fixture's real-hardware clock
         // count. Enforced by default; M68K_SST_AUDIT_CYCLES=1 switches to a
         // report-only summary (useful when burning down divergences).
-        // CHK's trap paths are exempt: ~200 negative-bound cases disagree
-        // by 2 clocks and the exact microcode rule is not yet understood
-        // (see exec_chk).
         if !t.has_addr_error_txn
             && let m68k::StepResult::Ok { cycles } = result
         {
             if audit_cycles() {
                 audit.record(opcode, &t.name, t.num_cycles, cycles);
-            } else if cycles as i64 != t.num_cycles as i64 && !is_chk_file(path) {
+            } else if cycles as i64 != t.num_cycles as i64 {
                 failures.push(format!(
                     "{}[{idx}] {}: cycles: expected {}, got {cycles}",
                     path.display(),

@@ -188,7 +188,7 @@ The [SingleStepTests](https://github.com/SingleStepTests/m68000) project provide
 - BCD arithmetic (ABCD, SBCD, NBCD)
 - Multiply/divide overflow handling
 - Exception frame generation
-- **Cycle counts**: 99.92% of the 261,894 fixture cases match the real-hardware clock counts exactly (261,695 of 261,894), and the suite enforces this on every run. The only exception is one 2-clock quirk in CHK's negative-bound trap path (~200 cases, documented in the source). For reference, this is tighter than Musashi, which for example charges `ADD.L Dn,Dn` at 6 cycles where the M68000UM and real hardware measure 8.
+- **Cycle counts**: all 261,894 fixture cases match the real-hardware clock counts exactly, and the suite enforces this on every run. For reference, this is tighter than Musashi, which for example charges `ADD.L Dn,Dn` at 6 cycles where the M68000UM and real hardware measure 8.
 
 ### Musashi Reference Implementation
 
