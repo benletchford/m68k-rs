@@ -45,10 +45,16 @@ impl CpuCore {
             } else {
                 self.d(dq) as i32 as i64
             };
-            let q = dividend / divisor;
-            let r = dividend % divisor;
-            let overflow = q < i32::MIN as i64 || q > i32::MAX as i64;
-            (q as i32 as u32, r as i32 as u32, overflow)
+            if dividend == i64::MIN && divisor == -1 {
+                // The one quotient that does not fit in i64: hardware just
+                // flags overflow, but Rust's i64 division would panic.
+                (0, 0, true)
+            } else {
+                let q = dividend / divisor;
+                let r = dividend % divisor;
+                let overflow = q < i32::MIN as i64 || q > i32::MAX as i64;
+                (q as i32 as u32, r as i32 as u32, overflow)
+            }
         } else {
             let divisor = divisor_u32 as u64;
             let dividend = if use_64 {
