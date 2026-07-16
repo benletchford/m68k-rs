@@ -799,7 +799,7 @@ fn fastmem_differential_fuzz_memory_ops() {
         let size2 = |v: u32| (v % 3) as u16;
         // Memory EA (mode,reg) in the safe data zone; returns (mode<<3)|reg
         // plus any extension words. d16 kept within ±0x1000 of the zone.
-        let mut mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
+        let mem_ea = |r: &mut dyn FnMut() -> u32, exts: &mut Vec<u16>| -> u16 {
             match r() % 5 {
                 0 => (2 << 3) | areg(r()), // (An)
                 1 => (3 << 3) | areg(r()), // (An)+
