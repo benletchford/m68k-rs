@@ -40,9 +40,8 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          release-type: rust
-          # Optionally configure package name if Cargo.toml is not at the root
-          # package-name: your-crate-name
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
           # You might need a PAT instead of GITHUB_TOKEN if you hit permission issues
           # token: ${{ secrets.YOUR_PAT }}
 

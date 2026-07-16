@@ -1,0 +1,10 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "bootstrap-sha": "19689d08434e4eabe1c86dc292a21603dedc5b2b",
+  "release-type": "rust",
+  "packages": {
+    ".": {
+      "package-name": "m68k"
+    }
+  }
+}
