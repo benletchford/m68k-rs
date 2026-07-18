@@ -2,9 +2,25 @@
 name = "m68k"
 version = "0.2.1"
 edition = "2024"
+rust-version = "1.93"
 license = "MIT"
 description = "A safe Rust M68000 family CPU emulator"
-exclude = ["tests/**/*", "benchmarks/**/*"]
+repository = "https://github.com/benletchford/m68k-rs"
+readme = "README.md"
+keywords = ["68000", "emulation", "m68k", "motorola"]
+categories = ["emulators"]
+publish = ["crates-io"]
+exclude = [
+    "/.github/**",
+    "/.gitignore",
+    "/.gitmodules",
+    "/.release-please-manifest.json",
+    "/CONTRIBUTING.md",
+    "/release-please-config.json",
+    "/rust-toolchain.toml",
+    "/scripts/**",
+    "/tests/**",
+]
 
 [dependencies]
 
