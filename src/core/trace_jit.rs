@@ -7,8 +7,9 @@
 use super::cpu::{CFLAG_SET, VFLAG_SET};
 use super::cpu::{CpuCore, NFLAG_SET};
 use super::execute::RUN_MODE_BERR_AERR_RESET;
+use super::mem_ops::{BitSource, DecodedMemOp, FastEa};
 use super::memory::AddressBus;
-use super::op_cache::{CachedRunResult, DecodedSimpleOp};
+use super::op_cache::{BitOp, CachedRunResult, DecodedSimpleOp};
 use super::types::{CpuType, Size};
 #[cfg(not(target_family = "wasm"))]
 use cranelift_codegen::Context;
@@ -31,6 +32,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 const TRACE_CACHE_SIZE: usize = 4096;
 pub(crate) const TRACE_MAX_OPS: usize = 16;
+const TRACE_MIN_OPS: usize = 3;
 const TRACE_HOT_THRESHOLD: u8 = 2;
 
 /// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
@@ -67,11 +69,16 @@ pub(crate) enum JitEa {
     PostInc(u8),
     /// -(An)
     PreDec(u8),
+    /// (d16,An), with the extension word captured in the trace.
+    Disp(u8, i16),
 }
 
 impl JitEa {
     fn is_mem(self) -> bool {
-        matches!(self, Self::Ind(_) | Self::PostInc(_) | Self::PreDec(_))
+        matches!(
+            self,
+            Self::Ind(_) | Self::PostInc(_) | Self::PreDec(_) | Self::Disp(_, _)
+        )
     }
 }
 
@@ -117,6 +124,12 @@ pub(crate) enum JitBitOp {
     Change,
     Clear,
     Set,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JitBitSource {
+    Reg(u8),
+    Imm(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -217,14 +230,43 @@ pub(crate) enum JitTraceOp {
         src: JitEa,
         dst: JitEa,
     },
+    /// Hot Classic Mac memory forms using the A5-relative global-data
+    /// convention. These require extension words, so they are represented
+    /// explicitly rather than going through the register-only trace ops.
+    AnDispUnary {
+        op: JitUnaryOp,
+        size: Size,
+        reg: u8,
+        displacement: i16,
+    },
+    AnDispAddqSubq {
+        data: u32,
+        size: Size,
+        reg: u8,
+        displacement: i16,
+        is_sub: bool,
+    },
+    AnDispBit {
+        op: JitBitOp,
+        bit: JitBitSource,
+        reg: u8,
+        displacement: i16,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
 struct TraceBuildOp {
     opcode: u16,
     extension: Option<u16>,
+    extension2: Option<u16>,
     pc: u32,
     op: JitTraceOp,
+}
+
+impl TraceBuildOp {
+    fn length(self) -> u8 {
+        2 + 2 * u8::from(self.extension.is_some()) + 2 * u8::from(self.extension2.is_some())
+    }
 }
 
 struct CompiledTrace {
@@ -404,6 +446,17 @@ impl TraceJit {
                             Err(_) => return None,
                         }
                     }
+                    if let Some(expected) = op.extension2 {
+                        let addr = cpu.address(op.pc.wrapping_add(4));
+                        match bus.try_read_word(addr) {
+                            Ok(extension) if extension == expected => {}
+                            Ok(_) => {
+                                miss = Some((index, op.pc, op.opcode));
+                                break;
+                            }
+                            Err(_) => return None,
+                        }
+                    }
                 }
             }
 
@@ -562,13 +615,13 @@ impl TraceJit {
             ops.push(op);
 
             let jit_op = op.op;
-            pc = pc.wrapping_add(jit_op.length() as u32);
+            pc = pc.wrapping_add(op.length() as u32);
             if jit_op.ends_trace() {
                 break;
             }
         }
 
-        if ops.len() < 2 || !ops.last().is_some_and(|op| op.op.ends_trace()) {
+        if ops.len() < TRACE_MIN_OPS || !ops.last().is_some_and(|op| op.op.ends_trace()) {
             return None;
         }
 
@@ -578,6 +631,9 @@ impl TraceJit {
             if let Some(extension) = op.extension {
                 code.extend_from_slice(&extension.to_be_bytes());
             }
+            if let Some(extension) = op.extension2 {
+                code.extend_from_slice(&extension.to_be_bytes());
+            }
         }
         debug_assert_eq!(code.len() as u32, pc.wrapping_sub(start_pc));
 
@@ -585,9 +641,15 @@ impl TraceJit {
             .last()
             .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
 
-        let needs_window = ops
-            .iter()
-            .any(|op| matches!(op.op, JitTraceOp::MoveMem { .. }));
+        let needs_window = ops.iter().any(|op| {
+            matches!(
+                op.op,
+                JitTraceOp::MoveMem { .. }
+                    | JitTraceOp::AnDispUnary { .. }
+                    | JitTraceOp::AnDispAddqSubq { .. }
+                    | JitTraceOp::AnDispBit { .. }
+            )
+        });
 
         // Address-masked code range, used by the store-overlap (SMC) bail
         // checks. Reject the exotic case of a trace wrapping the address
@@ -678,26 +740,34 @@ impl TraceJit {
             let mut cycles_before: i64 = 0;
             let mut cycles_value = builder.ins().iconst(types::I32, 0);
             for (index, op) in ops.iter().enumerate() {
-                let op_cycles = if let JitTraceOp::MoveMem { size, src, dst } = op.op {
-                    let env = mem_env.as_ref().expect("MoveMem implies a window env");
-                    emit_move_mem(
-                        &mut builder,
-                        cpu_ptr,
-                        MoveMemOp {
-                            pc: op.pc,
-                            size,
-                            src,
-                            dst,
-                        },
-                        env,
-                        &mut bails,
-                        BailAt {
-                            ops_before: index as u32,
-                            cycles_before,
-                        },
-                    )
-                } else {
-                    emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only)
+                let bail_at = BailAt {
+                    ops_before: index as u32,
+                    cycles_before,
+                };
+                let op_cycles = match op.op {
+                    JitTraceOp::MoveMem { size, src, dst } => {
+                        let env = mem_env.as_ref().expect("MoveMem implies a window env");
+                        emit_move_mem(
+                            &mut builder,
+                            cpu_ptr,
+                            MoveMemOp {
+                                pc: op.pc,
+                                size,
+                                src,
+                                dst,
+                            },
+                            env,
+                            &mut bails,
+                            bail_at,
+                        )
+                    }
+                    JitTraceOp::AnDispUnary { .. }
+                    | JitTraceOp::AnDispAddqSubq { .. }
+                    | JitTraceOp::AnDispBit { .. } => {
+                        let env = mem_env.as_ref().expect("AnDisp implies a window env");
+                        emit_an_disp_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    _ => emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only),
                 };
                 cycles_value = builder.ins().iadd(cycles_value, op_cycles);
                 // Exact for every op that can precede a bail (MoveMem and
@@ -912,14 +982,36 @@ impl JitTraceOp {
                             6
                         }
                     }
+                    JitEa::Disp(_, _) => {
+                        if long {
+                            12
+                        } else {
+                            8
+                        }
+                    }
                 };
-                let dst_c = if dst.is_mem() {
-                    if long { 8 } else { 4 }
-                } else {
-                    0
+                let dst_c = match dst {
+                    JitEa::Disp(_, _) => {
+                        if long {
+                            12
+                        } else {
+                            8
+                        }
+                    }
+                    _ if dst.is_mem() => {
+                        if long {
+                            8
+                        } else {
+                            4
+                        }
+                    }
+                    _ => 0,
                 };
                 4 + src_c + dst_c
             }
+            // These ops only execute in instruction-budgeted fastmem mode;
+            // conservative cycle maxima preserve the trace headroom guard.
+            Self::AnDispUnary { .. } | Self::AnDispAddqSubq { .. } | Self::AnDispBit { .. } => 24,
         }
     }
 
@@ -939,14 +1031,6 @@ impl JitTraceOp {
             _ => None,
         }
     }
-
-    fn length(self) -> u8 {
-        match self {
-            Self::Branch { length, .. } => length,
-            Self::Dbcc { .. } => 4,
-            _ => 2,
-        }
-    }
 }
 
 fn decode_trace_op<B: AddressBus>(
@@ -962,7 +1046,10 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_branch_word_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
-    if let Some(op) = decode_move_mem_trace_op(pc, opcode) {
+    if let Some(op) = decode_an_disp_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
 
@@ -971,6 +1058,7 @@ fn decode_trace_op<B: AddressBus>(
     Some(TraceBuildOp {
         opcode,
         extension: None,
+        extension2: None,
         pc,
         op,
     })
@@ -990,6 +1078,7 @@ fn decode_dbcc_trace_op<B: AddressBus>(
     Some(TraceBuildOp {
         opcode,
         extension: Some(extension),
+        extension2: None,
         pc,
         op: JitTraceOp::Dbcc {
             condition: ((opcode >> 8) & 0xF) as u8,
@@ -1018,6 +1107,7 @@ fn decode_branch_word_trace_op<B: AddressBus>(
     Some(TraceBuildOp {
         opcode,
         extension: Some(extension),
+        extension2: None,
         pc,
         op: JitTraceOp::Branch {
             condition,
@@ -1027,18 +1117,154 @@ fn decode_branch_word_trace_op<B: AddressBus>(
     })
 }
 
-/// MOVE/MOVEA (groups 1-3) where both EAs are register or register-indirect
-/// forms — no extension words. At least one side must be memory
-/// (register-to-register MOVEs are simple ops already).
-fn decode_move_mem_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
+fn decode_an_disp_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let decoded = DecodedMemOp::decode(cpu_type, opcode)?;
+    let read_ext =
+        |offset: u32, bus: &mut B| bus.try_read_word(cpu.address(pc.wrapping_add(offset))).ok();
+    let (extension, extension2, op) = match decoded {
+        DecodedMemOp::Tst {
+            size,
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let displacement = read_ext(2, bus)?;
+            (
+                displacement,
+                None,
+                JitTraceOp::AnDispUnary {
+                    op: JitUnaryOp::Tst,
+                    size,
+                    reg,
+                    displacement: displacement as i16,
+                },
+            )
+        }
+        DecodedMemOp::Clr {
+            size,
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let displacement = read_ext(2, bus)?;
+            (
+                displacement,
+                None,
+                JitTraceOp::AnDispUnary {
+                    op: JitUnaryOp::Clr,
+                    size,
+                    reg,
+                    displacement: displacement as i16,
+                },
+            )
+        }
+        DecodedMemOp::AddqSubq {
+            data,
+            size,
+            ea: FastEa::AnDisp(reg),
+            is_sub,
+        } => {
+            let displacement = read_ext(2, bus)?;
+            (
+                displacement,
+                None,
+                JitTraceOp::AnDispAddqSubq {
+                    data,
+                    size,
+                    reg,
+                    displacement: displacement as i16,
+                    is_sub,
+                },
+            )
+        }
+        DecodedMemOp::BitMem {
+            op,
+            bit,
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let op = match op {
+                BitOp::Test => JitBitOp::Test,
+                BitOp::Change => JitBitOp::Change,
+                BitOp::Clear => JitBitOp::Clear,
+                BitOp::Set => JitBitOp::Set,
+            };
+            match bit {
+                BitSource::Reg(bit_reg) => {
+                    let displacement = read_ext(2, bus)?;
+                    (
+                        displacement,
+                        None,
+                        JitTraceOp::AnDispBit {
+                            op,
+                            bit: JitBitSource::Reg(bit_reg),
+                            reg,
+                            displacement: displacement as i16,
+                        },
+                    )
+                }
+                BitSource::Imm => {
+                    let bit_word = read_ext(2, bus)?;
+                    let displacement = read_ext(4, bus)?;
+                    (
+                        bit_word,
+                        Some(displacement),
+                        JitTraceOp::AnDispBit {
+                            op,
+                            bit: JitBitSource::Imm((bit_word & 7) as u8),
+                            reg,
+                            displacement: displacement as i16,
+                        },
+                    )
+                }
+            }
+        }
+        _ => return None,
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(extension),
+        extension2,
+        pc,
+        op,
+    })
+}
+
+/// MOVE/MOVEA (groups 1-3) using register, register-indirect, or d16(An)
+/// EAs. At least one side must be memory; displacement words are captured
+/// in execution order for validation and self-modification checks.
+fn decode_move_mem_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
     let size = match opcode >> 12 {
         1 => Size::Byte,
         2 => Size::Long,
         3 => Size::Word,
         _ => return None,
     };
-    let src = decode_jit_ea((opcode >> 3) & 7, opcode & 7)?;
-    let dst = decode_jit_ea((opcode >> 6) & 7, (opcode >> 9) & 7)?;
+    let src_mode = (opcode >> 3) & 7;
+    let dst_mode = (opcode >> 6) & 7;
+    let mut next_ext = pc.wrapping_add(2);
+    let mut extensions = [None, None];
+    let mut extension_count = 0usize;
+    let mut read_disp = |mode: u16| -> Option<i16> {
+        if mode != 5 {
+            return Some(0);
+        }
+        let value = bus.try_read_word(cpu.address(next_ext)).ok()?;
+        next_ext = next_ext.wrapping_add(2);
+        extensions[extension_count] = Some(value);
+        extension_count += 1;
+        Some(value as i16)
+    };
+    let src_disp = read_disp(src_mode)?;
+    let dst_disp = read_disp(dst_mode)?;
+    let src = decode_jit_ea(src_mode, opcode & 7, src_disp)?;
+    let dst = decode_jit_ea(dst_mode, (opcode >> 9) & 7, dst_disp)?;
     if !src.is_mem() && !dst.is_mem() {
         return None;
     }
@@ -1048,19 +1274,21 @@ fn decode_move_mem_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
     }
     Some(TraceBuildOp {
         opcode,
-        extension: None,
+        extension: extensions[0],
+        extension2: extensions[1],
         pc,
         op: JitTraceOp::MoveMem { size, src, dst },
     })
 }
 
-fn decode_jit_ea(mode: u16, reg: u16) -> Option<JitEa> {
+fn decode_jit_ea(mode: u16, reg: u16, displacement: i16) -> Option<JitEa> {
     Some(match mode & 7 {
         0 => JitEa::Data(reg as u8),
         1 => JitEa::Addr(reg as u8),
         2 => JitEa::Ind(reg as u8),
         3 => JitEa::PostInc(reg as u8),
         4 => JitEa::PreDec(reg as u8),
+        5 => JitEa::Disp(reg as u8, displacement),
         _ => return None,
     })
 }
@@ -1104,7 +1332,106 @@ fn execute_portable_op(
     if let JitTraceOp::MoveMem { size, src, dst } = op.op {
         return execute_portable_move_mem(cpu, size, src, dst, code_start, code_end);
     }
+    if matches!(
+        op.op,
+        JitTraceOp::AnDispUnary { .. }
+            | JitTraceOp::AnDispAddqSubq { .. }
+            | JitTraceOp::AnDispBit { .. }
+    ) {
+        return execute_portable_an_disp(cpu, op, code_start, code_end);
+    }
     Some(execute_portable_reg_op(cpu, op))
+}
+
+#[cfg(any(target_family = "wasm", test))]
+fn execute_portable_an_disp(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let store = match trace.op {
+        JitTraceOp::AnDispUnary {
+            op: JitUnaryOp::Clr,
+            size,
+            reg,
+            displacement,
+        }
+        | JitTraceOp::AnDispAddqSubq {
+            size,
+            reg,
+            displacement,
+            ..
+        } => Some((size, reg, displacement)),
+        JitTraceOp::AnDispBit {
+            op: JitBitOp::Change | JitBitOp::Clear | JitBitOp::Set,
+            reg,
+            displacement,
+            ..
+        } => Some((Size::Byte, reg, displacement)),
+        _ => None,
+    };
+    if let Some((size, reg, displacement)) = store {
+        let raw = cpu.dar[8 + reg as usize].wrapping_add(displacement as i32 as u32);
+        let masked = raw & cpu.address_mask;
+        if masked < code_end && masked.wrapping_add(size.bytes()) > code_start {
+            return None;
+        }
+    }
+    let op = match trace.op {
+        JitTraceOp::AnDispUnary {
+            op: JitUnaryOp::Tst,
+            size,
+            reg,
+            ..
+        } => DecodedMemOp::Tst {
+            size,
+            ea: FastEa::AnDisp(reg),
+        },
+        JitTraceOp::AnDispUnary {
+            op: JitUnaryOp::Clr,
+            size,
+            reg,
+            ..
+        } => DecodedMemOp::Clr {
+            size,
+            ea: FastEa::AnDisp(reg),
+        },
+        JitTraceOp::AnDispAddqSubq {
+            data,
+            size,
+            reg,
+            is_sub,
+            ..
+        } => DecodedMemOp::AddqSubq {
+            data,
+            size,
+            ea: FastEa::AnDisp(reg),
+            is_sub,
+        },
+        JitTraceOp::AnDispBit { op, bit, reg, .. } => DecodedMemOp::BitMem {
+            op: match op {
+                JitBitOp::Test => BitOp::Test,
+                JitBitOp::Change => BitOp::Change,
+                JitBitOp::Clear => BitOp::Clear,
+                JitBitOp::Set => BitOp::Set,
+            },
+            bit: match bit {
+                JitBitSource::Reg(reg) => BitSource::Reg(reg),
+                JitBitSource::Imm(_) => BitSource::Imm,
+            },
+            ea: FastEa::AnDisp(reg),
+        },
+        _ => return None,
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(cpu, op) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
 }
 
 /// Portable MoveMem, mirroring `emit_move_mem` exactly: all checks before
@@ -1162,6 +1489,10 @@ fn execute_portable_move_mem(
             staged = Some((8 + r as usize, a));
             read(cpu, off)
         }
+        JitEa::Disp(r, displacement) => {
+            let a = cpu.dar[8 + r as usize].wrapping_add(displacement as i32 as u32);
+            read(cpu, locate(cpu, a)?)
+        }
     };
 
     let dst_base = |cpu: &CpuCore, r: u8| match staged {
@@ -1188,7 +1519,7 @@ fn execute_portable_move_mem(
                 value
             };
         }
-        JitEa::Ind(r) | JitEa::PostInc(r) | JitEa::PreDec(r) => {
+        JitEa::Ind(r) | JitEa::PostInc(r) | JitEa::PreDec(r) | JitEa::Disp(r, _) => {
             let base = dst_base(cpu, r);
             let (addr, new_reg) = match dst {
                 JitEa::Ind(_) => (base, None),
@@ -1196,6 +1527,9 @@ fn execute_portable_move_mem(
                 JitEa::PreDec(_) => {
                     let a = base.wrapping_sub(jit_ea_step(size, r));
                     (a, Some(a))
+                }
+                JitEa::Disp(_, displacement) => {
+                    (base.wrapping_add(displacement as i32 as u32), None)
                 }
                 _ => unreachable!(),
             };
@@ -1549,6 +1883,11 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::MoveMem { .. } => {
             unreachable!("MoveMem is handled by execute_portable_move_mem")
         }
+        JitTraceOp::AnDispUnary { .. }
+        | JitTraceOp::AnDispAddqSubq { .. }
+        | JitTraceOp::AnDispBit { .. } => {
+            unreachable!("AnDisp ops are handled by execute_portable_an_disp")
+        }
     }
 }
 
@@ -1870,6 +2209,11 @@ fn emit_jit_op(
         }
         JitTraceOp::ShiftReg { .. } => unreachable!("ShiftReg traces are wasm-only"),
         JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
+        JitTraceOp::AnDispUnary { .. }
+        | JitTraceOp::AnDispAddqSubq { .. }
+        | JitTraceOp::AnDispBit { .. } => {
+            unreachable!("AnDisp ops are emitted by emit_an_disp_mem")
+        }
         JitTraceOp::Branch {
             condition,
             displacement,
@@ -2012,6 +2356,133 @@ fn window_store(
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
+fn guard_store_not_code(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    bail: Block,
+    masked: Value,
+    size: Size,
+) {
+    let lt_end = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThan, masked, env.code_end as i64);
+    let past = builder.ins().iadd_imm(masked, size.bytes() as i64);
+    let gt_start = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThan, past, env.code_start as i64);
+    let bad = builder.ins().band(lt_end, gt_start);
+    branch_guard(builder, bail, bad);
+}
+
+/// Emit the displacement-memory operations that dominate Classic Mac code.
+/// The displacement is baked into the trace; only the live An value and
+/// fastmem bounds need checking at runtime.
+#[cfg(not(target_family = "wasm"))]
+fn emit_an_disp_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+    let (reg, displacement, size) = match trace.op {
+        JitTraceOp::AnDispUnary {
+            reg,
+            displacement,
+            size,
+            ..
+        }
+        | JitTraceOp::AnDispAddqSubq {
+            reg,
+            displacement,
+            size,
+            ..
+        } => (reg, displacement, size),
+        JitTraceOp::AnDispBit {
+            reg, displacement, ..
+        } => (reg, displacement, Size::Byte),
+        _ => unreachable!(),
+    };
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+    let addr = builder.ins().iadd_imm(base, displacement as i64);
+    let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+    let value = window_load(builder, env, off, size);
+
+    match trace.op {
+        JitTraceOp::AnDispUnary {
+            op: JitUnaryOp::Tst,
+            ..
+        } => set_logic_flags(builder, cpu, value, size),
+        JitTraceOp::AnDispUnary {
+            op: JitUnaryOp::Clr,
+            ..
+        } => {
+            guard_store_not_code(builder, env, bail, masked, size);
+            let zero = iconst_u32(builder, 0);
+            window_store(builder, env, off, size, zero);
+            store_u32(builder, cpu, offset_of!(CpuCore, n_flag), 0);
+            store_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), 0);
+            store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
+            store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
+        }
+        JitTraceOp::AnDispAddqSubq { data, is_sub, .. } => {
+            guard_store_not_code(builder, env, bail, masked, size);
+            let src = iconst_u32(builder, data);
+            let result = if is_sub {
+                builder.ins().isub(value, src)
+            } else {
+                builder.ins().iadd(value, src)
+            };
+            window_store(builder, env, off, size, result);
+            if is_sub {
+                set_sub_flags(builder, cpu, src, value, result, size);
+            } else {
+                set_add_flags(builder, cpu, src, value, result, size);
+            }
+        }
+        JitTraceOp::AnDispBit { op, bit, .. } => {
+            let bit = match bit {
+                JitBitSource::Reg(reg) => {
+                    let value = load_reg(builder, cpu, JitDirectReg::Data(reg));
+                    builder.ins().band_imm(value, 7)
+                }
+                JitBitSource::Imm(bit) => iconst_u32(builder, bit as u32),
+            };
+            let one = iconst_u32(builder, 1);
+            let mask = builder.ins().ishl(one, bit);
+            let tested = builder.ins().band(value, mask);
+            let not_z = flag_from_nonzero(builder, tested, 1);
+            match op {
+                JitBitOp::Test => {}
+                JitBitOp::Change | JitBitOp::Clear | JitBitOp::Set => {
+                    guard_store_not_code(builder, env, bail, masked, Size::Byte);
+                    let result = match op {
+                        JitBitOp::Change => builder.ins().bxor(value, mask),
+                        JitBitOp::Clear => {
+                            let inverted = builder.ins().bxor_imm(mask, -1);
+                            builder.ins().band(value, inverted)
+                        }
+                        JitBitOp::Set => builder.ins().bor(value, mask),
+                        JitBitOp::Test => unreachable!(),
+                    };
+                    window_store(builder, env, off, Size::Byte, result);
+                }
+            }
+            store_value_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), not_z);
+        }
+        _ => unreachable!(),
+    }
+    cycles_const(builder, trace.op.max_cycles())
+}
+
 /// Emit a MOVE/MOVEA with memory operands. All alignment/window/code-overlap
 /// checks run before anything commits; each check branches to a bail block
 /// that sets `pc = op.pc` and returns the ops retired before this one, so a
@@ -2067,6 +2538,12 @@ fn emit_move_mem(
             staged = Some((r, a));
             window_load(builder, env, off, size)
         }
+        JitEa::Disp(r, displacement) => {
+            let base = load_an(builder, r);
+            let a = builder.ins().iadd_imm(base, displacement as i64);
+            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            window_load(builder, env, off, size)
+        }
     };
 
     // A destination base register must observe a same-register source
@@ -2097,7 +2574,7 @@ fn emit_move_mem(
             };
             store_reg(builder, cpu, JitDirectReg::Addr(r), v);
         }
-        JitEa::Ind(r) | JitEa::PostInc(r) | JitEa::PreDec(r) => {
+        JitEa::Ind(r) | JitEa::PostInc(r) | JitEa::PreDec(r) | JitEa::Disp(r, _) => {
             let base = dst_base(builder, r);
             let (addr, new_reg) = match op.dst {
                 JitEa::Ind(_) => (base, None),
@@ -2108,6 +2585,9 @@ fn emit_move_mem(
                 JitEa::PreDec(_) => {
                     let a = builder.ins().iadd_imm(base, -(jit_ea_step(size, r) as i64));
                     (a, Some(a))
+                }
+                JitEa::Disp(_, displacement) => {
+                    (builder.ins().iadd_imm(base, displacement as i64), None)
                 }
                 _ => unreachable!(),
             };
@@ -2741,6 +3221,7 @@ mod portable_tests {
             TraceBuildOp {
                 opcode: 0x22D8,
                 extension: None,
+                extension2: None,
                 pc: 0x0100,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -2751,6 +3232,7 @@ mod portable_tests {
             TraceBuildOp {
                 opcode: 0x51C8,
                 extension: Some(0xFFFC),
+                extension2: None,
                 pc: 0x0102,
                 op: JitTraceOp::Dbcc {
                     condition: 1,
@@ -2833,6 +3315,7 @@ mod portable_tests {
         let op = TraceBuildOp {
             opcode: 0x30D8,
             extension: None,
+            extension2: None,
             pc: 0x0100,
             op: JitTraceOp::MoveMem {
                 size: Size::Word,
@@ -2850,12 +3333,152 @@ mod portable_tests {
     }
 
     #[test]
+    fn portable_trace_executes_classic_mac_a5_mix() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x10000];
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(5, 0x1000);
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x34);
+        mem[0x1100] = 0x08;
+
+        let ops = [
+            TraceBuildOp {
+                opcode: 0x4A2D,
+                extension: Some(0x0100),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::AnDispUnary {
+                    op: JitUnaryOp::Tst,
+                    size: Size::Byte,
+                    reg: 5,
+                    displacement: 0x0100,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x082D,
+                extension: Some(3),
+                extension2: Some(0x0100),
+                pc: 0x0104,
+                op: JitTraceOp::AnDispBit {
+                    op: JitBitOp::Test,
+                    bit: JitBitSource::Imm(3),
+                    reg: 5,
+                    displacement: 0x0100,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x1B40,
+                extension: Some(0x0100),
+                extension2: None,
+                pc: 0x010A,
+                op: JitTraceOp::MoveMem {
+                    size: Size::Byte,
+                    src: JitEa::Data(0),
+                    dst: JitEa::Disp(5, 0x0100),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x422D,
+                extension: Some(0x0100),
+                extension2: None,
+                pc: 0x010E,
+                op: JitTraceOp::AnDispUnary {
+                    op: JitUnaryOp::Clr,
+                    size: Size::Byte,
+                    reg: 5,
+                    displacement: 0x0100,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x322D,
+                extension: Some(0x0100),
+                extension2: None,
+                pc: 0x0112,
+                op: JitTraceOp::MoveMem {
+                    size: Size::Word,
+                    src: JitEa::Disp(5, 0x0100),
+                    dst: JitEa::Data(1),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x526D,
+                extension: Some(0x0100),
+                extension2: None,
+                pc: 0x0116,
+                op: JitTraceOp::AnDispAddqSubq {
+                    data: 1,
+                    size: Size::Word,
+                    reg: 5,
+                    displacement: 0x0100,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x2F2D,
+                extension: Some(0x0100),
+                extension2: None,
+                pc: 0x011A,
+                op: JitTraceOp::MoveMem {
+                    size: Size::Long,
+                    src: JitEa::Disp(5, 0x0100),
+                    dst: JitEa::PreDec(7),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x588F,
+                extension: None,
+                extension2: None,
+                pc: 0x011E,
+                op: JitTraceOp::AddqSubqAddr {
+                    reg: 7,
+                    data: 4,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60DE,
+                extension: None,
+                extension2: None,
+                pc: 0x0120,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -34,
+                    length: 2,
+                },
+            },
+        ];
+        // The portable memory helpers read the live extension words just as
+        // the native trace validates them before executing.
+        for op in ops {
+            let at = op.pc as usize;
+            mem[at..at + 2].copy_from_slice(&op.opcode.to_be_bytes());
+            if let Some(extension) = op.extension {
+                mem[at + 2..at + 4].copy_from_slice(&extension.to_be_bytes());
+            }
+            if let Some(extension) = op.extension2 {
+                mem[at + 4..at + 6].copy_from_slice(&extension.to_be_bytes());
+            }
+        }
+
+        let packed = execute_portable_trace(&mut cpu, &ops, 0x0100, 0x0122);
+
+        assert_eq!((packed >> 32) as usize, ops.len());
+        assert_eq!(cpu.pc, 0x0100);
+        assert_eq!(cpu.d(1) & 0xFFFF, 0);
+        assert_eq!(&mem[0x1100..0x1102], &1u16.to_be_bytes());
+        assert_eq!(&mem[0x7FFC..0x8000], &0x0001_0000u32.to_be_bytes());
+        assert_eq!(cpu.a(7), 0x8000);
+    }
+
+    #[test]
     fn portable_trace_executes_unconditional_loop_iteration() {
         let mut cpu = cpu();
         let ops = [
             TraceBuildOp {
                 opcode: 0x5280,
                 extension: None,
+                extension2: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 0,
@@ -2867,6 +3490,7 @@ mod portable_tests {
             TraceBuildOp {
                 opcode: 0x60FC,
                 extension: None,
+                extension2: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -2895,6 +3519,7 @@ mod portable_tests {
             TraceBuildOp {
                 opcode: 0x5340,
                 extension: None,
+                extension2: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 0,
@@ -2906,6 +3531,7 @@ mod portable_tests {
             TraceBuildOp {
                 opcode: 0x66FC,
                 extension: None,
+                extension2: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 6,
@@ -2934,6 +3560,7 @@ mod portable_tests {
         let ops = [TraceBuildOp {
             opcode: 0xE188,
             extension: None,
+            extension2: None,
             pc: 0x0100,
             op: JitTraceOp::ShiftReg {
                 reg: 0,

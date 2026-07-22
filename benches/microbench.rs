@@ -148,33 +148,91 @@ fn bench_loop<B: BenchBus>(
 }
 
 fn bench_batch_loop(label: &str, name: &str, words: &[u16], instrs: u32) {
+    bench_batch_loop_at(label, name, words, instrs, 0x100);
+}
+
+fn bench_batch_loop_at(label: &str, name: &str, words: &[u16], instrs: u32, code_base: usize) {
     let mut bus = LinearMemoryBus::new(0x10000);
     for (i, word) in words.iter().enumerate() {
-        bus.write_word_at((i * 2) as u32, *word);
+        bus.write_word_at((code_base + i * 2) as u32, *word);
     }
 
     let prepare_cpu = || {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_sr(0x2700);
-        cpu.pc = 0;
+        cpu.pc = code_base as u32;
         cpu.set_a(5, 0x1000);
         cpu.set_a(7, 0x8000);
         cpu
     };
 
     let mut warm_cpu = prepare_cpu();
-    let warm = warm_cpu.run_batch(&mut bus, 5_000_000, &[]);
+    // Systemless always watches PC 0 as its clean-exit sentinel. An
+    // unrelated watched PC must not force a nonzero self-loop to execute
+    // only one iteration per native trace call.
+    let warm = warm_cpu.run_batch(&mut bus, 5_000_000, &[0]);
     assert_eq!(warm.instructions, 5_000_000);
 
     let mut cpu = prepare_cpu();
     let start = Instant::now();
-    let result = cpu.run_batch(&mut bus, instrs, &[]);
+    let result = cpu.run_batch(&mut bus, instrs, &[0]);
     let elapsed = start.elapsed().as_secs_f64();
     assert_eq!(result.instructions, instrs);
     println!(
         "{label:9} {name:18} {:8.1} M instr/s",
         instrs as f64 / elapsed / 1_000_000.0
+    );
+}
+
+fn bench_one_shot_trace(head_ops: usize, instrs: u32) {
+    assert!((2..=16).contains(&head_ops));
+    let mut words = vec![0x5280; head_ops - 1]; // ADDQ.L #1,D0
+    words.push(0x6002); // BRA.B over the padding word
+    words.push(0x4E71); // padding, never executed
+    words.push(0x5381); // SUBQ.L #1,D1 (interpreted return path)
+    let bytes_after_back_branch = (words.len() + 1) * 2;
+    let back_disp = -(bytes_after_back_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | (back_disp as u8 as u16));
+
+    bench_batch_loop_at(
+        "batch",
+        &format!("one-shot {head_ops}"),
+        &words,
+        instrs,
+        0x100 + head_ops * 0x40,
+    );
+}
+
+fn bench_one_shot_a5_trace(head_ops: usize, instrs: u32) {
+    assert!((2..=9).contains(&head_ops));
+    let a5_ops: &[&[u16]] = &[
+        &[0x4A2D, 0x0100],         // TST.B $0100(A5)
+        &[0x526D, 0x0100],         // ADDQ.W #1,$0100(A5)
+        &[0x322D, 0x0100],         // MOVE.W $0100(A5),D1
+        &[0x422D, 0x0100],         // CLR.B $0100(A5)
+        &[0x1B40, 0x0100],         // MOVE.B D0,$0100(A5)
+        &[0x082D, 0x0003, 0x0100], // BTST #3,$0100(A5)
+    ];
+    let mut words = Vec::new();
+    for i in 0..head_ops - 1 {
+        words.extend_from_slice(a5_ops[i % a5_ops.len()]);
+    }
+    words.push(0x6002); // BRA.B over the padding word
+    words.push(0x4E71); // padding, never executed
+    words.push(0x5381); // SUBQ.L #1,D1 (interpreted return path)
+    let bytes_after_back_branch = (words.len() + 1) * 2;
+    let back_disp = -(bytes_after_back_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | (back_disp as u8 as u16));
+
+    bench_batch_loop_at(
+        "batch",
+        &format!("A5 one-shot {head_ops}"),
+        &words,
+        instrs,
+        0x800 + head_ops * 0x40,
     );
 }
 
@@ -205,6 +263,21 @@ fn bench_set<B: BenchBus>(label: &str) {
 fn main() {
     println!("m68k microbench");
     let only = std::env::args().nth(1);
+    if only.as_deref() == Some("trace-calls") {
+        // Unlike a self-loop, each native trace here executes once before
+        // returning to Rust. This isolates the call-boundary break-even
+        // point seen in branch-heavy application code such as Lemmings.
+        for head_ops in 2..=9 {
+            bench_one_shot_trace(head_ops, 50_000_000);
+        }
+        return;
+    }
+    if only.as_deref() == Some("a5-trace-calls") {
+        for head_ops in 2..=9 {
+            bench_one_shot_a5_trace(head_ops, 50_000_000);
+        }
+        return;
+    }
     if only.as_deref() != Some("batch") {
         bench_set::<PlainBenchBus>("plain");
         bench_set::<LinearMemoryBus>("linearbus");
