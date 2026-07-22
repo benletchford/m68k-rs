@@ -147,6 +147,37 @@ fn bench_loop<B: BenchBus>(
     );
 }
 
+fn bench_batch_loop(label: &str, name: &str, words: &[u16], instrs: u32) {
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (i, word) in words.iter().enumerate() {
+        bus.write_word_at((i * 2) as u32, *word);
+    }
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = 0;
+        cpu.set_a(5, 0x1000);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    let warm = warm_cpu.run_batch(&mut bus, 5_000_000, &[]);
+    assert_eq!(warm.instructions, 5_000_000);
+
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    let result = cpu.run_batch(&mut bus, instrs, &[]);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(result.instructions, instrs);
+    println!(
+        "{label:9} {name:18} {:8.1} M instr/s",
+        instrs as f64 / elapsed / 1_000_000.0
+    );
+}
+
 fn bench_set<B: BenchBus>(label: &str) {
     bench_linear::<B>(label, "linear NOP", 0x4E71, 4, 40_000_000);
     bench_linear::<B>(label, "linear ADDQ", 0x5280, 4, 40_000_000);
@@ -173,6 +204,30 @@ fn bench_set<B: BenchBus>(label: &str) {
 
 fn main() {
     println!("m68k microbench");
-    bench_set::<PlainBenchBus>("plain");
-    bench_set::<LinearMemoryBus>("linearbus");
+    let only = std::env::args().nth(1);
+    if only.as_deref() != Some("batch") {
+        bench_set::<PlainBenchBus>("plain");
+        bench_set::<LinearMemoryBus>("linearbus");
+    }
+    // A5-relative globals and stack temporaries dominate classic Mac code.
+    // This loop mirrors the hottest Lemmings opcode forms found by runtime
+    // profiling while remaining deterministic and self-contained.
+    if only.as_deref() != Some("legacy") {
+        bench_batch_loop(
+            "batch",
+            "classic Mac mix",
+            &[
+                0x4A2D, 0x0100, // TST.B $0100(A5)
+                0x082D, 0x0003, 0x0100, // BTST #3,$0100(A5)
+                0x1B40, 0x0100, // MOVE.B D0,$0100(A5)
+                0x422D, 0x0100, // CLR.B $0100(A5)
+                0x322D, 0x0100, // MOVE.W $0100(A5),D1
+                0x526D, 0x0100, // ADDQ.W #1,$0100(A5)
+                0x2F2D, 0x0100, // MOVE.L $0100(A5),-(A7)
+                0x588F, // ADDQ.L #4,A7
+                0x60DE, // BRA.B back to the first instruction
+            ],
+            200_000_000,
+        );
+    }
 }

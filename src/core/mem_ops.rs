@@ -773,6 +773,236 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
     Some(true)
 }
 
+/// Specialized execution for the common A5-relative data accesses emitted
+/// by classic Mac compilers. AnDisp is unusually hot because A5 is the
+/// application's global-data base. Keeping the extension cursor, resolved
+/// offset and value in locals avoids the generic Ctx/Pending/Loc state
+/// machine while retaining its all-checks-before-commit fallback contract.
+#[inline]
+fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
+    let read_word = |cpu: &CpuCore, pc: u32| -> Result<u32, ()> {
+        let off = win.off(cpu.address(pc), 2).ok_or(())?;
+        Ok(win.read(off, Size::Word))
+    };
+    let locate = |cpu: &CpuCore, reg: u8, disp: u32, size: Size| -> Result<usize, ()> {
+        let raw = (cpu.dar[8 + reg as usize] as i32).wrapping_add(disp as u16 as i16 as i32) as u32;
+        if cpu.is_pre_68020 && size != Size::Byte && (raw & 1) != 0 {
+            return Err(());
+        }
+        win.off(cpu.address(raw), size.bytes()).ok_or(())
+    };
+
+    match op {
+        DecodedMemOp::Move {
+            size,
+            src: FastEa::AnDisp(src),
+            dst: FastEa::DataReg(dst),
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, src, ext, size) else {
+                return Some(false);
+            };
+            let value = win.read(off, size);
+            let mask = size.mask();
+            let dst = dst as usize;
+            cpu.dar[dst] = (cpu.dar[dst] & !mask) | value;
+            cpu.set_logic_flags(value, size);
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::Move {
+            size,
+            src: FastEa::AnDisp(src),
+            dst: FastEa::AddrReg(dst),
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, src, ext, size) else {
+                return Some(false);
+            };
+            let value = win.read(off, size);
+            cpu.dar[8 + dst as usize] = if size == Size::Word {
+                value as u16 as i16 as i32 as u32
+            } else {
+                value
+            };
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::Move {
+            size,
+            src: FastEa::DataReg(src),
+            dst: FastEa::AnDisp(dst),
+        }
+        | DecodedMemOp::Move {
+            size,
+            src: FastEa::AddrReg(src),
+            dst: FastEa::AnDisp(dst),
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, dst, ext, size) else {
+                return Some(false);
+            };
+            let src_index = if matches!(
+                op,
+                DecodedMemOp::Move {
+                    src: FastEa::DataReg(_),
+                    ..
+                }
+            ) {
+                src as usize
+            } else {
+                8 + src as usize
+            };
+            let value = cpu.dar[src_index] & size.mask();
+            win.write(off, size, value);
+            cpu.set_logic_flags(value, size);
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::Move {
+            size,
+            src: FastEa::AnDisp(src),
+            dst: FastEa::AnPreDec(dst),
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(src_off) = locate(cpu, src, ext, size) else {
+                return Some(false);
+            };
+            let dst_addr = cpu.dar[8 + dst as usize].wrapping_sub(ea_step(size, dst));
+            if cpu.is_pre_68020 && size != Size::Byte && (dst_addr & 1) != 0 {
+                return Some(false);
+            }
+            let Some(dst_off) = win.off(cpu.address(dst_addr), size.bytes()) else {
+                return Some(false);
+            };
+            let value = win.read(src_off, size);
+            cpu.dar[8 + dst as usize] = dst_addr;
+            win.write(dst_off, size, value);
+            cpu.set_logic_flags(value, size);
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::Move {
+            size,
+            src: FastEa::AnDisp(src),
+            dst: FastEa::AnDisp(dst),
+        } => {
+            let Ok(src_ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(dst_ext) = read_word(cpu, cpu.pc.wrapping_add(2)) else {
+                return Some(false);
+            };
+            let Ok(src_off) = locate(cpu, src, src_ext, size) else {
+                return Some(false);
+            };
+            let Ok(dst_off) = locate(cpu, dst, dst_ext, size) else {
+                return Some(false);
+            };
+            let value = win.read(src_off, size);
+            win.write(dst_off, size, value);
+            cpu.set_logic_flags(value, size);
+            cpu.pc = cpu.pc.wrapping_add(4);
+            Some(true)
+        }
+        DecodedMemOp::Tst {
+            size,
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, reg, ext, size) else {
+                return Some(false);
+            };
+            cpu.set_logic_flags(win.read(off, size), size);
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::Clr {
+            size,
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, reg, ext, size) else {
+                return Some(false);
+            };
+            win.write(off, size, 0);
+            cpu.n_flag = 0;
+            cpu.not_z_flag = 0;
+            cpu.v_flag = 0;
+            cpu.c_flag = 0;
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::AddqSubq {
+            data,
+            size,
+            ea: FastEa::AnDisp(reg),
+            is_sub,
+        } => {
+            let Ok(ext) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, reg, ext, size) else {
+                return Some(false);
+            };
+            let dst = win.read(off, size);
+            let result = if is_sub {
+                dst.wrapping_sub(data)
+            } else {
+                dst.wrapping_add(data)
+            };
+            win.write(off, size, result & size.mask());
+            if is_sub {
+                cpu.set_sub_flags(data, dst, result, size);
+            } else {
+                cpu.set_add_flags(data, dst, result, size);
+            }
+            cpu.pc = cpu.pc.wrapping_add(2);
+            Some(true)
+        }
+        DecodedMemOp::BitMem {
+            op,
+            bit: BitSource::Imm,
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let Ok(bit) = read_word(cpu, cpu.pc) else {
+                return Some(false);
+            };
+            let Ok(ext) = read_word(cpu, cpu.pc.wrapping_add(2)) else {
+                return Some(false);
+            };
+            let Ok(off) = locate(cpu, reg, ext, Size::Byte) else {
+                return Some(false);
+            };
+            let bit = bit & 7;
+            let mask = 1 << bit;
+            let value = win.read(off, Size::Byte);
+            cpu.not_z_flag = u32::from(value & mask != 0);
+            match op {
+                BitOp::Test => {}
+                BitOp::Set => win.write(off, Size::Byte, value | mask),
+                BitOp::Clear => win.write(off, Size::Byte, value & !mask),
+                BitOp::Change => win.write(off, Size::Byte, value ^ mask),
+            }
+            cpu.pc = cpu.pc.wrapping_add(4);
+            Some(true)
+        }
+        _ => None,
+    }
+}
+
 /// Specialized DBcc/BSR/RTS/Bcc.W execution: at most one extension word,
 /// no EA resolution, so the `Ctx` plumbing is skipped. Mirrors the generic
 /// arms exactly (which remain the single source of truth for the other
@@ -1057,6 +1287,10 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     if let DecodedMemOp::Move { size, src, dst } = op
         && let Some(handled) = fast_move(cpu, win, size, src, dst)
     {
+        return handled;
+    }
+
+    if let Some(handled) = fast_an_disp(cpu, win, op) {
         return handled;
     }
 
@@ -1479,5 +1713,112 @@ fn apply_binary_to_reg(
             cpu.dar[reg] = (cpu.dar[reg] & !mask) | (result & mask);
             cpu.set_logic_flags(result, size);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cpu_with_window(mem: &mut [u8]) -> CpuCore {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.fm_ptr = mem.as_mut_ptr() as usize;
+        cpu.fm_base = 0;
+        cpu.fm_len = mem.len() as u32;
+        cpu.pc = 0x100;
+        cpu.set_a(5, 0x400);
+        cpu
+    }
+
+    #[test]
+    fn fast_an_disp_tst_and_clr_advance_extension_cursor() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x100..0x102].copy_from_slice(&0x0012u16.to_be_bytes());
+        mem[0x412] = 0x80;
+        let mut cpu = cpu_with_window(&mut mem);
+
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::Tst {
+                size: Size::Byte,
+                ea: FastEa::AnDisp(5),
+            }
+        ));
+        assert_eq!(cpu.pc, 0x102);
+        assert_ne!(cpu.n_flag, 0);
+        assert_ne!(cpu.not_z_flag, 0);
+
+        cpu.pc = 0x100;
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::Clr {
+                size: Size::Byte,
+                ea: FastEa::AnDisp(5),
+            }
+        ));
+        assert_eq!(mem[0x412], 0);
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.not_z_flag, 0);
+    }
+
+    #[test]
+    fn fast_an_disp_immediate_bit_uses_both_extension_words() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x100..0x102].copy_from_slice(&3u16.to_be_bytes());
+        mem[0x102..0x104].copy_from_slice(&0x0012u16.to_be_bytes());
+        mem[0x412] = 0b0000_1000;
+        let mut cpu = cpu_with_window(&mut mem);
+
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::BitMem {
+                op: BitOp::Test,
+                bit: BitSource::Imm,
+                ea: FastEa::AnDisp(5),
+            }
+        ));
+        assert_eq!(cpu.pc, 0x104);
+        assert_eq!(cpu.not_z_flag, 1);
+        assert_eq!(mem[0x412], 0b0000_1000);
+    }
+
+    #[test]
+    fn fast_an_disp_move_checks_both_operands_before_commit() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x100..0x102].copy_from_slice(&0x0012u16.to_be_bytes());
+        mem[0x412..0x416].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let mut cpu = cpu_with_window(&mut mem);
+        cpu.set_a(7, 0x800);
+
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::Move {
+                size: Size::Long,
+                src: FastEa::AnDisp(5),
+                dst: FastEa::AnPreDec(7),
+            }
+        ));
+        assert_eq!(cpu.a(7), 0x7FC);
+        assert_eq!(&mem[0x7FC..0x800], &0xDEAD_BEEFu32.to_be_bytes());
+        assert_eq!(cpu.pc, 0x102);
+
+        cpu.pc = 0x100;
+        cpu.set_a(7, 2);
+        let old_flags = (cpu.n_flag, cpu.not_z_flag, cpu.v_flag, cpu.c_flag);
+        assert!(!execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::Move {
+                size: Size::Long,
+                src: FastEa::AnDisp(5),
+                dst: FastEa::AnPreDec(7),
+            }
+        ));
+        assert_eq!(cpu.a(7), 2);
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(
+            (cpu.n_flag, cpu.not_z_flag, cpu.v_flag, cpu.c_flag),
+            old_flags
+        );
     }
 }
