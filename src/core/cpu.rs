@@ -209,6 +209,10 @@ pub struct CpuCore {
     pub(crate) trace_probe_skip: [u32; 4],
     pub(crate) trace_record_skip_at: u8,
     pub(crate) trace_probe_skip_at: u8,
+    /// True while the trace JIT is recording an executed multi-block path.
+    /// Kept on the CPU so the normal instruction loop avoids a TLS lookup
+    /// when no recording is active.
+    pub(crate) trace_recording: bool,
 
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
@@ -264,6 +268,7 @@ impl CpuCore {
             trace_probe_skip: [super::trace_jit::TRACE_PC_NONE; 4],
             trace_record_skip_at: 0,
             trace_probe_skip_at: 0,
+            trace_recording: false,
             change_of_flow: false,
             pref_addr: 0,
             pref_data: 0,
