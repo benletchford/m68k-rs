@@ -425,7 +425,7 @@ impl DecodedSimpleOp {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     pub(crate) fn execute(self, cpu: &mut CpuCore) -> i32 {
         match self {
             Self::Nop => 4,
