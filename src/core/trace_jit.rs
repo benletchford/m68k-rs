@@ -24,7 +24,7 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 #[cfg(not(target_family = "wasm"))]
 use cranelift_module::{Linkage, Module, default_libcall_names};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::fmt;
 #[cfg(not(target_family = "wasm"))]
 use std::mem::{offset_of, size_of, transmute};
@@ -35,6 +35,9 @@ pub(crate) const TRACE_MAX_OPS: usize = 128;
 pub(crate) const TRACE_MIN_OPS: usize = 3;
 const TRACE_MIN_SELF_LOOP_OPS: usize = 2;
 const TRACE_HOT_THRESHOLD: u8 = 2;
+const TRACE_ADAPT_WINDOW: u8 = 64;
+const TRACE_ADAPT_MISMATCHES: u8 = 48;
+const TRACE_MAX_ADAPTIVE_RERECORDS: u8 = 1;
 
 /// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
 pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
@@ -310,14 +313,39 @@ struct CompiledTrace {
     code_start: u32,
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
     code_end: u32,
+    /// A recorded interior branch is a path prediction. Sample its guarded
+    /// exits in bounded windows so an initially rare path cannot permanently
+    /// strand a later dominant path in the interpreter.
+    has_guarded_branch: bool,
+    adaptive_calls: Cell<u32>,
+    adaptive_guard_exits: Cell<u32>,
+    adaptive_rerecords: u8,
     #[cfg(not(target_family = "wasm"))]
     func: TraceFn,
+}
+
+impl CompiledTrace {
+    fn is_guarded_branch_exit(&self, cpu: &CpuCore, ops_done: u32) -> bool {
+        let Some(index) = ops_done.checked_sub(1).map(|index| index as usize) else {
+            return false;
+        };
+        self.ops.get(index).is_some_and(|op| {
+            matches!(
+                op.op,
+                JitTraceOp::Branch {
+                    expected_taken: Some(_),
+                    ..
+                }
+            ) && cpu.ppc == op.pc
+        })
+    }
 }
 
 struct TraceRecording {
     start_pc: u32,
     cpu_type: CpuType,
     ops: Vec<TraceBuildOp>,
+    adaptive_rerecords: u8,
 }
 
 enum TraceSlot {
@@ -326,6 +354,7 @@ enum TraceSlot {
         pc: u32,
         cpu_type: CpuType,
         hits: u8,
+        adaptive_rerecords: u8,
     },
     Rejected {
         pc: u32,
@@ -538,11 +567,10 @@ impl TraceJit {
                 let by_cycles = (cpu.cycles_remaining / trace.max_cycles).max(1) as u32;
                 by_instrs.min(by_cycles)
             };
-
             let mut cycles_total = 0i64;
             let mut retired = 0u32;
             let mut full_iters = 0u32;
-            loop {
+            let guarded_branch_exit = loop {
                 #[cfg(not(target_family = "wasm"))]
                 let packed = unsafe { (trace.func)(cpu as *mut CpuCore) };
                 #[cfg(target_family = "wasm")]
@@ -550,14 +578,21 @@ impl TraceJit {
                     execute_portable_trace(cpu, &trace.ops, trace.code_start, trace.code_end);
                 cycles_total += (packed as u32) as i64;
                 let ops_done = (packed >> 32) as u32;
+                let partial_call = ops_done < ops_len;
+                let guarded_branch_exit =
+                    partial_call && trace.is_guarded_branch_exit(cpu, ops_done);
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_native_call(pc, cpu_type, ops_done);
+                #[cfg(feature = "trace-profile")]
+                if guarded_branch_exit {
+                    super::trace_profile::note_guarded_branch_exit(pc, cpu_type);
+                }
                 retired += ops_done;
-                if ops_done < ops_len {
+                if partial_call {
                     // A memory check bailed before its op, or a guarded
                     // interior branch took a different path. PC identifies
                     // the correct interpreter/next-trace continuation.
-                    break;
+                    break guarded_branch_exit;
                 }
                 full_iters += 1;
                 // Re-entering the (already validated) loop head is the only
@@ -566,7 +601,32 @@ impl TraceJit {
                 // committing, so nothing needs re-checking between
                 // iterations.
                 if full_iters >= max_iters || cpu.pc != pc {
-                    break;
+                    break false;
+                }
+            };
+            let mut rerecord_dominant_path = false;
+            if guarded_branch_exit
+                && trace.has_guarded_branch
+                && trace.adaptive_rerecords < TRACE_MAX_ADAPTIVE_RERECORDS
+            {
+                // A guarded exit ends this Rust entry, so `full_iters + 1`
+                // is the exact number of native calls since entry. Updating
+                // only here keeps correctly predicted traces off the
+                // adaptation hot path while still distinguishing dominant
+                // side exits from genuinely alternating branches.
+                let calls = trace
+                    .adaptive_calls
+                    .get()
+                    .saturating_add(full_iters.saturating_add(1));
+                let exits = trace.adaptive_guard_exits.get().saturating_add(1);
+                trace.adaptive_calls.set(calls);
+                trace.adaptive_guard_exits.set(exits);
+                if calls >= u32::from(TRACE_ADAPT_WINDOW) {
+                    rerecord_dominant_path = exits >= u32::from(TRACE_ADAPT_MISMATCHES)
+                        && u64::from(exits) * u64::from(TRACE_ADAPT_WINDOW)
+                            >= u64::from(calls) * u64::from(TRACE_ADAPT_MISMATCHES);
+                    trace.adaptive_calls.set(0);
+                    trace.adaptive_guard_exits.set(0);
                 }
             }
             cpu.cycles_remaining -= i32::try_from(cycles_total).unwrap_or(i32::MAX);
@@ -576,6 +636,19 @@ impl TraceJit {
                 // progress through full dispatch.
                 return None;
             }
+            if rerecord_dominant_path {
+                let adaptive_rerecords = trace.adaptive_rerecords.saturating_add(1);
+                self.slots[idx] = TraceSlot::Counting {
+                    pc,
+                    cpu_type,
+                    hits: 0,
+                    adaptive_rerecords,
+                };
+                cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+                cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
+                #[cfg(feature = "trace-profile")]
+                super::trace_profile::note_adaptive_rerecord(pc, cpu_type);
+            }
             return Some((CachedRunResult::Ran, retired));
         }
 
@@ -584,6 +657,7 @@ impl TraceJit {
                 pc: counted_pc,
                 cpu_type: counted_type,
                 hits,
+                adaptive_rerecords,
             } if *counted_pc == pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
                 if *hits < TRACE_HOT_THRESHOLD {
@@ -593,6 +667,7 @@ impl TraceJit {
                     start_pc: pc,
                     cpu_type,
                     ops: Vec::with_capacity(TRACE_MAX_OPS),
+                    adaptive_rerecords: *adaptive_rerecords,
                 });
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_recording(pc, cpu_type);
@@ -639,6 +714,7 @@ impl TraceJit {
                     pc,
                     cpu_type,
                     hits: 1,
+                    adaptive_rerecords: 0,
                 };
                 TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
             }
@@ -686,11 +762,15 @@ impl TraceJit {
         let idx = trace_cache_index(recording.start_pc);
         let start_pc = recording.start_pc;
         let cpu_type = recording.cpu_type;
+        let adaptive_rerecords = recording.adaptive_rerecords;
         #[cfg(feature = "trace-profile")]
         let recorded_ops = recording.ops.len();
         self.slots[idx] =
             match self.compile_decoded_ops(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc)) {
-                Some(trace) => TraceSlot::Compiled(trace),
+                Some(mut trace) => {
+                    trace.adaptive_rerecords = adaptive_rerecords;
+                    TraceSlot::Compiled(trace)
+                }
                 None => {
                     push_probe_skip(cpu, start_pc);
                     TraceSlot::Rejected {
@@ -1044,6 +1124,18 @@ impl TraceJit {
             needs_window,
             code_start,
             code_end,
+            has_guarded_branch: ops.iter().any(|op| {
+                matches!(
+                    op.op,
+                    JitTraceOp::Branch {
+                        expected_taken: Some(_),
+                        ..
+                    }
+                )
+            }),
+            adaptive_calls: Cell::new(0),
+            adaptive_guard_exits: Cell::new(0),
+            adaptive_rerecords: 0,
             func,
         })
     }
@@ -1061,6 +1153,18 @@ impl TraceJit {
             needs_window: params.needs_window,
             code_start: params.code_start,
             code_end: params.code_end,
+            has_guarded_branch: params.ops.iter().any(|op| {
+                matches!(
+                    op.op,
+                    JitTraceOp::Branch {
+                        expected_taken: Some(_),
+                        ..
+                    }
+                )
+            }),
+            adaptive_calls: Cell::new(0),
+            adaptive_guard_exits: Cell::new(0),
+            adaptive_rerecords: 0,
         })
     }
 }

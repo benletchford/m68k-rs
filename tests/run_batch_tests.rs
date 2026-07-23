@@ -162,6 +162,68 @@ fn multi_block_trace_guard_side_exit_matches_step() {
 }
 
 #[test]
+fn multi_block_trace_path_change_matches_step() {
+    // First record the BNE path, then switch to the opposite, dominant path.
+    // The common path is the same CMP/branch/copy/DBRA topology observed in
+    // Lemmings; the outer path resets its pointers and counter.
+    let words = [
+        (0x1000, 0xB210), // CMP.B (A0),D1
+        (0x1002, 0x6606), // BNE.S outer
+        (0x1004, 0x10DC), // MOVE.B (A4)+,(A0)+
+        (0x1006, 0x51C8), // DBRA D0,head
+        (0x1008, 0xFFF8),
+        (0x100A, 0x2042), // outer: MOVEA.L D2,A0
+        (0x100C, 0x2843), // MOVEA.L D3,A4
+        (0x100E, 0x707F), // MOVEQ #127,D0
+        (0x1010, 0x5884), // ADDQ.L #4,D4
+        (0x1012, 0x60EC), // BRA.S head
+    ];
+    let prepare = || {
+        let mut cpu = cpu_at(0x1000);
+        cpu.set_a(0, 0x2000);
+        cpu.set_a(4, 0x3000);
+        cpu.set_d(0, 127);
+        cpu.set_d(1, 1);
+        cpu.set_d(2, 0x2000);
+        cpu.set_d(3, 0x3000);
+        cpu
+    };
+
+    let mut batch_bus = bus_with(&words);
+    let mut batch_cpu = prepare();
+    assert_eq!(
+        batch_cpu.run_batch(&mut batch_bus, 14, &[0]).instructions,
+        14
+    );
+    batch_cpu.set_d(1, 0);
+    let result = batch_cpu.run_batch(&mut batch_bus, 100_000, &[0]);
+    assert_eq!(result.instructions, 100_000);
+
+    let mut step_bus = bus_with(&words);
+    let mut step_cpu = prepare();
+    for _ in 0..14 {
+        assert!(matches!(
+            step_cpu.step(&mut step_bus),
+            m68k::StepResult::Ok { .. }
+        ));
+    }
+    step_cpu.set_d(1, 0);
+    for _ in 0..100_000 {
+        assert!(matches!(
+            step_cpu.step(&mut step_bus),
+            m68k::StepResult::Ok { .. }
+        ));
+    }
+
+    assert_eq!(batch_cpu.pc, step_cpu.pc);
+    assert_eq!(batch_cpu.get_sr(), step_cpu.get_sr());
+    for reg in 0..8 {
+        assert_eq!(batch_cpu.d(reg), step_cpu.d(reg), "D{reg}");
+        assert_eq!(batch_cpu.a(reg), step_cpu.a(reg), "A{reg}");
+    }
+}
+
+#[test]
 fn aline_trap_exits_without_counting_the_trap() {
     // NOP ; NOP ; A-line ; NOP
     let mut bus = bus_with(&[
