@@ -77,6 +77,91 @@ fn unrelated_watch_keeps_jit_loop_budget_exact() {
 }
 
 #[test]
+fn multi_block_trace_follows_recorded_taken_branch() {
+    // loop: ADDQ D0; BNE skip; NOP; skip: ADDQ D1; BRA loop
+    // BNE is an interior branch. A region trace follows its observed taken
+    // edge, skips the NOP, and closes only at the final backward BRA.
+    let mut bus = bus_with(&[
+        (0x1000, 0x5280),
+        (0x1002, 0x6602),
+        (0x1004, 0x4E71),
+        (0x1006, 0x5281),
+        (0x1008, 0x60F6),
+    ]);
+    let mut cpu = cpu_at(0x1000);
+
+    let result = cpu.run_batch(&mut bus, 1_000_000, &[0]);
+
+    assert_eq!(result.exit, BatchExit::BudgetExhausted);
+    assert_eq!(result.instructions, 1_000_000);
+    assert_eq!(cpu.d(0), 250_000);
+    assert_eq!(cpu.d(1), 250_000);
+    assert_eq!(cpu.pc, 0x1000);
+}
+
+#[test]
+fn multi_block_trace_yields_before_interior_watched_pc() {
+    let mut bus = bus_with(&[
+        (0x1000, 0x5280), // ADDQ.L #1,D0
+        (0x1002, 0x6602), // BNE.S 0x1006
+        (0x1004, 0x4E71), // uncommon fallthrough
+        (0x1006, 0x5281), // ADDQ.L #1,D1
+        (0x1008, 0x60F6), // BRA.S 0x1000
+    ]);
+    let mut cpu = cpu_at(0x1000);
+
+    // Compile and exercise the region before enabling the watch.
+    let warmup = cpu.run_batch(&mut bus, 100, &[]);
+    assert_eq!(warmup.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    let d0_before = cpu.d(0);
+    let d1_before = cpu.d(1);
+
+    let result = cpu.run_batch(&mut bus, 100, &[0x1006]);
+
+    assert_eq!(result.exit, BatchExit::WatchedPc { pc: 0x1006 });
+    assert_eq!(result.instructions, 2);
+    assert_eq!(cpu.pc, 0x1006);
+    assert_eq!(cpu.d(0), d0_before + 1);
+    assert_eq!(cpu.d(1), d1_before);
+}
+
+#[test]
+fn multi_block_trace_guard_side_exit_matches_step() {
+    // The recorded BNE path is initially taken, but D0 reaches zero and
+    // forces one not-taken side exit through the NOP before paths rejoin.
+    let words = [
+        (0x1000, 0x5340), // SUBQ.W #1,D0
+        (0x1002, 0x6602), // BNE.S 0x1006
+        (0x1004, 0x4E71), // uncommon fallthrough
+        (0x1006, 0x5281), // ADDQ.L #1,D1
+        (0x1008, 0x60F6), // BRA.S 0x1000
+    ];
+    let mut batch_bus = bus_with(&words);
+    let mut batch_cpu = cpu_at(0x1000);
+    batch_cpu.set_d(0, 6);
+    let result = batch_cpu.run_batch(&mut batch_bus, 100_000, &[0]);
+    assert_eq!(result.instructions, 100_000);
+
+    let mut step_bus = bus_with(&words);
+    let mut step_cpu = cpu_at(0x1000);
+    step_cpu.set_d(0, 6);
+    for _ in 0..100_000 {
+        assert!(matches!(
+            step_cpu.step(&mut step_bus),
+            m68k::StepResult::Ok { .. }
+        ));
+    }
+
+    assert_eq!(batch_cpu.pc, step_cpu.pc);
+    assert_eq!(batch_cpu.get_sr(), step_cpu.get_sr());
+    for reg in 0..8 {
+        assert_eq!(batch_cpu.d(reg), step_cpu.d(reg), "D{reg}");
+        assert_eq!(batch_cpu.a(reg), step_cpu.a(reg), "A{reg}");
+    }
+}
+
+#[test]
 fn aline_trap_exits_without_counting_the_trap() {
     // NOP ; NOP ; A-line ; NOP
     let mut bus = bus_with(&[

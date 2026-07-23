@@ -278,6 +278,21 @@ fn main() {
         }
         return;
     }
+    if only.as_deref() == Some("region") {
+        bench_batch_loop(
+            "batch",
+            "multi-block region",
+            &[
+                0x5280, // ADDQ.L #1,D0
+                0x6602, // BNE.S skip
+                0x4E71, // uncommon fallthrough
+                0x5281, // skip: ADDQ.L #1,D1
+                0x60F6, // BRA.S loop
+            ],
+            200_000_000,
+        );
+        return;
+    }
     if only.as_deref() != Some("batch") {
         bench_set::<PlainBenchBus>("plain");
         bench_set::<LinearMemoryBus>("linearbus");

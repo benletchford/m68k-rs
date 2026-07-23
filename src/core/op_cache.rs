@@ -419,6 +419,7 @@ impl DecodedSimpleOp {
                 condition,
                 displacement: displacement as i32,
                 length: 2,
+                expected_taken: None,
             }),
             _ => None,
         }
@@ -943,7 +944,7 @@ impl CpuCore {
             if probe {
                 probe = false;
                 if let Some((result, _instructions)) =
-                    trace_jit::try_execute_trace(self, bus, cpu_type, u32::MAX, false)
+                    trace_jit::try_execute_trace(self, bus, cpu_type, u32::MAX, false, &[])
                 {
                     match result {
                         CachedRunResult::Ran => {
@@ -964,6 +965,7 @@ impl CpuCore {
             self.ir = opcode as u32;
 
             let Some(op) = self.decoded_simple_op(opcode, cpu_type) else {
+                trace_jit::stop_recording(self);
                 return CachedRunResult::Miss(opcode);
             };
             let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
@@ -972,6 +974,7 @@ impl CpuCore {
                 None
             };
             let cycles = op.execute(self);
+            trace_jit::record_executed(self, bus, self.ppc, self.pc);
             if let Some(branch_pc) = branch_pc
                 && self.pc <= branch_pc
             {
@@ -980,6 +983,7 @@ impl CpuCore {
             self.cycles_remaining -= cycles;
         }
 
+        trace_jit::stop_recording(self);
         CachedRunResult::Ran
     }
 
@@ -990,9 +994,9 @@ impl CpuCore {
     /// - `budget` counts retired instructions, and `*retired` is
     ///   incremented in place so the caller keeps an exact count even
     ///   when JIT traces retire many instructions per call.
-    /// - Traces are only attempted while at least `TRACE_MAX_OPS`
-    ///   instructions of budget remain, so a trace can never overshoot
-    ///   the budget.
+    /// - Traces are only attempted while at least `TRACE_MIN_OPS`
+    ///   instructions remain; the trace itself checks its exact length
+    ///   before entry, so it cannot overshoot the budget.
     /// - After every retired instruction (or trace), the new PC is
     ///   checked against `watch_pcs`.
     pub(crate) fn run_decoded_simple_batch<B: AddressBus>(
@@ -1011,7 +1015,7 @@ impl CpuCore {
         let mut probe = probe_on_entry && trace_jit::has_trace_candidates();
 
         while remaining > 0 {
-            if probe && remaining >= trace_jit::TRACE_MAX_OPS as u32 {
+            if probe && remaining >= trace_jit::TRACE_MIN_OPS as u32 {
                 // run_batch is instruction-budgeted, not cycle-budgeted.
                 // A long-running self-loop can consume the synthetic cycle
                 // headroom in one trace call; replenish it before every
@@ -1025,9 +1029,14 @@ impl CpuCore {
                 // having an unrelated watch (Systemless always watches PC
                 // 0 for clean exit) must not serialize every JIT iteration.
                 let single_iter = watch && watch_pcs.contains(&self.pc);
-                if let Some((result, instructions)) =
-                    trace_jit::try_execute_trace(self, bus, cpu_type, remaining, single_iter)
-                {
+                if let Some((result, instructions)) = trace_jit::try_execute_trace(
+                    self,
+                    bus,
+                    cpu_type,
+                    remaining,
+                    single_iter,
+                    watch_pcs,
+                ) {
                     match result {
                         CachedRunResult::Ran => {
                             remaining -= instructions;
@@ -1082,6 +1091,7 @@ impl CpuCore {
                         None
                     };
                     let _cycles = op.execute(self);
+                    trace_jit::record_executed(self, bus, self.ppc, self.pc);
                     if let Some(branch_pc) = branch_pc
                         && self.pc <= branch_pc
                     {
@@ -1090,21 +1100,28 @@ impl CpuCore {
                 }
                 CachedOp::Mem(op) => {
                     if !super::mem_ops::execute_mem_op(self, op) {
+                        trace_jit::stop_recording(self);
                         return BatchInnerExit::Miss(opcode);
                     }
+                    trace_jit::record_executed(self, bus, self.ppc, self.pc);
                     if self.pc <= self.ppc {
                         probe = trace_jit::note_backward_branch(self, cpu_type);
                     }
                 }
-                CachedOp::Complex => return BatchInnerExit::Miss(opcode),
+                CachedOp::Complex => {
+                    trace_jit::stop_recording(self);
+                    return BatchInnerExit::Miss(opcode);
+                }
             }
             remaining -= 1;
             *retired += 1;
             if watch && watch_pcs.contains(&self.pc) {
+                trace_jit::stop_recording(self);
                 return BatchInnerExit::Watched(self.pc);
             }
         }
 
+        trace_jit::stop_recording(self);
         BatchInnerExit::Budget
     }
 
