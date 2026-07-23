@@ -61,6 +61,22 @@ fn budget_exhausted_count_is_exact_with_jit_traces() {
 }
 
 #[test]
+fn unrelated_watch_keeps_jit_loop_budget_exact() {
+    // Systemless always watches PC 0 for a clean exit. A trace whose loop
+    // head is elsewhere may run multiple iterations per native call, but
+    // must still stop at the exact requested instruction budget.
+    let mut bus = bus_with(&[(0x1000, 0x5280), (0x1002, 0x60FC)]);
+    let mut cpu = cpu_at(0x1000);
+
+    let result = cpu.run_batch(&mut bus, 1_000_001, &[0]);
+
+    assert_eq!(result.exit, BatchExit::BudgetExhausted);
+    assert_eq!(result.instructions, 1_000_001);
+    assert_eq!(cpu.d(0), 500_001);
+    assert_eq!(cpu.pc, 0x1002);
+}
+
+#[test]
 fn aline_trap_exits_without_counting_the_trap() {
     // NOP ; NOP ; A-line ; NOP
     let mut bus = bus_with(&[

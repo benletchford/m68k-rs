@@ -1012,9 +1012,21 @@ impl CpuCore {
 
         while remaining > 0 {
             if probe && remaining >= trace_jit::TRACE_MAX_OPS as u32 {
+                // run_batch is instruction-budgeted, not cycle-budgeted.
+                // A long-running self-loop can consume the synthetic cycle
+                // headroom in one trace call; replenish it before every
+                // probe so subsequent iterations do not silently fall back
+                // to the interpreter. Cycle-budgeted callers use the other
+                // decoded-op loop and retain their real remaining budget.
+                self.cycles_remaining = i32::MAX / 2;
                 probe = false;
+                // A self-loop only needs to stop after one iteration when
+                // returning to its own head would hit a watched PC. Merely
+                // having an unrelated watch (Systemless always watches PC
+                // 0 for clean exit) must not serialize every JIT iteration.
+                let single_iter = watch && watch_pcs.contains(&self.pc);
                 if let Some((result, instructions)) =
-                    trace_jit::try_execute_trace(self, bus, cpu_type, remaining, watch)
+                    trace_jit::try_execute_trace(self, bus, cpu_type, remaining, single_iter)
                 {
                     match result {
                         CachedRunResult::Ran => {
