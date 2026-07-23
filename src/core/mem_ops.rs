@@ -1146,6 +1146,7 @@ fn brief_index(cpu: &CpuCore, pending: &Pending, base: u32, ext: u32) -> Option<
 
 /// Resolve one EA to a location, reading extension words and recording
 /// pending register updates. No CPU state is modified.
+#[inline(always)]
 fn resolve(cpu: &CpuCore, win: Win, ea: FastEa, size: Size, ctx: &mut Ctx) -> Option<Loc> {
     let mem = |cpu: &CpuCore, ctx: &Ctx, raw: u32| -> Option<Loc> {
         if ctx.aligned_only && size != Size::Byte && (raw & 1) != 0 {
@@ -1249,7 +1250,7 @@ fn resolve_control_addr(cpu: &CpuCore, win: Win, ea: FastEa, ctx: &mut Ctx) -> O
     }
 }
 
-#[inline]
+#[inline(always)]
 fn load(cpu: &CpuCore, win: Win, loc: &Loc, size: Size) -> u32 {
     match *loc {
         Loc::Reg(i) => cpu.dar[i] & size.mask(),
@@ -1258,7 +1259,7 @@ fn load(cpu: &CpuCore, win: Win, loc: &Loc, size: Size) -> u32 {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn store(cpu: &mut CpuCore, win: Win, loc: &Loc, size: Size, value: u32) {
     match *loc {
         Loc::Reg(i) => {
