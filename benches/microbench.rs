@@ -236,6 +236,48 @@ fn bench_one_shot_a5_trace(head_ops: usize, instrs: u32) {
     );
 }
 
+/// Measure decoded generic memory operations without allowing a backward
+/// branch to turn the workload into a native JIT loop. Each pass walks the
+/// same straight-line code, retaining the decoded-op cache while resetting
+/// only the architectural state changed by the instruction stream.
+fn bench_generic_memory(name: &str, words: &[u16], instrs_per_pattern: u32) {
+    const CODE_BASE: usize = 0x100;
+    const PATTERNS: u32 = 16_384;
+    const PASSES: u32 = 512;
+    let mut bus = LinearMemoryBus::new(0x10_0000);
+    for pattern in 0..PATTERNS as usize {
+        for (word, value) in words.iter().enumerate() {
+            bus.write_word_at(
+                (CODE_BASE + (pattern * words.len() + word) * 2) as u32,
+                *value,
+            );
+        }
+    }
+
+    let instrs_per_pass = PATTERNS * instrs_per_pattern;
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68040);
+    cpu.set_sr(0x2700);
+    cpu.pc = CODE_BASE as u32;
+    cpu.set_a(0, 0x80000);
+    let warm = cpu.run_batch(&mut bus, instrs_per_pass, &[0]);
+    assert_eq!(warm.instructions, instrs_per_pass);
+
+    let start = Instant::now();
+    for _ in 0..PASSES {
+        cpu.pc = CODE_BASE as u32;
+        cpu.set_a(0, 0x80000);
+        let result = cpu.run_batch(&mut bus, instrs_per_pass, &[0]);
+        assert_eq!(result.instructions, instrs_per_pass);
+    }
+    let elapsed = start.elapsed().as_secs_f64();
+    let instrs = u64::from(instrs_per_pass) * u64::from(PASSES);
+    println!(
+        "batch     {name:18} {:8.1} M instr/s",
+        instrs as f64 / elapsed / 1_000_000.0
+    );
+}
+
 fn bench_set<B: BenchBus>(label: &str) {
     bench_linear::<B>(label, "linear NOP", 0x4E71, 4, 40_000_000);
     bench_linear::<B>(label, "linear ADDQ", 0x5280, 4, 40_000_000);
@@ -276,6 +318,13 @@ fn main() {
         for head_ops in 2..=9 {
             bench_one_shot_a5_trace(head_ops, 50_000_000);
         }
+        return;
+    }
+    if only.as_deref() == Some("generic-memory") {
+        bench_generic_memory("TST.B (A0)", &[0x4A10], 1);
+        bench_generic_memory("TST.B (A0)+", &[0x4A18], 1);
+        bench_generic_memory("TST.B index", &[0x4A30, 0x0000], 1);
+        bench_generic_memory("ADD.W (A0),D0", &[0xD050], 1);
         return;
     }
     if only.as_deref() == Some("region") {
