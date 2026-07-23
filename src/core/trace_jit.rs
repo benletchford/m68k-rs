@@ -33,6 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const TRACE_CACHE_SIZE: usize = 4096;
 pub(crate) const TRACE_MAX_OPS: usize = 128;
 pub(crate) const TRACE_MIN_OPS: usize = 3;
+const TRACE_MIN_SELF_LOOP_OPS: usize = 2;
 const TRACE_HOT_THRESHOLD: u8 = 2;
 
 /// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
@@ -779,7 +780,20 @@ impl TraceJit {
         ops: Vec<TraceBuildOp>,
         recorded_exit_pc: Option<u32>,
     ) -> Option<CompiledTrace> {
-        if ops.len() < TRACE_MIN_OPS || !ops.last().is_some_and(|op| op.op.ends_trace()) {
+        if !ops.last().is_some_and(|op| op.op.ends_trace()) {
+            return None;
+        }
+
+        let self_loop = recorded_exit_pc == Some(start_pc)
+            || ops
+                .last()
+                .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
+        let min_ops = if self_loop {
+            TRACE_MIN_SELF_LOOP_OPS
+        } else {
+            TRACE_MIN_OPS
+        };
+        if ops.len() < min_ops {
             return None;
         }
 
@@ -808,11 +822,6 @@ impl TraceJit {
                     .wrapping_sub(start_pc)
             );
         }
-
-        let self_loop = recorded_exit_pc == Some(start_pc)
-            || ops
-                .last()
-                .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
 
         // A checked memory CMP does not amortize trace validation and the
         // native/Rust boundary in the short non-self-loop regions measured

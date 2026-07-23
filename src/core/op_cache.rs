@@ -1106,6 +1106,8 @@ impl CpuCore {
                         trace_jit::stop_recording(self);
                         return BatchInnerExit::Miss(opcode);
                     }
+                    #[cfg(feature = "trace-profile")]
+                    super::trace_profile::note_decoded_mem(self.ppc, opcode);
                     trace_jit::record_executed(self, bus, self.ppc, self.pc);
                     if self.pc <= self.ppc {
                         probe = trace_jit::note_backward_branch(self, cpu_type);

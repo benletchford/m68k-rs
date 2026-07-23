@@ -1161,6 +1161,22 @@ fn mem_trace_memcpy_loop_matches_step() {
     });
 }
 
+/// A memory operation followed immediately by DBRA is a common 68k copy-loop
+/// shape. It must remain exact when admitted as the minimum two-op self-loop.
+#[test]
+fn mem_trace_two_op_memcpy_loop_matches_step() {
+    let words = &[
+        0x22D8, // $1000: MOVE.L (A0)+,(A1)+
+        0x51C8, 0xFFFC, // $1002: DBRA D0,$1000
+        0xA000, // $1006: sentinel
+    ];
+    assert_fastmem_matches_step("two-op mem-trace memcpy", words, CpuType::M68000, |cpu| {
+        cpu.set_a(0, 0x2000);
+        cpu.set_a(1, 0x3000);
+        cpu.set_d(0, 127);
+    });
+}
+
 /// Backward word copy with pre-decrement on both sides.
 #[test]
 fn mem_trace_predec_copy_matches_step() {

@@ -174,6 +174,7 @@ fn measure_batch_loop_at(words: &[u16], instrs: u32, code_base: usize) -> f64 {
         cpu.set_a(5, 0x1000);
         cpu.set_a(6, 0x5000);
         cpu.set_a(7, 0x8000);
+        cpu.set_d(2, 0x8000);
         cpu.set_d(7, 1);
         cpu
     };
@@ -387,6 +388,67 @@ fn bench_lemmings_self_loops() {
     );
 }
 
+/// The dominant decoded-memory sites remaining after memory-source CMP
+/// traces are two-instruction copy/fill loops. Each synthetic outer loop
+/// resets its pointers and counter so the measured inner DBRA loop can run
+/// indefinitely without leaving the fastmem window.
+fn bench_lemmings_two_op_memory_loops() {
+    const SCALE: u32 = 10;
+    let cases = [
+        (
+            "MOVE.B D1,(A0)+",
+            vec![
+                0x2042, // MOVEA.L D2,A0
+                0x707F, // MOVEQ #127,D0
+                0x10C1, // inner: MOVE.B D1,(A0)+
+                0x51C8, 0xFFFC, // DBRA D0,inner
+                0x60F4, // BRA.S outer
+            ],
+            3_702_308u32,
+        ),
+        (
+            "MOVE.B (A4)+,(A0)+",
+            vec![
+                0x2042, // MOVEA.L D2,A0
+                0x2842, // MOVEA.L D2,A4
+                0x707F, // MOVEQ #127,D0
+                0x10DC, // inner: MOVE.B (A4)+,(A0)+
+                0x51C8, 0xFFFC, // DBRA D0,inner
+                0x60F2, // BRA.S outer
+            ],
+            4_532_090u32,
+        ),
+        (
+            "MOVE.L (A1)+,(A0)+",
+            vec![
+                0x2042, // MOVEA.L D2,A0
+                0x2242, // MOVEA.L D2,A1
+                0x707F, // MOVEQ #127,D0
+                0x20D9, // inner: MOVE.L (A1)+,(A0)+
+                0x51C8, 0xFFFC, // DBRA D0,inner
+                0x60F2, // BRA.S outer
+            ],
+            2_405_305u32,
+        ),
+    ];
+    let mut total_instrs = 0u64;
+    let mut total_elapsed = 0.0;
+    for (index, (name, words, loop_iterations)) in cases.iter().enumerate() {
+        let instrs = loop_iterations * 2 * SCALE;
+        let elapsed = measure_batch_loop_at(words, instrs, 0x4000 + index * 0x100);
+        total_instrs += u64::from(instrs);
+        total_elapsed += elapsed;
+        println!(
+            "batch     {name:23} {:8.1} M instr/s",
+            f64::from(instrs) / elapsed / 1_000_000.0
+        );
+    }
+    println!(
+        "batch     Lemmings two-op loops   {:8.1} M instr/s",
+        total_instrs as f64 / total_elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -478,6 +540,10 @@ fn main() {
     }
     if only.as_deref() == Some("lemmings-self-loops") {
         bench_lemmings_self_loops();
+        return;
+    }
+    if only.as_deref() == Some("lemmings-two-op-loops") {
+        bench_lemmings_two_op_memory_loops();
         return;
     }
     if only.as_deref() == Some("a5-trace-calls") {
