@@ -1246,3 +1246,39 @@ fn mem_trace_unaligned_matches_step_on_68020() {
         cpu.set_d(2, 0x0BAD_0001);
     });
 }
+
+/// The two memory-source CMP forms found at the hottest rejected Lemmings
+/// trace heads must compile without changing architectural behavior.
+#[test]
+fn mem_trace_cmp_sources_match_step() {
+    let indirect = &[
+        0xB210, // $1000: CMP.B (A0),D1
+        0x4E71, // $1002: NOP (three-op minimum with DBRA)
+        0x51C8, 0xFFFA, // $1004: DBRA D0,$1000
+        0xA000, // $1008: sentinel
+    ];
+    assert_fastmem_matches_step("mem-trace cmp indirect", indirect, CpuType::M68000, |cpu| {
+        cpu.set_a(0, 0x2000);
+        cpu.set_d(0, 127);
+        cpu.set_d(1, 0x1234_567F);
+        cpu.set_ccr(0x10);
+    });
+
+    let displacement = &[
+        0xBC6E, 0x0010, // $1000: CMP.W $0010(A6),D6
+        0x4E71, // $1004: NOP
+        0x51C8, 0xFFF8, // $1006: DBRA D0,$1000
+        0xA000, // $100A: sentinel
+    ];
+    assert_fastmem_matches_step(
+        "mem-trace cmp displacement",
+        displacement,
+        CpuType::M68000,
+        |cpu| {
+            cpu.set_a(6, 0x2100);
+            cpu.set_d(0, 127);
+            cpu.set_d(6, 0xCAFE_BEEF);
+            cpu.set_ccr(0x10);
+        },
+    );
+}

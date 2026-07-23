@@ -9,7 +9,7 @@ use super::cpu::{CpuCore, NFLAG_SET};
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::mem_ops::{BitSource, DecodedMemOp, FastEa};
 use super::memory::AddressBus;
-use super::op_cache::{BitOp, CachedRunResult, DecodedSimpleOp};
+use super::op_cache::{BinaryOp, BitOp, CachedRunResult, DecodedSimpleOp};
 use super::types::{CpuType, Size};
 #[cfg(not(target_family = "wasm"))]
 use cranelift_codegen::Context;
@@ -233,6 +233,15 @@ pub(crate) enum JitTraceOp {
         size: Size,
         src: JitEa,
         dst: JitEa,
+    },
+    /// Read-only ALU operation from fast memory to a data register. The
+    /// initial decoder deliberately admits only CMP with `(An)`/`d16(An)`
+    /// sources; the generic shape leaves room for other read-only forms.
+    AluMemToReg {
+        op: JitBinaryOp,
+        size: Size,
+        src: JitEa,
+        dst: u8,
     },
     /// Hot Classic Mac memory forms using the A5-relative global-data
     /// convention. These require extension words, so they are represented
@@ -540,6 +549,8 @@ impl TraceJit {
                     execute_portable_trace(cpu, &trace.ops, trace.code_start, trace.code_end);
                 cycles_total += (packed as u32) as i64;
                 let ops_done = (packed >> 32) as u32;
+                #[cfg(feature = "trace-profile")]
+                super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                 retired += ops_done;
                 if ops_done < ops_len {
                     // A memory check bailed before its op, or a guarded
@@ -582,6 +593,8 @@ impl TraceJit {
                     cpu_type,
                     ops: Vec::with_capacity(TRACE_MAX_OPS),
                 });
+                #[cfg(feature = "trace-profile")]
+                super::trace_profile::note_recording(pc, cpu_type);
                 cpu.trace_recording = true;
                 None
             }
@@ -631,6 +644,17 @@ impl TraceJit {
         }
     }
 
+    #[cfg(feature = "trace-profile")]
+    fn is_rejected(&self, pc: u32, cpu_type: CpuType) -> bool {
+        matches!(
+            &self.slots[trace_cache_index(pc)],
+            TraceSlot::Rejected {
+                pc: rejected_pc,
+                cpu_type: rejected_type,
+            } if *rejected_pc == pc && *rejected_type == cpu_type
+        )
+    }
+
     fn reject_recording(&mut self, cpu: &mut CpuCore) {
         if let Some(recording) = self.recording.take() {
             let idx = trace_cache_index(recording.start_pc);
@@ -661,6 +685,8 @@ impl TraceJit {
         let idx = trace_cache_index(recording.start_pc);
         let start_pc = recording.start_pc;
         let cpu_type = recording.cpu_type;
+        #[cfg(feature = "trace-profile")]
+        let recorded_ops = recording.ops.len();
         self.slots[idx] =
             match self.compile_decoded_ops(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc)) {
                 Some(trace) => TraceSlot::Compiled(trace),
@@ -672,6 +698,10 @@ impl TraceJit {
                     }
                 }
             };
+        #[cfg(feature = "trace-profile")]
+        if matches!(self.slots[idx], TraceSlot::Compiled(_)) {
+            super::trace_profile::note_compiled(start_pc, cpu_type, recorded_ops);
+        }
     }
 
     fn record_executed<B: AddressBus>(
@@ -693,6 +723,14 @@ impl TraceJit {
         }
 
         let Some(mut op) = decode_trace_op(cpu, bus, executed_pc, cpu_type) else {
+            #[cfg(feature = "trace-profile")]
+            super::trace_profile::note_blocker(
+                start_pc,
+                cpu_type,
+                recording.ops.len(),
+                executed_pc,
+                cpu.ir as u16,
+            );
             self.finish_recording(cpu, executed_pc);
             return;
         };
@@ -776,10 +814,24 @@ impl TraceJit {
                 .last()
                 .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
 
+        // A checked memory CMP does not amortize trace validation and the
+        // native/Rust boundary in the short non-self-loop regions measured
+        // from Lemmings. Keep those on the already-fast decoded-memory path;
+        // native compilation is profitable only when one validation can be
+        // reused across repeated self-loop iterations.
+        if !self_loop
+            && ops
+                .iter()
+                .any(|op| matches!(op.op, JitTraceOp::AluMemToReg { .. }))
+        {
+            return None;
+        }
+
         let needs_window = ops.iter().any(|op| {
             matches!(
                 op.op,
                 JitTraceOp::MoveMem { .. }
+                    | JitTraceOp::AluMemToReg { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::AnDispAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
@@ -917,6 +969,10 @@ impl TraceJit {
                             &mut bails,
                             bail_at,
                         )
+                    }
+                    JitTraceOp::AluMemToReg { .. } => {
+                        let env = mem_env.as_ref().expect("AluMemToReg implies a window env");
+                        emit_alu_mem_to_reg(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::AnDispAddqSubq { .. }
@@ -1065,6 +1121,27 @@ pub(crate) fn stop_recording(cpu: &mut CpuCore) {
     }
 }
 
+/// End a recording because the decoded fast loop reached an opcode that it
+/// cannot execute. Profiling builds retain the stranded prefix and blocker;
+/// ordinary builds are identical to `stop_recording`.
+#[cfg(feature = "trace-profile")]
+pub(crate) fn stop_recording_at_blocker(cpu: &mut CpuCore, pc: u32, opcode: u16) {
+    if cpu.trace_recording {
+        TRACE_JIT.with_borrow_mut(|jit| {
+            if let Some(recording) = jit.recording.as_ref() {
+                super::trace_profile::note_blocker(
+                    recording.start_pc,
+                    recording.cpu_type,
+                    recording.ops.len(),
+                    pc,
+                    opcode,
+                );
+            }
+            jit.finish_recording(cpu, pc);
+        });
+    }
+}
+
 /// Note that execution just took a backward branch to `cpu.pc` (a potential
 /// trace head) and return whether the caller should probe the trace cache.
 ///
@@ -1076,6 +1153,14 @@ pub(crate) fn stop_recording(cpu: &mut CpuCore) {
 #[inline]
 pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool {
     let pc = cpu.pc;
+    #[cfg(feature = "trace-profile")]
+    {
+        // Consult the actual direct-mapped slot instead of relying only on
+        // the CPU's four-entry skip cache: a busy workload can evict a PC
+        // from that tiny filter even though its trace remains rejected.
+        let rejected = TRACE_JIT.with_borrow(|jit| jit.is_rejected(pc, cpu_type));
+        super::trace_profile::note_backward_edge(pc, cpu_type, rejected);
+    }
     if cpu.trace_probe_skip.contains(&pc) {
         // Known-uncompilable target: recording is a no-op and probing
         // cannot succeed.
@@ -1196,6 +1281,7 @@ impl JitTraceOp {
                 };
                 4 + src_c + dst_c
             }
+            Self::AluMemToReg { .. } => 24,
             // These ops only execute in instruction-budgeted fastmem mode;
             // conservative cycle maxima preserve the trace headroom guard.
             Self::AnDispUnary { .. } | Self::AnDispAddqSubq { .. } | Self::AnDispBit { .. } => 24,
@@ -1234,6 +1320,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_an_disp_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_alu_mem_to_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
@@ -1469,6 +1558,47 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     })
 }
 
+/// CMP `<ea>,Dn` for the two addressing forms that dominate the rejected
+/// Lemmings traces. The access itself is emitted against the fastmem window;
+/// the extension word is captured for validation and displacement baking.
+fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluToReg {
+        op: BinaryOp::Cmp,
+        size,
+        src,
+        dst,
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    let (src, extension) = match src {
+        FastEa::AnInd(reg) => (JitEa::Ind(reg), None),
+        FastEa::AnDisp(reg) => {
+            let displacement = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (JitEa::Disp(reg, displacement as i16), Some(displacement))
+        }
+        _ => return None,
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension,
+        extension2: None,
+        pc,
+        op: JitTraceOp::AluMemToReg {
+            op: JitBinaryOp::Cmp,
+            size,
+            src,
+            dst,
+        },
+    })
+}
+
 fn decode_jit_ea(mode: u16, reg: u16, displacement: i16) -> Option<JitEa> {
     Some(match mode & 7 {
         0 => JitEa::Data(reg as u8),
@@ -1533,6 +1663,9 @@ fn execute_portable_op(
 ) -> Option<i32> {
     if let JitTraceOp::MoveMem { size, src, dst } = op.op {
         return execute_portable_move_mem(cpu, size, src, dst, code_start, code_end);
+    }
+    if matches!(op.op, JitTraceOp::AluMemToReg { .. }) {
+        return execute_portable_alu_mem_to_reg(cpu, op);
     }
     if matches!(
         op.op,
@@ -1629,6 +1762,40 @@ fn execute_portable_an_disp(
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
     if super::mem_ops::execute_mem_op(cpu, op) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(target_family = "wasm", test))]
+fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::AluMemToReg {
+        op: JitBinaryOp::Cmp,
+        size,
+        src,
+        dst,
+    } = trace.op
+    else {
+        return None;
+    };
+    let src = match src {
+        JitEa::Ind(reg) => FastEa::AnInd(reg),
+        JitEa::Disp(reg, _) => FastEa::AnDisp(reg),
+        _ => return None,
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::AluToReg {
+            op: BinaryOp::Cmp,
+            size,
+            src,
+            dst,
+        },
+    ) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -2086,6 +2253,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::MoveMem { .. } => {
             unreachable!("MoveMem is handled by execute_portable_move_mem")
         }
+        JitTraceOp::AluMemToReg { .. } => {
+            unreachable!("AluMemToReg is handled by execute_portable_alu_mem_to_reg")
+        }
         JitTraceOp::AnDispUnary { .. }
         | JitTraceOp::AnDispAddqSubq { .. }
         | JitTraceOp::AnDispBit { .. } => {
@@ -2412,6 +2582,9 @@ fn emit_jit_op(
         }
         JitTraceOp::ShiftReg { .. } => unreachable!("ShiftReg traces are wasm-only"),
         JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
+        JitTraceOp::AluMemToReg { .. } => {
+            unreachable!("AluMemToReg is emitted by emit_alu_mem_to_reg")
+        }
         JitTraceOp::AnDispUnary { .. }
         | JitTraceOp::AnDispAddqSubq { .. }
         | JitTraceOp::AnDispBit { .. } => {
@@ -2577,6 +2750,53 @@ fn guard_store_not_code(
         .icmp_imm(IntCC::UnsignedGreaterThan, past, env.code_start as i64);
     let bad = builder.ins().band(lt_end, gt_start);
     branch_guard(builder, bail, bad);
+}
+
+/// Emit a read-only memory-to-register ALU operation. All address checks run
+/// before flags are committed, so a miss can re-execute the instruction via
+/// full dispatch without rolling back architectural state.
+#[cfg(not(target_family = "wasm"))]
+fn emit_alu_mem_to_reg(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::AluMemToReg {
+        op: JitBinaryOp::Cmp,
+        size,
+        src,
+        dst,
+    } = trace.op
+    else {
+        unreachable!("only CMP memory-to-register traces are decoded")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base_reg = match src {
+        JitEa::Ind(reg) | JitEa::Disp(reg, _) => reg,
+        _ => unreachable!("CMP trace decoder only admits (An) and d16(An)"),
+    };
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(base_reg));
+    let addr = match src {
+        JitEa::Ind(_) => base,
+        JitEa::Disp(_, displacement) => builder.ins().iadd_imm(base, displacement as i64),
+        _ => unreachable!(),
+    };
+    let (off, _) = checked_window_off(builder, env, bail, addr, size);
+    let src_value = window_load(builder, env, off, size);
+    let dst_value = load_reg(builder, cpu, JitDirectReg::Data(dst));
+    let dst_value = mask_value(builder, dst_value, size);
+    let result = builder.ins().isub(dst_value, src_value);
+    set_cmp_flags(builder, cpu, src_value, dst_value, result, size);
+    cycles_const(builder, trace.op.max_cycles())
 }
 
 /// Emit the displacement-memory operations that dominate Classic Mac code.
@@ -3587,6 +3807,94 @@ mod portable_tests {
         assert!(cycles.is_some());
         assert_eq!(&mem[0x202..0x204], &0xBEEFu16.to_be_bytes());
         assert_eq!(cpu.a(0), 0x204);
+    }
+
+    #[test]
+    fn decodes_hot_cmp_memory_sources() {
+        let cpu = cpu();
+        let mut mem = super::super::memory::LinearMemoryBus::new(0x1000);
+        mem.write_word(0x0100, 0xB210); // CMP.B (A0),D1
+        let indirect = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(indirect.extension, None);
+        assert!(matches!(
+            indirect.op,
+            JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Cmp,
+                size: Size::Byte,
+                src: JitEa::Ind(0),
+                dst: 1,
+            }
+        ));
+
+        mem.write_word(0x0100, 0xBC6E); // CMP.W $0010(A6),D6
+        mem.write_word(0x0102, 0x0010);
+        let displacement = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(displacement.extension, Some(0x0010));
+        assert!(matches!(
+            displacement.op,
+            JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Cmp,
+                size: Size::Word,
+                src: JitEa::Disp(6, 0x0010),
+                dst: 6,
+            }
+        ));
+    }
+
+    #[test]
+    fn portable_cmp_memory_sets_nzvc_and_preserves_x() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x0200);
+        cpu.set_d(1, 0x1234_567F);
+        cpu.set_ccr(0x10); // X set; CMP must preserve it.
+        mem[0x0200] = 0x80;
+
+        let op = TraceBuildOp {
+            opcode: 0xB210,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Cmp,
+                size: Size::Byte,
+                src: JitEa::Ind(0),
+                dst: 1,
+            },
+        };
+        assert!(execute_portable_op(&mut cpu, op, 0x0100, 0x0102).is_some());
+        assert_eq!(cpu.d(1), 0x1234_567F, "CMP does not write its destination");
+        assert_eq!(cpu.get_ccr(), 0x1B, "X/N/V/C set and Z clear");
+    }
+
+    #[test]
+    fn portable_cmp_displacement_bails_without_changing_state() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(6, 0x00FF_F000); // displacement remains outside the window
+        cpu.set_d(6, 0xCAFE_BEEF);
+        cpu.set_ccr(0x15);
+        mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+
+        let op = TraceBuildOp {
+            opcode: 0xBC6E,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Cmp,
+                size: Size::Word,
+                src: JitEa::Disp(6, 0x0010),
+                dst: 6,
+            },
+        };
+        cpu.pc = 0x0444;
+        assert_eq!(execute_portable_op(&mut cpu, op, 0x0100, 0x0104), None);
+        assert_eq!(cpu.pc, 0x0444);
+        assert_eq!(cpu.d(6), 0xCAFE_BEEF);
+        assert_eq!(cpu.get_ccr(), 0x15);
     }
 
     #[test]

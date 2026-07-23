@@ -24,6 +24,12 @@ exclude = [
 
 [dependencies]
 
+[features]
+default = []
+# Opt-in trace-opportunity accounting for emulator profiling. Disabled builds
+# contain none of the counters or reporting code.
+trace-profile = []
+
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 cranelift-codegen = "0.132.0"
 cranelift-frontend = "0.132.0"

@@ -152,6 +152,14 @@ fn bench_batch_loop(label: &str, name: &str, words: &[u16], instrs: u32) {
 }
 
 fn bench_batch_loop_at(label: &str, name: &str, words: &[u16], instrs: u32, code_base: usize) {
+    let elapsed = measure_batch_loop_at(words, instrs, code_base);
+    println!(
+        "{label:9} {name:18} {:8.1} M instr/s",
+        instrs as f64 / elapsed / 1_000_000.0
+    );
+}
+
+fn measure_batch_loop_at(words: &[u16], instrs: u32, code_base: usize) -> f64 {
     let mut bus = LinearMemoryBus::new(0x10000);
     for (i, word) in words.iter().enumerate() {
         bus.write_word_at((code_base + i * 2) as u32, *word);
@@ -162,8 +170,11 @@ fn bench_batch_loop_at(label: &str, name: &str, words: &[u16], instrs: u32, code
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_sr(0x2700);
         cpu.pc = code_base as u32;
+        cpu.set_a(0, 0x4000);
         cpu.set_a(5, 0x1000);
+        cpu.set_a(6, 0x5000);
         cpu.set_a(7, 0x8000);
+        cpu.set_d(7, 1);
         cpu
     };
 
@@ -179,10 +190,7 @@ fn bench_batch_loop_at(label: &str, name: &str, words: &[u16], instrs: u32, code
     let result = cpu.run_batch(&mut bus, instrs, &[0]);
     let elapsed = start.elapsed().as_secs_f64();
     assert_eq!(result.instructions, instrs);
-    println!(
-        "{label:9} {name:18} {:8.1} M instr/s",
-        instrs as f64 / elapsed / 1_000_000.0
-    );
+    elapsed
 }
 
 fn bench_one_shot_trace(head_ops: usize, instrs: u32) {
@@ -233,6 +241,149 @@ fn bench_one_shot_a5_trace(head_ops: usize, instrs: u32) {
         &words,
         instrs,
         0x800 + head_ops * 0x40,
+    );
+}
+
+/// Exercise the complete application-style trace round trip: validate and
+/// enter one non-self-looping native trace, return to the decoded Rust loop,
+/// execute a short tail, and take a backward branch to probe the trace again.
+fn bench_trace_roundtrip(head_ops: usize, instrs: u32) {
+    assert!((3..=16).contains(&head_ops));
+    let mut words = vec![0x5280; head_ops - 1]; // ADDQ.L #1,D0
+    words.extend_from_slice(&[
+        0x51CF, 0x0004, // DBF D7, reset (terminal non-self-loop trace op)
+        0x4E71, // padding, skipped by the taken DBF
+        0x7E01, // reset: MOVEQ #1,D7 (interpreted tail)
+    ]);
+    let bytes_after_back_branch = (words.len() + 1) * 2;
+    let back_disp = -(bytes_after_back_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | (back_disp as u8 as u16));
+
+    bench_batch_loop_at(
+        "batch",
+        &format!("roundtrip {head_ops}"),
+        &words,
+        instrs,
+        0x1000 + head_ops * 0x40,
+    );
+}
+
+fn blocked_roundtrip(prefix_ops: usize, blocker: &[u16]) -> Vec<u16> {
+    let mut words = vec![0x5280; prefix_ops]; // traceable ADDQ.L #1,D0 prefix
+    words.extend_from_slice(blocker);
+    words.extend_from_slice(&[
+        0x51CF, 0x0004, // DBF D7, reset (terminal non-self-loop trace op)
+        0x4E71, // padding, skipped by the taken DBF
+        0x7E01, // reset: MOVEQ #1,D7 (interpreted tail)
+    ]);
+    let bytes_after_back_branch = (words.len() + 1) * 2;
+    let back_disp = -(bytes_after_back_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | (back_disp as u8 as u16));
+    words
+}
+
+fn blocked_self_loop(prefix_ops: usize, blocker: &[u16]) -> Vec<u16> {
+    let mut words = vec![0x5280; prefix_ops];
+    words.extend_from_slice(blocker);
+    let bytes_after_back_branch = (words.len() + 1) * 2;
+    let back_disp = -(bytes_after_back_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | (back_disp as u8 as u16));
+    words
+}
+
+/// Replay the three dominant rejected-trace shapes observed during a
+/// 206,780,516-instruction Lemmings run. Instruction budgets preserve their
+/// measured rejected-loop ratio (483,003 : 399,980 : 407,271). These are the
+/// dynamic backedges minus the initial visit that installs each trace
+/// candidate; consulting the actual trace slot avoids undercounting when the
+/// PC falls out of the CPU's four-entry skip filter. Each case's instruction
+/// budget also includes its full synthetic loop length, avoiding the prefix-
+/// length double-weighting that a projected-dispatch ratio causes.
+fn bench_lemmings_opportunities() {
+    const SCALE: u32 = 10;
+    let cases = [
+        (
+            "CMP.B (A0),D1 p5",
+            blocked_roundtrip(5, &[0xB210]),
+            483_003u32,
+            9u32,
+        ),
+        (
+            "CMP.W d16(A6) p4",
+            blocked_roundtrip(4, &[0xBC6E, 0x0100]),
+            399_980u32,
+            8u32,
+        ),
+        (
+            "CMP.B (A0),D1 p2",
+            blocked_roundtrip(2, &[0xB210]),
+            407_271u32,
+            6u32,
+        ),
+    ];
+
+    let mut total_instrs = 0u64;
+    let mut total_elapsed = 0.0;
+    for (index, (name, words, rejected_hits, instrs_per_iteration)) in cases.iter().enumerate() {
+        let instrs = rejected_hits * instrs_per_iteration * SCALE;
+        let elapsed = measure_batch_loop_at(words, instrs, 0x2000 + index * 0x100);
+        total_instrs += u64::from(instrs);
+        total_elapsed += elapsed;
+        println!(
+            "batch     {name:18} {:8.1} M instr/s",
+            f64::from(instrs) / elapsed / 1_000_000.0
+        );
+    }
+    println!(
+        "batch     Lemmings weighted  {:8.1} M instr/s",
+        total_instrs as f64 / total_elapsed / 1_000_000.0
+    );
+}
+
+/// Optimistic counterpart to `lemmings-opportunities`: the same measured
+/// blocker mix when the instruction following the captured prefix eventually
+/// closes directly back to the trace head. This is the only topology for
+/// which memory CMP traces are admitted after the round-trip regression test.
+fn bench_lemmings_self_loops() {
+    const SCALE: u32 = 10;
+    let cases = [
+        (
+            "CMP.B self p5",
+            blocked_self_loop(5, &[0xB210]),
+            483_003u32,
+            7u32,
+        ),
+        (
+            "CMP.W self p4",
+            blocked_self_loop(4, &[0xBC6E, 0x0100]),
+            399_980u32,
+            6u32,
+        ),
+        (
+            "CMP.B self p2",
+            blocked_self_loop(2, &[0xB210]),
+            407_271u32,
+            4u32,
+        ),
+    ];
+    let mut total_instrs = 0u64;
+    let mut total_elapsed = 0.0;
+    for (index, (name, words, rejected_hits, instrs_per_iteration)) in cases.iter().enumerate() {
+        let instrs = rejected_hits * instrs_per_iteration * SCALE;
+        let elapsed = measure_batch_loop_at(words, instrs, 0x3000 + index * 0x100);
+        total_instrs += u64::from(instrs);
+        total_elapsed += elapsed;
+        println!(
+            "batch     {name:18} {:8.1} M instr/s",
+            f64::from(instrs) / elapsed / 1_000_000.0
+        );
+    }
+    println!(
+        "batch     Lemmings self-loop {:8.1} M instr/s",
+        total_instrs as f64 / total_elapsed / 1_000_000.0
     );
 }
 
@@ -306,12 +457,27 @@ fn main() {
     println!("m68k microbench");
     let only = std::env::args().nth(1);
     if only.as_deref() == Some("trace-calls") {
-        // Unlike a self-loop, each native trace here executes once before
-        // returning to Rust. This isolates the call-boundary break-even
-        // point seen in branch-heavy application code such as Lemmings.
+        // The trace function returns to the Rust self-loop driver after each
+        // iteration, isolating the native call-boundary break-even point.
+        // `trace-roundtrips` additionally includes validation, cache probing,
+        // and decoded-loop re-entry, as real non-self-loop traces do.
         for head_ops in 2..=9 {
             bench_one_shot_trace(head_ops, 50_000_000);
         }
+        return;
+    }
+    if only.as_deref() == Some("trace-roundtrips") {
+        for head_ops in 3..=9 {
+            bench_trace_roundtrip(head_ops, 50_000_000);
+        }
+        return;
+    }
+    if only.as_deref() == Some("lemmings-opportunities") {
+        bench_lemmings_opportunities();
+        return;
+    }
+    if only.as_deref() == Some("lemmings-self-loops") {
+        bench_lemmings_self_loops();
         return;
     }
     if only.as_deref() == Some("a5-trace-calls") {
