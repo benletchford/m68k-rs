@@ -612,7 +612,7 @@ struct Pending {
 }
 
 impl Pending {
-    #[inline]
+    #[inline(always)]
     fn a(&self, cpu: &CpuCore, reg: u8) -> u32 {
         // Later pendings shadow earlier ones (e.g. CMPM (A0)+,(A0)+).
         for i in (0..self.count as usize).rev() {
@@ -623,13 +623,13 @@ impl Pending {
         cpu.dar[8 + reg as usize]
     }
 
-    #[inline]
+    #[inline(always)]
     fn push(&mut self, reg: u8, value: u32) {
         self.slots[self.count as usize] = (reg, value);
         self.count += 1;
     }
 
-    #[inline]
+    #[inline(always)]
     fn commit(&self, cpu: &mut CpuCore) {
         for i in 0..self.count as usize {
             cpu.dar[8 + self.slots[i].0 as usize] = self.slots[i].1;
@@ -1674,7 +1674,7 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn apply_binary_to_reg(
     cpu: &mut CpuCore,
     op: BinaryOp,
