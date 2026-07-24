@@ -2695,7 +2695,62 @@ fn emit_jit_op(
                 cycles_const(builder, 4)
             }
         }
-        JitTraceOp::ShiftReg { .. } => unreachable!("ShiftReg traces are wasm-only"),
+        JitTraceOp::ShiftReg {
+            reg,
+            size,
+            count_or_reg,
+            count_is_register,
+            direction,
+            op,
+        } => {
+            debug_assert!(!count_is_register && matches!((op, direction), (0, 0) | (1, 1)));
+            let shift = if count_or_reg == 0 {
+                8
+            } else {
+                u32::from(count_or_reg)
+            };
+            let value = load_reg_sized(builder, cpu, JitDirectReg::Data(reg), size);
+            let bits = size.bits() as u32;
+            let (result, shifted_out) = match (op, direction) {
+                (0, 0) => {
+                    let signed = match size {
+                        Size::Byte => sign_extend_byte(builder, value),
+                        Size::Word => sign_extend_word(builder, value),
+                        Size::Long => value,
+                    };
+                    let result = builder.ins().sshr_imm(signed, i64::from(shift));
+                    let shifted_out = if shift >= bits {
+                        let msb = iconst_u32(builder, size_msb(size));
+                        builder.ins().band(value, msb)
+                    } else {
+                        let bit = iconst_u32(builder, 1u32 << (shift - 1));
+                        builder.ins().band(value, bit)
+                    };
+                    (result, shifted_out)
+                }
+                (1, 1) => {
+                    let result = builder.ins().ishl_imm(value, i64::from(shift));
+                    let shifted_out = if shift > bits {
+                        iconst_u32(builder, 0)
+                    } else {
+                        let bit = iconst_u32(builder, 1u32 << (bits - shift));
+                        builder.ins().band(value, bit)
+                    };
+                    (result, shifted_out)
+                }
+                _ => unreachable!("unsupported native register shift"),
+            };
+            let result = mask_value(builder, result, size);
+            write_data_reg_sized(builder, cpu, reg, size, result);
+            let carry = flag_from_nonzero(builder, shifted_out, CFLAG_SET);
+            store_value_u32(builder, cpu, offset_of!(CpuCore, c_flag), carry);
+            store_value_u32(builder, cpu, offset_of!(CpuCore, x_flag), carry);
+            store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
+            set_logic_flags_nv(builder, cpu, result, size);
+
+            let base = if pre020 && size == Size::Long { 8 } else { 6 };
+            cycles_const(builder, base + 2 * shift as i32)
+        }
         JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is emitted by emit_alu_mem_to_reg")
@@ -3286,14 +3341,19 @@ fn size_msb(size: Size) -> u32 {
 
 #[cfg(not(target_family = "wasm"))]
 fn set_logic_flags(builder: &mut FunctionBuilder<'_>, cpu: Value, value: Value, size: Size) {
+    set_logic_flags_nv(builder, cpu, value, size);
+    store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
+    store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
+}
+
+#[cfg(not(target_family = "wasm"))]
+fn set_logic_flags_nv(builder: &mut FunctionBuilder<'_>, cpu: Value, value: Value, size: Size) {
     let value = mask_value(builder, value, size);
     let msb = iconst_u32(builder, size_msb(size));
     let sign_bits = builder.ins().band(value, msb);
     let n = flag_from_nonzero(builder, sign_bits, NFLAG_SET);
     store_value_u32(builder, cpu, offset_of!(CpuCore, n_flag), n);
     store_value_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), value);
-    store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
-    store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -4317,5 +4377,232 @@ mod portable_tests {
         assert_eq!(cpu.d(0), 0x0000_0100);
         assert_eq!(cpu.ppc, 0x0100);
         assert_eq!(cpu.ir, 0xE188);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_trace_accepts_only_supported_immediate_shift_forms() {
+        let asr = DecodedSimpleOp::decode(CpuType::M68040, 0xE247)
+            .unwrap()
+            .to_jit_trace_op();
+        assert!(matches!(
+            asr,
+            Some(JitTraceOp::ShiftReg {
+                reg: 7,
+                size: Size::Word,
+                count_or_reg: 1,
+                count_is_register: false,
+                direction: 0,
+                op: 0,
+            })
+        ));
+
+        let immediate_asl = DecodedSimpleOp::decode(CpuType::M68040, 0xE347)
+            .unwrap()
+            .to_jit_trace_op();
+        assert!(immediate_asl.is_none());
+
+        let immediate_lsl = DecodedSimpleOp::decode(CpuType::M68040, 0xE788)
+            .unwrap()
+            .to_jit_trace_op();
+        assert!(matches!(
+            immediate_lsl,
+            Some(JitTraceOp::ShiftReg {
+                reg: 0,
+                size: Size::Long,
+                count_or_reg: 3,
+                count_is_register: false,
+                direction: 1,
+                op: 1,
+            })
+        ));
+
+        let register_asr = DecodedSimpleOp::decode(CpuType::M68040, 0xE267)
+            .unwrap()
+            .to_jit_trace_op();
+        assert!(register_asr.is_none());
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_immediate_asr_matches_interpreter() {
+        let cases = [
+            (Size::Byte, 1u8, 0xA5A5_5581u32),
+            (Size::Byte, 7, 0xA5A5_557Fu32),
+            (Size::Byte, 0, 0xA5A5_5580u32), // encoded zero means eight
+            (Size::Word, 1, 0xA5A5_8001u32), // Lemmings' E247 shape
+            (Size::Word, 4, 0xA5A5_7FF0u32),
+            (Size::Word, 0, 0xA5A5_8100u32),
+            (Size::Long, 1, 0x8000_0001u32),
+            (Size::Long, 5, 0x7FFF_FFE0u32),
+            (Size::Long, 0, 0x8100_0080u32),
+        ];
+
+        for cpu_type in [CpuType::M68000, CpuType::M68040] {
+            for (size, encoded_count, initial) in cases {
+                let shift = if encoded_count == 0 {
+                    8
+                } else {
+                    u32::from(encoded_count)
+                };
+                let size_code = match size {
+                    Size::Byte => 0,
+                    Size::Word => 1,
+                    Size::Long => 2,
+                };
+                let opcode = 0xE000 | (u16::from(encoded_count) << 9) | (size_code << 6) | 7;
+                let ops = vec![
+                    TraceBuildOp {
+                        opcode,
+                        extension: None,
+                        extension2: None,
+                        pc: 0x0100,
+                        op: JitTraceOp::ShiftReg {
+                            reg: 7,
+                            size,
+                            count_or_reg: encoded_count,
+                            count_is_register: false,
+                            direction: 0,
+                            op: 0,
+                        },
+                    },
+                    TraceBuildOp {
+                        opcode: 0x60FC,
+                        extension: None,
+                        extension2: None,
+                        pc: 0x0102,
+                        op: JitTraceOp::Branch {
+                            condition: 0,
+                            displacement: -4,
+                            length: 2,
+                            expected_taken: None,
+                        },
+                    },
+                ];
+
+                let mut expected = cpu();
+                expected.set_cpu_type(cpu_type);
+                expected.set_d(7, initial);
+                expected.set_ccr(0x1F);
+                let (result, shift_cycles) = expected.exec_asr(size, shift, initial & size.mask());
+                expected.set_d(7, (initial & !size.mask()) | result);
+
+                let mut actual = cpu();
+                actual.set_cpu_type(cpu_type);
+                actual.set_d(7, initial);
+                actual.set_ccr(0x1F);
+                let mut jit = TraceJit::new();
+                let compiled = jit
+                    .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
+                    .expect("native ASR loop should compile");
+                let packed = unsafe { (compiled.func)(&mut actual) };
+
+                assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?} {size:?} #{shift}");
+                assert_eq!(
+                    packed as u32 as i32,
+                    shift_cycles + 10,
+                    "{cpu_type:?} {size:?} #{shift} cycles"
+                );
+                assert_eq!(actual.d(7), expected.d(7), "{cpu_type:?} {size:?} #{shift}");
+                assert_eq!(
+                    actual.get_ccr(),
+                    expected.get_ccr(),
+                    "{cpu_type:?} {size:?} #{shift} flags"
+                );
+                assert_eq!(actual.pc, 0x0100);
+                assert_eq!(actual.ppc, 0x0102);
+                assert_eq!(actual.ir, 0x60FC);
+            }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_immediate_lsl_matches_interpreter() {
+        let cases = [
+            (Size::Byte, 1u8, 0xA5A5_5581u32),
+            (Size::Byte, 0, 0xA5A5_5580u32), // encoded zero means eight
+            (Size::Word, 4, 0xA5A5_1801u32),
+            (Size::Word, 0, 0xA5A5_8180u32),
+            (Size::Long, 3, 0x9000_0001u32), // Lemmings' E788 shape
+            (Size::Long, 0, 0x0180_0081u32),
+        ];
+
+        for cpu_type in [CpuType::M68000, CpuType::M68040] {
+            for (size, encoded_count, initial) in cases {
+                let shift = if encoded_count == 0 {
+                    8
+                } else {
+                    u32::from(encoded_count)
+                };
+                let size_code = match size {
+                    Size::Byte => 0,
+                    Size::Word => 1,
+                    Size::Long => 2,
+                };
+                let opcode = 0xE108 | (u16::from(encoded_count) << 9) | (size_code << 6);
+                let ops = vec![
+                    TraceBuildOp {
+                        opcode,
+                        extension: None,
+                        extension2: None,
+                        pc: 0x0100,
+                        op: JitTraceOp::ShiftReg {
+                            reg: 0,
+                            size,
+                            count_or_reg: encoded_count,
+                            count_is_register: false,
+                            direction: 1,
+                            op: 1,
+                        },
+                    },
+                    TraceBuildOp {
+                        opcode: 0x60FC,
+                        extension: None,
+                        extension2: None,
+                        pc: 0x0102,
+                        op: JitTraceOp::Branch {
+                            condition: 0,
+                            displacement: -4,
+                            length: 2,
+                            expected_taken: None,
+                        },
+                    },
+                ];
+
+                let mut expected = cpu();
+                expected.set_cpu_type(cpu_type);
+                expected.set_d(0, initial);
+                expected.set_ccr(0x1F);
+                let (result, shift_cycles) = expected.exec_lsl(size, shift, initial & size.mask());
+                expected.set_d(0, (initial & !size.mask()) | result);
+
+                let mut actual = cpu();
+                actual.set_cpu_type(cpu_type);
+                actual.set_d(0, initial);
+                actual.set_ccr(0x1F);
+                let mut jit = TraceJit::new();
+                let compiled = jit
+                    .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
+                    .expect("native LSL loop should compile");
+                let packed = unsafe { (compiled.func)(&mut actual) };
+
+                assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?} {size:?} #{shift}");
+                assert_eq!(
+                    packed as u32 as i32,
+                    shift_cycles + 10,
+                    "{cpu_type:?} {size:?} #{shift} cycles"
+                );
+                assert_eq!(actual.d(0), expected.d(0), "{cpu_type:?} {size:?} #{shift}");
+                assert_eq!(
+                    actual.get_ccr(),
+                    expected.get_ccr(),
+                    "{cpu_type:?} {size:?} #{shift} flags"
+                );
+                assert_eq!(actual.pc, 0x0100);
+                assert_eq!(actual.ppc, 0x0102);
+                assert_eq!(actual.ir, 0x60FC);
+            }
+        }
     }
 }

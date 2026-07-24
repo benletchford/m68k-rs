@@ -408,8 +408,22 @@ impl DecodedSimpleOp {
                 }
                 #[cfg(not(target_family = "wasm"))]
                 {
-                    let _ = (reg, size, count_or_reg, count_is_register, direction, op);
-                    None
+                    // Native traces lower the immediate-count shift forms
+                    // exercised by measured hot regions. Keep other variants
+                    // on the decoded interpreter until their flag handling is
+                    // lowered and measured independently.
+                    if !count_is_register && matches!((op, direction), (0, 0) | (1, 1)) {
+                        Some(JitTraceOp::ShiftReg {
+                            reg,
+                            size,
+                            count_or_reg,
+                            count_is_register,
+                            direction,
+                            op,
+                        })
+                    } else {
+                        None
+                    }
                 }
             }
             Self::BranchShort {

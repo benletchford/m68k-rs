@@ -295,6 +295,29 @@ fn blocked_self_loop(prefix_ops: usize, blocker: &[u16]) -> Vec<u16> {
     words
 }
 
+/// Isolate the largest rejected trace from the Lemmings profile: a hot
+/// region executed 24 traceable operations before `ASR.W #1,D7`, then seven
+/// more before `LSL.L #3,D0`. The surrounding ADDQs are synthetic; this
+/// benchmark measures the cost of rejecting versus compiling that topology,
+/// while the application profile measures its end-to-end importance.
+fn bench_immediate_shift_trace() {
+    let mut words = vec![0x5280; 24];
+    words.push(0xE247);
+    words.extend(std::iter::repeat_n(0x5280, 7));
+    words.push(0xE788);
+    let bytes_after_back_branch = (words.len() + 1) * 2;
+    let back_disp = -(bytes_after_back_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | (back_disp as u8 as u16));
+    bench_batch_loop_at(
+        "batch",
+        "shift blockers p24/32",
+        &words,
+        200_000_000,
+        0x7000,
+    );
+}
+
 /// Replay the three dominant rejected-trace shapes observed during a
 /// 206,780,516-instruction Lemmings run. Instruction budgets preserve their
 /// measured rejected-loop ratio (483,003 : 399,980 : 407,271). These are the
@@ -605,6 +628,10 @@ fn main() {
     }
     if only.as_deref() == Some("trace-branch-bias") {
         bench_trace_branch_bias();
+        return;
+    }
+    if only.as_deref() == Some("immediate-shifts") {
+        bench_immediate_shift_trace();
         return;
     }
     if only.as_deref() == Some("a5-trace-calls") {
