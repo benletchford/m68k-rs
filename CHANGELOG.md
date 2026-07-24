@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.2.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.3...m68k-v0.2.4) (2026-07-24)
+
+
+### Bug Fixes
+
+* count successful calls in trace adaptation ([a2dcfbd](https://github.com/benletchford/m68k-rs/commit/a2dcfbd5c107a0bf09ffbf6c24d289d19e624f88))
+
+
+### Performance Improvements
+
+* adapt JIT traces to dominant branch paths ([4b95efb](https://github.com/benletchford/m68k-rs/commit/4b95efb1317ba2cccc763426ac64690a67d1489a))
+
 ## [0.2.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.2...m68k-v0.2.3) (2026-07-24)
 
 
