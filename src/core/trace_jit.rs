@@ -239,8 +239,7 @@ pub(crate) enum JitTraceOp {
         dst: JitEa,
     },
     /// Read-only ALU operation from fast memory to a data register. The
-    /// initial decoder deliberately admits only CMP with `(An)`/`d16(An)`
-    /// sources; the generic shape leaves room for other read-only forms.
+    /// decoder admits measured CMP/ADD/SUB `(An)`/`d16(An)` sources.
     AluMemToReg {
         op: JitBinaryOp,
         size: Size,
@@ -1673,7 +1672,7 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     })
 }
 
-/// CMP `<ea>,Dn` for the two addressing forms that dominate the rejected
+/// CMP/ADD/SUB `<ea>,Dn` for the two addressing forms that dominate rejected
 /// Lemmings traces. The access itself is emitted against the fastmem window;
 /// the extension word is captured for validation and displacement baking.
 fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
@@ -1683,14 +1682,15 @@ fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
     opcode: u16,
     cpu_type: CpuType,
 ) -> Option<TraceBuildOp> {
-    let DecodedMemOp::AluToReg {
-        op: BinaryOp::Cmp,
-        size,
-        src,
-        dst,
-    } = DecodedMemOp::decode(cpu_type, opcode)?
+    let DecodedMemOp::AluToReg { op, size, src, dst } = DecodedMemOp::decode(cpu_type, opcode)?
     else {
         return None;
+    };
+    let op = match op {
+        BinaryOp::Cmp => JitBinaryOp::Cmp,
+        BinaryOp::Add => JitBinaryOp::Add,
+        BinaryOp::Sub => JitBinaryOp::Sub,
+        _ => return None,
     };
     let (src, extension) = match src {
         FastEa::AnInd(reg) => (JitEa::Ind(reg), None),
@@ -1705,12 +1705,7 @@ fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
         extension,
         extension2: None,
         pc,
-        op: JitTraceOp::AluMemToReg {
-            op: JitBinaryOp::Cmp,
-            size,
-            src,
-            dst,
-        },
+        op: JitTraceOp::AluMemToReg { op, size, src, dst },
     })
 }
 
@@ -1886,14 +1881,14 @@ fn execute_portable_an_disp(
 
 #[cfg(any(target_family = "wasm", test))]
 fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
-    let JitTraceOp::AluMemToReg {
-        op: JitBinaryOp::Cmp,
-        size,
-        src,
-        dst,
-    } = trace.op
-    else {
+    let JitTraceOp::AluMemToReg { op, size, src, dst } = trace.op else {
         return None;
+    };
+    let op = match op {
+        JitBinaryOp::Cmp => BinaryOp::Cmp,
+        JitBinaryOp::Add => BinaryOp::Add,
+        JitBinaryOp::Sub => BinaryOp::Sub,
+        _ => return None,
     };
     let src = match src {
         JitEa::Ind(reg) => FastEa::AnInd(reg),
@@ -1902,15 +1897,7 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
     };
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
-    if super::mem_ops::execute_mem_op(
-        cpu,
-        DecodedMemOp::AluToReg {
-            op: BinaryOp::Cmp,
-            size,
-            src,
-            dst,
-        },
-    ) {
+    if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::AluToReg { op, size, src, dst }) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -2934,14 +2921,8 @@ fn emit_alu_mem_to_reg(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::AluMemToReg {
-        op: JitBinaryOp::Cmp,
-        size,
-        src,
-        dst,
-    } = trace.op
-    else {
-        unreachable!("only CMP memory-to-register traces are decoded")
+    let JitTraceOp::AluMemToReg { op, size, src, dst } = trace.op else {
+        unreachable!("expected memory-to-register ALU trace")
     };
     let bail = builder.create_block();
     bails.push(BailReq {
@@ -2952,7 +2933,7 @@ fn emit_alu_mem_to_reg(
 
     let base_reg = match src {
         JitEa::Ind(reg) | JitEa::Disp(reg, _) => reg,
-        _ => unreachable!("CMP trace decoder only admits (An) and d16(An)"),
+        _ => unreachable!("ALU trace decoder only admits (An) and d16(An)"),
     };
     let base = load_reg(builder, cpu, JitDirectReg::Addr(base_reg));
     let addr = match src {
@@ -2964,8 +2945,23 @@ fn emit_alu_mem_to_reg(
     let src_value = window_load(builder, env, off, size);
     let dst_value = load_reg(builder, cpu, JitDirectReg::Data(dst));
     let dst_value = mask_value(builder, dst_value, size);
-    let result = builder.ins().isub(dst_value, src_value);
-    set_cmp_flags(builder, cpu, src_value, dst_value, result, size);
+    match op {
+        JitBinaryOp::Cmp => {
+            let result = builder.ins().isub(dst_value, src_value);
+            set_cmp_flags(builder, cpu, src_value, dst_value, result, size);
+        }
+        JitBinaryOp::Add => {
+            let result = builder.ins().iadd(dst_value, src_value);
+            write_data_reg_sized(builder, cpu, dst, size, result);
+            set_add_flags(builder, cpu, src_value, dst_value, result, size);
+        }
+        JitBinaryOp::Sub => {
+            let result = builder.ins().isub(dst_value, src_value);
+            write_data_reg_sized(builder, cpu, dst, size, result);
+            set_sub_flags(builder, cpu, src_value, dst_value, result, size);
+        }
+        _ => unreachable!("unsupported memory-to-register ALU operation"),
+    }
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -3985,7 +3981,7 @@ mod portable_tests {
     }
 
     #[test]
-    fn decodes_hot_cmp_memory_sources() {
+    fn decodes_hot_alu_memory_sources() {
         let cpu = cpu();
         let mut mem = super::super::memory::LinearMemoryBus::new(0x1000);
         mem.write_word(0x0100, 0xB210); // CMP.B (A0),D1
@@ -4012,6 +4008,34 @@ mod portable_tests {
                 size: Size::Word,
                 src: JitEa::Disp(6, 0x0010),
                 dst: 6,
+            }
+        ));
+
+        mem.write_word(0x0100, 0xDE6D); // ADD.W $0010(A5),D7
+        mem.write_word(0x0102, 0x0010);
+        let add = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(add.extension, Some(0x0010));
+        assert!(matches!(
+            add.op,
+            JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Add,
+                size: Size::Word,
+                src: JitEa::Disp(5, 0x0010),
+                dst: 7,
+            }
+        ));
+
+        mem.write_word(0x0100, 0x986D); // SUB.W $0010(A5),D4
+        mem.write_word(0x0102, 0x0010);
+        let sub = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(sub.extension, Some(0x0010));
+        assert!(matches!(
+            sub.op,
+            JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Sub,
+                size: Size::Word,
+                src: JitEa::Disp(5, 0x0010),
+                dst: 4,
             }
         ));
     }
@@ -4070,6 +4094,226 @@ mod portable_tests {
         assert_eq!(cpu.pc, 0x0444);
         assert_eq!(cpu.d(6), 0xCAFE_BEEF);
         assert_eq!(cpu.get_ccr(), 0x15);
+    }
+
+    #[test]
+    fn portable_add_displacement_updates_register_and_flags() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        mem[0x0210..0x0212].copy_from_slice(&1u16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(5, 0x0200);
+        cpu.set_d(7, 0xA5A5_7FFF);
+        cpu.set_ccr(0x1F);
+
+        let op = TraceBuildOp {
+            opcode: 0xDE6D,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Add,
+                size: Size::Word,
+                src: JitEa::Disp(5, 0x0010),
+                dst: 7,
+            },
+        };
+        assert!(execute_portable_op(&mut cpu, op, 0x0100, 0x0104).is_some());
+        assert_eq!(cpu.d(7), 0xA5A5_8000);
+        assert_eq!(cpu.get_ccr(), 0x0A, "N/V set; X/Z/C clear");
+    }
+
+    #[test]
+    fn portable_sub_displacement_updates_register_and_flags() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        mem[0x0210..0x0212].copy_from_slice(&1u16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(5, 0x0200);
+        cpu.set_d(4, 0xA5A5_8000);
+        cpu.set_ccr(0x1F);
+
+        let op = TraceBuildOp {
+            opcode: 0x986D,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Sub,
+                size: Size::Word,
+                src: JitEa::Disp(5, 0x0010),
+                dst: 4,
+            },
+        };
+        assert!(execute_portable_op(&mut cpu, op, 0x0100, 0x0104).is_some());
+        assert_eq!(cpu.d(4), 0xA5A5_7FFF);
+        assert_eq!(cpu.get_ccr(), 0x02, "V set; X/N/Z/C clear");
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_add_displacement_matches_interpreter_result() {
+        let cases = [
+            (Size::Byte, None, 0x81, 0xA5A5_557F),
+            (Size::Word, Some(0x0010), 1, 0xA5A5_7FFF),
+            (Size::Long, None, 0x8000_0000, 0x8000_0000),
+        ];
+
+        for cpu_type in [CpuType::M68000, CpuType::M68040] {
+            for (size, displacement, src_value, initial) in cases {
+                let dst = 7usize;
+                let addr_reg = 5usize;
+                let op_mode = match size {
+                    Size::Byte => 0,
+                    Size::Word => 1,
+                    Size::Long => 2,
+                };
+                let ea_mode = if displacement.is_some() { 5 } else { 2 };
+                let opcode = 0xD000
+                    | ((dst as u16) << 9)
+                    | (op_mode << 6)
+                    | (ea_mode << 3)
+                    | addr_reg as u16;
+                let src = displacement
+                    .map(|disp| JitEa::Disp(addr_reg as u8, disp))
+                    .unwrap_or(JitEa::Ind(addr_reg as u8));
+                let branch_pc = if displacement.is_some() {
+                    0x0104
+                } else {
+                    0x0102
+                };
+                let branch_displacement = if displacement.is_some() { -6 } else { -4 };
+                let ops = vec![
+                    TraceBuildOp {
+                        opcode,
+                        extension: displacement.map(|disp| disp as u16),
+                        extension2: None,
+                        pc: 0x0100,
+                        op: JitTraceOp::AluMemToReg {
+                            op: JitBinaryOp::Add,
+                            size,
+                            src,
+                            dst: dst as u8,
+                        },
+                    },
+                    TraceBuildOp {
+                        opcode: 0x6000 | branch_displacement as u8 as u16,
+                        extension: None,
+                        extension2: None,
+                        pc: branch_pc,
+                        op: JitTraceOp::Branch {
+                            condition: 0,
+                            displacement: branch_displacement,
+                            length: 2,
+                            expected_taken: None,
+                        },
+                    },
+                ];
+
+                let mut expected = cpu();
+                expected.set_cpu_type(cpu_type);
+                expected.set_d(dst, initial);
+                expected.set_ccr(0x1F);
+                let mut unused_bus = super::super::memory::LinearMemoryBus::new(2);
+                let (result, _) =
+                    expected.exec_add(&mut unused_bus, size, src_value, initial & size.mask());
+                expected.set_d(dst, (initial & !size.mask()) | result);
+
+                let mut actual = cpu();
+                let mut mem = vec![0u8; 0x1000];
+                let address = 0x0200usize + displacement.unwrap_or(0) as usize;
+                match size {
+                    Size::Byte => mem[address] = src_value as u8,
+                    Size::Word => {
+                        mem[address..address + 2]
+                            .copy_from_slice(&(src_value as u16).to_be_bytes());
+                    }
+                    Size::Long => {
+                        mem[address..address + 4].copy_from_slice(&src_value.to_be_bytes());
+                    }
+                }
+                attach_window(&mut actual, &mut mem);
+                actual.set_cpu_type(cpu_type);
+                actual.set_a(addr_reg, 0x0200);
+                actual.set_d(dst, initial);
+                actual.set_ccr(0x1F);
+                let mut jit = TraceJit::new();
+                let compiled = jit
+                    .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
+                    .expect("native ADD loop should compile");
+                let packed = unsafe { (compiled.func)(&mut actual) };
+
+                assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?} {size:?}");
+                assert_eq!(actual.d(dst), expected.d(dst), "{cpu_type:?} {size:?}");
+                assert_eq!(
+                    actual.get_ccr(),
+                    expected.get_ccr(),
+                    "{cpu_type:?} {size:?} flags"
+                );
+                assert_eq!(actual.pc, 0x0100);
+            }
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_sub_displacement_matches_interpreter_result() {
+        for cpu_type in [CpuType::M68000, CpuType::M68040] {
+            let mut expected = cpu();
+            expected.set_cpu_type(cpu_type);
+            expected.set_d(4, 0xA5A5_8000);
+            expected.set_ccr(0x1F);
+            let mut unused_bus = super::super::memory::LinearMemoryBus::new(2);
+            let (result, _) = expected.exec_sub(&mut unused_bus, Size::Word, 1, 0x8000);
+            expected.set_d(4, 0xA5A5_0000 | result);
+
+            let mut actual = cpu();
+            let mut mem = vec![0u8; 0x1000];
+            mem[0x0210..0x0212].copy_from_slice(&1u16.to_be_bytes());
+            attach_window(&mut actual, &mut mem);
+            actual.set_cpu_type(cpu_type);
+            actual.set_a(5, 0x0200);
+            actual.set_d(4, 0xA5A5_8000);
+            actual.set_ccr(0x1F);
+            let ops = vec![
+                TraceBuildOp {
+                    opcode: 0x986D,
+                    extension: Some(0x0010),
+                    extension2: None,
+                    pc: 0x0100,
+                    op: JitTraceOp::AluMemToReg {
+                        op: JitBinaryOp::Sub,
+                        size: Size::Word,
+                        src: JitEa::Disp(5, 0x0010),
+                        dst: 4,
+                    },
+                },
+                TraceBuildOp {
+                    opcode: 0x60FA,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0104,
+                    op: JitTraceOp::Branch {
+                        condition: 0,
+                        displacement: -6,
+                        length: 2,
+                        expected_taken: None,
+                    },
+                },
+            ];
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
+                .expect("native SUB loop should compile");
+            let packed = unsafe { (compiled.func)(&mut actual) };
+
+            assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?}");
+            assert_eq!(actual.d(4), expected.d(4), "{cpu_type:?}");
+            assert_eq!(actual.get_ccr(), expected.get_ccr(), "{cpu_type:?} flags");
+            assert_eq!(actual.pc, 0x0100);
+        }
     }
 
     #[test]
