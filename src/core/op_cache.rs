@@ -965,7 +965,10 @@ impl CpuCore {
             self.ir = opcode as u32;
 
             let Some(op) = self.decoded_simple_op(opcode, cpu_type) else {
+                #[cfg(not(feature = "trace-profile"))]
                 trace_jit::stop_recording(self);
+                #[cfg(feature = "trace-profile")]
+                trace_jit::stop_recording_at_blocker(self, self.ppc, opcode);
                 return CachedRunResult::Miss(opcode);
             };
             let branch_pc = if matches!(op, DecodedSimpleOp::BranchShort { .. }) {
@@ -1109,7 +1112,10 @@ impl CpuCore {
                     }
                 }
                 CachedOp::Complex => {
+                    #[cfg(not(feature = "trace-profile"))]
                     trace_jit::stop_recording(self);
+                    #[cfg(feature = "trace-profile")]
+                    trace_jit::stop_recording_at_blocker(self, self.ppc, opcode);
                     return BatchInnerExit::Miss(opcode);
                 }
             }

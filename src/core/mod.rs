@@ -17,4 +17,6 @@ pub mod registers;
 pub mod status;
 pub mod timing;
 pub mod trace_jit;
+#[cfg(feature = "trace-profile")]
+pub mod trace_profile;
 pub mod types;
