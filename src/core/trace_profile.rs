@@ -595,6 +595,46 @@ mod tests {
     }
 
     #[test]
+    fn rare_non_self_loop_guard_exit_is_not_rerecorded() {
+        reset();
+        const HEAD: u32 = 0x8000;
+        let mut bus = LinearMemoryBus::new(0x1_0000);
+        let words = [
+            0x5340, // SUBQ.W #1,D0
+            0x6602, // BNE.S common (taken about 99% of entries)
+            0x7063, // rare: MOVEQ #99,D0
+            0x5281, // common: ADDQ.L #1,D1
+            0x51CF, 0x0004, // DBF D7,outer
+            0x4E71, // unreachable padding
+            0x4E71, // unreachable padding
+            0x7E01, // outer: MOVEQ #1,D7
+            0x60EC, // BRA.S head
+        ];
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word(HEAD + index as u32 * 2, *word);
+        }
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = HEAD;
+        cpu.set_d(0, 100);
+        cpu.set_d(7, 1);
+        assert_eq!(cpu.run_batch(&mut bus, 50_000, &[0]).instructions, 50_000);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == HEAD)
+            .expect("rare-exit loop head was profiled");
+        assert_eq!(row.recording_attempts, 1);
+        assert_eq!(row.adaptive_rerecords, 0);
+        assert_eq!(row.compiled_ops, 4);
+        assert!(row.guarded_branch_exits > 64);
+    }
+
+    #[test]
     fn report_ranks_decoded_memory_opcodes_by_execution_count() {
         reset();
         note_decoded_mem(0x1000, 0x20d9);

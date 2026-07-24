@@ -313,10 +313,10 @@ struct CompiledTrace {
     code_start: u32,
     #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
     code_end: u32,
-    /// A recorded interior branch is a path prediction. Sample its guarded
-    /// exits in bounded windows so an initially rare path cannot permanently
-    /// strand a later dominant path in the interpreter.
-    has_guarded_branch: bool,
+    /// A recorded interior branch is a path prediction eligible for adaptive
+    /// rerecording. Cleared after the one allowed rerecord so completed traces
+    /// stay off the accounting path.
+    adaptive_branch: bool,
     adaptive_calls: Cell<u32>,
     adaptive_guard_exits: Cell<u32>,
     adaptive_rerecords: u8,
@@ -570,7 +570,7 @@ impl TraceJit {
             let mut cycles_total = 0i64;
             let mut retired = 0u32;
             let mut full_iters = 0u32;
-            let guarded_branch_exit = loop {
+            let (guarded_branch_exit, partial_call_this_entry) = loop {
                 #[cfg(not(target_family = "wasm"))]
                 let packed = unsafe { (trace.func)(cpu as *mut CpuCore) };
                 #[cfg(target_family = "wasm")]
@@ -592,7 +592,7 @@ impl TraceJit {
                     // A memory check bailed before its op, or a guarded
                     // interior branch took a different path. PC identifies
                     // the correct interpreter/next-trace continuation.
-                    break guarded_branch_exit;
+                    break (guarded_branch_exit, true);
                 }
                 full_iters += 1;
                 // Re-entering the (already validated) loop head is the only
@@ -601,24 +601,23 @@ impl TraceJit {
                 // committing, so nothing needs re-checking between
                 // iterations.
                 if full_iters >= max_iters || cpu.pc != pc {
-                    break false;
+                    break (false, false);
                 }
             };
             let mut rerecord_dominant_path = false;
-            if guarded_branch_exit
-                && trace.has_guarded_branch
-                && trace.adaptive_rerecords < TRACE_MAX_ADAPTIVE_RERECORDS
-            {
-                // A guarded exit ends this Rust entry, so `full_iters + 1`
-                // is the exact number of native calls since entry. Updating
-                // only here keeps correctly predicted traces off the
-                // adaptation hot path while still distinguishing dominant
-                // side exits from genuinely alternating branches.
+            if trace.adaptive_branch {
+                // Account once per Rust entry, not once per guest operation.
+                // Non-self-loop traces normally make one native call per
+                // entry, while self-loops may make many; both successful
+                // predictions and guarded exits belong in the denominator.
                 let calls = trace
                     .adaptive_calls
                     .get()
-                    .saturating_add(full_iters.saturating_add(1));
-                let exits = trace.adaptive_guard_exits.get().saturating_add(1);
+                    .saturating_add(full_iters.saturating_add(u32::from(partial_call_this_entry)));
+                let exits = trace
+                    .adaptive_guard_exits
+                    .get()
+                    .saturating_add(u32::from(guarded_branch_exit));
                 trace.adaptive_calls.set(calls);
                 trace.adaptive_guard_exits.set(exits);
                 if calls >= u32::from(TRACE_ADAPT_WINDOW) {
@@ -769,6 +768,9 @@ impl TraceJit {
             match self.compile_decoded_ops(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc)) {
                 Some(mut trace) => {
                     trace.adaptive_rerecords = adaptive_rerecords;
+                    if adaptive_rerecords >= TRACE_MAX_ADAPTIVE_RERECORDS {
+                        trace.adaptive_branch = false;
+                    }
                     TraceSlot::Compiled(trace)
                 }
                 None => {
@@ -1124,7 +1126,7 @@ impl TraceJit {
             needs_window,
             code_start,
             code_end,
-            has_guarded_branch: ops.iter().any(|op| {
+            adaptive_branch: ops.iter().any(|op| {
                 matches!(
                     op.op,
                     JitTraceOp::Branch {
@@ -1153,7 +1155,7 @@ impl TraceJit {
             needs_window: params.needs_window,
             code_start: params.code_start,
             code_end: params.code_end,
-            has_guarded_branch: params.ops.iter().any(|op| {
+            adaptive_branch: params.ops.iter().any(|op| {
                 matches!(
                     op.op,
                     JitTraceOp::Branch {
