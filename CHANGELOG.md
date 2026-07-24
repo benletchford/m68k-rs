@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.2.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.2...m68k-v0.2.3) (2026-07-24)
+
+
+### Performance Improvements
+
+* JIT hot memory-source CMP loops ([3571e27](https://github.com/benletchford/m68k-rs/commit/3571e2754399bc5ef229f97687fac585a911df16))
+* JIT hot memory-source CMP loops ([a497005](https://github.com/benletchford/m68k-rs/commit/a49700513c4c2e789c103eb8642e6368e2c83a93))
+* JIT two-instruction self-loops ([6433e09](https://github.com/benletchford/m68k-rs/commit/6433e094a82fc8bf7db23c214e60ab152200105d))
+* JIT two-instruction self-loops ([cdc342a](https://github.com/benletchford/m68k-rs/commit/cdc342a3f82eab52308a31407678c508af6477db))
+
 ## [0.2.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.1...m68k-v0.2.2) (2026-07-23)
 
 
