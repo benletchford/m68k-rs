@@ -6,8 +6,9 @@
 
 use super::types::CpuType;
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write;
+use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TraceProfileRow {
@@ -24,6 +25,19 @@ pub struct TraceProfileRow {
     pub jit_retired: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedMemProfileRow {
+    pub opcode: u16,
+    pub executions: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedMemSiteProfileRow {
+    pub pc: u32,
+    pub opcode: u16,
+    pub executions: u64,
+}
+
 impl TraceProfileRow {
     /// Approximate interpreter dispatches made eligible by supporting the
     /// blocker. This deliberately excludes the blocker itself: some control-
@@ -37,6 +51,8 @@ impl TraceProfileRow {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TraceProfileSnapshot {
     pub rows: Vec<TraceProfileRow>,
+    pub decoded_mem_ops: Vec<DecodedMemProfileRow>,
+    pub decoded_mem_sites: Vec<DecodedMemSiteProfileRow>,
     pub backward_hits: u64,
     pub rejected_hits: u64,
     pub native_calls: u64,
@@ -120,6 +136,55 @@ impl TraceProfileSnapshot {
                 average
             );
         }
+
+        let mut decoded_mem_ops = self.decoded_mem_ops.clone();
+        decoded_mem_ops.sort_unstable_by(|a, b| {
+            b.executions
+                .cmp(&a.executions)
+                .then_with(|| a.opcode.cmp(&b.opcode))
+        });
+        let decoded_mem_total: u64 = decoded_mem_ops.iter().map(|row| row.executions).sum();
+        let _ = writeln!(
+            out,
+            "decoded memory operations: total={decoded_mem_total} distinct_opcodes={}",
+            decoded_mem_ops.len()
+        );
+        let _ = writeln!(out, "rank  opcode  executions percent");
+        for (rank, row) in decoded_mem_ops.iter().take(40).enumerate() {
+            let percent = if decoded_mem_total == 0 {
+                0.0
+            } else {
+                row.executions as f64 * 100.0 / decoded_mem_total as f64
+            };
+            let _ = writeln!(
+                out,
+                "{:>4}  {:04X} {:>11} {:>6.2}%",
+                rank + 1,
+                row.opcode,
+                row.executions,
+                percent
+            );
+        }
+
+        let mut decoded_mem_sites = self.decoded_mem_sites.clone();
+        decoded_mem_sites.sort_unstable_by(|a, b| {
+            b.executions
+                .cmp(&a.executions)
+                .then_with(|| a.pc.cmp(&b.pc))
+                .then_with(|| a.opcode.cmp(&b.opcode))
+        });
+        let _ = writeln!(out, "decoded memory sites by execution count");
+        let _ = writeln!(out, "rank  pc        opcode  executions");
+        for (rank, row) in decoded_mem_sites.iter().take(60).enumerate() {
+            let _ = writeln!(
+                out,
+                "{:>4}  {:08X}  {:04X} {:>11}",
+                rank + 1,
+                row.pc,
+                row.opcode,
+                row.executions
+            );
+        }
         out
     }
 }
@@ -138,9 +203,46 @@ struct Row {
     jit_retired: u64,
 }
 
+/// The site key is already a uniformly useful `(pc << 16) | opcode` integer,
+/// so hashing it again only adds overhead to this hot, feature-only profiler.
 #[derive(Default)]
+struct IdentityHasher(u64);
+
+impl Hasher for IdentityHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = hash;
+    }
+
+    fn write_u64(&mut self, value: u64) {
+        self.0 = value;
+    }
+}
+
+type SiteCounts = HashMap<u64, u64, BuildHasherDefault<IdentityHasher>>;
+
 struct Profile {
     rows: BTreeMap<(u32, u32), Row>,
+    decoded_mem_counts: Box<[u64]>,
+    decoded_mem_site_counts: SiteCounts,
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        Self {
+            rows: BTreeMap::new(),
+            decoded_mem_counts: vec![0; super::op_cache::DECODE_TABLE_SIZE].into_boxed_slice(),
+            decoded_mem_site_counts: SiteCounts::default(),
+        }
+    }
 }
 
 impl Profile {
@@ -171,12 +273,34 @@ impl Profile {
                 jit_retired: row.jit_retired,
             })
             .collect();
+        let decoded_mem_ops = self
+            .decoded_mem_counts
+            .iter()
+            .enumerate()
+            .filter_map(|(opcode, &executions)| {
+                (executions != 0).then_some(DecodedMemProfileRow {
+                    opcode: opcode as u16,
+                    executions,
+                })
+            })
+            .collect();
+        let decoded_mem_sites = self
+            .decoded_mem_site_counts
+            .iter()
+            .map(|(&key, &executions)| DecodedMemSiteProfileRow {
+                pc: (key >> 16) as u32,
+                opcode: key as u16,
+                executions,
+            })
+            .collect();
         TraceProfileSnapshot {
             backward_hits: rows.iter().map(|row| row.backward_hits).sum(),
             rejected_hits: rows.iter().map(|row| row.rejected_hits).sum(),
             native_calls: rows.iter().map(|row| row.native_calls).sum(),
             jit_retired: rows.iter().map(|row| row.jit_retired).sum(),
             rows,
+            decoded_mem_ops,
+            decoded_mem_sites,
         }
     }
 }
@@ -201,6 +325,20 @@ pub fn reset() {
 
 pub fn snapshot() -> TraceProfileSnapshot {
     PROFILE.with_borrow(|profile| profile.0.snapshot())
+}
+
+pub(crate) fn note_decoded_mem(pc: u32, opcode: u16) {
+    PROFILE.with_borrow_mut(|profile| {
+        let count = &mut profile.0.decoded_mem_counts[usize::from(opcode)];
+        *count = count.saturating_add(1);
+        let site_key = (u64::from(pc) << 16) | u64::from(opcode);
+        let site_count = profile
+            .0
+            .decoded_mem_site_counts
+            .entry(site_key)
+            .or_default();
+        *site_count = site_count.saturating_add(1);
+    });
 }
 
 pub(crate) fn note_backward_edge(pc: u32, cpu_type: CpuType, rejected: bool) {
@@ -317,5 +455,48 @@ mod tests {
         assert_eq!(row.blocker_pc, Some(2));
         assert_eq!(row.blocker_opcode, Some(0x0640));
         assert_eq!(row.projected_dispatches(), row.rejected_hits);
+    }
+
+    #[test]
+    fn two_op_self_loop_is_compiled_and_runs_natively() {
+        reset();
+        let mut bus = LinearMemoryBus::new(0x4000);
+        bus.write_word(0, 0x22D8); // MOVE.L (A0)+,(A1)+
+        bus.write_word(2, 0x51C8); // DBRA D0,$0000
+        bus.write_word(4, 0xFFFC);
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(0, 0x1000);
+        cpu.set_a(1, 0x2000);
+        cpu.set_d(0, 1000);
+        cpu.pc = 0;
+        let result = cpu.run_batch(&mut bus, 120, &[]);
+        assert_eq!(result.instructions, 120);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0)
+            .expect("two-op loop head was profiled");
+        assert_eq!(row.compiled_ops, 2);
+        assert!(row.native_calls > 0);
+        assert!(row.jit_retired > 0);
+    }
+
+    #[test]
+    fn report_ranks_decoded_memory_opcodes_by_execution_count() {
+        reset();
+        note_decoded_mem(0x1000, 0x20d9);
+        note_decoded_mem(0x1002, 0x10dc);
+        note_decoded_mem(0x1000, 0x20d9);
+
+        let snapshot = snapshot();
+        assert_eq!(snapshot.decoded_mem_ops.len(), 2);
+        let report = snapshot.report();
+        assert!(report.contains("decoded memory operations: total=3 distinct_opcodes=2"));
+        assert!(report.find("20D9").unwrap() < report.find("10DC").unwrap());
+        assert!(report.contains("00001000  20D9           2"));
     }
 }
