@@ -23,6 +23,8 @@ pub struct TraceProfileRow {
     pub compiled_ops: u32,
     pub native_calls: u64,
     pub jit_retired: u64,
+    pub guarded_branch_exits: u64,
+    pub adaptive_rerecords: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,18 +124,23 @@ impl TraceProfileSnapshot {
                 .then_with(|| a.start_pc.cmp(&b.start_pc))
         });
         let _ = writeln!(out, "compiled traces by retired instructions");
-        let _ = writeln!(out, "rank  start_pc  ops      calls      retired avg_ops");
+        let _ = writeln!(
+            out,
+            "rank  start_pc  ops      calls      retired avg_ops guard_exits rerecords"
+        );
         for (rank, row) in compiled_rows.iter().take(40).enumerate() {
             let average = row.jit_retired as f64 / row.native_calls as f64;
             let _ = writeln!(
                 out,
-                "{:>4}  {:08X}  {:>3} {:>10} {:>12} {:>7.2}",
+                "{:>4}  {:08X}  {:>3} {:>10} {:>12} {:>7.2} {:>11} {:>9}",
                 rank + 1,
                 row.start_pc,
                 row.compiled_ops,
                 row.native_calls,
                 row.jit_retired,
-                average
+                average,
+                row.guarded_branch_exits,
+                row.adaptive_rerecords
             );
         }
 
@@ -201,6 +208,8 @@ struct Row {
     compiled_ops: u32,
     native_calls: u64,
     jit_retired: u64,
+    guarded_branch_exits: u64,
+    adaptive_rerecords: u64,
 }
 
 /// The site key is already a uniformly useful `(pc << 16) | opcode` integer,
@@ -271,6 +280,8 @@ impl Profile {
                 compiled_ops: row.compiled_ops,
                 native_calls: row.native_calls,
                 jit_retired: row.jit_retired,
+                guarded_branch_exits: row.guarded_branch_exits,
+                adaptive_rerecords: row.adaptive_rerecords,
             })
             .collect();
         let decoded_mem_ops = self
@@ -392,6 +403,20 @@ pub(crate) fn note_native_call(pc: u32, cpu_type: CpuType, retired: u32) {
     });
 }
 
+pub(crate) fn note_guarded_branch_exit(pc: u32, cpu_type: CpuType) {
+    PROFILE.with_borrow_mut(|profile| {
+        let row = profile.0.row(pc, cpu_type);
+        row.guarded_branch_exits = row.guarded_branch_exits.saturating_add(1);
+    });
+}
+
+pub(crate) fn note_adaptive_rerecord(pc: u32, cpu_type: CpuType) {
+    PROFILE.with_borrow_mut(|profile| {
+        let row = profile.0.row(pc, cpu_type);
+        row.adaptive_rerecords = row.adaptive_rerecords.saturating_add(1);
+    });
+}
+
 fn cpu_type_from_repr(value: u32) -> CpuType {
     match value {
         1 => CpuType::M68000,
@@ -483,6 +508,130 @@ mod tests {
         assert_eq!(row.compiled_ops, 2);
         assert!(row.native_calls > 0);
         assert!(row.jit_retired > 0);
+    }
+
+    #[test]
+    fn dominant_guard_side_exit_is_rerecorded() {
+        reset();
+        const HEAD: u32 = 0x6000;
+        let words = [
+            0xB210, // CMP.B (A0),D1
+            0x6606, // BNE.S outer
+            0x10DC, // common: MOVE.B (A4)+,(A0)+
+            0x51C8, 0xFFF8, // DBRA D0,head
+            0x2042, // outer: MOVEA.L D2,A0
+            0x2843, // MOVEA.L D3,A4
+            0x707F, // MOVEQ #127,D0
+            0x5884, // ADDQ.L #4,D4
+            0x60EC, // BRA.S head
+        ];
+        let mut bus = LinearMemoryBus::new(0x1_0000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word(HEAD + index as u32 * 2, *word);
+        }
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = HEAD;
+        cpu.set_a(0, 0x4000);
+        cpu.set_a(4, 0x5000);
+        cpu.set_d(0, 127);
+        cpu.set_d(1, 1);
+        cpu.set_d(2, 0x4000);
+        cpu.set_d(3, 0x5000);
+
+        // Record the uncommon seven-op BNE path, then make the four-op
+        // fallthrough loop dominant long enough to trigger adaptation.
+        assert_eq!(cpu.run_batch(&mut bus, 14, &[0]).instructions, 14);
+        cpu.set_d(1, 0);
+        assert_eq!(cpu.run_batch(&mut bus, 100_000, &[0]).instructions, 100_000);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == HEAD)
+            .expect("biased loop head was profiled");
+        assert_eq!(row.recording_attempts, 2);
+        assert_eq!(row.adaptive_rerecords, 1);
+        assert_eq!(row.guarded_branch_exits, 64);
+        assert_eq!(row.compiled_ops, 4);
+        assert!(row.jit_retired > 90_000);
+    }
+
+    #[test]
+    fn alternating_guard_paths_are_not_rerecorded() {
+        reset();
+        const HEAD: u32 = 0x7000;
+        let mut bus = LinearMemoryBus::new(0x1_0000);
+        let words = [
+            0x4600, // NOT.B D0: alternates Z every iteration
+            0x6602, // BNE.S skip
+            0x4E71, // opposite-path NOP
+            0x5281, // skip: ADDQ.L #1,D1
+            0x60F6, // BRA.S head
+        ];
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word(HEAD + index as u32 * 2, *word);
+        }
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = HEAD;
+        assert_eq!(cpu.run_batch(&mut bus, 100_000, &[0]).instructions, 100_000);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == HEAD)
+            .expect("alternating loop head was profiled");
+        assert_eq!(row.recording_attempts, 1);
+        assert_eq!(row.adaptive_rerecords, 0);
+        assert_eq!(row.compiled_ops, 5);
+        assert!(row.guarded_branch_exits > 1_000);
+    }
+
+    #[test]
+    fn rare_non_self_loop_guard_exit_is_not_rerecorded() {
+        reset();
+        const HEAD: u32 = 0x8000;
+        let mut bus = LinearMemoryBus::new(0x1_0000);
+        let words = [
+            0x5340, // SUBQ.W #1,D0
+            0x6602, // BNE.S common (taken about 99% of entries)
+            0x7063, // rare: MOVEQ #99,D0
+            0x5281, // common: ADDQ.L #1,D1
+            0x51CF, 0x0004, // DBF D7,outer
+            0x4E71, // unreachable padding
+            0x4E71, // unreachable padding
+            0x7E01, // outer: MOVEQ #1,D7
+            0x60EC, // BRA.S head
+        ];
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word(HEAD + index as u32 * 2, *word);
+        }
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = HEAD;
+        cpu.set_d(0, 100);
+        cpu.set_d(7, 1);
+        assert_eq!(cpu.run_batch(&mut bus, 50_000, &[0]).instructions, 50_000);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == HEAD)
+            .expect("rare-exit loop head was profiled");
+        assert_eq!(row.recording_attempts, 1);
+        assert_eq!(row.adaptive_rerecords, 0);
+        assert_eq!(row.compiled_ops, 4);
+        assert!(row.guarded_branch_exits > 64);
     }
 
     #[test]

@@ -449,6 +449,63 @@ fn bench_lemmings_two_op_memory_loops() {
     );
 }
 
+/// Reproduce the path bias observed at Lemmings `$2AD5C`: the trace is first
+/// recorded through an uncommon conditional edge, then the workload settles
+/// into a copy loop reached through the opposite edge. A first-path-only
+/// recorder keeps side-exiting after the CMP/branch pair and interprets the
+/// MOVE/DBRA pair even though the four-op common path is a profitable loop.
+fn bench_trace_branch_bias() {
+    const CODE_BASE: u32 = 0x6000;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0xB210, // CMP.B (A0),D1
+        0x6606, // BNE.S outer
+        0x10DC, // common: MOVE.B (A4)+,(A0)+
+        0x51C8, 0xFFF8, // DBRA D0,head
+        0x2042, // outer: MOVEA.L D2,A0
+        0x2843, // MOVEA.L D3,A4
+        0x707F, // MOVEQ #127,D0
+        0x5884, // ADDQ.L #4,D4
+        0x60EC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+
+    let prepare_cpu = |comparison: u32| {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x4000);
+        cpu.set_a(4, 0x5000);
+        cpu.set_d(0, 127);
+        cpu.set_d(1, comparison);
+        cpu.set_d(2, 0x4000);
+        cpu.set_d(3, 0x5000);
+        cpu
+    };
+
+    // Two uncommon-path iterations are exactly enough to install and record
+    // the trace, without exercising it long enough to hide a later phase
+    // change from an adaptive policy.
+    let mut cpu = prepare_cpu(1);
+    let warm = cpu.run_batch(&mut bus, 14, &[0]);
+    assert_eq!(warm.instructions, 14);
+    assert_eq!(cpu.pc, CODE_BASE);
+
+    cpu.set_d(1, 0);
+    let start = Instant::now();
+    let result = cpu.run_batch(&mut bus, INSTRS, &[0]);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(result.instructions, INSTRS);
+    println!(
+        "batch     biased CMP/copy loop {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -544,6 +601,10 @@ fn main() {
     }
     if only.as_deref() == Some("lemmings-two-op-loops") {
         bench_lemmings_two_op_memory_loops();
+        return;
+    }
+    if only.as_deref() == Some("trace-branch-bias") {
+        bench_trace_branch_bias();
         return;
     }
     if only.as_deref() == Some("a5-trace-calls") {
