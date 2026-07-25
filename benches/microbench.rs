@@ -617,6 +617,32 @@ fn bench_lemmings_two_op_memory_loops() {
     );
 }
 
+/// Reproduce the hottest wholly interpreted loop in the post-batching
+/// Lemmings profile.  The real loop has five indexed byte loads, two long
+/// and one word register-to-memory ADDs, twelve register-only instructions,
+/// and a closing DBRA.  Keeping the same 21-instruction shape makes this a
+/// useful end-to-end measure of whether tracing the missing memory forms
+/// amortizes validation, guards, and native entry.
+fn bench_lemmings_indexed_memory_loop() {
+    const INSTRS: u32 = 210_000_000;
+    let words = [
+        0x2042, // outer: MOVEA.L D2,A0
+        0x2442, // MOVEA.L D2,A2
+        0x707F, // MOVEQ #127,D0
+        0x1832, 0x1000, // inner: MOVE.B 0(A2,D1.W),D4
+        0x4E71, 0x4E71, 0x4E71, 0x1832, 0x1001, // MOVE.B 1(A2,D1.W),D4
+        0x4E71, 0x4E71, 0xD998, // ADD.L D4,(A0)+
+        0x1832, 0x1002, // MOVE.B 2(A2,D1.W),D4
+        0x4E71, 0x4E71, 0x4E71, 0x1832, 0x1003, // MOVE.B 3(A2,D1.W),D4
+        0x4E71, 0x4E71, 0xD998, // ADD.L D4,(A0)+
+        0x1832, 0x1004, // MOVE.B 4(A2,D1.W),D4
+        0x4E71, 0x4E71, 0xD958, // ADD.W D4,(A0)+
+        0x51C8, 0xFFCC, // DBRA D0,inner
+        0x60C2, // BRA.S outer
+    ];
+    bench_batch_loop_at("batch", "Lemmings indexed loop", &words, INSTRS, 0x7000);
+}
+
 /// Reproduce the path bias observed at Lemmings `$2AD5C`: the trace is first
 /// recorded through an uncommon conditional edge, then the workload settles
 /// into a copy loop reached through the opposite edge. A first-path-only
@@ -769,6 +795,10 @@ fn main() {
     }
     if only.as_deref() == Some("lemmings-two-op-loops") {
         bench_lemmings_two_op_memory_loops();
+        return;
+    }
+    if only.as_deref() == Some("lemmings-indexed-loop") {
+        bench_lemmings_indexed_memory_loop();
         return;
     }
     if only.as_deref() == Some("trace-branch-bias") {

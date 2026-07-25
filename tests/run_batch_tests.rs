@@ -1360,3 +1360,38 @@ fn mem_trace_cmp_sources_match_step() {
         },
     );
 }
+
+/// Lemmings' hottest remaining graphics loop combines scaled brief-indexed
+/// byte reads with word/long ADDs through a postincrement destination. The
+/// compiled loop must match the interpreter's addresses, big-endian stores,
+/// postincrements, and NZVCX results exactly.
+#[test]
+fn mem_trace_indexed_move_and_postinc_add_matches_step() {
+    let words = &[
+        0x2545, 0x0004, // $1000: MOVE.L D5,$0004(A2)
+        0x2086, // $1004: MOVE.L D6,(A0)
+        0x1832, 0x1C00, // $1006: MOVE.B 0(A2,D1.L*4),D4
+        0xD998, // $100A: ADD.L D4,(A0)+
+        0x1832, 0x1C01, // $100C: MOVE.B 1(A2,D1.L*4),D4
+        0xD998, // $1010: ADD.L D4,(A0)+
+        0x1832, 0x1C02, // $1012: MOVE.B 2(A2,D1.L*4),D4
+        0xD958, // $1016: ADD.W D4,(A0)+
+        0x51C8, 0xFFEC, // $1018: DBRA D0,$1006
+        0xA000, // $101C: sentinel
+    ];
+    assert_fastmem_matches_step(
+        "mem-trace indexed/add-postinc",
+        words,
+        CpuType::M68040,
+        |cpu| {
+            cpu.set_a(0, 0x3000);
+            cpu.set_a(2, 0x2000);
+            cpu.set_d(0, 127);
+            cpu.set_d(1, 1);
+            cpu.set_d(4, 0xA5A5_A5A5);
+            cpu.set_d(5, 0x7F01_80FF);
+            cpu.set_d(6, 0x7FFF_FF80);
+            cpu.set_ccr(0x10);
+        },
+    );
+}
