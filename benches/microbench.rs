@@ -318,6 +318,23 @@ fn bench_immediate_shift_trace() {
     );
 }
 
+/// Isolate the largest remaining rejected trace in the post-shift Lemmings
+/// profile: seven traceable operations followed by `ADD.W d16(A5),D7`.
+/// The ADDQ prefix is synthetic; the measured application profile establishes
+/// how often the real trace executes, while this benchmark measures the cost
+/// of admitting its memory-source ADD rather than rejecting the whole trace.
+fn bench_memory_add_trace() {
+    let words = blocked_self_loop(7, &[0xDE6D, 0x0100]);
+    bench_batch_loop_at("batch", "ADD.W d16(A5),D7 p7", &words, 200_000_000, 0x7800);
+}
+
+/// Isolate the largest rejected trace after memory-source ADD was admitted:
+/// ten traceable operations followed by `SUB.W d16(A5),D4`.
+fn bench_memory_sub_trace() {
+    let words = blocked_self_loop(10, &[0x986D, 0x0100]);
+    bench_batch_loop_at("batch", "SUB.W d16(A5),D4 p10", &words, 200_000_000, 0x7A00);
+}
+
 /// Replay the three dominant rejected-trace shapes observed during a
 /// 206,780,516-instruction Lemmings run. Instruction budgets preserve their
 /// measured rejected-loop ratio (483,003 : 399,980 : 407,271). These are the
@@ -632,6 +649,14 @@ fn main() {
     }
     if only.as_deref() == Some("immediate-shifts") {
         bench_immediate_shift_trace();
+        return;
+    }
+    if only.as_deref() == Some("memory-add") {
+        bench_memory_add_trace();
+        return;
+    }
+    if only.as_deref() == Some("memory-sub") {
+        bench_memory_sub_trace();
         return;
     }
     if only.as_deref() == Some("a5-trace-calls") {
