@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.4...m68k-v0.2.5) (2026-07-25)
+
+
+### Performance Improvements
+
+* batch profitable self-loops in native JIT ([36922d8](https://github.com/benletchford/m68k-rs/commit/36922d8a0f892353be9572c3f7c12173c68a854a))
+* JIT brief-indexed MOVE and postincrement ADD loops ([db116c2](https://github.com/benletchford/m68k-rs/commit/db116c2fbba94c06a6bdf0ab98742d63e914bef0))
+* JIT data-only MOVEM.W postincrement loops ([00f635f](https://github.com/benletchford/m68k-rs/commit/00f635f2c93cafec0567956423bc7bc0a90548f1))
+* JIT immediate ASR and LSL shifts ([0897f04](https://github.com/benletchford/m68k-rs/commit/0897f045c38a77ddb30bcbd1309bc773fa499c84))
+* JIT immediate ASR and LSL shifts ([d9e89a1](https://github.com/benletchford/m68k-rs/commit/d9e89a1d20bfd59ee26c026bb7d6ce1b7d500630))
+* JIT memory-source ADD and SUB traces ([99c0f19](https://github.com/benletchford/m68k-rs/commit/99c0f19383506b994db67d779214bfcac16b226e))
+* JIT profitable indirect JSR boundaries ([abad647](https://github.com/benletchford/m68k-rs/commit/abad647e23814c07f22824ec556797dd97b621a2))
+
 ## [0.2.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.3...m68k-v0.2.4) (2026-07-24)
 
 
