@@ -335,6 +335,134 @@ fn bench_memory_sub_trace() {
     bench_batch_loop_at("batch", "SUB.W d16(A5),D4 p10", &words, 200_000_000, 0x7A00);
 }
 
+#[derive(Clone, Copy)]
+enum IndirectJsrMix {
+    Register,
+    MemoryAlu,
+    MemoryHeavy,
+}
+
+impl IndirectJsrMix {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "register" => Some(Self::Register),
+            "memory-alu" => Some(Self::MemoryAlu),
+            "memory-heavy" => Some(Self::MemoryHeavy),
+            _ => None,
+        }
+    }
+
+    fn index(self) -> u32 {
+        match self {
+            Self::Register => 0,
+            Self::MemoryAlu => 1,
+            Self::MemoryHeavy => 2,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Register => "register",
+            Self::MemoryAlu => "memory-ALU",
+            Self::MemoryHeavy => "memory-heavy",
+        }
+    }
+
+    fn append_prefix_op(self, words: &mut Vec<u16>, index: usize) {
+        match self {
+            Self::Register => words.push(0x5280), // ADDQ.L #1,D0
+            Self::MemoryAlu if index == 0 => {
+                words.extend_from_slice(&[0x986D, 0x0100]); // SUB.W $0100(A5),D4
+            }
+            Self::MemoryAlu => words.push(0x5280), // ADDQ.L #1,D0
+            Self::MemoryHeavy => {
+                let op: &[u16] = match index % 4 {
+                    0 => &[0x986D, 0x0100], // SUB.W $0100(A5),D4
+                    1 => &[0x322D, 0x0100], // MOVE.W $0100(A5),D1
+                    2 => &[0x526D, 0x0100], // ADDQ.W #1,$0100(A5)
+                    _ => &[0x4A2D, 0x0100], // TST.B $0100(A5)
+                };
+                words.extend_from_slice(op);
+            }
+        }
+    }
+}
+
+/// Measure a non-self-loop region ending in `JSR (A0)`, followed by an RTS
+/// and a backward branch that re-enters the region. The three mixes separate
+/// fixed trace/call overhead from the savings available for register-only,
+/// Lemmings-like memory-ALU, and memory-heavy Classic Mac code.
+fn measure_indirect_jsr_region(
+    mix: IndirectJsrMix,
+    head_ops: usize,
+    instrs: u32,
+    code_base: u32,
+) -> f64 {
+    assert!((3..=24).contains(&head_ops));
+    let mut words = Vec::new();
+    for index in 0..head_ops - 1 {
+        mix.append_prefix_op(&mut words, index);
+    }
+    words.push(0x4E90); // JSR (A0)
+    let branch_word = words.len();
+    let bytes_after_branch = (branch_word + 1) * 2;
+    let back_disp = -(bytes_after_branch as i16);
+    assert!((-128..=-1).contains(&back_disp));
+    words.push(0x6000 | back_disp as u8 as u16); // return path: BRA.S head
+    let rts_word = words.len();
+    words.push(0x4E75); // subroutine: RTS
+
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(code_base + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = code_base;
+        cpu.set_a(0, code_base + rts_word as u32 * 2);
+        cpu.set_a(5, 0x1000);
+        cpu.set_a(7, 0xF000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    let warm = warm_cpu.run_batch(&mut bus, 5_000_000, &[0]);
+    assert_eq!(warm.instructions, 5_000_000);
+
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    let result = cpu.run_batch(&mut bus, instrs, &[0]);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(result.instructions, instrs);
+    elapsed
+}
+
+fn bench_indirect_jsr_regions() {
+    const INSTRS: u32 = 50_000_000;
+    let mixes = [
+        IndirectJsrMix::Register,
+        IndirectJsrMix::MemoryAlu,
+        IndirectJsrMix::MemoryHeavy,
+    ];
+    for mix in mixes {
+        for head_ops in 3usize..=12 {
+            bench_indirect_jsr_case(mix, head_ops, INSTRS);
+        }
+    }
+}
+
+fn bench_indirect_jsr_case(mix: IndirectJsrMix, head_ops: usize, instrs: u32) {
+    let code_base = 0x4000 + mix.index() * 0x1000 + head_ops as u32 * 0x80;
+    let elapsed = measure_indirect_jsr_region(mix, head_ops, instrs, code_base);
+    println!(
+        "batch     JSR {:12} {head_ops:2} {:8.1} M instr/s",
+        mix.label(),
+        f64::from(instrs) / elapsed / 1_000_000.0
+    );
+}
+
 /// Replay the three dominant rejected-trace shapes observed during a
 /// 206,780,516-instruction Lemmings run. Instruction budgets preserve their
 /// measured rejected-loop ratio (483,003 : 399,980 : 407,271). These are the
@@ -657,6 +785,25 @@ fn main() {
     }
     if only.as_deref() == Some("memory-sub") {
         bench_memory_sub_trace();
+        return;
+    }
+    if only.as_deref() == Some("indirect-jsr") {
+        match (std::env::args().nth(2), std::env::args().nth(3)) {
+            (Some(mix), Some(head_ops)) => {
+                let mix = IndirectJsrMix::parse(&mix)
+                    .expect("indirect-jsr mix must be register, memory-alu, or memory-heavy");
+                let head_ops = head_ops
+                    .parse()
+                    .expect("indirect-jsr op count must be an integer");
+                let instrs = std::env::args()
+                    .nth(4)
+                    .map(|value| value.parse().expect("instruction count must be an integer"))
+                    .unwrap_or(50_000_000);
+                bench_indirect_jsr_case(mix, head_ops, instrs);
+            }
+            (None, None) => bench_indirect_jsr_regions(),
+            _ => panic!("indirect-jsr requires both a mix and an operation count"),
+        }
         return;
     }
     if only.as_deref() == Some("a5-trace-calls") {
