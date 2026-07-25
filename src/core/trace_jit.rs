@@ -9,7 +9,7 @@ use super::cpu::{CpuCore, NFLAG_SET};
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::mem_ops::{BitSource, DecodedMemOp, FastEa};
 use super::memory::AddressBus;
-use super::op_cache::{BinaryOp, BitOp, CachedRunResult, DecodedSimpleOp};
+use super::op_cache::{BinaryOp, BitOp, CachedRunResult, DecodedSimpleOp, is_pre_68020};
 use super::types::{CpuType, Size};
 #[cfg(not(target_family = "wasm"))]
 use cranelift_codegen::Context;
@@ -76,8 +76,8 @@ pub(crate) enum JitDirectReg {
     Addr(u8),
 }
 
-/// Effective-address forms allowed in memory trace ops. All are one-word
-/// (no extension), so the trace's code bytes stay contiguous and cheap to
+/// Effective-address forms allowed in memory trace ops. Extension words are
+/// captured in the trace so indexed/displacement operands remain cheap to
 /// validate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JitEa {
@@ -91,13 +91,25 @@ pub(crate) enum JitEa {
     PreDec(u8),
     /// (d16,An), with the extension word captured in the trace.
     Disp(u8, i16),
+    /// Brief (d8,An,Xn), decoded once when the trace is recorded.
+    Index {
+        base: u8,
+        index: JitDirectReg,
+        index_long: bool,
+        scale: u8,
+        displacement: i8,
+    },
 }
 
 impl JitEa {
     fn is_mem(self) -> bool {
         matches!(
             self,
-            Self::Ind(_) | Self::PostInc(_) | Self::PreDec(_) | Self::Disp(_, _)
+            Self::Ind(_)
+                | Self::PostInc(_)
+                | Self::PreDec(_)
+                | Self::Disp(_, _)
+                | Self::Index { .. }
         )
     }
 }
@@ -266,6 +278,13 @@ pub(crate) enum JitTraceOp {
         op: JitBinaryOp,
         size: Size,
         src: JitEa,
+        dst: u8,
+    },
+    /// ADD.W/L Dn,(An)+, the store/accumulate form in Lemmings' hottest
+    /// still-interpreted indexed graphics loop.
+    AddRegToPostInc {
+        size: Size,
+        src: u8,
         dst: u8,
     },
     /// Hot Classic Mac memory forms using the A5-relative global-data
@@ -1037,6 +1056,7 @@ impl TraceJit {
                 op.op,
                 JitTraceOp::MoveMem { .. }
                     | JitTraceOp::AluMemToReg { .. }
+                    | JitTraceOp::AddRegToPostInc { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::AnDispAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
@@ -1229,6 +1249,19 @@ impl TraceJit {
                     JitTraceOp::AluMemToReg { .. } => {
                         let env = mem_env.as_ref().expect("AluMemToReg implies a window env");
                         emit_alu_mem_to_reg(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::AddRegToPostInc { .. } => {
+                        let env = mem_env
+                            .as_ref()
+                            .expect("AddRegToPostInc implies a window env");
+                        emit_add_reg_to_postinc(
+                            &mut builder,
+                            cpu_ptr,
+                            *op,
+                            env,
+                            &mut bails,
+                            bail_at,
+                        )
                     }
                     JitTraceOp::IndirectJsr { reg } => {
                         let env = mem_env.as_ref().expect("IndirectJsr implies a window env");
@@ -1583,6 +1616,13 @@ impl JitTraceOp {
                             8
                         }
                     }
+                    JitEa::Index { .. } => {
+                        if long {
+                            14
+                        } else {
+                            10
+                        }
+                    }
                 };
                 let dst_c = match dst {
                     JitEa::Disp(_, _) => {
@@ -1590,6 +1630,13 @@ impl JitTraceOp {
                             12
                         } else {
                             8
+                        }
+                    }
+                    JitEa::Index { .. } => {
+                        if long {
+                            14
+                        } else {
+                            10
                         }
                     }
                     _ if dst.is_mem() => {
@@ -1604,6 +1651,13 @@ impl JitTraceOp {
                 4 + src_c + dst_c
             }
             Self::AluMemToReg { .. } => 24,
+            Self::AddRegToPostInc { size, .. } => {
+                if size == Size::Long {
+                    20
+                } else {
+                    12
+                }
+            }
             Self::IndirectJsr { .. } => 16,
             // These ops only execute in instruction-budgeted fastmem mode;
             // conservative cycle maxima preserve the trace headroom guard.
@@ -1652,6 +1706,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_alu_mem_to_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_add_reg_to_postinc_trace_op(pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
@@ -1872,20 +1929,25 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     let mut next_ext = pc.wrapping_add(2);
     let mut extensions = [None, None];
     let mut extension_count = 0usize;
-    let mut read_disp = |mode: u16| -> Option<i16> {
-        if mode != 5 {
+    let mut read_ea_ext = |mode: u16| -> Option<u16> {
+        if mode != 5 && mode != 6 {
             return Some(0);
         }
         let value = bus.try_read_word(cpu.address(next_ext)).ok()?;
         next_ext = next_ext.wrapping_add(2);
         extensions[extension_count] = Some(value);
         extension_count += 1;
-        Some(value as i16)
+        Some(value)
     };
-    let src_disp = read_disp(src_mode)?;
-    let dst_disp = read_disp(dst_mode)?;
-    let src = decode_jit_ea(src_mode, opcode & 7, src_disp)?;
-    let dst = decode_jit_ea(dst_mode, (opcode >> 9) & 7, dst_disp)?;
+    let src_ext = read_ea_ext(src_mode)?;
+    let dst_ext = read_ea_ext(dst_mode)?;
+    let src = decode_jit_ea(src_mode, opcode & 7, src_ext, cpu.cpu_type)?;
+    let dst = decode_jit_ea(dst_mode, (opcode >> 9) & 7, dst_ext, cpu.cpu_type)?;
+    // The measured loop only needs indexed reads. Indexed stores can be
+    // added when a profile demonstrates that their extra emitter paths pay.
+    if matches!(dst, JitEa::Index { .. }) {
+        return None;
+    }
     if !src.is_mem() && !dst.is_mem() {
         return None;
     }
@@ -1899,6 +1961,32 @@ fn decode_move_mem_trace_op<B: AddressBus>(
         extension2: extensions[1],
         pc,
         op: JitTraceOp::MoveMem { size, src, dst },
+    })
+}
+
+fn decode_add_reg_to_postinc_trace_op(
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluToMem {
+        op: BinaryOp::Add,
+        size,
+        src,
+        dst: FastEa::AnPostInc(dst),
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    if !matches!(size, Size::Word | Size::Long) {
+        return None;
+    }
+    Some(TraceBuildOp {
+        opcode,
+        extension: None,
+        extension2: None,
+        pc,
+        op: JitTraceOp::AddRegToPostInc { size, src, dst },
     })
 }
 
@@ -1939,14 +2027,36 @@ fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
     })
 }
 
-fn decode_jit_ea(mode: u16, reg: u16, displacement: i16) -> Option<JitEa> {
+fn decode_jit_ea(mode: u16, reg: u16, extension: u16, cpu_type: CpuType) -> Option<JitEa> {
     Some(match mode & 7 {
         0 => JitEa::Data(reg as u8),
         1 => JitEa::Addr(reg as u8),
         2 => JitEa::Ind(reg as u8),
         3 => JitEa::PostInc(reg as u8),
         4 => JitEa::PreDec(reg as u8),
-        5 => JitEa::Disp(reg as u8, displacement),
+        5 => JitEa::Disp(reg as u8, extension as i16),
+        6 => {
+            if !is_pre_68020(cpu_type) && (extension & 0x0100) != 0 {
+                return None;
+            }
+            let index_num = ((extension >> 12) & 7) as u8;
+            let index = if (extension & 0x8000) != 0 {
+                JitDirectReg::Addr(index_num)
+            } else {
+                JitDirectReg::Data(index_num)
+            };
+            JitEa::Index {
+                base: reg as u8,
+                index,
+                index_long: (extension & 0x0800) != 0,
+                scale: if is_pre_68020(cpu_type) {
+                    0
+                } else {
+                    ((extension >> 9) & 3) as u8
+                },
+                displacement: extension as u8 as i8,
+            }
+        }
         _ => return None,
     })
 }
@@ -2006,6 +2116,9 @@ fn execute_portable_op(
     }
     if matches!(op.op, JitTraceOp::AluMemToReg { .. }) {
         return execute_portable_alu_mem_to_reg(cpu, op);
+    }
+    if matches!(op.op, JitTraceOp::AddRegToPostInc { .. }) {
+        return execute_portable_add_reg_to_postinc(cpu, op, code_start, code_end);
     }
     if matches!(
         op.op,
@@ -2155,6 +2268,39 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
     }
 }
 
+#[cfg(any(target_family = "wasm", test))]
+fn execute_portable_add_reg_to_postinc(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::AddRegToPostInc { size, src, dst } = trace.op else {
+        return None;
+    };
+    let raw = cpu.dar[8 + dst as usize];
+    let masked = raw & cpu.address_mask;
+    if masked < code_end && masked.wrapping_add(size.bytes()) > code_start {
+        return None;
+    }
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::AluToMem {
+            op: BinaryOp::Add,
+            size,
+            src,
+            dst: FastEa::AnPostInc(dst),
+        },
+    ) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
 /// Portable MoveMem, mirroring `emit_move_mem` exactly: all checks before
 /// any commit; window reads/writes via the fastmem scratch fields.
 #[cfg(any(target_family = "wasm", test))]
@@ -2212,6 +2358,28 @@ fn execute_portable_move_mem(
         }
         JitEa::Disp(r, displacement) => {
             let a = cpu.dar[8 + r as usize].wrapping_add(displacement as i32 as u32);
+            read(cpu, locate(cpu, a)?)
+        }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = cpu.dar[8 + base as usize];
+            let raw_index = match index {
+                JitDirectReg::Data(r) => cpu.dar[r as usize],
+                JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+            };
+            let index = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            let a = base
+                .wrapping_add(index.wrapping_shl(scale as u32))
+                .wrapping_add(displacement as i32 as u32);
             read(cpu, locate(cpu, a)?)
         }
     };
@@ -2286,6 +2454,7 @@ fn execute_portable_move_mem(
             }
             cpu.set_logic_flags(value, size);
         }
+        JitEa::Index { .. } => return None,
     }
 
     Some(JitTraceOp::MoveMem { size, src, dst }.max_cycles())
@@ -2610,6 +2779,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         }
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is handled by execute_portable_alu_mem_to_reg")
+        }
+        JitTraceOp::AddRegToPostInc { .. } => {
+            unreachable!("AddRegToPostInc is handled by execute_portable_add_reg_to_postinc")
         }
         JitTraceOp::AnDispUnary { .. }
         | JitTraceOp::AnDispAddqSubq { .. }
@@ -2995,6 +3167,9 @@ fn emit_jit_op(
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is emitted by emit_alu_mem_to_reg")
         }
+        JitTraceOp::AddRegToPostInc { .. } => {
+            unreachable!("AddRegToPostInc is emitted by emit_add_reg_to_postinc")
+        }
         JitTraceOp::AnDispUnary { .. }
         | JitTraceOp::AnDispAddqSubq { .. }
         | JitTraceOp::AnDispBit { .. } => {
@@ -3228,6 +3403,44 @@ fn emit_alu_mem_to_reg(
     cycles_const(builder, trace.op.max_cycles())
 }
 
+/// Emit ADD.W/L Dn,(An)+. The window, alignment, and self-modification
+/// guards all run before memory, address-register, or flag state is changed.
+#[cfg(not(target_family = "wasm"))]
+fn emit_add_reg_to_postinc(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::AddRegToPostInc { size, src, dst } = trace.op else {
+        unreachable!("expected register-to-postincrement ADD trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let addr = load_reg(builder, cpu, JitDirectReg::Addr(dst));
+    let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+    guard_store_not_code(builder, env, bail, masked, size);
+    let dst_value = window_load(builder, env, off, size);
+    let src_value = load_reg(builder, cpu, JitDirectReg::Data(src));
+    let src_value = mask_value(builder, src_value, size);
+    let result = builder.ins().iadd(dst_value, src_value);
+
+    window_store(builder, env, off, size, result);
+    let next = builder
+        .ins()
+        .iadd_imm(addr, i64::from(jit_ea_step(size, dst)));
+    store_reg(builder, cpu, JitDirectReg::Addr(dst), next);
+    set_add_flags(builder, cpu, src_value, dst_value, result, size);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
 /// Emit terminal `JSR (An)`. The stack write is checked before the stack
 /// pointer, flow state, or PC changes, so a miss can re-execute the call via
 /// full dispatch. A successful call ends this non-self-loop trace; writing
@@ -3431,6 +3644,31 @@ fn emit_move_mem(
             let (off, _) = checked_window_off(builder, env, bail, a, size);
             window_load(builder, env, off, size)
         }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = load_an(builder, base);
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let a = builder.ins().iadd(base, index);
+            let a = builder.ins().iadd_imm(a, displacement as i64);
+            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            window_load(builder, env, off, size)
+        }
     };
 
     // A destination base register must observe a same-register source
@@ -3502,6 +3740,7 @@ fn emit_move_mem(
             window_store(builder, env, off, size, value);
             set_logic_flags(builder, cpu, value, size);
         }
+        JitEa::Index { .. } => unreachable!("indexed MOVE destination is not traceable"),
     }
 
     cycles_const(
