@@ -118,6 +118,11 @@ pub(crate) enum DecodedMemOp {
         src: FastEa,
         dst: FastEa,
     },
+    /// MOVEM.W (An)+,<register list>. The fast path accepts data-register-
+    /// only masks at execution time; other lists fall back atomically.
+    MovemWordPostInc {
+        base: u8,
+    },
     /// ADD/SUB/AND/OR/CMP `<ea>,Dn`
     AluToReg {
         op: BinaryOp,
@@ -323,6 +328,12 @@ fn decode_group_0(opcode: u16) -> Option<DecodedMemOp> {
 fn decode_group_4(cpu_type: CpuType, opcode: u16) -> Option<DecodedMemOp> {
     if opcode == 0x4E75 {
         return Some(DecodedMemOp::Rts);
+    }
+
+    if (opcode & 0xFFF8) == 0x4C98 {
+        return Some(DecodedMemOp::MovemWordPostInc {
+            base: (opcode & 7) as u8,
+        });
     }
 
     // LEA: 0100 rrr1 11mm mrrr
@@ -773,11 +784,47 @@ fn fast_move(cpu: &mut CpuCore, win: Win, size: Size, src: FastEa, dst: FastEa) 
     Some(true)
 }
 
-/// Specialized execution for the common A5-relative data accesses emitted
-/// by classic Mac compilers. AnDisp is unusually hot because A5 is the
-/// application's global-data base. Keeping the extension cursor, resolved
-/// offset and value in locals avoids the generic Ctx/Pending/Loc state
-/// machine while retaining its all-checks-before-commit fallback contract.
+/// Data-register-only MOVEM.W (An)+. The extension word and complete source
+/// span are checked before any destination register or An is changed.
+#[inline]
+fn fast_movem_word_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
+    let Some(mask_off) = win.off(cpu.address(cpu.pc), 2) else {
+        return false;
+    };
+    let mask = win.read(mask_off, Size::Word) as u16;
+    if mask == 0 || (mask & 0xFF00) != 0 {
+        return false;
+    }
+    let data_mask = mask as u8;
+    let bytes = data_mask.count_ones() * 2;
+    let raw = cpu.dar[8 + base as usize];
+    if cpu.is_pre_68020 && (raw & 1) != 0 {
+        return false;
+    }
+    let masked = cpu.address(raw);
+    if bytes > win.len || masked as u64 + bytes as u64 > cpu.address_mask as u64 + 1 {
+        return false;
+    }
+    let Some(mut off) = win.off(masked, bytes) else {
+        return false;
+    };
+
+    for reg in 0..8 {
+        if (data_mask & (1 << reg)) == 0 {
+            continue;
+        }
+        cpu.dar[reg] = win.read(off, Size::Word) as u16 as i16 as i32 as u32;
+        off += 2;
+    }
+    cpu.dar[8 + base as usize] = raw.wrapping_add(bytes);
+    cpu.pc = cpu.pc.wrapping_add(2);
+    true
+}
+
+/// Specialized execution for d16(An) data accesses. Keeping the extension
+/// cursor, resolved offset, and value in locals avoids the generic
+/// Ctx/Pending/Loc state machine while retaining its all-checks-before-commit
+/// fallback contract.
 #[inline]
 fn fast_an_disp(cpu: &mut CpuCore, win: Win, op: DecodedMemOp) -> Option<bool> {
     let read_word = |cpu: &CpuCore, pc: u32| -> Result<u32, ()> {
@@ -1291,6 +1338,10 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
         return handled;
     }
 
+    if let DecodedMemOp::MovemWordPostInc { base } = op {
+        return fast_movem_word_postinc(cpu, win, base);
+    }
+
     if let Some(handled) = fast_an_disp(cpu, win, op) {
         return handled;
     }
@@ -1343,6 +1394,9 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
             cpu.set_logic_flags(value, size);
             finish_pc!();
             true
+        }
+        DecodedMemOp::MovemWordPostInc { .. } => {
+            unreachable!("MOVEM.W postincrement is handled by its fast path")
         }
         DecodedMemOp::AluToReg { op, size, src, dst } => {
             let Some(src_loc) = resolve(cpu, win, src, size, &mut ctx) else {
@@ -1730,6 +1784,46 @@ mod tests {
         cpu.pc = 0x100;
         cpu.set_a(5, 0x400);
         cpu
+    }
+
+    #[test]
+    fn fast_movem_word_postincrement_is_atomic_and_sign_extends() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x100..0x102].copy_from_slice(&0x00FEu16.to_be_bytes());
+        let words = [0x8000u16, 1, 0x7FFF, 0xFFFF, 0, 0x1234, 0xABCD];
+        for (index, word) in words.into_iter().enumerate() {
+            mem[0x200 + index * 2..0x202 + index * 2].copy_from_slice(&word.to_be_bytes());
+        }
+        let mut cpu = cpu_with_window(&mut mem);
+        cpu.set_a(0, 0x200);
+        cpu.set_ccr(0x1F);
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::MovemWordPostInc { base: 0 }
+        ));
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.a(0), 0x20E);
+        assert_eq!(cpu.d(1), 0xFFFF_8000);
+        assert_eq!(cpu.d(2), 1);
+        assert_eq!(cpu.d(3), 0x7FFF);
+        assert_eq!(cpu.d(4), 0xFFFF_FFFF);
+        assert_eq!(cpu.d(7), 0xFFFF_ABCD);
+        assert_eq!(cpu.get_ccr(), 0x1F);
+
+        cpu.pc = 0x100;
+        cpu.set_a(0, 0x0FFA); // complete seven-word source span is outside RAM
+        for reg in 1..8 {
+            cpu.set_d(reg, 0xA000_0000 | reg as u32);
+        }
+        assert!(!execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::MovemWordPostInc { base: 0 }
+        ));
+        assert_eq!(cpu.pc, 0x100);
+        assert_eq!(cpu.a(0), 0x0FFA);
+        for reg in 1..8 {
+            assert_eq!(cpu.d(reg), 0xA000_0000 | reg as u32);
+        }
     }
 
     #[test]

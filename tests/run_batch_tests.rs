@@ -62,9 +62,9 @@ fn budget_exhausted_count_is_exact_with_jit_traces() {
 
 #[test]
 fn unrelated_watch_keeps_jit_loop_budget_exact() {
-    // Systemless always watches PC 0 for a clean exit. A trace whose loop
-    // head is elsewhere may run multiple iterations per native call, but
-    // must still stop at the exact requested instruction budget.
+    // A caller may always watch PC 0 as a clean-exit sentinel. A trace whose
+    // loop head is elsewhere may run multiple iterations per native call,
+    // but must still stop at the exact requested instruction budget.
     let mut bus = bus_with(&[(0x1000, 0x5280), (0x1002, 0x60FC)]);
     let mut cpu = cpu_at(0x1000);
 
@@ -164,8 +164,8 @@ fn multi_block_trace_guard_side_exit_matches_step() {
 #[test]
 fn multi_block_trace_path_change_matches_step() {
     // First record the BNE path, then switch to the opposite, dominant path.
-    // The common path is the same CMP/branch/copy/DBRA topology observed in
-    // Lemmings; the outer path resets its pointers and counter.
+    // The common path is a CMP/branch/copy/DBRA topology; the outer path
+    // resets its pointers and counter.
     let words = [
         (0x1000, 0xB210), // CMP.B (A0),D1
         (0x1002, 0x6606), // BNE.S outer
@@ -1325,8 +1325,8 @@ fn mem_trace_unaligned_matches_step_on_68020() {
     });
 }
 
-/// The two memory-source CMP forms found at the hottest rejected Lemmings
-/// trace heads must compile without changing architectural behavior.
+/// Common memory-source CMP forms must compile without changing
+/// architectural behavior.
 #[test]
 fn mem_trace_cmp_sources_match_step() {
     let indirect = &[
@@ -1361,10 +1361,9 @@ fn mem_trace_cmp_sources_match_step() {
     );
 }
 
-/// Lemmings' hottest remaining graphics loop combines scaled brief-indexed
-/// byte reads with word/long ADDs through a postincrement destination. The
-/// compiled loop must match the interpreter's addresses, big-endian stores,
-/// postincrements, and NZVCX results exactly.
+/// A loop combining scaled brief-indexed byte reads with word/long ADDs
+/// through a postincrement destination must match the interpreter's
+/// addresses, big-endian stores, postincrements, and NZVCX results exactly.
 #[test]
 fn mem_trace_indexed_move_and_postinc_add_matches_step() {
     let words = &[

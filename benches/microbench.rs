@@ -180,9 +180,9 @@ fn measure_batch_loop_at(words: &[u16], instrs: u32, code_base: usize) -> f64 {
     };
 
     let mut warm_cpu = prepare_cpu();
-    // Systemless always watches PC 0 as its clean-exit sentinel. An
-    // unrelated watched PC must not force a nonzero self-loop to execute
-    // only one iteration per native trace call.
+    // Some callers always watch PC 0 as a clean-exit sentinel. An unrelated
+    // watched PC must not force a nonzero self-loop to execute only one
+    // iteration per native trace call.
     let warm = warm_cpu.run_batch(&mut bus, 5_000_000, &[0]);
     assert_eq!(warm.instructions, 5_000_000);
 
@@ -214,9 +214,9 @@ fn bench_one_shot_trace(head_ops: usize, instrs: u32) {
     );
 }
 
-fn bench_one_shot_a5_trace(head_ops: usize, instrs: u32) {
+fn bench_one_shot_displacement_trace(head_ops: usize, instrs: u32) {
     assert!((2..=9).contains(&head_ops));
-    let a5_ops: &[&[u16]] = &[
+    let displacement_ops: &[&[u16]] = &[
         &[0x4A2D, 0x0100],         // TST.B $0100(A5)
         &[0x526D, 0x0100],         // ADDQ.W #1,$0100(A5)
         &[0x322D, 0x0100],         // MOVE.W $0100(A5),D1
@@ -226,7 +226,7 @@ fn bench_one_shot_a5_trace(head_ops: usize, instrs: u32) {
     ];
     let mut words = Vec::new();
     for i in 0..head_ops - 1 {
-        words.extend_from_slice(a5_ops[i % a5_ops.len()]);
+        words.extend_from_slice(displacement_ops[i % displacement_ops.len()]);
     }
     words.push(0x6002); // BRA.B over the padding word
     words.push(0x4E71); // padding, never executed
@@ -238,7 +238,7 @@ fn bench_one_shot_a5_trace(head_ops: usize, instrs: u32) {
 
     bench_batch_loop_at(
         "batch",
-        &format!("A5 one-shot {head_ops}"),
+        &format!("d16(An) one-shot {head_ops}"),
         &words,
         instrs,
         0x800 + head_ops * 0x40,
@@ -295,11 +295,10 @@ fn blocked_self_loop(prefix_ops: usize, blocker: &[u16]) -> Vec<u16> {
     words
 }
 
-/// Isolate the largest rejected trace from the Lemmings profile: a hot
-/// region executed 24 traceable operations before `ASR.W #1,D7`, then seven
-/// more before `LSL.L #3,D0`. The surrounding ADDQs are synthetic; this
-/// benchmark measures the cost of rejecting versus compiling that topology,
-/// while the application profile measures its end-to-end importance.
+/// Measure a rejected-trace shape with 24 traceable operations before
+/// `ASR.W #1,D7`, then seven more before `LSL.L #3,D0`. The surrounding
+/// ADDQs are synthetic so the benchmark isolates the cost of rejecting
+/// versus compiling that topology.
 fn bench_immediate_shift_trace() {
     let mut words = vec![0x5280; 24];
     words.push(0xE247);
@@ -318,11 +317,9 @@ fn bench_immediate_shift_trace() {
     );
 }
 
-/// Isolate the largest remaining rejected trace in the post-shift Lemmings
-/// profile: seven traceable operations followed by `ADD.W d16(A5),D7`.
-/// The ADDQ prefix is synthetic; the measured application profile establishes
-/// how often the real trace executes, while this benchmark measures the cost
-/// of admitting its memory-source ADD rather than rejecting the whole trace.
+/// Measure seven traceable operations followed by `ADD.W d16(A5),D7`.
+/// The ADDQ prefix is synthetic so the benchmark isolates the cost of
+/// admitting its memory-source ADD rather than rejecting the whole trace.
 fn bench_memory_add_trace() {
     let words = blocked_self_loop(7, &[0xDE6D, 0x0100]);
     bench_batch_loop_at("batch", "ADD.W d16(A5),D7 p7", &words, 200_000_000, 0x7800);
@@ -391,7 +388,7 @@ impl IndirectJsrMix {
 /// Measure a non-self-loop region ending in `JSR (A0)`, followed by an RTS
 /// and a backward branch that re-enters the region. The three mixes separate
 /// fixed trace/call overhead from the savings available for register-only,
-/// Lemmings-like memory-ALU, and memory-heavy Classic Mac code.
+/// memory-ALU, and memory-heavy code.
 fn measure_indirect_jsr_region(
     mix: IndirectJsrMix,
     head_ops: usize,
@@ -463,15 +460,14 @@ fn bench_indirect_jsr_case(mix: IndirectJsrMix, head_ops: usize, instrs: u32) {
     );
 }
 
-/// Replay the three dominant rejected-trace shapes observed during a
-/// 206,780,516-instruction Lemmings run. Instruction budgets preserve their
-/// measured rejected-loop ratio (483,003 : 399,980 : 407,271). These are the
-/// dynamic backedges minus the initial visit that installs each trace
+/// Replay three profiled rejected-trace shapes. Instruction budgets preserve
+/// their measured rejected-loop ratio (483,003 : 399,980 : 407,271). These
+/// are the dynamic backedges minus the initial visit that installs each trace
 /// candidate; consulting the actual trace slot avoids undercounting when the
 /// PC falls out of the CPU's four-entry skip filter. Each case's instruction
 /// budget also includes its full synthetic loop length, avoiding the prefix-
 /// length double-weighting that a projected-dispatch ratio causes.
-fn bench_lemmings_opportunities() {
+fn bench_profiled_opportunities() {
     const SCALE: u32 = 10;
     let cases = [
         (
@@ -507,16 +503,16 @@ fn bench_lemmings_opportunities() {
         );
     }
     println!(
-        "batch     Lemmings weighted  {:8.1} M instr/s",
+        "batch     profiled weighted  {:8.1} M instr/s",
         total_instrs as f64 / total_elapsed / 1_000_000.0
     );
 }
 
-/// Optimistic counterpart to `lemmings-opportunities`: the same measured
+/// Optimistic counterpart to `profiled-opportunities`: the same measured
 /// blocker mix when the instruction following the captured prefix eventually
 /// closes directly back to the trace head. This is the only topology for
 /// which memory CMP traces are admitted after the round-trip regression test.
-fn bench_lemmings_self_loops() {
+fn bench_profiled_self_loops() {
     const SCALE: u32 = 10;
     let cases = [
         (
@@ -551,7 +547,7 @@ fn bench_lemmings_self_loops() {
         );
     }
     println!(
-        "batch     Lemmings self-loop {:8.1} M instr/s",
+        "batch     profiled self-loop {:8.1} M instr/s",
         total_instrs as f64 / total_elapsed / 1_000_000.0
     );
 }
@@ -560,7 +556,7 @@ fn bench_lemmings_self_loops() {
 /// traces are two-instruction copy/fill loops. Each synthetic outer loop
 /// resets its pointers and counter so the measured inner DBRA loop can run
 /// indefinitely without leaving the fastmem window.
-fn bench_lemmings_two_op_memory_loops() {
+fn bench_profiled_two_op_memory_loops() {
     const SCALE: u32 = 10;
     let cases = [
         (
@@ -612,18 +608,16 @@ fn bench_lemmings_two_op_memory_loops() {
         );
     }
     println!(
-        "batch     Lemmings two-op loops   {:8.1} M instr/s",
+        "batch     profiled two-op loops   {:8.1} M instr/s",
         total_instrs as f64 / total_elapsed / 1_000_000.0
     );
 }
 
-/// Reproduce the hottest wholly interpreted loop in the post-batching
-/// Lemmings profile.  The real loop has five indexed byte loads, two long
-/// and one word register-to-memory ADDs, twelve register-only instructions,
-/// and a closing DBRA.  Keeping the same 21-instruction shape makes this a
-/// useful end-to-end measure of whether tracing the missing memory forms
-/// amortizes validation, guards, and native entry.
-fn bench_lemmings_indexed_memory_loop() {
+/// Exercise five indexed byte loads, two long and one word register-to-memory
+/// ADDs, twelve register-only instructions, and a closing DBRA. Keeping the
+/// same 21-instruction shape provides an end-to-end measure of whether tracing
+/// the missing memory forms amortizes validation, guards, and native entry.
+fn bench_indexed_memory_loop() {
     const INSTRS: u32 = 210_000_000;
     let words = [
         0x2042, // outer: MOVEA.L D2,A0
@@ -640,12 +634,65 @@ fn bench_lemmings_indexed_memory_loop() {
         0x51C8, 0xFFCC, // DBRA D0,inner
         0x60C2, // BRA.S outer
     ];
-    bench_batch_loop_at("batch", "Lemmings indexed loop", &words, INSTRS, 0x7000);
+    bench_batch_loop_at("batch", "indexed memory loop", &words, INSTRS, 0x7000);
 }
 
-/// Reproduce the path bias observed at Lemmings `$2AD5C`: the trace is first
-/// recorded through an uncommon conditional edge, then the workload settles
-/// into a copy loop reached through the opposite edge. A first-path-only
+/// Exercise a MOVEM.W that loads seven signed lookup indexes, seven indexed
+/// byte MOVEs that write looked-up values contiguously, and a closing DBRA.
+/// Keeping MOVEM in the complete loop ensures the benchmark covers trace
+/// admission as well as the indexed operations.
+fn bench_movem_indexed_loop() {
+    const INSTRS: u32 = 210_000_000;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x204B, // outer: MOVEA.L A3,A0 (index-list source)
+        0x224C, // MOVEA.L A4,A1 (byte destination)
+        0x244D, // MOVEA.L A5,A2 (lookup table)
+        0x707F, // MOVEQ #127,D0
+        0x4C98, 0x00FE, // inner: MOVEM.W (A0)+,D1-D7
+        0x12F2, 0x1000, // MOVE.B 0(A2,D1.W),(A1)+
+        0x12F2, 0x2000, // MOVE.B 0(A2,D2.W),(A1)+
+        0x12F2, 0x3000, // MOVE.B 0(A2,D3.W),(A1)+
+        0x12F2, 0x4000, // MOVE.B 0(A2,D4.W),(A1)+
+        0x12F2, 0x5000, // MOVE.B 0(A2,D5.W),(A1)+
+        0x12F2, 0x6000, // MOVE.B 0(A2,D6.W),(A1)+
+        0x12F2, 0x7000, // MOVE.B 0(A2,D7.W),(A1)+
+        0x51C8, 0xFFDE, // DBRA D0,inner
+        0x60D2, // BRA.S outer
+    ];
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(3, 0x4000);
+        cpu.set_a(4, 0x5000);
+        cpu.set_a(5, 0x6000);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     MOVEM indexed loop      {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
+/// Reproduce a path-biased trace that is first recorded through an uncommon
+/// conditional edge before settling into a copy loop on the opposite edge.
+/// A first-path-only
 /// recorder keeps side-exiting after the CMP/branch pair and interprets the
 /// MOVE/DBRA pair even though the four-op common path is a profitable loop.
 fn bench_trace_branch_bias() {
@@ -785,20 +832,24 @@ fn main() {
         }
         return;
     }
-    if only.as_deref() == Some("lemmings-opportunities") {
-        bench_lemmings_opportunities();
+    if only.as_deref() == Some("profiled-opportunities") {
+        bench_profiled_opportunities();
         return;
     }
-    if only.as_deref() == Some("lemmings-self-loops") {
-        bench_lemmings_self_loops();
+    if only.as_deref() == Some("profiled-self-loops") {
+        bench_profiled_self_loops();
         return;
     }
-    if only.as_deref() == Some("lemmings-two-op-loops") {
-        bench_lemmings_two_op_memory_loops();
+    if only.as_deref() == Some("profiled-two-op-loops") {
+        bench_profiled_two_op_memory_loops();
         return;
     }
-    if only.as_deref() == Some("lemmings-indexed-loop") {
-        bench_lemmings_indexed_memory_loop();
+    if only.as_deref() == Some("indexed-memory-loop") {
+        bench_indexed_memory_loop();
+        return;
+    }
+    if only.as_deref() == Some("movem-indexed-loop") {
+        bench_movem_indexed_loop();
         return;
     }
     if only.as_deref() == Some("trace-branch-bias") {
@@ -836,9 +887,9 @@ fn main() {
         }
         return;
     }
-    if only.as_deref() == Some("a5-trace-calls") {
+    if only.as_deref() == Some("displacement-trace-calls") {
         for head_ops in 2..=9 {
-            bench_one_shot_a5_trace(head_ops, 50_000_000);
+            bench_one_shot_displacement_trace(head_ops, 50_000_000);
         }
         return;
     }
@@ -868,13 +919,12 @@ fn main() {
         bench_set::<PlainBenchBus>("plain");
         bench_set::<LinearMemoryBus>("linearbus");
     }
-    // A5-relative globals and stack temporaries dominate classic Mac code.
-    // This loop mirrors the hottest Lemmings opcode forms found by runtime
-    // profiling while remaining deterministic and self-contained.
+    // Exercise displacement-based globals and stack temporaries in a
+    // deterministic, self-contained loop.
     if only.as_deref() != Some("legacy") {
         bench_batch_loop(
             "batch",
-            "classic Mac mix",
+            "displacement mix",
             &[
                 0x4A2D, 0x0100, // TST.B $0100(A5)
                 0x082D, 0x0003, 0x0100, // BTST #3,$0100(A5)

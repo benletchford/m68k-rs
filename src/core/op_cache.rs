@@ -1043,8 +1043,8 @@ impl CpuCore {
                 probe = false;
                 // A self-loop only needs to stop after one iteration when
                 // returning to its own head would hit a watched PC. Merely
-                // having an unrelated watch (Systemless always watches PC
-                // 0 for clean exit) must not serialize every JIT iteration.
+                // having an unrelated watch (for example, a clean-exit
+                // sentinel at PC 0) must not serialize every JIT iteration.
                 let single_iter = watch && watch_pcs.contains(&self.pc);
                 if let Some((result, instructions)) = trace_jit::try_execute_trace(
                     self,
