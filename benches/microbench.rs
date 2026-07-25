@@ -643,6 +643,60 @@ fn bench_lemmings_indexed_memory_loop() {
     bench_batch_loop_at("batch", "Lemmings indexed loop", &words, INSTRS, 0x7000);
 }
 
+/// Reproduce the loop at Lemmings `$493010` in full. The MOVEM.W at its
+/// head loads seven signed lookup indexes, seven indexed byte MOVEs write
+/// the looked-up values contiguously, and DBRA closes the loop. Earlier
+/// synthetic tests began after MOVEM and therefore missed the instruction
+/// that prevented this real loop from entering the JIT at all.
+fn bench_lemmings_movem_indexed_loop() {
+    const INSTRS: u32 = 210_000_000;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x204B, // outer: MOVEA.L A3,A0 (index-list source)
+        0x224C, // MOVEA.L A4,A1 (byte destination)
+        0x244D, // MOVEA.L A5,A2 (lookup table)
+        0x707F, // MOVEQ #127,D0
+        0x4C98, 0x00FE, // inner: MOVEM.W (A0)+,D1-D7
+        0x12F2, 0x1000, // MOVE.B 0(A2,D1.W),(A1)+
+        0x12F2, 0x2000, // MOVE.B 0(A2,D2.W),(A1)+
+        0x12F2, 0x3000, // MOVE.B 0(A2,D3.W),(A1)+
+        0x12F2, 0x4000, // MOVE.B 0(A2,D4.W),(A1)+
+        0x12F2, 0x5000, // MOVE.B 0(A2,D5.W),(A1)+
+        0x12F2, 0x6000, // MOVE.B 0(A2,D6.W),(A1)+
+        0x12F2, 0x7000, // MOVE.B 0(A2,D7.W),(A1)+
+        0x51C8, 0xFFDE, // DBRA D0,inner
+        0x60D2, // BRA.S outer
+    ];
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(3, 0x4000);
+        cpu.set_a(4, 0x5000);
+        cpu.set_a(5, 0x6000);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     Lemmings MOVEM loop     {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce the path bias observed at Lemmings `$2AD5C`: the trace is first
 /// recorded through an uncommon conditional edge, then the workload settles
 /// into a copy loop reached through the opposite edge. A first-path-only
@@ -799,6 +853,10 @@ fn main() {
     }
     if only.as_deref() == Some("lemmings-indexed-loop") {
         bench_lemmings_indexed_memory_loop();
+        return;
+    }
+    if only.as_deref() == Some("lemmings-movem-loop") {
+        bench_lemmings_movem_indexed_loop();
         return;
     }
     if only.as_deref() == Some("trace-branch-bias") {

@@ -272,6 +272,15 @@ pub(crate) enum JitTraceOp {
         src: JitEa,
         dst: JitEa,
     },
+    /// MOVEM.W (An)+,<data-register mask>. This is the head of Lemmings'
+    /// hot palette-lookup loop. Keeping this deliberately narrow avoids the
+    /// architectural corner cases of address registers in a postincrement
+    /// MOVEM list while allowing the complete measured loop to compile.
+    MovemWordPostInc {
+        base: u8,
+        data_mask: u8,
+        cycles: i32,
+    },
     /// Read-only ALU operation from fast memory to a data register. The
     /// decoder admits measured CMP/ADD/SUB `(An)`/`d16(An)` sources.
     AluMemToReg {
@@ -348,8 +357,8 @@ struct CompiledTrace {
     /// extra loop-carried state costs more than the saved call boundary.
     #[cfg(not(target_family = "wasm"))]
     native_loop: bool,
-    /// Contains `MoveMem` ops: only executable while a fastmem window is
-    /// active (i.e. inside `run_batch`).
+    /// Contains memory ops: only executable while a fastmem window is active
+    /// (i.e. inside `run_batch`).
     needs_window: bool,
     /// Address-masked range of the trace's code bytes; trace stores into
     /// this range bail so self-modification is observed like the
@@ -1055,6 +1064,7 @@ impl TraceJit {
             matches!(
                 op.op,
                 JitTraceOp::MoveMem { .. }
+                    | JitTraceOp::MovemWordPostInc { .. }
                     | JitTraceOp::AluMemToReg { .. }
                     | JitTraceOp::AddRegToPostInc { .. }
                     | JitTraceOp::AnDispUnary { .. }
@@ -1241,6 +1251,19 @@ impl TraceJit {
                                 src,
                                 dst,
                             },
+                            env,
+                            &mut bails,
+                            bail_at,
+                        )
+                    }
+                    JitTraceOp::MovemWordPostInc { .. } => {
+                        let env = mem_env
+                            .as_ref()
+                            .expect("MovemWordPostInc implies a window env");
+                        emit_movem_word_postinc(
+                            &mut builder,
+                            cpu_ptr,
+                            *op,
                             env,
                             &mut bails,
                             bail_at,
@@ -1650,6 +1673,7 @@ impl JitTraceOp {
                 };
                 4 + src_c + dst_c
             }
+            Self::MovemWordPostInc { cycles, .. } => cycles,
             Self::AluMemToReg { .. } => 24,
             Self::AddRegToPostInc { size, .. } => {
                 if size == Size::Long {
@@ -1711,6 +1735,9 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_add_reg_to_postinc_trace_op(pc, opcode, cpu_type) {
         return Some(op);
     }
+    if let Some(op) = decode_movem_word_postinc_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
     if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
@@ -1723,6 +1750,40 @@ fn decode_trace_op<B: AddressBus>(
         extension2: None,
         pc,
         op,
+    })
+}
+
+/// Decode the exact MOVEM form observed at the head of Lemmings' hot
+/// palette-lookup loop. Restricting the mask to D0-D7 makes the loads and
+/// final address update independent: no loaded register can alias the base
+/// An, so the operation has a simple all-or-bail implementation.
+fn decode_movem_word_postinc_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    // 0100 1100 10 011 rrr = MOVEM.W (Ar)+,<register list>.
+    if (opcode & 0xFFF8) != 0x4C98 {
+        return None;
+    }
+    let mask = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    if mask == 0 || (mask & 0xFF00) != 0 {
+        return None;
+    }
+    let data_mask = mask as u8;
+    let cycles = 12 + 4 * data_mask.count_ones() as i32;
+    // The per-mode timing overhead is zero for (An)+ on every CPU path.
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(mask),
+        extension2: None,
+        pc,
+        op: JitTraceOp::MovemWordPostInc {
+            base: (opcode & 7) as u8,
+            data_mask,
+            cycles,
+        },
     })
 }
 
@@ -2114,6 +2175,9 @@ fn execute_portable_op(
     if let JitTraceOp::MoveMem { size, src, dst } = op.op {
         return execute_portable_move_mem(cpu, size, src, dst, code_start, code_end);
     }
+    if matches!(op.op, JitTraceOp::MovemWordPostInc { .. }) {
+        return execute_portable_movem_word_postinc(cpu, op);
+    }
     if matches!(op.op, JitTraceOp::AluMemToReg { .. }) {
         return execute_portable_alu_mem_to_reg(cpu, op);
     }
@@ -2132,6 +2196,50 @@ fn execute_portable_op(
         return execute_portable_indirect_jsr(cpu, op, reg);
     }
     Some(execute_portable_reg_op(cpu, op))
+}
+
+#[cfg(any(target_family = "wasm", test))]
+fn execute_portable_movem_word_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::MovemWordPostInc {
+        base,
+        data_mask,
+        cycles,
+    } = trace.op
+    else {
+        return None;
+    };
+    let bytes = data_mask.count_ones() * 2;
+    let raw = cpu.dar[8 + base as usize];
+    if cpu.is_pre_68020 && (raw & 1) != 0 {
+        return None;
+    }
+    let masked = raw & cpu.address_mask;
+    if bytes == 0
+        || bytes > cpu.fm_len
+        || masked as u64 + bytes as u64 > cpu.address_mask as u64 + 1
+    {
+        return None;
+    }
+    let off = masked.wrapping_sub(cpu.fm_base);
+    if off > cpu.fm_len - bytes {
+        return None;
+    }
+
+    let mut next_off = off as usize;
+    for reg in 0..8 {
+        if (data_mask & (1 << reg)) == 0 {
+            continue;
+        }
+        let value = unsafe {
+            let p = (cpu.fm_ptr as *const u8).add(next_off);
+            u16::from_be_bytes([*p, *p.add(1)]) as i16 as i32 as u32
+        };
+        cpu.dar[reg] = value;
+        next_off += 2;
+    }
+    cpu.dar[8 + base as usize] = raw.wrapping_add(bytes);
+    cpu.pc = trace.pc.wrapping_add(4);
+    Some(cycles)
 }
 
 #[cfg(any(target_family = "wasm", test))]
@@ -2777,6 +2885,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::MoveMem { .. } => {
             unreachable!("MoveMem is handled by execute_portable_move_mem")
         }
+        JitTraceOp::MovemWordPostInc { .. } => {
+            unreachable!("MovemWordPostInc is handled by execute_portable_movem_word_postinc")
+        }
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is handled by execute_portable_alu_mem_to_reg")
         }
@@ -3164,6 +3275,9 @@ fn emit_jit_op(
             cycles_const(builder, base + 2 * shift as i32)
         }
         JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
+        JitTraceOp::MovemWordPostInc { .. } => {
+            unreachable!("MovemWordPostInc is emitted by emit_movem_word_postinc")
+        }
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is emitted by emit_alu_mem_to_reg")
         }
@@ -3297,6 +3411,78 @@ fn window_load(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value, size
             builder.ins().bswap(v)
         }
     }
+}
+
+/// Emit a data-register-only MOVEM.W (An)+. A single check covers the
+/// contiguous register list before any register or address state changes;
+/// the individual big-endian loads are then safe to emit without guards.
+#[cfg(not(target_family = "wasm"))]
+fn emit_movem_word_postinc(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::MovemWordPostInc {
+        base,
+        data_mask,
+        cycles,
+    } = trace.op
+    else {
+        unreachable!("expected MOVEM.W postincrement trace")
+    };
+    let bytes = data_mask.count_ones() * 2;
+    debug_assert!(bytes != 0 && bytes <= 16);
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let raw = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    if env.aligned_only {
+        let low = builder.ins().band_imm(raw, 1);
+        let bad = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
+        branch_guard(builder, bail, bad);
+    }
+    let masked = builder.ins().band_imm(raw, env.address_mask as i64);
+    let last_valid_start = env.address_mask.saturating_sub(bytes - 1);
+    let wraps = builder.ins().icmp_imm(
+        IntCC::UnsignedGreaterThan,
+        masked,
+        i64::from(last_valid_start),
+    );
+    branch_guard(builder, bail, wraps);
+    let too_short = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
+    branch_guard(builder, bail, too_short);
+    let off = builder.ins().isub(masked, env.fm_base);
+    let limit = builder.ins().iadd_imm(env.fm_len, -i64::from(bytes));
+    let outside = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+    branch_guard(builder, bail, outside);
+
+    let mut ordinal = 0i64;
+    for reg in 0..8 {
+        if (data_mask & (1 << reg)) == 0 {
+            continue;
+        }
+        let word_off = if ordinal == 0 {
+            off
+        } else {
+            builder.ins().iadd_imm(off, ordinal * 2)
+        };
+        let word = window_load(builder, env, word_off, Size::Word);
+        let value = sign_extend_word(builder, word);
+        store_reg(builder, cpu, JitDirectReg::Data(reg), value);
+        ordinal += 1;
+    }
+    let next = builder.ins().iadd_imm(raw, i64::from(bytes));
+    store_reg(builder, cpu, JitDirectReg::Addr(base), next);
+    cycles_const(builder, cycles)
 }
 
 /// Big-endian sized store of (sized) `value` into the window.
@@ -4524,6 +4710,147 @@ mod portable_tests {
         assert!(cycles.is_some());
         assert_eq!(&mem[0x202..0x204], &0xBEEFu16.to_be_bytes());
         assert_eq!(cpu.a(0), 0x204);
+    }
+
+    fn movem_word_postinc_op() -> TraceBuildOp {
+        TraceBuildOp {
+            opcode: 0x4C98,
+            extension: Some(0x00FE),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::MovemWordPostInc {
+                base: 0,
+                data_mask: 0xFE,
+                cycles: 40,
+            },
+        }
+    }
+
+    #[test]
+    fn decodes_lemmings_movem_word_postincrement() {
+        let cpu = cpu();
+        let mut mem = super::super::memory::LinearMemoryBus::new(0x1000);
+        mem.write_word(0x0100, 0x4C98);
+        mem.write_word(0x0102, 0x00FE);
+        let op = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(op.length(), 4);
+        assert!(matches!(
+            op.op,
+            JitTraceOp::MovemWordPostInc {
+                base: 0,
+                data_mask: 0xFE,
+                cycles: 40,
+            }
+        ));
+
+        mem.write_word(0x0102, 0x0101); // address-register masks stay interpreted
+        assert!(decode_movem_word_postinc_trace_op(&cpu, &mut mem, 0x0100, 0x4C98).is_none());
+    }
+
+    #[test]
+    fn portable_movem_word_postincrement_sign_extends_and_preserves_flags() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        let words = [0x8000u16, 1, 0x7FFF, 0xFFFF, 0, 0x1234, 0xABCD];
+        for (index, word) in words.into_iter().enumerate() {
+            mem[0x0200 + index * 2..0x0202 + index * 2].copy_from_slice(&word.to_be_bytes());
+        }
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x0200);
+        cpu.set_ccr(0x1F);
+
+        assert_eq!(
+            execute_portable_op(&mut cpu, movem_word_postinc_op(), 0x0100, 0x0104),
+            Some(40)
+        );
+        assert_eq!(cpu.d(0), 0);
+        assert_eq!(cpu.d(1), 0xFFFF_8000);
+        assert_eq!(cpu.d(2), 1);
+        assert_eq!(cpu.d(3), 0x0000_7FFF);
+        assert_eq!(cpu.d(4), 0xFFFF_FFFF);
+        assert_eq!(cpu.d(5), 0);
+        assert_eq!(cpu.d(6), 0x0000_1234);
+        assert_eq!(cpu.d(7), 0xFFFF_ABCD);
+        assert_eq!(cpu.a(0), 0x020E);
+        assert_eq!(cpu.pc, 0x0104);
+        assert_eq!(cpu.get_ccr(), 0x1F, "MOVEM does not affect flags");
+    }
+
+    #[test]
+    fn portable_movem_word_postincrement_bails_without_partial_state() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x0208]; // seven words do not fit at $0200
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x0200);
+        for reg in 1..8 {
+            cpu.set_d(reg, 0xA000_0000 | reg as u32);
+        }
+        cpu.pc = 0x0444;
+
+        assert_eq!(
+            execute_portable_op(&mut cpu, movem_word_postinc_op(), 0x0100, 0x0104),
+            None
+        );
+        assert_eq!(cpu.a(0), 0x0200);
+        assert_eq!(cpu.pc, 0x0444);
+        for reg in 1..8 {
+            assert_eq!(cpu.d(reg), 0xA000_0000 | reg as u32);
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_movem_word_postincrement_matches_portable_and_bails_atomically() {
+        let ops = vec![
+            movem_word_postinc_op(),
+            TraceBuildOp {
+                opcode: 0x51C8,
+                extension: Some(0xFFFA),
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::Dbcc {
+                    condition: 1,
+                    reg: 0,
+                    displacement: -6,
+                },
+            },
+        ];
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        let words = [0x8000u16, 1, 0x7FFF, 0xFFFF, 0, 0x1234, 0xABCD];
+        for (index, word) in words.into_iter().enumerate() {
+            mem[0x0200 + index * 2..0x0202 + index * 2].copy_from_slice(&word.to_be_bytes());
+        }
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(0, 0x0200);
+        cpu.set_d(0, 2);
+        cpu.set_ccr(0x1F);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&cpu, 0x0100, CpuType::M68000, ops, Some(0x0100))
+            .expect("MOVEM/DBRA loop should compile");
+
+        let packed = unsafe { compiled.call_native(&mut cpu, 1) };
+        assert_eq!((packed >> 32) as u32, 2);
+        assert_eq!(packed as u32, 50);
+        assert_eq!(cpu.d(0), 1);
+        assert_eq!(cpu.d(1), 0xFFFF_8000);
+        assert_eq!(cpu.d(7), 0xFFFF_ABCD);
+        assert_eq!(cpu.a(0), 0x020E);
+        assert_eq!(cpu.pc, 0x0100);
+        assert_eq!(cpu.get_ccr(), 0x1F);
+
+        cpu.set_a(0, 0x00FF_FFF8); // the register list crosses the address mask
+        for reg in 1..8 {
+            cpu.set_d(reg, 0xB000_0000 | reg as u32);
+        }
+        let packed = unsafe { compiled.call_native(&mut cpu, 1) };
+        assert_eq!(packed, 0, "bail retires no instructions or cycles");
+        assert_eq!(cpu.pc, 0x0100);
+        assert_eq!(cpu.a(0), 0x00FF_FFF8);
+        for reg in 1..8 {
+            assert_eq!(cpu.d(reg), 0xB000_0000 | reg as u32);
+        }
     }
 
     #[test]
