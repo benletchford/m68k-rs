@@ -506,7 +506,40 @@ mod tests {
             .find(|row| row.start_pc == 0)
             .expect("two-op loop head was profiled");
         assert_eq!(row.compiled_ops, 2);
+        #[cfg(not(target_family = "wasm"))]
+        assert!(
+            row.native_calls > 1,
+            "two-op read/write loops retain the measured faster one-pass path"
+        );
+        #[cfg(target_family = "wasm")]
         assert!(row.native_calls > 0);
+        assert!(row.jit_retired > 0);
+    }
+
+    #[test]
+    fn cheap_self_loop_iterations_stay_in_one_native_call() {
+        reset();
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.write_word(0, 0x5280); // ADDQ.L #1,D0
+        bus.write_word(2, 0x60FC); // BRA.S $0000
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0;
+        let result = cpu.run_batch(&mut bus, 120, &[]);
+        assert_eq!(result.instructions, 120);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0)
+            .expect("cheap loop head was profiled");
+        assert_eq!(row.compiled_ops, 2);
+        #[cfg(not(target_family = "wasm"))]
+        assert_eq!(row.native_calls, 1);
+        #[cfg(target_family = "wasm")]
+        assert!(row.native_calls > 1);
         assert!(row.jit_retired > 0);
     }
 

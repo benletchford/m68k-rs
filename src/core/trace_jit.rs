@@ -15,8 +15,8 @@ use super::types::{CpuType, Size};
 use cranelift_codegen::Context;
 #[cfg(not(target_family = "wasm"))]
 use cranelift_codegen::ir::{
-    AbiParam, Block, Function, InstBuilder, MemFlags, Type, UserFuncName, Value, condcodes::IntCC,
-    types,
+    AbiParam, Block, BlockArg, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
+    condcodes::IntCC, types,
 };
 #[cfg(not(target_family = "wasm"))]
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -49,10 +49,20 @@ const TRACE_MAX_ADAPTIVE_RERECORDS: u8 = 1;
 pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
 
 #[cfg(not(target_family = "wasm"))]
-/// Compiled trace entry point. Returns `(ops_retired << 32) | cycles`:
-/// a full pass retires every op; a mem-op bail retires a prefix and sets
-/// `cpu.pc` to the first un-executed instruction.
-type TraceFn = unsafe extern "C" fn(*mut CpuCore) -> u64;
+/// Original one-pass compiled trace entry point.
+type TraceOnceFn = unsafe extern "C" fn(*mut CpuCore) -> u64;
+
+#[cfg(not(target_family = "wasm"))]
+/// Counted self-loop entry point. Keeping repeated guest iterations inside
+/// generated code avoids an ABI round trip for every tiny loop.
+type TraceLoopFn = unsafe extern "C" fn(*mut CpuCore, u32) -> u64;
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+enum NativeTraceFn {
+    Once(TraceOnceFn),
+    Loop(TraceLoopFn),
+}
 
 static TRACE_JIT_HAS_CANDIDATES: AtomicBool = AtomicBool::new(false);
 
@@ -312,7 +322,13 @@ struct CompiledTrace {
     /// without re-validating: trace stores that would touch code bail out
     /// before committing, and nothing observable happens between
     /// iterations.
+    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
     self_loop: bool,
+    /// The native body was generated as a counted loop. Short read/write
+    /// MoveMem loops deliberately retain the original one-pass body: the
+    /// extra loop-carried state costs more than the saved call boundary.
+    #[cfg(not(target_family = "wasm"))]
+    native_loop: bool,
     /// Contains `MoveMem` ops: only executable while a fastmem window is
     /// active (i.e. inside `run_batch`).
     needs_window: bool,
@@ -332,10 +348,18 @@ struct CompiledTrace {
     adaptive_guard_exits: Cell<u32>,
     adaptive_rerecords: u8,
     #[cfg(not(target_family = "wasm"))]
-    func: TraceFn,
+    func: NativeTraceFn,
 }
 
 impl CompiledTrace {
+    #[cfg(all(not(target_family = "wasm"), test))]
+    unsafe fn call_native(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
+        match self.func {
+            NativeTraceFn::Once(func) => unsafe { func(cpu) },
+            NativeTraceFn::Loop(func) => unsafe { func(cpu, max_iters) },
+        }
+    }
+
     fn is_guarded_branch_exit(&self, cpu: &CpuCore, ops_done: u32) -> bool {
         let Some(index) = ops_done.checked_sub(1).map(|index| index as usize) else {
             return false;
@@ -568,6 +592,14 @@ impl TraceJit {
             if instr_budget < ops_len {
                 return None;
             }
+            // A generated loop clearly amortizes the ABI boundary for the
+            // mixed 3+-op and read-only loops measured from Lemmings. A
+            // two-op read/write MoveMem loop is already dominated by its two
+            // checked guest accesses; carrying native loop state made that
+            // case 3.5% slower at the median, so retain the old one-pass
+            // function and repeat it in this already-validated Rust entry.
+            #[cfg(not(target_family = "wasm"))]
+            let batch_self_loop = trace.native_loop;
             // How many whole iterations fit in both budgets. The guards
             // above ensure at least one; the instruction budget is the
             // caller's (u32::MAX on the cycle-budgeted paths).
@@ -581,10 +613,77 @@ impl TraceJit {
             let mut cycles_total = 0i64;
             let mut retired = 0u32;
             let mut full_iters = 0u32;
+            #[cfg(not(target_family = "wasm"))]
+            let (guarded_branch_exit, partial_call_this_entry) = if batch_self_loop {
+                let NativeTraceFn::Loop(func) = trace.func else {
+                    unreachable!("a batched trace must have a counted entry point")
+                };
+                loop {
+                    let call_max_iters = max_iters - full_iters;
+                    let packed = unsafe { func(cpu as *mut CpuCore, call_max_iters) };
+                    cycles_total += (packed as u32) as i64;
+                    let ops_done = (packed >> 32) as u32;
+                    let completed = ops_done / ops_len;
+                    let remainder = ops_done % ops_len;
+                    let partial_call = completed < call_max_iters;
+                    // A side exit at the last op has a zero remainder after
+                    // one or more complete numeric trace lengths. PC/ppc
+                    // distinguish it from an op-zero memory bail.
+                    let exit_ops = if partial_call && remainder == 0 && ops_done != 0 {
+                        ops_len
+                    } else {
+                        remainder
+                    };
+                    let guarded_branch_exit =
+                        partial_call && trace.is_guarded_branch_exit(cpu, exit_ops);
+                    #[cfg(feature = "trace-profile")]
+                    super::trace_profile::note_native_call(pc, cpu_type, ops_done);
+                    #[cfg(feature = "trace-profile")]
+                    if guarded_branch_exit {
+                        super::trace_profile::note_guarded_branch_exit(pc, cpu_type);
+                    }
+                    retired += ops_done;
+                    full_iters += completed;
+                    if partial_call {
+                        break (guarded_branch_exit, true);
+                    }
+                    if full_iters >= max_iters || cpu.pc != pc {
+                        break (false, false);
+                    }
+                }
+            } else {
+                // This is intentionally the original direct-call driver.
+                // Tiny memory loops can execute this path once per two guest
+                // instructions, so even generalized result accounting is
+                // measurable here.
+                let NativeTraceFn::Once(func) = trace.func else {
+                    unreachable!("a one-pass trace must have a linear entry point")
+                };
+                loop {
+                    let packed = unsafe { func(cpu as *mut CpuCore) };
+                    cycles_total += (packed as u32) as i64;
+                    let ops_done = (packed >> 32) as u32;
+                    let partial_call = ops_done < ops_len;
+                    let guarded_branch_exit =
+                        partial_call && trace.is_guarded_branch_exit(cpu, ops_done);
+                    #[cfg(feature = "trace-profile")]
+                    super::trace_profile::note_native_call(pc, cpu_type, ops_done);
+                    #[cfg(feature = "trace-profile")]
+                    if guarded_branch_exit {
+                        super::trace_profile::note_guarded_branch_exit(pc, cpu_type);
+                    }
+                    retired += ops_done;
+                    if partial_call {
+                        break (guarded_branch_exit, true);
+                    }
+                    full_iters += 1;
+                    if full_iters >= max_iters || cpu.pc != pc {
+                        break (false, false);
+                    }
+                }
+            };
+            #[cfg(target_family = "wasm")]
             let (guarded_branch_exit, partial_call_this_entry) = loop {
-                #[cfg(not(target_family = "wasm"))]
-                let packed = unsafe { (trace.func)(cpu as *mut CpuCore) };
-                #[cfg(target_family = "wasm")]
                 let packed =
                     execute_portable_trace(cpu, &trace.ops, trace.code_start, trace.code_end);
                 cycles_total += (packed as u32) as i64;
@@ -600,17 +699,9 @@ impl TraceJit {
                 }
                 retired += ops_done;
                 if partial_call {
-                    // A memory check bailed before its op, or a guarded
-                    // interior branch took a different path. PC identifies
-                    // the correct interpreter/next-trace continuation.
                     break (guarded_branch_exit, true);
                 }
                 full_iters += 1;
-                // Re-entering the (already validated) loop head is the only
-                // continue condition; trace ops cannot fault or take
-                // exceptions, and stores that would touch code bail before
-                // committing, so nothing needs re-checking between
-                // iterations.
                 if full_iters >= max_iters || cpu.pc != pc {
                     break (false, false);
                 }
@@ -1000,10 +1091,23 @@ impl TraceJit {
             aligned_only,
             address_mask,
         } = params;
+        // Matched Lemmings and microbenchmark profiles show a clear win for
+        // mixed 3+-op and read-only self-loops. A two-op read/write MoveMem
+        // loop regresses when it carries counters around the generated loop,
+        // so compile that shape with the original linear body instead of
+        // trying to disable batching only at call time.
+        let native_loop = self_loop
+            && (ops.len() >= 3
+                || !ops
+                    .iter()
+                    .any(|op| matches!(op.op, JitTraceOp::MoveMem { .. })));
         let module = self.module.as_mut()?;
         let ptr_ty = module.target_config().pointer_type();
         let mut sig = module.make_signature();
         sig.params.push(AbiParam::new(ptr_ty));
+        if native_loop {
+            sig.params.push(AbiParam::new(types::I32));
+        }
         sig.returns.push(AbiParam::new(types::I64));
 
         let name = format!("m68k_trace_{}", self.next_func);
@@ -1045,11 +1149,43 @@ impl TraceJit {
                 None
             };
 
+            let zero = builder.ins().iconst(types::I32, 0);
+            let max_iters = if native_loop {
+                builder.block_params(block)[1]
+            } else {
+                builder.ins().iconst(types::I32, 1)
+            };
+            let trace_body = if native_loop {
+                let trace_body = builder.create_block();
+                builder.append_block_param(trace_body, types::I32); // accumulated cycles
+                builder.append_block_param(trace_body, types::I32); // retired instructions
+                builder.append_block_param(trace_body, types::I32); // iterations remaining
+                let initial_args: [BlockArg; 3] = [zero.into(), zero.into(), max_iters.into()];
+                builder.ins().jump(trace_body, &initial_args);
+                builder.switch_to_block(trace_body);
+                Some(trace_body)
+            } else {
+                None
+            };
+            let (cycles_before_iter, retired_before_iter, iterations_left) =
+                if let Some(trace_body) = trace_body {
+                    let params = builder.block_params(trace_body);
+                    (params[0], params[1], params[2])
+                } else {
+                    (zero, zero, max_iters)
+                };
+
             let mut bails: Vec<BailReq> = Vec::new();
-            let mut cycles_value = builder.ins().iconst(types::I32, 0);
+            let mut cycles_value = cycles_before_iter;
             for (index, op) in ops.iter().enumerate() {
                 let bail_at = BailAt {
-                    ops_before: index as u32,
+                    ops_before: if native_loop {
+                        RetiredBefore::Dynamic(
+                            builder.ins().iadd_imm(retired_before_iter, index as i64),
+                        )
+                    } else {
+                        RetiredBefore::Constant(index as u32)
+                    },
                     cycles_before: cycles_value,
                 };
                 let op_cycles = match op.op {
@@ -1067,6 +1203,11 @@ impl TraceJit {
                         length,
                         expected_taken,
                         cycles_value,
+                        if native_loop {
+                            RetiredBefore::Dynamic(retired_before_iter)
+                        } else {
+                            RetiredBefore::Constant(0)
+                        },
                         (index + 1) as u32,
                     ),
                     JitTraceOp::MoveMem { size, src, dst } => {
@@ -1114,21 +1255,54 @@ impl TraceJit {
                 );
             }
 
-            // Success: all ops retired. Pack (ops_retired << 32) | cycles.
+            let retired_value = builder
+                .ins()
+                .iadd_imm(retired_before_iter, ops.len() as i64);
+            if let Some(trace_body) = trace_body {
+                let iterations_left = builder.ins().iadd_imm(iterations_left, -1);
+                let more_iterations = builder.ins().icmp_imm(IntCC::NotEqual, iterations_left, 0);
+                let live_pc = load_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, pc));
+                let at_head = builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, live_pc, i64::from(start_pc));
+                let repeat = builder.ins().band(more_iterations, at_head);
+                let done = builder.create_block();
+                let repeat_args: [BlockArg; 3] = [
+                    cycles_value.into(),
+                    retired_value.into(),
+                    iterations_left.into(),
+                ];
+                builder
+                    .ins()
+                    .brif(repeat, trace_body, &repeat_args, done, &[]);
+                builder.switch_to_block(done);
+            }
+
             let cycles64 = builder.ins().uextend(types::I64, cycles_value);
-            let ops_len = builder.ins().iconst(types::I64, (ops.len() as i64) << 32);
-            let packed = builder.ins().bor(cycles64, ops_len);
+            let retired64 = if native_loop {
+                let retired64 = builder.ins().uextend(types::I64, retired_value);
+                builder.ins().ishl_imm(retired64, 32)
+            } else {
+                builder.ins().iconst(types::I64, (ops.len() as i64) << 32)
+            };
+            let packed = builder.ins().bor(cycles64, retired64);
             builder.ins().return_(&[packed]);
 
             // Bail exits: set PC to the un-executed op, return the ops and
-            // (constant) cycles retired before it.
+            // accumulated cycles/instructions retired before it.
             for bail in bails {
                 builder.switch_to_block(bail.block);
                 store_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, pc), bail.pc);
                 let cycles64 = builder.ins().uextend(types::I64, bail.at.cycles_before);
-                let retired = builder
-                    .ins()
-                    .iconst(types::I64, (bail.at.ops_before as i64) << 32);
+                let retired = match bail.at.ops_before {
+                    RetiredBefore::Constant(ops) => {
+                        builder.ins().iconst(types::I64, i64::from(ops) << 32)
+                    }
+                    RetiredBefore::Dynamic(ops) => {
+                        let retired = builder.ins().uextend(types::I64, ops);
+                        builder.ins().ishl_imm(retired, 32)
+                    }
+                };
                 let packed = builder.ins().bor(cycles64, retired);
                 builder.ins().return_(&[packed]);
             }
@@ -1141,7 +1315,11 @@ impl TraceJit {
         module.clear_context(&mut ctx);
         module.finalize_definitions().ok()?;
         let ptr = module.get_finalized_function(func_id);
-        let func = unsafe { transmute::<*const u8, TraceFn>(ptr) };
+        let func = if native_loop {
+            NativeTraceFn::Loop(unsafe { transmute::<*const u8, TraceLoopFn>(ptr) })
+        } else {
+            NativeTraceFn::Once(unsafe { transmute::<*const u8, TraceOnceFn>(ptr) })
+        };
 
         Some(CompiledTrace {
             pc: start_pc,
@@ -1151,6 +1329,7 @@ impl TraceJit {
             contiguous_code,
             max_cycles,
             self_loop,
+            native_loop,
             needs_window,
             code_start,
             code_end,
@@ -1773,7 +1952,7 @@ fn decode_jit_ea(mode: u16, reg: u16, displacement: i16) -> Option<JitEa> {
 }
 
 /// Interpreted trace execution (wasm and unit tests). Same contract as a
-/// compiled [`TraceFn`]: returns `(ops_retired << 32) | cycles`, and a
+/// compiled native trace: returns `(ops_retired << 32) | cycles`, and a
 /// mem-op bail sets `pc` to the un-executed op.
 #[cfg(any(target_family = "wasm", test))]
 fn execute_portable_trace(
@@ -2854,8 +3033,15 @@ struct MemEnv {
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Copy)]
 struct BailAt {
-    ops_before: u32,
+    ops_before: RetiredBefore,
     cycles_before: Value,
+}
+
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Copy)]
+enum RetiredBefore {
+    Constant(u32),
+    Dynamic(Value),
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -3774,6 +3960,7 @@ fn emit_guarded_branch(
     length: u8,
     expected_taken: bool,
     cycles_before: Value,
+    retired_before_iter: RetiredBefore,
     ops_done: u32,
 ) -> Value {
     let target_pc = (trace_pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32;
@@ -3808,7 +3995,16 @@ fn emit_guarded_branch(
     store_u32(builder, cpu, offset_of!(CpuCore, ppc), trace_pc);
     let total_cycles = builder.ins().iadd(cycles_before, op_cycles);
     let cycles64 = builder.ins().uextend(types::I64, total_cycles);
-    let retired = builder.ins().iconst(types::I64, (ops_done as i64) << 32);
+    let retired = match retired_before_iter {
+        RetiredBefore::Constant(retired) => builder
+            .ins()
+            .iconst(types::I64, i64::from(retired + ops_done) << 32),
+        RetiredBefore::Dynamic(retired) => {
+            let retired = builder.ins().iadd_imm(retired, i64::from(ops_done));
+            let retired = builder.ins().uextend(types::I64, retired);
+            builder.ins().ishl_imm(retired, 32)
+        }
+    };
     let packed = builder.ins().bor(cycles64, retired);
     builder.ins().return_(&[packed]);
 
@@ -4413,7 +4609,7 @@ mod portable_tests {
                 let compiled = jit
                     .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
                     .expect("native ADD loop should compile");
-                let packed = unsafe { (compiled.func)(&mut actual) };
+                let packed = unsafe { compiled.call_native(&mut actual, 1) };
 
                 assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?} {size:?}");
                 assert_eq!(actual.d(dst), expected.d(dst), "{cpu_type:?} {size:?}");
@@ -4477,7 +4673,7 @@ mod portable_tests {
             let compiled = jit
                 .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
                 .expect("native SUB loop should compile");
-            let packed = unsafe { (compiled.func)(&mut actual) };
+            let packed = unsafe { compiled.call_native(&mut actual, 1) };
 
             assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?}");
             assert_eq!(actual.d(4), expected.d(4), "{cpu_type:?}");
@@ -4618,7 +4814,7 @@ mod portable_tests {
         };
 
         let (mut success, success_mem) = prepare(0x0800);
-        let packed = unsafe { (compiled.func)(&mut success) };
+        let packed = unsafe { compiled.call_native(&mut success, 1) };
         assert_eq!((packed >> 32) as u32, 7);
         assert_eq!(packed as u32 as i32, 60);
         assert_eq!(success.d(1), 1);
@@ -4631,7 +4827,7 @@ mod portable_tests {
         assert!(success.change_of_flow);
 
         let (mut bail, bail_mem) = prepare(2);
-        let packed = unsafe { (compiled.func)(&mut bail) };
+        let packed = unsafe { compiled.call_native(&mut bail, 1) };
         assert_eq!((packed >> 32) as u32, 6);
         assert_eq!(packed as u32 as i32, 44);
         assert_eq!(bail.d(1), 1, "prefix remains committed");
@@ -4821,6 +5017,49 @@ mod portable_tests {
         assert_eq!(cpu.pc, 0x0100);
         assert_eq!(cpu.ppc, 0x0102);
         assert_eq!(cpu.ir, 0x60FC);
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn native_self_loop_batches_iterations_and_accumulates_progress() {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x5280,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 0,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60FC,
+                extension: None,
+                extension2: None,
+                pc: 0x0102,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -4,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let mut actual = cpu();
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&actual, 0x0100, CpuType::M68000, ops, Some(0x0100))
+            .expect("native self-loop should compile");
+
+        let packed = unsafe { compiled.call_native(&mut actual, 5) };
+
+        assert_eq!((packed >> 32) as u32, 10);
+        assert_eq!(packed as u32, 90);
+        assert_eq!(actual.d(0), 5);
+        assert_eq!(actual.pc, 0x0100);
     }
 
     #[test]
@@ -5065,7 +5304,7 @@ mod portable_tests {
                 let compiled = jit
                     .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
                     .expect("native ASR loop should compile");
-                let packed = unsafe { (compiled.func)(&mut actual) };
+                let packed = unsafe { compiled.call_native(&mut actual, 1) };
 
                 assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?} {size:?} #{shift}");
                 assert_eq!(
@@ -5155,7 +5394,7 @@ mod portable_tests {
                 let compiled = jit
                     .compile_decoded_ops(&actual, 0x0100, cpu_type, ops, Some(0x0100))
                     .expect("native LSL loop should compile");
-                let packed = unsafe { (compiled.func)(&mut actual) };
+                let packed = unsafe { compiled.call_native(&mut actual, 1) };
 
                 assert_eq!((packed >> 32) as u32, 2, "{cpu_type:?} {size:?} #{shift}");
                 assert_eq!(
