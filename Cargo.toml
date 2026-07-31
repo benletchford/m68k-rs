@@ -16,6 +16,7 @@ exclude = [
     "/.gitmodules",
     "/.release-please-manifest.json",
     "/CONTRIBUTING.md",
+    "/committed.toml",
     "/release-please-config.json",
     "/rust-toolchain.toml",
     "/scripts/**",
