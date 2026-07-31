@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.5...m68k-v0.3.0) (2026-07-31)
+
+
+### Features
+
+* unify cycle-exact and high-performance emulation ([8d11edf](https://github.com/benletchford/m68k-rs/commit/8d11edf75feb62dd3211bfda7a3cb9a781f6b3e6))
+
 ## [0.2.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.4...m68k-v0.2.5) (2026-07-25)
 
 
