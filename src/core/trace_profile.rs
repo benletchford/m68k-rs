@@ -506,12 +506,12 @@ mod tests {
             .find(|row| row.start_pc == 0)
             .expect("two-op loop head was profiled");
         assert_eq!(row.compiled_ops, 2);
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         assert!(
             row.native_calls > 1,
             "two-op read/write loops retain the measured faster one-pass path"
         );
-        #[cfg(target_family = "wasm")]
+        #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         assert!(row.native_calls > 0);
         assert!(row.jit_retired > 0);
     }
@@ -536,9 +536,9 @@ mod tests {
             .find(|row| row.start_pc == 0)
             .expect("cheap loop head was profiled");
         assert_eq!(row.compiled_ops, 2);
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         assert_eq!(row.native_calls, 1);
-        #[cfg(target_family = "wasm")]
+        #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         assert!(row.native_calls > 1);
         assert!(row.jit_retired > 0);
     }

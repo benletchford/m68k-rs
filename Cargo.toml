@@ -27,6 +27,14 @@ serde = { version = "1.0", features = ["derive"], optional = true }
 
 [features]
 default = []
+# Compile hot `run_batch` traces to native code with Cranelift. Without this
+# feature, batching and FastMem remain available through the portable executor.
+jit = [
+    "dep:cranelift-codegen",
+    "dep:cranelift-frontend",
+    "dep:cranelift-jit",
+    "dep:cranelift-module",
+]
 # Serialize the complete architectural CPU state for deterministic save states.
 # Runtime-only decode, FastMem, and JIT caches are rebuilt after deserialization.
 serde = ["dep:serde"]
@@ -35,10 +43,10 @@ serde = ["dep:serde"]
 trace-profile = []
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
-cranelift-codegen = "0.132.0"
-cranelift-frontend = "0.132.0"
-cranelift-jit = "0.132.0"
-cranelift-module = "0.132.0"
+cranelift-codegen = { version = "0.132.0", optional = true }
+cranelift-frontend = { version = "0.132.0", optional = true }
+cranelift-jit = { version = "0.132.0", optional = true }
+cranelift-module = { version = "0.132.0", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"

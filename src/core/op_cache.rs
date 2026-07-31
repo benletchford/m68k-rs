@@ -394,7 +394,7 @@ impl DecodedSimpleOp {
                 direction,
                 op,
             } => {
-                #[cfg(target_family = "wasm")]
+                #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
                 {
                     Some(JitTraceOp::ShiftReg {
                         reg,
@@ -405,7 +405,7 @@ impl DecodedSimpleOp {
                         op,
                     })
                 }
-                #[cfg(not(target_family = "wasm"))]
+                #[cfg(all(feature = "jit", not(target_family = "wasm")))]
                 {
                     // Native traces lower the immediate-count shift forms
                     // exercised by measured hot regions. Keep other variants
