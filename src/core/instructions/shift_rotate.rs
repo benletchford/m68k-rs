@@ -6,20 +6,21 @@ use crate::core::cpu::{CFLAG_SET, CpuCore};
 use crate::core::types::{CpuType, Size};
 
 impl CpuCore {
-    /// Register shift/rotate base cost. On the 68000 a long operation needs two
-    /// extra clocks (base 8 vs 6 for byte/word); the variable part is `2 * count`
-    /// on top. Other sizes and CPU types keep the base of 6.
+    /// MC68000 register shift/rotate timing: a base cost plus 2 cycles per
+    /// shift step. The long-operand base is 8 (vs 6 for byte/word); the core
+    /// previously used 6 for all sizes, under-billing every long shift/rotate
+    /// by 2 on pre-68020 CPUs. Later CPU types keep their existing barrel-shifter
+    /// value.
     #[inline]
-    fn shift_rot_base(&self, size: Size) -> i32 {
-        if matches!(
-            self.cpu_type,
-            CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
-        ) && size == Size::Long
-        {
-            8
-        } else {
-            6
+    fn shift_reg_cycles(&self, size: Size, count: u32) -> i32 {
+        // 68020+ shifts go through the barrel shifter: cost is independent
+        // of the count. 6 here lands on 4 cycles after the per-type cycle
+        // scaling, matching the cycle-exact A1200 reference measurement.
+        if !matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) {
+            return 6;
         }
+        let base = if size == Size::Long { 8 } else { 6 };
+        base + 2 * count as i32
     }
 
     /// Execute ASL (Arithmetic Shift Left).
@@ -28,7 +29,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, self.shift_rot_base(size));
+            return (value, self.shift_reg_cycles(size, 0));
         }
 
         let mask = size.mask();
@@ -62,7 +63,7 @@ impl CpuCore {
         self.v_flag = if overflow { 0x80 } else { 0 };
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * shift as i32)
+        (result, self.shift_reg_cycles(size, shift))
     }
 
     /// Execute ASR (Arithmetic Shift Right).
@@ -71,7 +72,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, self.shift_rot_base(size));
+            return (value, self.shift_reg_cycles(size, 0));
         }
 
         let mask = size.mask();
@@ -98,7 +99,7 @@ impl CpuCore {
         self.v_flag = 0; // ASR never sets overflow
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * shift as i32)
+        (result & mask, self.shift_reg_cycles(size, shift))
     }
 
     /// Execute LSL (Logical Shift Left).
@@ -107,7 +108,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, self.shift_rot_base(size));
+            return (value, self.shift_reg_cycles(size, 0));
         }
 
         let mask = size.mask();
@@ -130,7 +131,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * shift as i32)
+        (result, self.shift_reg_cycles(size, shift))
     }
 
     /// Execute LSR (Logical Shift Right).
@@ -139,7 +140,7 @@ impl CpuCore {
         if shift == 0 {
             self.c_flag = 0;
             self.set_logic_flags(value, size);
-            return (value, self.shift_rot_base(size));
+            return (value, self.shift_reg_cycles(size, 0));
         }
 
         let mask = size.mask();
@@ -163,7 +164,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * shift as i32)
+        (result, self.shift_reg_cycles(size, shift))
     }
 
     /// Execute ROL (Rotate Left).
@@ -178,7 +179,7 @@ impl CpuCore {
             self.c_flag = 0;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, self.shift_rot_base(size));
+            return (result, self.shift_reg_cycles(size, 0));
         }
 
         // Counts that are multiples of operand size still perform a full cycle
@@ -200,7 +201,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * cnt as i32)
+        (result, self.shift_reg_cycles(size, cnt))
     }
 
     /// Execute ROR (Rotate Right).
@@ -215,7 +216,7 @@ impl CpuCore {
             self.c_flag = 0;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, self.shift_rot_base(size));
+            return (result, self.shift_reg_cycles(size, 0));
         }
 
         let mut steps = cnt % bits;
@@ -235,15 +236,16 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * cnt as i32)
+        (result, self.shift_reg_cycles(size, cnt))
     }
 
     /// Execute ROXL (Rotate Left through X).
     pub fn exec_roxl(&mut self, size: Size, shift: u32, value: u32) -> (u32, i32) {
         let bits = size.bits() as u32;
         let mask = size.mask();
-        // Timing counts the full shift count; the rotation itself repeats every
-        // (bits + 1) positions because X participates as an extra bit.
+        // Cycle count uses the original rotate count, not the count reduced
+        // modulo (bits+1) for the rotation itself.
+        let count = shift;
         let steps = shift % (bits + 1);
 
         if steps == 0 {
@@ -252,7 +254,7 @@ impl CpuCore {
             self.c_flag = self.x_flag;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, self.shift_rot_base(size) + 2 * shift as i32);
+            return (result, self.shift_reg_cycles(size, count));
         }
 
         let mut result = value & mask;
@@ -269,7 +271,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * shift as i32)
+        (result, self.shift_reg_cycles(size, count))
     }
 
     /// Execute ROXR (Rotate Right through X).
@@ -277,8 +279,8 @@ impl CpuCore {
         let bits = size.bits() as u32;
         let mask = size.mask();
         let msb = size.msb_mask();
-        // Timing counts the full shift count; the rotation itself repeats every
-        // (bits + 1) positions because X participates as an extra bit.
+        // Cycle count uses the original rotate count (see exec_roxl).
+        let count = shift;
         let steps = shift % (bits + 1);
 
         if steps == 0 {
@@ -287,7 +289,7 @@ impl CpuCore {
             self.c_flag = self.x_flag;
             self.v_flag = 0;
             self.set_logic_flags_nv(result, size);
-            return (result, self.shift_rot_base(size) + 2 * shift as i32);
+            return (result, self.shift_reg_cycles(size, count));
         }
 
         let mut result = value & mask;
@@ -304,7 +306,7 @@ impl CpuCore {
         self.v_flag = 0;
         self.set_logic_flags_nv(result, size);
 
-        (result, self.shift_rot_base(size) + 2 * shift as i32)
+        (result, self.shift_reg_cycles(size, count))
     }
 
     /// Helper: set N and Z flags only (V already set by caller).
@@ -312,5 +314,31 @@ impl CpuCore {
         let msb = size.msb_mask();
         self.n_flag = if value & msb != 0 { 0x80 } else { 0 };
         self.not_z_flag = value & size.mask();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::types::CpuType;
+
+    #[test]
+    fn m68010_long_register_shift_uses_pre_68020_timing() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68010);
+
+        let (_, cycles) = cpu.exec_lsl(Size::Long, 8, 0x0000_0001);
+
+        assert_eq!(cycles, 24);
+    }
+
+    #[test]
+    fn m68020_register_shift_uses_barrel_shifter_timing() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68020);
+
+        let (_, cycles) = cpu.exec_lsl(Size::Long, 8, 0x0000_0001);
+
+        assert_eq!(cycles, 6);
     }
 }

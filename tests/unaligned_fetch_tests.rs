@@ -126,6 +126,11 @@ fn test_odd_pc_fetch_triggers_address_error_on_68020() {
     );
 }
 
+// Ported from upstream m68k-rs (post-fork regression test): a register-only
+// instruction followed by an odd-PC opcode fetch must not restore a stale
+// data/address rollback snapshot when the fetch faults. Confirms the vendored
+// cycle-exact core never leaks pre-instruction register state through a
+// fetch-fault path.
 #[test]
 fn test_odd_pc_fetch_after_register_only_instruction_does_not_restore_stale_snapshot() {
     let mut cpu = CpuCore::new();

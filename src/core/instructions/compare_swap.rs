@@ -8,7 +8,7 @@ use crate::core::memory::AddressBus;
 use crate::core::types::Size;
 
 impl CpuCore {
-    /// CAS.<size> Dc,Du,<ea>
+    /// `CAS.<size> Dc,Du,<ea>`
     ///
     /// Musashi fixtures only use CAS.L (opcode pattern 0x0EC0..0x0EFF).
     pub fn exec_cas<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
@@ -24,12 +24,46 @@ impl CpuCore {
             Some(m) => m,
             None => return self.take_exception(bus, 4),
         };
-        if mode.is_register_direct() || matches!(mode, AddressingMode::Immediate) {
+        // Memory alterable only: register direct, PC-relative and immediate
+        // forms do not exist (and must not consume the extension word).
+        if !((2..=6).contains(&ea_mode) || (ea_mode == 7 && ea_reg <= 1)) {
             return self.take_exception(bus, 4);
         }
 
         let size = decode_cas_size(opcode);
-        let addr = self.get_ea_address(bus, mode, size);
+        // Resolve the operand address with post-increment/pre-decrement
+        // commits deferred: a misaligned CAS was dropped from 68060 silicon
+        // and must trap with no architectural state changed, so the 68060SP
+        // handler can emulate the whole instruction.
+        let (addr, ea_commit) = match mode {
+            AddressingMode::PostIncrement(reg) => {
+                let addr = self.a(reg as usize);
+                let inc = if reg == 7 && size == Size::Byte {
+                    2 // A7 always stays word-aligned
+                } else {
+                    size.bytes()
+                };
+                (addr, Some((reg as usize, addr.wrapping_add(inc))))
+            }
+            AddressingMode::PreDecrement(reg) => {
+                let dec = if reg == 7 && size == Size::Byte {
+                    2
+                } else {
+                    size.bytes()
+                };
+                let addr = self.a(reg as usize).wrapping_sub(dec);
+                (addr, Some((reg as usize, addr)))
+            }
+            _ => (self.get_ea_address(bus, mode, size), None),
+        };
+        let misalign_mask = if size == Size::Long { 3 } else { 1 };
+        if size != Size::Byte && (addr & misalign_mask) != 0 && self.trap_unimpl_060() {
+            return self
+                .take_exception(bus, crate::core::exceptions::vector::UNIMPLEMENTED_INTEGER);
+        }
+        if let Some((reg, value)) = ea_commit {
+            self.set_a(reg, value);
+        }
         let mem = match size {
             Size::Byte => self.read_8(bus, addr) as u32,
             Size::Word => self.read_16(bus, addr) as u32,
@@ -53,10 +87,11 @@ impl CpuCore {
             self.set_d(dc, write_d_sized(dc_val, mem, size));
         }
 
+        self.trace_t0_68040_sync();
         20
     }
 
-    /// CAS2.<size> Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)
+    /// `CAS2.<size> Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)`
     ///
     /// Musashi fixtures use CAS2.L with two extension words.
     pub fn exec_cas2<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
@@ -111,11 +146,27 @@ impl CpuCore {
                 }
             }
         } else {
-            // Any mismatch: load both memory operands into compare registers.
-            self.set_d(dc1, write_d_sized(dc1_val, mem1, size));
-            self.set_d(dc2, write_d_sized(dc2_val, mem2, size));
+            // Any mismatch loads both memory operands into the compare
+            // registers. The write order is generation-dependent and decides
+            // which value survives when Dc1 == Dc2: pre-68040 parts write
+            // Dc2 then Dc1, the 68040/060 write Dc1 then Dc2.
+            let is_040_plus = matches!(
+                self.cpu_type,
+                crate::core::types::CpuType::M68EC040
+                    | crate::core::types::CpuType::M68LC040
+                    | crate::core::types::CpuType::M68040
+                    | crate::core::types::CpuType::M68060
+            );
+            if is_040_plus {
+                self.set_d(dc1, write_d_sized(self.d(dc1), mem1, size));
+                self.set_d(dc2, write_d_sized(self.d(dc2), mem2, size));
+            } else {
+                self.set_d(dc2, write_d_sized(self.d(dc2), mem2, size));
+                self.set_d(dc1, write_d_sized(self.d(dc1), mem1, size));
+            }
         }
 
+        self.trace_t0_68040_sync();
         40
     }
 

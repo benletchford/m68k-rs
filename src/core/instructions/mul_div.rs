@@ -8,22 +8,32 @@ use crate::core::execute::RUN_MODE_BERR_AERR_RESET;
 use crate::core::memory::AddressBus;
 use crate::core::types::{CpuType, Size};
 
-/// MULS multiplier-dependent term: the number of `01`/`10` bit pairs in the
-/// source word with a trailing 0 appended (bit transitions in `[src15..src0, 0]`).
-/// On the 68000 MULS.W costs `38 + 2 * this`.
+/// MULS multiplier-dependent cycle count: the number of `01`/`10` bit pairs in
+/// the source word with a 0 appended to the low end (bit transitions in the
+/// 17-bit sequence `[src15..src0, 0]`). MULS = 38 + 2*this + EA on the 68000.
 #[inline]
 fn muls_transitions(src: u16) -> u32 {
     let s = (src as u32) << 1; // append a trailing 0 bit
     ((s ^ (s >> 1)) & 0xFFFF).count_ones()
 }
 
-/// MC68000 DIVU.W compute cycles. `divisor` must be non-zero. An early overflow
-/// (high word of the dividend >= divisor) terminates quickly; otherwise the
-/// data-dependent restoring-division loop is simulated.
+#[inline]
+fn mulu_internal_clocks(src: u16) -> u32 {
+    34 + 2 * src.count_ones()
+}
+
+#[inline]
+fn muls_internal_clocks(src: u16) -> u32 {
+    34 + 2 * muls_transitions(src)
+}
+
+/// MC68000 DIVU.W compute cycles (excluding the EA fetch). `divisor` must be
+/// non-zero. Early overflow (high word of the dividend >= divisor) terminates
+/// fast; otherwise the data-dependent restoring-division loop is simulated.
 #[inline]
 fn divu_cycles(dividend: u32, divisor: u16) -> i32 {
     let div = divisor as u32;
-    // Early overflow: the quotient cannot fit in 16 bits.
+    // Early overflow: quotient cannot fit in 16 bits.
     if (dividend >> 16) >= div {
         return 10;
     }
@@ -46,9 +56,9 @@ fn divu_cycles(dividend: u32, divisor: u16) -> i32 {
     mcycles * 2
 }
 
-/// MC68000 DIVS.W compute cycles. `divisor` must be non-zero. A small base plus
-/// a negative-dividend penalty, with fast early-overflow termination and an
-/// otherwise quotient-bit-dependent loop.
+/// MC68000 DIVS.W compute cycles (excluding the EA fetch). `divisor` must be
+/// non-zero. Signed division: a small base plus a negative-dividend penalty,
+/// fast early-overflow termination, otherwise a quotient-bit-dependent loop.
 #[inline]
 fn divs_cycles(dividend: i32, divisor: i16) -> i32 {
     let mut mcycles: i32 = 6;
@@ -62,6 +72,8 @@ fn divs_cycles(dividend: i32, divisor: i16) -> i32 {
         return (mcycles + 2) * 2;
     }
     mcycles += 55;
+    // A non-negative divisor saves one cycle for a non-negative dividend
+    // and costs one for a negative dividend (WinUAE getDivs68kCycles).
     if divisor >= 0 {
         if dividend >= 0 {
             mcycles -= 1;
@@ -82,9 +94,17 @@ fn divs_cycles(dividend: i32, divisor: i16) -> i32 {
 }
 
 impl CpuCore {
+    fn finish_m68000_mul<B: AddressBus>(&mut self, bus: &mut B, internal_clocks: u32) {
+        // 68000 MULU/MULS perform the final prefetch before the multiplier's
+        // internal clocks, then write Dn after that sync interval.
+        self.top_up_prefetch(bus);
+        self.internal_cycles(internal_clocks);
+        self.flush_sync(bus);
+    }
+
     /// Execute MULU (unsigned 16x16 -> 32 multiply).
     ///
-    /// MULU <ea>, Dn
+    /// `MULU <ea>, Dn`
     pub fn exec_mulu<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -99,6 +119,9 @@ impl CpuCore {
         let dst = self.d(dst_reg) & 0xFFFF;
         let result = src * dst;
 
+        if self.cpu_type == CpuType::M68000 {
+            self.finish_m68000_mul(bus, mulu_internal_clocks(src as u16));
+        }
         self.set_d(dst_reg, result);
 
         // Set flags
@@ -107,17 +130,20 @@ impl CpuCore {
         self.v_flag = 0;
         self.c_flag = 0;
 
-        // MC68000: MULU.W = 38 + 2 * (number of 1 bits in the source word).
+        // MC68000: MULU.W = 38 + 2 * (ones in the 16-bit source) + EA.
+        // 020+ has a fixed-cost multiplier; the cycle-exact A1200/FS-UAE
+        // reference measures MULU.W at ~27 cycles, so pre-scale to 42
+        // (-> 27 after scale_cycles_for_cpu_type).
         if self.cpu_type == CpuType::M68000 {
-            38 + 2 * src.count_ones() as i32
+            38 + 2 * (src & 0xFFFF).count_ones() as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
-            38
+            42
         }
     }
 
     /// Execute MULS (signed 16x16 -> 32 multiply).
     ///
-    /// MULS <ea>, Dn
+    /// `MULS <ea>, Dn`
     pub fn exec_muls<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -132,6 +158,9 @@ impl CpuCore {
         let dst = self.d(dst_reg) as i16 as i32;
         let result = (src * dst) as u32;
 
+        if self.cpu_type == CpuType::M68000 {
+            self.finish_m68000_mul(bus, muls_internal_clocks(src as u16));
+        }
         self.set_d(dst_reg, result);
 
         // Set flags
@@ -140,18 +169,19 @@ impl CpuCore {
         self.v_flag = 0;
         self.c_flag = 0;
 
-        // MC68000: MULS.W = 38 + 2 * (bit transitions in the source word << 1).
+        // MC68000: MULS.W = 38 + 2 * (bit transitions in source<<1) + EA.
+        // 020+ fixed-cost multiplier (~27 cycles measured); pre-scale 42.
         if self.cpu_type == CpuType::M68000 {
-            38 + 2 * muls_transitions(src as u16) as i32
+            38 + 2 * muls_transitions(src as u16) as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
-            38
+            42
         }
     }
 
     /// Execute DIVU (unsigned 32÷16 -> 16Q + 16R).
     ///
-    /// DIVU <ea>, Dn
-    /// Result: Dn[31:16] = remainder, Dn[15:0] = quotient
+    /// `DIVU <ea>, Dn`
+    /// Result: `Dn[31:16]` = remainder, `Dn[15:0]` = quotient
     pub fn exec_divu<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -165,18 +195,46 @@ impl CpuCore {
         }
         let dst = self.d(dst_reg);
 
+        let m68000 = self.cpu_type == CpuType::M68000;
         if src == 0 {
-            // Division by zero - trigger trap
+            // Division by zero: 8 internal clocks precede the exception's
+            // first stack write (Moira: SYNC(8) then the zero-divide
+            // exception).
+            if m68000 {
+                self.internal_cycles(8);
+            }
             return self.exception_zero_divide(bus);
         }
 
-        // On the 68000 the cycle count is data-dependent (restoring division);
-        // other CPU types keep the flat worst-case value.
-        let cycles = if self.cpu_type == CpuType::M68000 {
+        let div_clocks = if m68000 {
             divu_cycles(dst, src as u16)
         } else {
             140
         };
+        let cycles = if m68000 {
+            div_clocks + self.ea_source_cycles(mode, Size::Word)
+        } else {
+            140
+        };
+        // The final prefetch precedes the division algorithm's internal
+        // clocks (Moira: prefetch<POLL> then SYNC): the np is the
+        // instruction's last bus access and carries the IPL poll, so an
+        // interrupt rising during the division is taken one instruction
+        // later.
+        if m68000 {
+            self.top_up_prefetch(bus);
+            if div_clocks > 4 {
+                self.internal_cycles((div_clocks - 4) as u32);
+                // Advance the beam for the division's internal clocks now, before
+                // the instruction boundary (Moira's SYNC runs immediately after
+                // prefetch<POLL>). Deferring them past the boundary -- to the next
+                // instruction's first bus access -- mistimes CPU-vs-bitplane-DMA
+                // contention during an active display, doubling the beam cost of a
+                // DIV run mid-fetch (timing-test row 31 8722 -> 4820 cck vs vAmiga
+                // 4790; TEK Rampage's Ellis scene depends on it).
+                self.flush_sync(bus);
+            }
+        }
 
         let quotient = dst / src;
         let remainder = dst % src;
@@ -205,8 +263,8 @@ impl CpuCore {
 
     /// Execute DIVS (signed 32÷16 -> 16Q + 16R).
     ///
-    /// DIVS <ea>, Dn
-    /// Result: Dn[31:16] = remainder, Dn[15:0] = quotient
+    /// `DIVS <ea>, Dn`
+    /// Result: `Dn[31:16]` = remainder, `Dn[15:0]` = quotient
     pub fn exec_divs<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -220,18 +278,46 @@ impl CpuCore {
         }
         let dst = self.d(dst_reg) as i32;
 
+        let m68000 = self.cpu_type == CpuType::M68000;
         if src == 0 {
-            // Division by zero - trigger trap
+            // Division by zero: 8 internal clocks precede the exception's
+            // first stack write (Moira: SYNC(8) then the zero-divide
+            // exception).
+            if m68000 {
+                self.internal_cycles(8);
+            }
             return self.exception_zero_divide(bus);
         }
 
-        // On the 68000 the cycle count is data-dependent (signed restoring
-        // division); other CPU types keep the flat worst-case value.
-        let cycles = if self.cpu_type == CpuType::M68000 {
+        let div_clocks = if m68000 {
             divs_cycles(dst, src as i16)
         } else {
             158
         };
+        let cycles = if m68000 {
+            div_clocks + self.ea_source_cycles(mode, Size::Word)
+        } else {
+            158
+        };
+        // The final prefetch precedes the division algorithm's internal
+        // clocks (Moira: prefetch<POLL> then SYNC): the np is the
+        // instruction's last bus access and carries the IPL poll, so an
+        // interrupt rising during the division is taken one instruction
+        // later.
+        if m68000 {
+            self.top_up_prefetch(bus);
+            if div_clocks > 4 {
+                self.internal_cycles((div_clocks - 4) as u32);
+                // Advance the beam for the division's internal clocks now, before
+                // the instruction boundary (Moira's SYNC runs immediately after
+                // prefetch<POLL>). Deferring them past the boundary -- to the next
+                // instruction's first bus access -- mistimes CPU-vs-bitplane-DMA
+                // contention during an active display, doubling the beam cost of a
+                // DIV run mid-fetch (timing-test row 31 8722 -> 4820 cck vs vAmiga
+                // 4790; TEK Rampage's Ellis scene depends on it).
+                self.flush_sync(bus);
+            }
+        }
 
         // Special case: 0x80000000 / -1 = 0x80000000 (would overflow)
         // But Musashi returns quotient=0, remainder=0 for this
@@ -269,5 +355,87 @@ impl CpuCore {
         self.c_flag = 0;
 
         cycles
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum Event {
+        ReadWord(u32),
+        Sync(u32),
+    }
+
+    #[derive(Default)]
+    struct TraceBus {
+        events: Vec<Event>,
+    }
+
+    impl AddressBus for TraceBus {
+        fn read_byte(&mut self, _address: u32) -> u8 {
+            0
+        }
+
+        fn read_word(&mut self, address: u32) -> u16 {
+            self.events.push(Event::ReadWord(address));
+            0x4e71
+        }
+
+        fn read_long(&mut self, _address: u32) -> u32 {
+            0
+        }
+
+        fn write_byte(&mut self, _address: u32, _value: u8) {}
+
+        fn write_word(&mut self, _address: u32, _value: u16) {}
+
+        fn write_long(&mut self, _address: u32, _value: u32) {}
+
+        fn sync(&mut self, cpu_clocks: u32) {
+            self.events.push(Event::Sync(cpu_clocks));
+        }
+    }
+
+    fn m68000_cpu_with_one_prefetch_word() -> CpuCore {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.pc = 0x2000;
+        cpu.prefetch_queue = [0x4e71, 0];
+        cpu.prefetch_count = 1;
+        cpu
+    }
+
+    #[test]
+    fn m68000_mulu_data_register_prefetches_before_multiplier_sync() {
+        let mut cpu = m68000_cpu_with_one_prefetch_word();
+        let mut bus = TraceBus::default();
+        cpu.dar[0] = 0x0000_0003;
+        cpu.dar[1] = 0x0000_0004;
+
+        let cycles = cpu.exec_mulu(&mut bus, AddressingMode::DataDirect(0), 1);
+
+        assert_eq!(cycles, 42);
+        assert_eq!(cpu.dar[1], 0x0000_000C);
+        assert_eq!(cpu.prefetch_count, 2);
+        assert_eq!(cpu.pending_sync_clocks, 0);
+        assert_eq!(bus.events, vec![Event::ReadWord(0x2002), Event::Sync(38)]);
+    }
+
+    #[test]
+    fn m68000_muls_data_register_prefetches_before_multiplier_sync() {
+        let mut cpu = m68000_cpu_with_one_prefetch_word();
+        let mut bus = TraceBus::default();
+        cpu.dar[0] = 0x0000_FFFF;
+        cpu.dar[1] = 0x0000_0002;
+
+        let cycles = cpu.exec_muls(&mut bus, AddressingMode::DataDirect(0), 1);
+
+        assert_eq!(cycles, 40);
+        assert_eq!(cpu.dar[1], 0xFFFF_FFFE);
+        assert_eq!(cpu.prefetch_count, 2);
+        assert_eq!(cpu.pending_sync_clocks, 0);
+        assert_eq!(bus.events, vec![Event::ReadWord(0x2002), Event::Sync(36)]);
     }
 }

@@ -5,6 +5,7 @@ use super::memory::AddressBus;
 
 /// Supported CPU types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u32)]
 pub enum CpuType {
     Invalid = 0,
@@ -19,6 +20,7 @@ pub enum CpuType {
     M68LC040 = 8,
     M68040 = 9,
     SCC68070 = 10,
+    M68060 = 11,
 }
 
 /// Trap handler with CPU and bus access for HLE.
@@ -239,4 +241,45 @@ pub struct BatchResult {
     pub instructions: u32,
     /// Why the batch returned.
     pub exit: BatchExit,
+}
+
+/// Reason a [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) call
+/// returned.
+///
+/// Trap variants have exactly the same CPU/PC state as [`StepResult`]: the
+/// trapping opcode has been fetched and `pc` points past it, but no hardware
+/// exception entry has been performed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleBatchExit {
+    /// The requested cycle budget was met or crossed at an instruction or
+    /// interrupt boundary.
+    BudgetExhausted,
+    /// The CPU executed STOP, or was already stopped with no serviceable
+    /// interrupt on entry.
+    Stopped,
+    /// A-line trap (0xAxxx opcode).
+    AlineTrap { opcode: u16 },
+    /// F-line trap (0xFxxx opcode).
+    FlineTrap { opcode: u16 },
+    /// TRAP #n instruction.
+    TrapInstruction { trap_num: u8 },
+    /// BKPT #n instruction.
+    Breakpoint { bp_num: u8 },
+    /// Illegal instruction.
+    IllegalInstruction { opcode: u16 },
+}
+
+/// Result of [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CycleBatchResult {
+    /// Actual CPU cycles consumed. This may exceed the requested budget
+    /// because instructions and interrupt entry are never split.
+    pub cycles: i32,
+    /// Number of instructions that fully retired.
+    ///
+    /// A surfaced trapping instruction is excluded. RESET and internally
+    /// taken exceptions count as instructions; interrupt entry does not.
+    pub instructions: u32,
+    /// Why execution returned.
+    pub exit: CycleBatchExit,
 }

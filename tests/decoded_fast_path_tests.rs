@@ -170,7 +170,7 @@ fn execute_decoded_short_branch_loop_runs_at_instruction_boundary() {
 }
 
 #[test]
-fn execute_decoded_short_branch_loop_observes_modified_opcode() {
+fn execute_short_branch_loop_preserves_prefetched_opcode() {
     let mut bus = TestBus::new();
     let mut cpu = boot_cpu(&mut bus);
 
@@ -182,16 +182,24 @@ fn execute_decoded_short_branch_loop_observes_modified_opcode() {
     assert_eq!(cpu.d(0), 1);
     assert_eq!(cpu.pc, 0x0100);
 
+    // The 68000's branch refill already fetched the loop head. A host-side
+    // write becomes visible after that queued word retires and the branch
+    // refills the queue again.
     bus.write_word_at(0x0100, 0x5380); // SUBQ.L #1,D0
 
     let cycles = cpu.execute(&mut bus, 18);
     assert_eq!(cycles, 18);
-    assert_eq!(cpu.d(0), 0);
+    assert_eq!(cpu.d(0), 2);
+    assert_eq!(cpu.pc, 0x0100);
+
+    let cycles = cpu.execute(&mut bus, 18);
+    assert_eq!(cycles, 18);
+    assert_eq!(cpu.d(0), 1);
     assert_eq!(cpu.pc, 0x0100);
 }
 
 #[test]
-fn execute_trace_jit_loop_observes_modified_opcode_after_warmup() {
+fn transaction_exact_execute_bypasses_trace_jit_after_warmup() {
     let mut bus = TestBus::new();
     let mut cpu = boot_cpu(&mut bus);
 
@@ -203,11 +211,13 @@ fn execute_trace_jit_loop_observes_modified_opcode_after_warmup() {
     assert_eq!(cpu.d(0), 10);
     assert_eq!(cpu.pc, 0x0100);
 
+    // execute() remains transaction-exact even after a hot loop: the queued
+    // opcode retires once before the externally modified word is fetched.
     bus.write_word_at(0x0100, 0x5380); // SUBQ.L #1,D0
 
     let cycles = cpu.execute(&mut bus, 18);
     assert_eq!(cycles, 18);
-    assert_eq!(cpu.d(0), 9);
+    assert_eq!(cpu.d(0), 11);
     assert_eq!(cpu.pc, 0x0100);
 }
 

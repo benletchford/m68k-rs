@@ -2635,7 +2635,13 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 4
             }
         }
-        JitTraceOp::Swap { reg } => cpu.exec_swap(reg as usize),
+        JitTraceOp::Swap { reg } => {
+            let reg = reg as usize;
+            let result = cpu.d(reg).rotate_right(16);
+            cpu.set_d(reg, result);
+            cpu.set_logic_flags(result, Size::Long);
+            4
+        }
         JitTraceOp::Ext { reg, size } => cpu.exec_ext(size, reg as usize),
         JitTraceOp::Extb { reg } => cpu.exec_extb(reg as usize),
         JitTraceOp::AddqSubqReg {
@@ -2797,7 +2803,29 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 }
             }
         }
-        JitTraceOp::Exg { opcode } => cpu.exec_exg(opcode),
+        JitTraceOp::Exg { opcode } => {
+            let rx = ((opcode >> 9) & 7) as usize;
+            let ry = (opcode & 7) as usize;
+            match (opcode >> 3) & 0x1F {
+                0x08 => {
+                    let tmp = cpu.d(rx);
+                    cpu.set_d(rx, cpu.d(ry));
+                    cpu.set_d(ry, tmp);
+                }
+                0x09 => {
+                    let tmp = cpu.a(rx);
+                    cpu.set_a(rx, cpu.a(ry));
+                    cpu.set_a(ry, tmp);
+                }
+                0x11 => {
+                    let tmp = cpu.d(rx);
+                    cpu.set_d(rx, cpu.a(ry));
+                    cpu.set_a(ry, tmp);
+                }
+                _ => {}
+            }
+            6
+        }
         JitTraceOp::SccDataReg { condition, reg } => {
             let value = if cpu.test_condition(condition) {
                 0xFF
@@ -3268,8 +3296,14 @@ fn emit_jit_op(
             store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
             set_logic_flags_nv(builder, cpu, result, size);
 
-            let base = if pre020 && size == Size::Long { 8 } else { 6 };
-            cycles_const(builder, base + 2 * shift as i32)
+            if pre020 {
+                let base = if size == Size::Long { 8 } else { 6 };
+                cycles_const(builder, base + 2 * shift as i32)
+            } else {
+                // 68020+ has a barrel shifter. Its handler returns a fixed
+                // pre-scaled cost independent of the encoded count.
+                cycles_const(builder, 6)
+            }
         }
         JitTraceOp::MoveMem { .. } => unreachable!("MoveMem is emitted by emit_move_mem"),
         JitTraceOp::MovemWordPostInc { .. } => {

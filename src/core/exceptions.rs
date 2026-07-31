@@ -26,10 +26,94 @@ pub mod vector {
     pub const SPURIOUS_INTERRUPT: u32 = 24;
     pub const TRAP_BASE: u32 = 32;
 
+    /// 68060: integer instructions removed from silicon (MOVEP, CHK2/CMP2,
+    /// CAS2, misaligned CAS, 64-bit MUL/DIV) trap here for the OS-side
+    /// 68060 software package to emulate.
+    pub const UNIMPLEMENTED_INTEGER: u32 = 61;
+    /// 68060: FP operand data types the FPU no longer handles in hardware
+    /// (packed decimal, denormals) - pre-instruction, format $0.
+    pub const FP_UNSUPP_DATA_TYPE: u32 = 55;
+    /// 68060: FP addressing forms dropped from silicon (dynamic-list
+    /// FMOVEM, immediate packed operands, multi-register control-list
+    /// FMOVEM.L #imm) - pre-instruction, format $0.
+    pub const FP_UNIMPLEMENTED_EA: u32 = 60;
+
     // 68020+ MMU exceptions (vector numbers per 68k docs; used by 68030/68040 PMMU).
     pub const MMU_CONFIGURATION_ERROR: u32 = 56;
     pub const MMU_ILLEGAL_OPERATION_ERROR: u32 = 57;
     pub const MMU_ACCESS_LEVEL_VIOLATION_ERROR: u32 = 58;
+}
+
+/// 68060 fault status long word (FSLW) bits, as consumed by OS fault
+/// handlers (bit names per MC68060UM Table 8-9 / Linux asm/traps.h).
+pub mod fslw {
+    /// Read access.
+    pub const RW_R: u32 = 0x0100_0000;
+    /// Write access.
+    pub const RW_W: u32 = 0x0080_0000;
+    /// Transfer size shift (bits 22-21): 00 long, 01 byte, 10 word.
+    pub const SIZE_SHIFT: u32 = 21;
+    /// Transfer modifier shift (bits 18-16): holds the function code.
+    pub const TM_SHIFT: u32 = 16;
+    /// Instruction (1) or operand (0) access.
+    pub const IO: u32 = 0x0000_8000;
+    /// Invalid descriptor in the root (level A) table.
+    pub const PTA: u32 = 0x0000_1000;
+    /// Invalid descriptor in the pointer (level B) table.
+    pub const PTB: u32 = 0x0000_0800;
+    /// Invalid indirect page descriptor.
+    pub const IL: u32 = 0x0000_0400;
+    /// Page fault (invalid page descriptor).
+    pub const PF: u32 = 0x0000_0200;
+    /// Supervisor protection violation.
+    pub const SP: u32 = 0x0000_0100;
+    /// Write protection violation.
+    pub const WP: u32 = 0x0000_0080;
+    /// Bus error on table search.
+    pub const TWE: u32 = 0x0000_0040;
+    /// Bus error on read.
+    pub const RE: u32 = 0x0000_0020;
+    /// Bus error on write.
+    pub const WE: u32 = 0x0000_0010;
+}
+
+/// Compose the 68060 FSLW for an access error.
+fn fslw_060(
+    write: bool,
+    instruction: bool,
+    size: u32,
+    fc: u16,
+    cause: Option<crate::mmu::MmuFaultCause>,
+) -> u32 {
+    use crate::mmu::MmuFaultCause;
+    let mut w = if write { fslw::RW_W } else { fslw::RW_R };
+    w |= match size {
+        1 => 0b01 << fslw::SIZE_SHIFT,
+        2 => 0b10 << fslw::SIZE_SHIFT,
+        _ => 0, // long
+    };
+    w |= u32::from(fc & 7) << fslw::TM_SHIFT;
+    if instruction {
+        w |= fslw::IO;
+    }
+    w |= match cause {
+        Some(MmuFaultCause::PointerA) => fslw::PTA,
+        Some(MmuFaultCause::PointerB) => fslw::PTB,
+        Some(MmuFaultCause::Indirect) => fslw::IL,
+        Some(MmuFaultCause::PageFault) => fslw::PF,
+        Some(MmuFaultCause::WriteProtect) => fslw::WP,
+        Some(MmuFaultCause::SupervisorProtect) => fslw::SP,
+        Some(MmuFaultCause::TableWalkBusError) => fslw::TWE,
+        // A physical bus error on the access itself.
+        Some(MmuFaultCause::AccessBusError) | None => {
+            if write {
+                fslw::WE
+            } else {
+                fslw::RE
+            }
+        }
+    };
+    w
 }
 
 /// Function code bits for exception stack frames.
@@ -63,87 +147,79 @@ impl CpuCore {
         self.dar[15] = self.dar[15].wrapping_sub(4);
     }
 
+    /// Push the 68000's 3-word exception frame (SR + PC) in the bus order the
+    /// hardware uses: PC low word first, then SR, then PC high word.
+    pub(crate) fn push_exception_frame_68000<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        stacked_pc: u32,
+        sr: u16,
+    ) {
+        let sp = self.dar[15].wrapping_sub(6);
+        self.dar[15] = sp;
+        self.write_16(bus, sp.wrapping_add(4), (stacked_pc & 0xFFFF) as u16);
+        self.write_16(bus, sp, sr);
+        self.write_16(bus, sp.wrapping_add(2), (stacked_pc >> 16) as u16);
+    }
+
     /// Process TRAP #n instruction.
+    ///
+    /// TRAP #n pushes the four-word format $0 frame on every 68010+ model
+    /// (M68020UM table 6-5 lists TRAP #N under format $0; the earlier
+    /// Musashi-derived format $2 frame on the 020/030 was wrong) with the
+    /// next instruction's PC stacked.
     pub fn trap<B: AddressBus>(&mut self, bus: &mut B, trap_num: u8) -> i32 {
         let vector = vector::TRAP_BASE + (trap_num & 0xF) as u32;
-
-        // Musashi 68020/68030 uses "format 2" stack frame for TRAP exceptions.
-        // 68040+ uses format 0 (same as simple exceptions).
-        let uses_format_2 = matches!(
-            self.cpu_type,
-            super::types::CpuType::M68EC020
-                | super::types::CpuType::M68020
-                | super::types::CpuType::M68EC030
-                | super::types::CpuType::M68030
-        );
-        if uses_format_2 {
-            let old_sr = self.get_sr();
-            // Match Musashi m68ki_init_exception: enter supervisor, clear trace.
-            self.set_s_flag(SFLAG_SET);
-            self.t1_flag = 0;
-            self.t0_flag = 0;
-
-            // Stacked PC for TRAP is the next instruction.
-            let stacked_pc = self.pc;
-            let vec_word = (vector as u16) << 2;
-
-            // Musashi m68ki_stack_frame_0010:
-            // push PPC (long), then 0x2000|(vector<<2) (word), then PC (long), then SR (word)
-            self.push_32(bus, self.ppc);
-            self.push_16(bus, 0x2000 | (vec_word & 0x0FFF));
-            self.push_32(bus, stacked_pc);
-            self.push_16(bus, old_sr);
-
-            self.jump_vector(bus, vector);
-            return self.exception_cycles(vector);
-        }
-
         self.take_exception(bus, vector)
     }
 
-    /// Process CHK exception.
-    pub fn exception_chk<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
+    /// Group-2 instruction exceptions: CHK/CHK2, TRAPcc/TRAPV (and FTRAPcc),
+    /// zero divide, and trace. The stacked PC is the next instruction on
+    /// every model; the 68020+ push the six-word format $2 frame whose
+    /// extra long is the address of the instruction that caused the
+    /// exception (M68020UM table 6-5), so a handler can decode or skip it.
+    pub(crate) fn take_group2_exception<B: AddressBus>(&mut self, bus: &mut B, vector: u32) -> i32 {
         let old_sr = self.get_sr();
 
-        // Enter supervisor, clear trace
+        // Enter supervisor, clear trace.
         self.set_s_flag(SFLAG_SET);
         self.t1_flag = 0;
         self.t0_flag = 0;
 
-        // Musashi treats CHK as a group-2 exception:
-        // - 68000: 3-word frame (PC, SR)
-        // - 68010: format-0 frame (vector<<2, PC, SR)
-        // - 68020+: format-2 frame (PPC, 0x2000|vector<<2, PC, SR)
-        //
-        // CHK stacks the next PC (self.pc) and includes PPC in the 020+ format-2 frame.
+        let next_pc = self.pc;
         match self.cpu_type {
             super::types::CpuType::M68000 => {
-                self.push_32(bus, self.pc);
-                self.push_16(bus, old_sr);
+                self.push_exception_frame_68000(bus, next_pc, old_sr);
             }
             super::types::CpuType::M68010 | super::types::CpuType::SCC68070 => {
-                self.push_16(bus, (vector::CHK as u16) << 2);
-                self.push_32(bus, self.pc);
+                self.push_16(bus, (vector as u16) << 2);
+                self.push_32(bus, next_pc);
                 self.push_16(bus, old_sr);
             }
             _ => {
-                let vec_word = (vector::CHK as u16) << 2;
+                let vec_word = (vector as u16) << 2;
                 self.push_32(bus, self.ppc);
                 self.push_16(bus, 0x2000 | (vec_word & 0x0FFF));
-                self.push_32(bus, self.pc);
+                self.push_32(bus, next_pc);
                 self.push_16(bus, old_sr);
             }
         }
 
-        // Jump to vector
-        self.jump_vector(bus, vector::CHK);
+        self.jump_vector(bus, vector);
+        self.exception_cycles(vector)
+    }
 
-        self.exception_cycles(vector::CHK)
+    /// Process CHK exception.
+    ///
+    /// The caller (exec_chk) reports the comparison's internal clocks before
+    /// calling this (8 for trap-on-too-big, 10 for trap-on-negative).
+    pub fn exception_chk<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
+        self.take_group2_exception(bus, vector::CHK)
     }
 
     /// Process zero divide exception.
     pub fn exception_zero_divide<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
-        self.take_exception(bus, vector::ZERO_DIVIDE)
+        self.take_group2_exception(bus, vector::ZERO_DIVIDE)
     }
 
     /// Process privilege violation exception.
@@ -153,7 +229,15 @@ impl CpuCore {
 
     /// Process trace exception.
     pub fn exception_trace<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
-        self.take_exception(bus, vector::TRACE)
+        // A pending trace recovers the CPU from the STOP state: STOP executed
+        // with the trace bit set in the incoming SR takes the trace exception
+        // instead of remaining stopped (the trace has priority over both the
+        // stopped state and its supervisor check).
+        self.stopped &= !super::execute::STOP_LEVEL_STOP;
+        // 4 internal clocks precede the trace frame's first stack write
+        // (Moira execException TRACE: SYNC(4)).
+        self.internal_cycles(4);
+        self.take_group2_exception(bus, vector::TRACE)
     }
 
     /// Process address error exception.
@@ -253,26 +337,47 @@ impl CpuCore {
         address: u32,
         write: bool,
         instruction: bool,
+        size: u32,
+        cause: Option<crate::mmu::MmuFaultCause>,
     ) -> i32 {
         let old_sr = self.get_sr();
         let was_supervisor = (old_sr & 0x2000) != 0;
+        // The faulted write's data, captured before any frame push: the
+        // pushes below are ordinary translated writes and each one replaces
+        // pending_fault_wdata, so reading the field mid-frame would hand the
+        // handler's writeback (WB3D / the 030 data output buffer) a zero
+        // instead of the value the guest was storing.
+        let fault_wdata = self.pending_fault_wdata;
 
         // Enter supervisor mode, clear trace
         self.set_s_flag(SFLAG_SET);
         self.t1_flag = 0;
         self.t0_flag = 0;
 
-        // Build function code / status word
-        let fc = if was_supervisor {
-            if instruction {
-                fc::SUPERVISOR_PROGRAM
-            } else {
-                fc::SUPERVISOR_DATA
+        // Build function code / status word. A MOVES data fault carries the
+        // SFC/DFC space it faulted in, not the CPU-state code: the handler
+        // reads the fc back out of the frame's SSW to PTEST the faulted
+        // space (mmu.library does exactly this). The override is consumed
+        // here: SFC/DFC only governs the MOVES operand cycle, never the
+        // exception dispatch itself -- the frame pushes and vector fetch
+        // below run in supervisor space (a stuck override would walk the
+        // user root pointer for the vector fetch, which on a kernel with
+        // split user/supervisor trees reads garbage).
+        let fc = match self.mmu_fc_override.take() {
+            Some(ofc) => ofc as u16,
+            None => {
+                if was_supervisor {
+                    if instruction {
+                        fc::SUPERVISOR_PROGRAM
+                    } else {
+                        fc::SUPERVISOR_DATA
+                    }
+                } else if instruction {
+                    fc::USER_PROGRAM
+                } else {
+                    fc::USER_DATA
+                }
             }
-        } else if instruction {
-            fc::USER_PROGRAM
-        } else {
-            fc::USER_DATA
         };
         let status_word = fc | if write { 0 } else { 0x10 } | if instruction { 0 } else { 0x08 };
 
@@ -303,13 +408,147 @@ impl CpuCore {
                 self.push_16_raw(bus, old_sr);
                 let _ = (status_word, address); // currently unused in this placeholder
             }
+            _ if self.is_060() => {
+                // 68060 access-error stack frame (format $4, 8 words): the
+                // fault address long at +$08 and the fault status long word
+                // (FSLW) at +$0C. The instruction has been rolled back, so
+                // RTE restarts it (same demand-paging model as the 040).
+                let fslw = fslw_060(write, instruction, size, fc, cause);
+                let fmt_vec = 0x4000 | ((vector::BUS_ERROR as u16) << 2);
+                self.push_32(bus, fslw);
+                self.push_32(bus, address);
+                self.push_16(bus, fmt_vec);
+                self.push_32(bus, self.ppc); // restart PC
+                self.push_16(bus, old_sr);
+                let _ = status_word;
+            }
+            _ if self.is_040() => {
+                // 68040 access-error stack frame (format 7, 30 words). The
+                // caller (trigger_bus_error) has already rolled the instruction
+                // back, so we stack PPC and leave the writeback/continuation
+                // fields clear: RTE then restarts the faulting instruction
+                // (demand-paging / Enforcer fix-and-retry model).
+                // Layout (Musashi m68ki_stack_frame_0111), pushed high->low.
+                //
+                // SSW: RW (bit 8), SZ (bits 6:5, 040 encoding: 00 long,
+                // 01 byte, 10 word), TM (bits 2:0) = function code, and ATC
+                // (bit 10) when the fault came out of the MMU table walk
+                // rather than the physical bus. ATC is what an OS-level
+                // page-fault handler (mmu.library, VMM, Enforcer) tests to
+                // tell a translation fault it must service from a real bus
+                // error it must pass on, so a translation fault without it
+                // gurus instead of demand-faulting.
+                let rw = if write { 0 } else { 0x0100 }; // SSW bit 8: 1 = read
+                let atc = if cause.is_some() { 0x0400u16 } else { 0 }; // SSW bit 10
+                let sz = match size {
+                    1 => 0x0020, // byte
+                    2 => 0x0040, // word
+                    _ => 0x0000, // long
+                };
+                let ssw = rw | atc | sz | (fc & 0x7); // TM = function code
+                let fmt_vec = 0x7000 | ((vector::BUS_ERROR as u16) << 2);
+                // A normal faulted write is reported in writeback slot 3 (V
+                // bit, size and TM in WB3S; address and data in WB3A/WB3D),
+                // matching real 68040 silicon and the WinUAE/Amiberry MMU
+                // reference (cpummu.cpp sets regs.wb3_status/wb3_data on a
+                // write fault and clears wb2 -- WB2 is reserved for MOVE16
+                // cacheline writes). MuGuardianAngel completes an allowed
+                // write by storing WB3D to WB3A, and Enforcer/MuForce discard
+                // a protected store by clearing WB3S.V; RTE (below) honours
+                // the cleared V. Putting the store in WB2 instead makes MuGA
+                // read a zero WB3D and clobber the target with 0.
+                let wb3s = if write {
+                    0x0080 | sz | (fc & 0x7) // V | SZ | TM
+                } else {
+                    0
+                };
+                for _ in 0..3 {
+                    self.push_32(bus, 0); // PD3, PD2, PD1
+                }
+                self.push_32(bus, 0); // WB1D / PD0
+                self.push_32(bus, 0); // WB1A
+                self.push_32(bus, 0); // WB2D
+                self.push_32(bus, 0); // WB2A
+                self.push_32(bus, if write { fault_wdata } else { 0 }); // WB3D
+                self.push_32(bus, if write { address } else { 0 }); // WB3A
+                self.push_32(bus, address); // fault address
+                self.push_16(bus, 0); // WB1S
+                self.push_16(bus, 0); // WB2S
+                self.push_16(bus, wb3s); // WB3S
+                self.push_16(bus, ssw); // special status word
+                self.push_32(bus, address); // effective address
+                self.push_16(bus, fmt_vec); // format 7 / vector offset
+                self.push_32(bus, self.ppc); // restart PC
+                self.push_16(bus, old_sr);
+            }
             _ => {
-                // TODO: 68020+ bus error stack frames (format A/B/7 variants) are not yet
-                // implemented. Minimal fallback.
-                self.push_16_raw(bus, (vector::BUS_ERROR as u16) << 2);
-                self.push_32_raw(bus, self.ppc);
-                self.push_16_raw(bus, old_sr);
-                let _ = (status_word, address);
+                // 68020/68030 long bus-cycle fault frame (format $B, 46
+                // words, M68030UM 8.2). Real silicon dumps pipeline state
+                // here and RTE *continues* the faulted instruction, with the
+                // handler able to rerun or complete the data cycle through
+                // the DF bit and the data input/output buffers. This core
+                // rolls the faulting instruction back instead and stacks its
+                // PC, so RTE restarts it from scratch: the pipeline dump and
+                // writeback buffers are left zero, and a handler that
+                // clears DF to suppress the rerun is not honoured (the
+                // restart re-issues the access; harmless for memory, the
+                // documented gap for side-effecting hardware registers).
+                //
+                // The special status word at +$0A is what a page-fault
+                // handler (mmu.library, VMM, Enforcer) actually parses:
+                // DF (bit 8) marks a faulted data cycle with its address in
+                // the long at +$10, RW (bit 6) the direction, SIZ (bits 5:4,
+                // 01 byte / 10 word / 00 long) the width, and FC2:0 the
+                // address space. An instruction-fetch fault instead reports
+                // a stage-B rerun (FB|RB, bits 14/12) with the fetch address
+                // in the stage B address long at +$24, the shape real
+                // handlers use to demand-page code.
+                let data_fault = !instruction;
+                let mut ssw: u16 = fc & 0x7;
+                if data_fault {
+                    ssw |= 0x0100; // DF: rerun data cycle
+                    if !write {
+                        ssw |= 0x0040; // RW: read
+                    }
+                    ssw |= match size {
+                        1 => 0x0010, // SIZ 01: byte
+                        2 => 0x0020, // SIZ 10: word
+                        _ => 0x0000, // SIZ 00: long
+                    };
+                } else {
+                    ssw |= 0x4000 | 0x1000; // FB|RB: rerun instruction stage B
+                }
+                let fmt_vec = 0xB000 | ((vector::BUS_ERROR as u16) << 2);
+                // Pushed high address -> low: internal words +$38..$5A (18
+                // words), version word +$36, internal +$30..$34 (3 words),
+                // data input buffer +$2C, internal +$28/$2A, stage B address
+                // +$24, internal +$1C..$22 (4 words), data output buffer
+                // +$18, internal +$14/$16, data fault address +$10, stage B
+                // and C pipe words +$0E/$0C, SSW +$0A, internal +$08.
+                for _ in 0..9 {
+                    self.push_32(bus, 0); // +$38..$5A
+                }
+                self.push_16(bus, 0); // +$36 version/internal
+                for _ in 0..3 {
+                    self.push_16(bus, 0); // +$30..$34
+                }
+                self.push_32(bus, 0); // +$2C data input buffer
+                self.push_32(bus, 0); // +$28/$2A internal
+                self.push_32(bus, if data_fault { 0 } else { address }); // +$24 stage B address
+                self.push_32(bus, 0); // +$20/$22 internal
+                self.push_32(bus, 0); // +$1C/$1E internal
+                // +$18 data output buffer: the value of a faulted write, so
+                // a handler can complete the write itself (clear DF).
+                self.push_32(bus, if write { fault_wdata } else { 0 });
+                self.push_32(bus, 0); // +$14/$16 internal
+                self.push_32(bus, if data_fault { address } else { 0 }); // +$10 data fault address
+                self.push_16(bus, 0); // +$0E pipe stage B
+                self.push_16(bus, 0); // +$0C pipe stage C
+                self.push_16(bus, ssw); // +$0A special status word
+                self.push_16(bus, 0); // +$08 internal
+                self.push_16(bus, fmt_vec); // +$06 format/vector
+                self.push_32(bus, self.ppc); // +$02 restart PC
+                self.push_16(bus, old_sr); // +$00 SR
             }
         }
 
@@ -337,6 +576,10 @@ impl CpuCore {
         // to bypass MMU translation during exception frame writes.
         self.exception_processing = true;
 
+        // Exception entry spends 4 internal clocks (vector number / state
+        // capture) before the first stack write.
+        self.internal_cycles(4);
+
         let old_sr = self.get_sr();
 
         // Match Musashi `m68ki_init_exception`: enter supervisor mode but do not modify M.
@@ -362,8 +605,7 @@ impl CpuCore {
         // - 68000: push PC, then SR (3-word frame)
         // - 68010+: push vector offset word (vector<<2), then PC, then SR (format 0)
         if self.cpu_type == super::types::CpuType::M68000 {
-            self.push_32(bus, stacked_pc);
-            self.push_16(bus, old_sr);
+            self.push_exception_frame_68000(bus, stacked_pc, old_sr);
         } else {
             self.push_16(bus, (vector as u16) << 2);
             self.push_32(bus, stacked_pc);
@@ -377,6 +619,48 @@ impl CpuCore {
         self.exception_processing = false;
 
         self.exception_cycles(vector)
+    }
+
+    /// 68060 "FP unimplemented instruction" exception: Line-F vector with
+    /// the six-word format $2 frame the 68060SP dispatches on (fmt/vector
+    /// word $202C). The frame's PC is the NEXT instruction (every extension
+    /// word must be consumed before calling this), the EA field holds the
+    /// calculated operand address (0 when the operand is not in memory),
+    /// and FPIAR points at the faulting instruction - the 060SP fetches
+    /// the opcode through FPIAR, not the frame.
+    pub(crate) fn take_fp_unimp_060<B: AddressBus>(&mut self, bus: &mut B, ea: u32) -> i32 {
+        self.fpiar = self.ppc;
+        let old_sr = self.get_sr();
+        self.set_s_flag(SFLAG_SET);
+        self.t1_flag = 0;
+        self.t0_flag = 0;
+        let vec_word = (vector::LINE_1111 as u16) << 2;
+        self.push_32(bus, ea);
+        self.push_16(bus, 0x2000 | (vec_word & 0x0FFF));
+        self.push_32(bus, self.pc);
+        self.push_16(bus, old_sr);
+        self.jump_vector(bus, vector::LINE_1111);
+        self.exception_cycles(vector::LINE_1111)
+    }
+
+    /// 68060 "FPU disabled" exception (PCR.DFP set, or an LC/EC060): the
+    /// eight-word format $4 frame ($402C) whose +$0C long holds the PC of
+    /// the faulted instruction so the OS can enable the FPU and restart.
+    /// The stacked PC also restarts the instruction; FPIAR is untouched
+    /// (the FPU never saw the instruction).
+    pub(crate) fn take_fp_disabled_060<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
+        let old_sr = self.get_sr();
+        self.set_s_flag(SFLAG_SET);
+        self.t1_flag = 0;
+        self.t0_flag = 0;
+        let vec_word = (vector::LINE_1111 as u16) << 2;
+        self.push_32(bus, self.ppc); // PC of the faulted instruction
+        self.push_32(bus, 0); // effective address (unused for disabled)
+        self.push_16(bus, 0x4000 | (vec_word & 0x0FFF));
+        self.push_32(bus, self.ppc); // restart the instruction
+        self.push_16(bus, old_sr);
+        self.jump_vector(bus, vector::LINE_1111);
+        self.exception_cycles(vector::LINE_1111)
     }
 
     /// Get cycles for exception processing.
@@ -397,6 +681,32 @@ impl CpuCore {
     }
 
     /// Check for trace exception after instruction execution.
+    /// SR-writing instructions (MOVE to SR, ORI/ANDI/EORI to SR) run the
+    /// pending-trace check against the OLD T0 on the 68020+: writing SR is
+    /// a pipeline-synchronizing event, so a set T0 traces the instruction
+    /// even when the write clears it. Marking the boundary as a change of
+    /// flow lets check_trace() (which reads the pre-instruction SR) see it.
+    pub(crate) fn trace_t0_sr_write(&mut self) {
+        if !self.is_pre_68020 {
+            self.change_of_flow = true;
+        }
+    }
+
+    /// The 68040 additionally runs the T0 check after a small set of
+    /// pipeline-synchronizing instructions that are not flow changes:
+    /// NOP, MOVEC, MOVE to USP, CAS, CAS2, MOVES, TAS, PFLUSH and PTEST
+    /// (WinUAE's trace_t0_68040_only sites).
+    pub(crate) fn trace_t0_68040_sync(&mut self) {
+        if matches!(
+            self.cpu_type,
+            super::types::CpuType::M68EC040
+                | super::types::CpuType::M68LC040
+                | super::types::CpuType::M68040
+        ) {
+            self.change_of_flow = true;
+        }
+    }
+
     pub fn check_trace(&mut self) -> bool {
         // T1 trace: trace after every instruction
         // T0 trace: trace only on change-of-flow (68020+)

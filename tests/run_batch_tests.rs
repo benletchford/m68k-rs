@@ -755,7 +755,7 @@ fn fastmem_move_and_alu_addressing_modes() {
         0x2A9B, // MOVE.L (A3)+,(A5)
         0x2B23, // MOVE.L -(A3),-(A5)... wait predec dst uses A5
         0xD095, // ADD.L (A5),D0
-        0x957C, 0x0002, // SUBA.W #2,A2... (see below)
+        0x94FC, 0x0002, // SUBA.W #2,A2
         0x0685, 0x0000, 0x0100, // ADDI.L #$100,D5
         0x0C6D, 0x0042, 0x0010, // CMPI.W #$42,$10(A5)
         0x4A2D, 0x0011, // TST.B $11(A5)
@@ -1270,7 +1270,10 @@ fn mem_trace_store_into_own_code_matches_step() {
         0x51C8, 0xFFFC, // $1002: DBRA D0,$1000
         0xA000, // $1006: sentinel (never reached by fall-through)
     ];
-    assert_fastmem_matches_step("mem-trace smc", words, CpuType::M68000, |cpu| {
+    // Use a non-prefetch CPU so this remains a cache-coherency test. On a
+    // real 68000, step() may legally retire words already in its prefetch
+    // queue while run_batch() is the explicitly non-transactional fast path.
+    assert_fastmem_matches_step("mem-trace smc", words, CpuType::M68020, |cpu| {
         // Stores start below the code and cross it after 64 iterations,
         // overwriting the loop with NOP + A-line — which must then execute.
         cpu.set_a(0, 0x0F00);

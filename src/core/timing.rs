@@ -381,49 +381,6 @@ pub(crate) fn ea_cycles_68000(mode: AddressingMode, size: Size) -> i32 {
     }
 }
 
-/// MOVE destination-side time (M68000UM Table 8-3, decomposed): like the
-/// source table, but pre-decrement costs the same as (An) and there is no
-/// separate fetch for the stored operand.
-#[inline]
-pub(crate) fn move_dst_cycles_68000(mode: AddressingMode, size: Size) -> i32 {
-    let long = size == Size::Long;
-    match mode {
-        AddressingMode::DataDirect(_) | AddressingMode::AddressDirect(_) => 0,
-        AddressingMode::AddressIndirect(_)
-        | AddressingMode::PostIncrement(_)
-        | AddressingMode::PreDecrement(_) => {
-            if long {
-                8
-            } else {
-                4
-            }
-        }
-        AddressingMode::Displacement(_) | AddressingMode::AbsoluteShort => {
-            if long {
-                12
-            } else {
-                8
-            }
-        }
-        AddressingMode::Index(_) => {
-            if long {
-                14
-            } else {
-                10
-            }
-        }
-        AddressingMode::AbsoluteLong => {
-            if long {
-                16
-            } else {
-                12
-            }
-        }
-        // Not legal MOVE destinations; unreachable in valid decode.
-        AddressingMode::PcDisplacement | AddressingMode::PcIndex | AddressingMode::Immediate => 0,
-    }
-}
-
 /// Control-address calculation time for LEA (M68000UM Table 8-9 column).
 #[inline]
 pub(crate) fn lea_ea_cycles_68000(mode: AddressingMode) -> i32 {
@@ -438,48 +395,6 @@ pub(crate) fn lea_ea_cycles_68000(mode: AddressingMode) -> i32 {
     }
 }
 
-/// Total JMP time (M68000UM Table 8-9).
-#[inline]
-pub(crate) fn jmp_cycles_68000(mode: AddressingMode) -> i32 {
-    match mode {
-        AddressingMode::AddressIndirect(_) => 8,
-        AddressingMode::Displacement(_)
-        | AddressingMode::AbsoluteShort
-        | AddressingMode::PcDisplacement => 10,
-        AddressingMode::Index(_) | AddressingMode::PcIndex => 14,
-        AddressingMode::AbsoluteLong => 12,
-        _ => 0,
-    }
-}
-
-/// Total JSR time (M68000UM Table 8-9).
-#[inline]
-pub(crate) fn jsr_cycles_68000(mode: AddressingMode) -> i32 {
-    match mode {
-        AddressingMode::AddressIndirect(_) => 16,
-        AddressingMode::Displacement(_)
-        | AddressingMode::AbsoluteShort
-        | AddressingMode::PcDisplacement => 18,
-        AddressingMode::Index(_) | AddressingMode::PcIndex => 22,
-        AddressingMode::AbsoluteLong => 20,
-        _ => 0,
-    }
-}
-
-/// Total PEA time (M68000UM Table 8-9).
-#[inline]
-pub(crate) fn pea_cycles_68000(mode: AddressingMode) -> i32 {
-    match mode {
-        AddressingMode::AddressIndirect(_) => 12,
-        AddressingMode::Displacement(_)
-        | AddressingMode::AbsoluteShort
-        | AddressingMode::PcDisplacement => 16,
-        AddressingMode::Index(_) | AddressingMode::PcIndex => 20,
-        AddressingMode::AbsoluteLong => 20,
-        _ => 0,
-    }
-}
-
 impl super::cpu::CpuCore {
     /// Standard-operand EA time (M68000UM Table 8-2) on 68000/68010;
     /// 0 on later types, which keep the legacy flat timings.
@@ -490,50 +405,5 @@ impl super::cpu::CpuCore {
         } else {
             0
         }
-    }
-
-    /// MOVE destination-side time (M68000UM Table 8-3) on 68000/68010.
-    #[inline]
-    pub(crate) fn move_dst_time(&self, mode: AddressingMode, size: Size) -> i32 {
-        if self.is_pre_68020 {
-            move_dst_cycles_68000(mode, size)
-        } else {
-            0
-        }
-    }
-
-    /// Base time of a standard `<ea> op Dn` instruction (M68000UM Table
-    /// 8-4/8-5): byte/word 4; long 6, or 8 when the operand comes from a
-    /// register or immediate (the table's footnote).
-    #[inline]
-    pub(crate) fn std_er_base(&self, mode: AddressingMode, size: Size, long_footnote: bool) -> i32 {
-        if size != Size::Long {
-            4
-        } else if long_footnote
-            && matches!(
-                mode,
-                AddressingMode::DataDirect(_)
-                    | AddressingMode::AddressDirect(_)
-                    | AddressingMode::Immediate
-            )
-        {
-            8
-        } else {
-            6
-        }
-    }
-}
-
-/// MOVEM per-mode overhead beyond the (An)/(An)+/-(An) baseline
-/// (M68000UM Table 8-8, decomposed).
-#[inline]
-pub(crate) fn movem_ea_extra_68000(mode: AddressingMode) -> i32 {
-    match mode {
-        AddressingMode::Displacement(_)
-        | AddressingMode::AbsoluteShort
-        | AddressingMode::PcDisplacement => 4,
-        AddressingMode::Index(_) | AddressingMode::PcIndex => 6,
-        AddressingMode::AbsoluteLong => 8,
-        _ => 0,
     }
 }

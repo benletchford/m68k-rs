@@ -23,9 +23,13 @@ exclude = [
 ]
 
 [dependencies]
+serde = { version = "1.0", features = ["derive"], optional = true }
 
 [features]
 default = []
+# Serialize the complete architectural CPU state for deterministic save states.
+# Runtime-only decode, FastMem, and JIT caches are rebuilt after deserialization.
+serde = ["dep:serde"]
 # Opt-in trace-opportunity accounting for emulator profiling. Disabled builds
 # contain none of the counters or reporting code.
 trace-profile = []
@@ -37,8 +41,8 @@ cranelift-jit = "0.132.0"
 cranelift-module = "0.132.0"
 
 [dev-dependencies]
-serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+astro-float = { version = "0.9", default-features = false, features = ["std"] }
 
 [[bench]]
 name = "microbench"

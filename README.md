@@ -2,7 +2,8 @@
 
 A safe, pure Rust implementation of the Motorola 68000 family CPU emulator.
 
-Strong for both low-level hardware-accurate emulation and high-level emulation (HLE).
+One core for transaction-accurate hardware emulation and high-throughput
+high-level emulation (HLE).
 
 [![Rust CI](https://github.com/benletchford/m68k-rs/actions/workflows/rust.yml/badge.svg)](https://github.com/benletchford/m68k-rs/actions/workflows/rust.yml)
 [![Crates.io](https://img.shields.io/crates/v/m68k.svg)](https://crates.io/crates/m68k)
@@ -10,12 +11,14 @@ Strong for both low-level hardware-accurate emulation and high-level emulation (
 
 ## Features
 
-- **Complete CPU family support**: M68000, M68010, M68020, M68030, M68040, and variants (EC/LC)
-- **Zero dependencies**: Pure Rust with no external runtime dependencies
+- **Complete CPU family support**: M68000 through M68060, including EC/LC variants and the SCC68070
+- **Two explicit execution contracts**: transaction-accurate cycle scheduling for hardware emulators, and an instruction-budgeted fast path for HLE
+- **Bus-visible accuracy**: 68000/68010 two-word prefetch, model-specific access ordering, and internal clock synchronization through `AddressBus::sync`
 - **Memory-safe core**: The interpreter — instruction semantics, decode, exceptions, MMU, FPU — is 100% safe Rust. The optional fast paths (fastmem batch execution and the trace JIT) use a small, contract-documented `unsafe` perimeter, fenced by step-vs-batch equivalence tests
-- **FPU emulation**: Full 68881/68882/68040 floating-point unit support
-- **MMU emulation**: 68030/68040 PMMU with table walks and transparent translation
+- **FPU emulation**: Software 80-bit extended precision, packed decimal, and model-specific 68881/68882/68040/68060 behavior
+- **MMU emulation**: 68030/68040/68060 translation, ATCs, transparent translation, `PTEST`, fault frames, and writeback
 - **HLE-ready**: Built-in trap interception for High-Level Emulation
+- **Save-state ready**: Optional `serde` support serializes architectural state while rebuilding runtime caches on load
 - **Extensively tested**: Validated against multiple industry-standard test suites
 
 ## Quick Start
@@ -24,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-m68k = "0.2"
+m68k = "0.3"
 ```
 
 ### Basic Usage
@@ -151,14 +154,41 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 
 ### Choosing an Approach
 
-| Method | Best For | Behavior on Trap |
-| :--- | :--- | :--- |
-| **`step()`** | Debuggers, Analyzers, Custom Control | Returns a `StepResult` variant (e.g., `AlineTrap`). The CPU **does not** take the exception automatically. If you do nothing, it acts like a NOP. You must manually call `cpu.take_exception(...)` if you want standard behavior. |
-| **`step_with_hle_handler()`** | OS Emulation (Mac/Amiga/Atari) | Calls your `HleHandler` callback. If it returns `true`, execution continues. If it returns `false`, the CPU **automatically** triggers the standard hardware exception (stacks frame, jumps to vector). |
+| Method | Budget | Execution contract | Host-visible exit |
+| :--- | :--- | :--- | :--- |
+| **`step()`** | One instruction | Transaction-accurate `AddressBus` accesses and cycles | Surfaces A-line, F-line, `TRAP`, `BKPT`, and illegal instructions without taking their exception |
+| **`step_with_hle_handler()`** | One instruction | Same precise path as `step()` | Offers traps to `HleHandler`; unhandled traps take the hardware exception |
+| **`execute()`** | CPU cycles | Precise path; whole instructions may overshoot the requested cycles | Takes traps as hardware exceptions and returns consumed cycles |
+| **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps like `step()` and reports STOP separately |
+| **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
 
-Use **`step()`** when you need full control over the execution loop or are building a debugger that needs to pause on every event.
+Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
+machine scheduler needs to advance the CPU by a clock budget without losing
+bus ordering or trap state:
 
-Use **`step_with_hle_handler()`** when implementing a high-level emulator (like a Macintosh or Amiga emulator) where you want to patch specific system calls but otherwise let the guest OS run normally.
+```rust
+use m68k::CycleBatchExit;
+
+let result = cpu.run_for_cycles(&mut bus, 512);
+match result.exit {
+    CycleBatchExit::BudgetExhausted => {
+        // result.cycles may be greater than 512: instructions are never split.
+    }
+    CycleBatchExit::Stopped => {
+        // Wait for a serviceable interrupt.
+    }
+    event => {
+        // Handle a surfaced trap. The trapping instruction is not included
+        // in result.instructions and no exception-entry cycles were charged.
+        println!("{event:?}");
+    }
+}
+```
+
+Use **`step_with_hle_handler()`** when patching selected guest OS calls while
+allowing every unhandled trap to follow hardware behavior. Use
+**`run_batch()`** for HLE workloads where host-call latency and instruction
+throughput matter more than observing the physical prefetch bus.
 
 ## Supported CPU Types
 
@@ -173,6 +203,7 @@ Use **`step_with_hle_handler()`** when implementing a high-level emulator (like 
 | `M68EC040` | 68040 embedded controller (no FPU/MMU) |
 | `M68LC040` | 68040 lite (no FPU)                    |
 | `M68040`   | Full 68040 with FPU and MMU            |
+| `M68060`   | Superscalar 68060 with FPU and MMU     |
 | `SCC68070` | Philips SCC68070 variant               |
 
 ## Validation & Testing
@@ -181,88 +212,97 @@ This emulator has been rigorously validated against multiple industry-standard t
 
 ### SingleStepTests (m68000)
 
-The [SingleStepTests](https://github.com/SingleStepTests/m68000) project provides exhaustive per-instruction test vectors derived from real hardware and cycle-accurate emulators. Our test suite runs **all 101 instruction categories** with thousands of test cases each, covering:
+The [SingleStepTests](https://github.com/SingleStepTests/m68000) project
+provides exhaustive per-instruction fixtures from MAME's microcoded 68000 core.
+The suite covers every supplied instruction file and 261,894 cases, including:
 
 - All addressing modes and operand sizes
 - Edge cases for condition codes (CCR/SR)
 - BCD arithmetic (ABCD, SBCD, NBCD)
 - Multiply/divide overflow handling
 - Exception frame generation
-- **Cycle counts**: all 261,894 fixture cases match the real-hardware clock counts exactly, and the suite enforces this on every run. For reference, this is tighter than Musashi, which for example charges `ADD.L Dn,Dn` at 6 cycles where the M68000UM and real hardware measure 8.
+- **Cycle and transaction auditing**: all 261,894 cases match their fixture cycle and bus-access totals, with separate ignored audit tools for access sequence and per-access timing analysis
 
 ### Musashi Reference Implementation
 
-We validate against [Musashi](https://github.com/kstenerud/Musashi), the gold-standard M68000 emulator used in MAME and countless other projects. Our integration tests:
+We also run binaries from [Musashi](https://github.com/kstenerud/Musashi), a
+widely deployed M68000 emulator. The integration tests:
 
 - Execute complete Musashi test binaries
 - Verify register state, memory contents, and exception handling
 - Cover 68000 through 68040 instruction sets
+- Explicitly exclude legacy cases whose undefined BCD flags or illegal
+  68000 encodings conflict with the hardware-oriented SingleStepTests model
 
 ### Cross-CPU Verification
 
 Additional test suites verify behavior across CPU generations:
 
-- **68040 FPU tests**: Floating-point transcendental functions, rounding modes
-- **MMU translation tests**: Table walks, TTR matching, fault handling
+- **FPU tests**: 80-bit arithmetic, transcendental functions, packed decimal, memory operands, rounding modes, and save/restore
+- **MMU translation tests**: 68030/68040/68060 table walks, ATCs, TTR matching, page crossings, fault frames, and writeback
 - **Privilege tests**: User/supervisor mode transitions, TRAP behavior
-- **Exception tests**: Double-fault detection, address error frames
+- **Exception tests**: Per-model frames, resumable bus faults, double faults, and address errors
+- **Execution-path differential tests**: Cold/warm cache state, self-modifying code, cycle batches, fast batches, and native traces
 
 ### Test Coverage
 
 ```
 tests/
-├── singlestep_m68000_v1_tests.rs   # 101 instruction test files
-├── musashi_tests.rs                 # Musashi integration suite
-├── cross_cpu_tests.rs               # Multi-generation verification
-├── m68040_tests.rs                  # 68040-specific features
-├── mmu_fault_tests.rs               # MMU and exception handling
-├── hle_interception_tests.rs        # Trap handler API tests
+├── singlestep_m68000_v1_tests.rs  # Exhaustive 68000 fixture suite
+├── musashi_tests.rs               # Musashi integration binaries
+├── m68020_tests.rs ...            # Generation-specific behavior
+├── m68060_tests.rs                # 68060 integer, FPU, and MMU behavior
+├── fpu_accuracy.rs                # Extended-precision differential tests
+├── run_for_cycles_tests.rs        # Precise cycle-batch boundary contract
+├── run_batch_tests.rs             # HLE fast-path equivalence and exits
 └── fixtures/
-    ├── m68000/                      # SingleStepTests submodule
-    └── Musashi/                     # Musashi reference submodule
+    ├── m68000/                    # External SingleStepTests checkout
+    └── Musashi/                   # Musashi reference binaries
 ```
 
 ## Architecture
 
 ```
 m68k/
-├── core/           # CPU core, registers, execution loop
+├── core/           # CPU state, interpreter, timing, caches, and trace JIT
 ├── dasm/           # Disassembler
-├── fpu/            # 68881/68882/68040 FPU emulation
-└── mmu/            # 68030/68040 PMMU emulation
+├── fpu/            # 80-bit FPU, packed decimal, and transcendental operations
+└── mmu/            # 68030/68040/68060 translation and ATCs
 ```
 
 ### Key Types
 
-| Type                    | Description                        |
-| ----------------------- | ---------------------------------- |
-| `CpuCore`               | Main CPU state and execution       |
-| `CpuType`               | CPU model selection enum           |
-| `AddressBus`            | Trait for memory/IO implementation |
-| `HleHandler`            | Trait for HLE interception         |
-| `StepResult`            | Instruction execution result       |
-| `CpuCore::is_stopped()` | STOP state check                   |
-| `CpuCore::is_halted()`  | Double-fault halt check            |
+| Type | Description |
+| :--- | :--- |
+| `CpuCore` | Main CPU state and execution APIs |
+| `CpuType` | CPU model selection enum |
+| `AddressBus` | Extensible memory, device, fetch-cache, timing, and fast-RAM contract |
+| `LinearMemoryBus` / `FastMem` | Ready-made flat memory and optional direct-RAM window |
+| `HleHandler` | Trap interception callbacks |
+| `StepResult` | Single-instruction result |
+| `CycleBatchResult` / `CycleBatchExit` | Precise cycle-scheduled execution result |
+| `BatchResult` / `BatchExit` | High-throughput instruction-batch result |
+| `CpuCore::is_stopped()` | STOP state check |
+| `CpuCore::is_halted()` | Double-fault halt check |
 
 ## Performance
 
-Correctness comes first — including cycle accuracy, see above — but m68k-rs is also fast. Two execution paths are provided:
+Accuracy and throughput are separate, deliberate contracts:
 
-- **`execute`/`step`** — the cycle-exact interpreter, backed by an opcode-indexed decode table and a trace JIT (Cranelift) that compiles hot backward-branch loops and runs them natively with exact cycle accounting.
-- **`run_batch`** — an instruction-budgeted fast path for HLE embedders. Buses that expose a contiguous RAM window (`AddressBus::fast_mem`, implemented by `LinearMemoryBus`) additionally get direct-RAM memory operands and JIT-compiled loops that include memory operations, with self-modifying code detected exactly.
+- **Precise execution** — `step`, `step_with_hle_handler`, `execute`, and
+  `run_for_cycles` use the interpreter and ordinary `AddressBus` calls. These
+  paths preserve bus-visible prefetch, access ordering, internal-clock
+  synchronization, fault state, and model-specific cycle accounting.
+- **Throughput execution** — `run_batch` reuses decoded operations and compiles
+  eligible hot backward-branch traces with Cranelift on native targets. A bus
+  may expose a contiguous `FastMem` window to keep eligible RAM operands
+  inside the trace. Guarded exits and self-modifying-code checks fall back
+  without partially committing an instruction.
 
-Measured head-to-head against [Musashi](https://github.com/kstenerud/Musashi) (the C core used by MAME) running identical 68000 workloads over the same flat memory, with final register/memory state cross-checked between the cores (one x86-64 machine snapshot; the harness lives on a separate benchmarking branch):
-
-| workload | Musashi | m68k-rs `execute` | m68k-rs `run_batch` |
-|---|---:|---:|---:|
-| tight ALU loop (reg mix) | 142 MIPS | **778 MIPS** | **757 MIPS** |
-| loop ADDQ/BRA | 175 | **504** | **472** |
-| loop TST/BNE | 193 | **536** | **543** |
-| memcpy inner loop | 106 | 48 | **291** |
-| linear ADDQ.L | 120 | 105 | 107 |
-| call/return | 146 | 74 | 80 |
-
-Hot loops — where emulated programs spend their time — run **2.7–5.5× faster than Musashi**; straight-line and call-heavy code currently sits at 0.5–0.9×. At these rates the interpreter emulates a 68000 clocked at roughly 700–950 MHz, cycle-exact — a stock 7.6 MHz Amiga 500 or Sega Genesis runs at ~100× real-time per core.
+The two paths share instruction semantics and are continuously compared in
+cold-cache, warm-cache, memory, control-flow, and fault tests. This keeps the
+hardware contract simple for machine emulators while allowing HLE systems to
+opt into lower dispatch overhead explicitly.
 
 ## License
 

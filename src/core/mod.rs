@@ -16,6 +16,8 @@ pub mod op_cache;
 pub mod registers;
 pub mod status;
 pub mod timing;
+pub mod timing_020;
+pub mod timing_060;
 pub mod trace_jit;
 #[cfg(feature = "trace-profile")]
 pub mod trace_profile;
