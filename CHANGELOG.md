@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.3.1...m68k-v0.3.2) (2026-07-31)
+
+
+### Bug Fixes
+
+* correct public API documentation ([e0d0b57](https://github.com/benletchford/m68k-rs/commit/e0d0b57fe5f0007a87d0e4027f29039bd5105cc5))
+
 ## [0.3.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.3.0...m68k-v0.3.1) (2026-07-31)
 
 
