@@ -28,20 +28,27 @@ fn long_shift_base_is_eight_on_68000() {
 }
 
 #[test]
-fn long_shift_base_unchanged_on_68020() {
-    // 68020+ is not affected by the 68000-only long-base correction.
+fn later_cpu_shift_handler_uses_fixed_prescaled_timing() {
+    // 68020+ timing is selected by finalize_cycles(), so the instruction
+    // handler returns its fixed pre-scaled value rather than a count-based
+    // 68000/68010 total.
     let mut c = cpu(CpuType::M68020);
-    assert_eq!(c.exec_asl(Size::Long, 1, 0x1).1, 8);
+    assert_eq!(c.exec_asl(Size::Long, 1, 0x1).1, 6);
+    assert_eq!(c.exec_asl(Size::Word, 1, 0x1).1, 6);
+}
+
+#[test]
+fn long_shift_base_is_eight_on_68010() {
+    let mut c = cpu(CpuType::M68010);
+    assert_eq!(c.exec_asl(Size::Long, 1, 0x1).1, 10);
     assert_eq!(c.exec_asl(Size::Word, 1, 0x1).1, 8);
 }
 
 #[test]
-fn long_shift_base_is_eight_on_68010_family() {
-    for kind in [CpuType::M68010, CpuType::SCC68070] {
-        let mut c = cpu(kind);
-        assert_eq!(c.exec_asl(Size::Long, 1, 0x1).1, 10);
-        assert_eq!(c.exec_asl(Size::Word, 1, 0x1).1, 8);
-    }
+fn scc68070_uses_fixed_prescaled_shift_timing() {
+    let mut c = cpu(CpuType::SCC68070);
+    assert_eq!(c.exec_asl(Size::Long, 1, 0x1).1, 6);
+    assert_eq!(c.exec_asl(Size::Word, 1, 0x1).1, 6);
 }
 
 #[test]

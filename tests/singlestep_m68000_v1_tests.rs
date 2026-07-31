@@ -1,7 +1,10 @@
 //! Integration suite for SingleStepTests `m68000` (68000-only) fixtures.
 //!
-//! Fixtures are not vendored in-repo (they are large). See:
-//! `tests/fixtures/m68000/README.md`
+//! Fixtures are not vendored in-repo (they are large); each per-file test
+//! skips itself when they are absent. Clone
+//! <https://github.com/SingleStepTests/m68000> (MIT) to
+//! `tests/fixtures/m68000`, or point `M68K_SST_FIXTURES` at the clone's
+//! `v1` directory (what CI does). See `tests/fixtures/README.md`.
 
 use std::collections::HashMap;
 use std::fs;
@@ -83,7 +86,7 @@ const REG_ORDER: [&str; 19] = [
 #[derive(Clone, Debug)]
 struct BinState {
     regs: [u32; REG_ORDER.len()],
-    #[allow(dead_code)]
+    /// The two prefetch-queue words: [word at exec PC, word at exec PC + 2].
     prefetch: [u32; 2],
     /// RAM is stored as byte pieces: (address, byte_value)
     ram: Vec<(u32, u8)>,
@@ -95,9 +98,49 @@ struct BinTest {
     initial: BinState,
     final_: BinState,
     has_addr_error_txn: bool,
-    /// Total clock periods the real 68000 spent on this instruction
-    /// (from the fixture's bus-transaction record).
+    /// Total CPU cycles the fixture (MAME microcoded core) reports for this
+    /// instruction -- ground truth for cycle-accuracy measurement.
+    fixture_cycles: u32,
+    /// Word-granular bus accesses in the fixture's transaction log (reads +
+    /// writes, excluding idle and address-error cycles) -- ground truth for
+    /// bus-access-count measurement.
+    fixture_access_words: u32,
+    /// The full ordered bus-access log (idle transactions folded into each
+    /// access's cycle offset) -- ground truth for access-sequence and
+    /// per-access timing measurement.
+    fixture_accesses: Vec<FixtureAccess>,
+}
+
+/// One completed bus cycle from the fixture's transaction log.
+///
+/// Upstream encoding (decode.py): tw 1 = write, 2 = read, 3 = TAS
+/// read-modify-write cycle, 4/5 = read/write address error (AS never
+/// asserted). Idle transactions (tw 0) are not stored as accesses; their
+/// cycles accumulate into the next access's `cycle_offset`.
+#[derive(Clone, Debug)]
+struct FixtureAccess {
+    is_write: bool,
+    is_tas: bool,
+    /// Word-aligned address driven on the address bus.
+    addr: u32,
+    /// Data bus value. For byte accesses only the strobed half is meaningful
+    /// (the 68000 cannot drive A0; a UDS-only byte read of 0xAB shows 0xAB00).
+    data: u16,
+    uds: bool,
+    lds: bool,
+    /// CPU clocks from instruction start to the start of this bus cycle
+    /// (sum of all preceding transactions' cycle counts).
+    cycle_offset: u32,
+    /// Duration of this bus cycle in CPU clocks (4 for a normal cycle).
+    cycles: u32,
+}
+
+/// Parsed summary of a `transactions` block.
+struct TxnInfo {
+    has_addr_error: bool,
     num_cycles: u32,
+    access_words: u32,
+    accesses: Vec<FixtureAccess>,
 }
 
 fn read_u8(bytes: &[u8], ptr: &mut usize) -> Result<u8, String> {
@@ -184,30 +227,57 @@ fn read_state(bytes: &[u8], ptr: &mut usize) -> Result<BinState, String> {
     })
 }
 
-fn read_transactions(bytes: &[u8], ptr: &mut usize) -> Result<(bool, u32), String> {
+fn read_transactions(bytes: &[u8], ptr: &mut usize) -> Result<TxnInfo, String> {
     let _num_bytes = read_block_header(bytes, ptr, MAGIC_TXNS)?;
     let num_cycles = read_u32_le(bytes, ptr)?;
     let num_transactions = read_u32_le(bytes, ptr)? as usize;
     let mut has_addr_error = false;
+    let mut access_words = 0u32;
+    let mut accesses: Vec<FixtureAccess> = Vec::new();
+    let mut cycle_offset = 0u32;
     for _ in 0..num_transactions {
         let tw = read_u8(bytes, ptr)?;
-        let _cycles = read_u32_le(bytes, ptr)?;
+        let cycles = read_u32_le(bytes, ptr)?;
         if tw == 0 {
+            // Idle transaction: internal CPU clocks, no bus activity.
+            cycle_offset = cycle_offset.saturating_add(cycles);
             continue;
         }
         // Upstream decode.py:
+        // 1 = write, 2 = read, 3 = TAS read-modify-write cycle,
         // 4 = read address error (no AS assert), 5 = write address error (no AS assert)
         if tw == 4 || tw == 5 {
             has_addr_error = true;
+        } else {
+            // A real completed bus cycle (read/write/TAS): one 16-bit access.
+            access_words += 1;
         }
         // fc, addr_bus, data_bus, UDS, LDS (all u32 LE)
         let _fc = read_u32_le(bytes, ptr)?;
-        let _addr_bus = read_u32_le(bytes, ptr)?;
-        let _data_bus = read_u32_le(bytes, ptr)?;
-        let _uds = read_u32_le(bytes, ptr)?;
-        let _lds = read_u32_le(bytes, ptr)?;
+        let addr_bus = read_u32_le(bytes, ptr)?;
+        let data_bus = read_u32_le(bytes, ptr)?;
+        let uds = read_u32_le(bytes, ptr)?;
+        let lds = read_u32_le(bytes, ptr)?;
+        if tw != 4 && tw != 5 {
+            accesses.push(FixtureAccess {
+                is_write: tw == 1,
+                is_tas: tw == 3,
+                addr: addr_bus & !1,
+                data: data_bus as u16,
+                uds: uds != 0,
+                lds: lds != 0,
+                cycle_offset,
+                cycles,
+            });
+        }
+        cycle_offset = cycle_offset.saturating_add(cycles);
     }
-    Ok((has_addr_error, num_cycles))
+    Ok(TxnInfo {
+        has_addr_error,
+        num_cycles,
+        access_words,
+        accesses,
+    })
 }
 
 fn read_test(bytes: &[u8], ptr: &mut usize) -> Result<BinTest, String> {
@@ -215,13 +285,15 @@ fn read_test(bytes: &[u8], ptr: &mut usize) -> Result<BinTest, String> {
     let name = read_name(bytes, ptr)?;
     let initial = read_state(bytes, ptr)?;
     let final_ = read_state(bytes, ptr)?;
-    let (has_addr_error_txn, num_cycles) = read_transactions(bytes, ptr)?;
+    let txn = read_transactions(bytes, ptr)?;
     Ok(BinTest {
         name,
         initial,
         final_,
-        has_addr_error_txn,
-        num_cycles,
+        has_addr_error_txn: txn.has_addr_error,
+        fixture_cycles: txn.num_cycles,
+        fixture_access_words: txn.access_words,
+        fixture_accesses: txn.accesses,
     })
 }
 
@@ -244,6 +316,9 @@ fn load_test_file(path: &Path) -> Result<Vec<BinTest>, String> {
 }
 
 fn fixture_root_v1() -> PathBuf {
+    if let Ok(root) = std::env::var("M68K_SST_FIXTURES") {
+        return PathBuf::from(root);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
@@ -292,6 +367,16 @@ impl CycleAudit {
 }
 
 fn run_one_file(path: &Path) {
+    if !path.exists() {
+        // The fixture set is a separate (large, MIT-licensed) clone; a
+        // checkout without it must still build and pass. CI fetches the
+        // fixtures and runs this suite for real.
+        eprintln!(
+            "skip {}: SingleStepTests fixtures not present (see tests/fixtures/README.md)",
+            path.display()
+        );
+        return;
+    }
     let tests = load_test_file(path).unwrap();
     let mut failures: Vec<String> = Vec::new();
     let mut audit = CycleAudit::default();
@@ -323,13 +408,13 @@ fn run_one_file(path: &Path) {
             && let m68k::StepResult::Ok { cycles } = result
         {
             if audit_cycles() {
-                audit.record(opcode, &t.name, t.num_cycles, cycles);
-            } else if cycles as i64 != t.num_cycles as i64 {
+                audit.record(opcode, &t.name, t.fixture_cycles, cycles);
+            } else if cycles as i64 != t.fixture_cycles as i64 {
                 failures.push(format!(
                     "{}[{idx}] {}: cycles: expected {}, got {cycles}",
                     path.display(),
                     t.name,
-                    t.num_cycles
+                    t.fixture_cycles
                 ));
                 if failures.len() >= 25 {
                     break;
@@ -515,6 +600,735 @@ macro_rules! singlestep_file_test {
             run_one_file(&path);
         }
     };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cycle / bus-access accuracy measurement (gap report)
+//
+// The per-file tests above assert only final register/RAM state. The fixtures
+// also carry the MAME-microcoded cycle count and the per-cycle bus transactions,
+// which this core currently neither models accurately nor checks. `cycle_gap_report`
+// runs every fixture case and tallies, per opcode file, how far the core's
+// returned cycle count and bus-access count are from ground truth -- the
+// measurement that drives Copperline's cycle-accurate pacing.
+//
+// Run with:
+//   cargo test --release --test singlestep_m68000_v1_tests cycle_gap_report -- --ignored --nocapture
+// ---------------------------------------------------------------------------------------------
+
+/// Bus that records word-granular access count (reads + writes), to compare
+/// against the fixture's transaction log. The core's `try_*` paths delegate to
+/// these infallible methods, so every access is counted here.
+#[derive(Default)]
+struct CountingBus {
+    inner: SparseBus,
+    accesses: u32,
+}
+
+impl AddressBus for CountingBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.accesses += 1;
+        self.inner.read_byte(address)
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        self.accesses += 1;
+        self.inner.read_word(address)
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        self.accesses += 2;
+        self.inner.read_long(address)
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        self.accesses += 1;
+        self.inner.write_byte(address, value);
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.accesses += 1;
+        self.inner.write_word(address, value);
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.accesses += 2;
+        self.inner.write_long(address, value);
+    }
+}
+
+#[derive(Default)]
+struct FileGap {
+    name: String,
+    cases: u64,
+    skipped: u64,
+    cyc_mismatch: u64,
+    cyc_abs_delta_sum: i64,
+    cyc_signed_delta_sum: i64,
+    cyc_max_abs_delta: i32,
+    cpu_cyc_sum: i64,
+    fix_cyc_sum: i64,
+    acc_mismatch: u64,
+    cpu_acc_sum: i64,
+    fix_acc_sum: i64,
+}
+
+#[test]
+#[ignore = "measurement, run explicitly with --ignored --nocapture"]
+fn cycle_gap_report() {
+    let root = fixture_root_v1();
+    let mut files: Vec<PathBuf> = match fs::read_dir(&root) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "cycle_gap_report: fixtures missing at {} ({e}); fetch SingleStepTests/m68000 first",
+                root.display()
+            );
+            return;
+        }
+    };
+    files.sort();
+
+    // Optional detail: set M68K_GAP_FILE=ADD.l.json.bin to dump, for that file,
+    // a histogram of (fixture_cycles -> cpu_cycles) mismatches keyed by
+    // addressing-mode fields of a sample opcode.
+    let detail_target = std::env::var("M68K_GAP_FILE").ok();
+    // (opcode_ea_mode, opcode_ea_reg_is_pcimm, fixture, cpu) -> (count, sample opcode)
+    let mut detail: HashMap<(u16, i32, i32), (u64, u16)> = HashMap::new();
+
+    let mut gaps: Vec<FileGap> = Vec::new();
+    for path in &files {
+        let tests = match load_test_file(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip {}: {e}", path.display());
+                continue;
+            }
+        };
+        let mut g = FileGap {
+            name: path.file_name().unwrap().to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let want_detail = detail_target.as_deref() == Some(g.name.as_str());
+        for t in &tests {
+            // Skip address-error cases (the state harness skips them too: they
+            // assert bus/prefetch-exact micro-behavior this core does not model).
+            if t.has_addr_error_txn {
+                continue;
+            }
+            let mut bus = CountingBus::default();
+            for (addr, b) in &t.initial.ram {
+                bus.inner.set_byte(*addr, *b);
+            }
+            let mut cpu = CpuCore::new();
+            cpu.set_sst_m68000_compat(true);
+            load_state_68000(&mut cpu, &t.initial);
+
+            let opcode = bus.inner.read_word(cpu.pc);
+            let mut hle = m68k::NoOpHleHandler;
+            let result = cpu.step_with_hle_handler(&mut bus, &mut hle);
+            let cpu_cycles = match result {
+                m68k::StepResult::Ok { cycles } => cycles,
+                _ => {
+                    g.skipped += 1;
+                    continue;
+                }
+            };
+
+            g.cases += 1;
+            let delta = cpu_cycles - t.fixture_cycles as i32;
+            g.cpu_cyc_sum += cpu_cycles as i64;
+            g.fix_cyc_sum += t.fixture_cycles as i64;
+            if delta != 0 {
+                g.cyc_mismatch += 1;
+                g.cyc_abs_delta_sum += delta.unsigned_abs() as i64;
+                g.cyc_signed_delta_sum += delta as i64;
+                g.cyc_max_abs_delta = g.cyc_max_abs_delta.max(delta.abs());
+                if want_detail {
+                    // key by ea mode (bits 5..3) so we see which addressing modes are off
+                    let ea_mode = (opcode >> 3) & 7;
+                    let e = detail
+                        .entry((ea_mode, t.fixture_cycles as i32, cpu_cycles))
+                        .or_insert((0, opcode));
+                    e.0 += 1;
+                }
+            }
+            g.cpu_acc_sum += bus.accesses as i64;
+            g.fix_acc_sum += t.fixture_access_words as i64;
+            if bus.accesses != t.fixture_access_words {
+                g.acc_mismatch += 1;
+            }
+        }
+        gaps.push(g);
+    }
+
+    if detail_target.is_some() && !detail.is_empty() {
+        println!("\n=== detail for {} ===", detail_target.as_deref().unwrap());
+        println!(
+            "{:>7} {:>9} {:>9} {:>8}  sample",
+            "ea_mode", "fixture", "cpu", "count"
+        );
+        let mut rows: Vec<_> = detail.iter().collect();
+        rows.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        for ((ea_mode, fix, cpu), (count, opcode)) in rows.iter().take(30) {
+            println!("{ea_mode:>7} {fix:>9} {cpu:>9} {count:>8}  {opcode:#06X}");
+        }
+    }
+
+    // Sort worst cycle-accuracy first.
+    gaps.sort_by(|a, b| {
+        let ra = a.cyc_mismatch as f64 / (a.cases.max(1) as f64);
+        let rb = b.cyc_mismatch as f64 / (b.cases.max(1) as f64);
+        rb.partial_cmp(&ra).unwrap()
+    });
+
+    println!("\n=== m68000 cycle / bus-access gap vs SingleStepTests (MAME) ===");
+    println!(
+        "{:<22} {:>8} {:>8} {:>8} {:>7} {:>9} {:>9}",
+        "opcode.size", "cases", "cyc!=", "%cyc!=", "maxd", "avgΔcyc", "%acc!="
+    );
+    let (mut tc, mut tm, mut tcpu_cyc, mut tfix_cyc, mut tacc_m, mut tcpu_acc, mut tfix_acc) =
+        (0u64, 0u64, 0i64, 0i64, 0u64, 0i64, 0i64);
+    for g in &gaps {
+        let pct = 100.0 * g.cyc_mismatch as f64 / (g.cases.max(1) as f64);
+        let avgd = g.cyc_signed_delta_sum as f64 / (g.cases.max(1) as f64);
+        let accpct = 100.0 * g.acc_mismatch as f64 / (g.cases.max(1) as f64);
+        // Only print the rows that actually have a gap, to keep it scannable.
+        if g.cyc_mismatch > 0 || g.acc_mismatch > 0 {
+            println!(
+                "{:<22} {:>8} {:>8} {:>7.1}% {:>7} {:>+9.2} {:>8.1}%",
+                g.name.replace(".json.bin", ""),
+                g.cases,
+                g.cyc_mismatch,
+                pct,
+                g.cyc_max_abs_delta,
+                avgd,
+                accpct
+            );
+        }
+        tc += g.cases;
+        tm += g.cyc_mismatch;
+        tcpu_cyc += g.cpu_cyc_sum;
+        tfix_cyc += g.fix_cyc_sum;
+        tacc_m += g.acc_mismatch;
+        tcpu_acc += g.cpu_acc_sum;
+        tfix_acc += g.fix_acc_sum;
+    }
+    println!("\n--- totals ---");
+    println!("files                : {}", gaps.len());
+    println!("cases                : {tc}");
+    println!(
+        "cycle mismatches     : {tm} ({:.1}%)",
+        100.0 * tm as f64 / (tc.max(1) as f64)
+    );
+    println!(
+        "sum CPU cycles       : {tcpu_cyc}  vs fixture {tfix_cyc}  (CPU/fixture = {:.3})",
+        tcpu_cyc as f64 / (tfix_cyc.max(1) as f64)
+    );
+    println!(
+        "bus-access mismatches: {tacc_m} ({:.1}%)",
+        100.0 * tacc_m as f64 / (tc.max(1) as f64)
+    );
+    println!(
+        "sum CPU accesses     : {tcpu_acc}  vs fixture {tfix_acc}  (CPU/fixture = {:.3})",
+        tcpu_acc as f64 / (tfix_acc.max(1) as f64)
+    );
+    println!(
+        "\nInterpretation: CPU/fixture cycle ratio < 1.0 means the core under-bills\n\
+         cycles (drives Copperline cycle pacing too fast). The bus-access ratio shows\n\
+         how the modeled access count compares to real 68000 word bus cycles."
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Access-sequence / per-access-timing measurement (gap reports)
+//
+// The fixtures' transaction logs are the per-bus-cycle ground truth from MAME's
+// microcoded 68000: every read/write in order, with the address/data/strobes
+// and the cycle offset at which each bus cycle starts. These two reports
+// measure how far the core's emitted access stream is from that truth:
+//
+//   access_sequence_gap_report  -- order/address/direction/data of accesses
+//                                  (the prefetch-model scoreboard)
+//   access_timing_gap_report    -- the cycle offset of each access within the
+//                                  instruction (the sync()-timing scoreboard)
+//
+// Run with:
+//   cargo test --release --test singlestep_m68000_v1_tests access_sequence_gap_report -- --ignored --nocapture
+//   cargo test --release --test singlestep_m68000_v1_tests access_timing_gap_report -- --ignored --nocapture
+// ---------------------------------------------------------------------------------------------
+
+/// One bus access as emitted by the core under test, word-granular to match
+/// the fixture transaction encoding.
+#[derive(Clone, Debug)]
+struct RecordedAccess {
+    is_write: bool,
+    /// Word-aligned address.
+    addr: u32,
+    /// Data on the active byte lanes (hi byte if UDS, lo byte if LDS).
+    data: u16,
+    uds: bool,
+    lds: bool,
+    /// CPU clocks of internal work the core reported (via `AddressBus::sync`)
+    /// since the previous access. Zero until the core implements sync().
+    sync_clocks_before: u32,
+}
+
+/// Bus that records every access the core makes, word-granular and in order,
+/// for comparison against fixture transaction logs. Long accesses are split
+/// into two word records (high word first, matching how the trait's
+/// `read_long`/`write_long` are defined to decompose).
+#[derive(Default)]
+struct RecordingBus {
+    inner: SparseBus,
+    accesses: Vec<RecordedAccess>,
+    pending_sync_clocks: u32,
+}
+
+impl RecordingBus {
+    fn record(&mut self, is_write: bool, byte_addr: u32, size: u8, data: u32) {
+        let word_addr = byte_addr & !1;
+        let (uds, lds, lane_data) = match size {
+            1 => {
+                if byte_addr & 1 == 0 {
+                    (true, false, ((data as u16) & 0xFF) << 8)
+                } else {
+                    (false, true, (data as u16) & 0xFF)
+                }
+            }
+            _ => (true, true, data as u16),
+        };
+        self.accesses.push(RecordedAccess {
+            is_write,
+            addr: word_addr,
+            data: lane_data,
+            uds,
+            lds,
+            sync_clocks_before: std::mem::take(&mut self.pending_sync_clocks),
+        });
+    }
+}
+
+impl AddressBus for RecordingBus {
+    fn sync(&mut self, cpu_clocks: u32) {
+        self.pending_sync_clocks += cpu_clocks;
+    }
+    fn read_byte(&mut self, address: u32) -> u8 {
+        let v = self.inner.read_byte(address);
+        self.record(false, address, 1, v as u32);
+        v
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        let v = self.inner.read_word(address);
+        self.record(false, address, 2, v as u32);
+        v
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        let hi = self.read_word(address);
+        let lo = self.read_word(address.wrapping_add(2));
+        ((hi as u32) << 16) | lo as u32
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        self.record(true, address, 1, value as u32);
+        self.inner.write_byte(address, value);
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.record(true, address, 2, value as u32);
+        self.inner.write_word(address, value);
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.write_word(address, (value >> 16) as u16);
+        self.write_word(address.wrapping_add(2), (value & 0xFFFF) as u16);
+    }
+}
+
+/// How a recorded access stream differs from the fixture's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SequenceMismatch {
+    /// Different number of bus accesses.
+    Count,
+    /// Same count, but some access differs in read/write direction.
+    Direction,
+    /// Same count and directions, but some access touches a different address.
+    Address,
+    /// Same count/directions/addresses, but data on the active lanes differs.
+    Data,
+}
+
+/// Compare the core's recorded access stream against the fixture's.
+/// Returns the first (most severe) category of mismatch, or None if they agree.
+fn compare_access_sequences(
+    fixture: &[FixtureAccess],
+    recorded: &[RecordedAccess],
+) -> Option<SequenceMismatch> {
+    if fixture.len() != recorded.len() {
+        return Some(SequenceMismatch::Count);
+    }
+    for (f, r) in fixture.iter().zip(recorded.iter()) {
+        if f.is_write != r.is_write {
+            return Some(SequenceMismatch::Direction);
+        }
+    }
+    for (f, r) in fixture.iter().zip(recorded.iter()) {
+        if f.addr & 0x00FF_FFFE != r.addr & 0x00FF_FFFE {
+            return Some(SequenceMismatch::Address);
+        }
+    }
+    for (f, r) in fixture.iter().zip(recorded.iter()) {
+        // Compare only the byte lanes both sides drive. TAS cycles in the
+        // fixture have read+write phases folded into one transaction whose
+        // data reflects the write; skip data comparison for them.
+        if f.is_tas {
+            continue;
+        }
+        let mut mask = 0u16;
+        if f.uds && r.uds {
+            mask |= 0xFF00;
+        }
+        if f.lds && r.lds {
+            mask |= 0x00FF;
+        }
+        if (f.data & mask) != (r.data & mask) {
+            return Some(SequenceMismatch::Data);
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct SequenceFileGap {
+    name: String,
+    cases: u64,
+    skipped: u64,
+    count_mismatch: u64,
+    direction_mismatch: u64,
+    address_mismatch: u64,
+    data_mismatch: u64,
+}
+
+impl SequenceFileGap {
+    fn mismatches(&self) -> u64 {
+        self.count_mismatch + self.direction_mismatch + self.address_mismatch + self.data_mismatch
+    }
+}
+
+/// Fixture files whose transaction logs the upstream README documents as
+/// unreliable: TAS ("doesn't properly handle the special 5-cycle TAS
+/// read-modify-write timing") and TRAPV ("some strange issue I don't
+/// understand with the TRAPV tests"). Their final-state assertions still run
+/// in the functional suite; only the access-stream reports skip them.
+const UNRELIABLE_TRANSACTION_FIXTURES: [&str; 2] = ["TAS.json.bin", "TRAPV.json.bin"];
+
+/// Shared driver: run every non-address-error fixture case through the core
+/// with a RecordingBus and hand (test, recorded accesses) to `visit`.
+fn for_each_recorded_case(mut visit: impl FnMut(&Path, &BinTest, &[RecordedAccess], bool)) {
+    let root = fixture_root_v1();
+    let mut files: Vec<PathBuf> = match fs::read_dir(&root) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().map(|x| x == "bin").unwrap_or(false))
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "fixtures missing at {} ({e}); fetch SingleStepTests/m68000 first",
+                root.display()
+            );
+            return;
+        }
+    };
+    files.sort();
+
+    for path in &files {
+        let fname = path.file_name().unwrap().to_string_lossy();
+        if UNRELIABLE_TRANSACTION_FIXTURES.contains(&fname.as_ref()) {
+            continue;
+        }
+        let tests = match load_test_file(path) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("skip {}: {e}", path.display());
+                continue;
+            }
+        };
+        for t in &tests {
+            if t.has_addr_error_txn {
+                continue;
+            }
+            let mut bus = RecordingBus::default();
+            for (addr, b) in &t.initial.ram {
+                bus.inner.set_byte(*addr, *b);
+            }
+            let mut cpu = CpuCore::new();
+            cpu.set_sst_m68000_compat(true);
+            load_state_68000(&mut cpu, &t.initial);
+
+            let mut hle = m68k::NoOpHleHandler;
+            let result = cpu.step_with_hle_handler(&mut bus, &mut hle);
+            let executed = matches!(result, m68k::StepResult::Ok { .. });
+            visit(path, t, &bus.accesses, executed);
+        }
+    }
+}
+
+#[test]
+#[ignore = "measurement, run explicitly with --ignored --nocapture"]
+fn access_sequence_gap_report() {
+    let mut gaps: Vec<SequenceFileGap> = Vec::new();
+    let mut current: Option<SequenceFileGap> = None;
+    // Optional: M68K_GAP_FILE=Bcc.json.bin prints the first few mismatching
+    // cases for that file with both access streams.
+    let detail_target = std::env::var("M68K_GAP_FILE").ok();
+    let mut detail_shown = 0usize;
+
+    for_each_recorded_case(|path, t, recorded, executed| {
+        let fname = path.file_name().unwrap().to_string_lossy().into_owned();
+        if current.as_ref().map(|g| g.name != fname).unwrap_or(true) {
+            if let Some(g) = current.take() {
+                gaps.push(g);
+            }
+            current = Some(SequenceFileGap {
+                name: fname.clone(),
+                ..Default::default()
+            });
+        }
+        let g = current.as_mut().unwrap();
+        if !executed {
+            g.skipped += 1;
+            return;
+        }
+        g.cases += 1;
+        match compare_access_sequences(&t.fixture_accesses, recorded) {
+            None => {}
+            Some(kind) => {
+                match kind {
+                    SequenceMismatch::Count => g.count_mismatch += 1,
+                    SequenceMismatch::Direction => g.direction_mismatch += 1,
+                    SequenceMismatch::Address => g.address_mismatch += 1,
+                    SequenceMismatch::Data => g.data_mismatch += 1,
+                }
+                if detail_target.as_deref() == Some(fname.as_str()) && detail_shown < 5 {
+                    detail_shown += 1;
+                    println!("\n--- {} mismatch ({kind:?}): {} ---", fname, t.name);
+                    println!("fixture ({} accesses):", t.fixture_accesses.len());
+                    for f in &t.fixture_accesses {
+                        println!(
+                            "  {} {:#010X} data={:#06X} uds={} lds={} @+{}",
+                            if f.is_write { "W" } else { "R" },
+                            f.addr,
+                            f.data,
+                            f.uds as u8,
+                            f.lds as u8,
+                            f.cycle_offset
+                        );
+                    }
+                    println!("core ({} accesses):", recorded.len());
+                    for r in recorded {
+                        println!(
+                            "  {} {:#010X} data={:#06X} uds={} lds={}",
+                            if r.is_write { "W" } else { "R" },
+                            r.addr,
+                            r.data,
+                            r.uds as u8,
+                            r.lds as u8
+                        );
+                    }
+                }
+            }
+        }
+    });
+    if let Some(g) = current.take() {
+        gaps.push(g);
+    }
+
+    gaps.sort_by(|a, b| {
+        let ra = a.mismatches() as f64 / (a.cases.max(1) as f64);
+        let rb = b.mismatches() as f64 / (b.cases.max(1) as f64);
+        rb.partial_cmp(&ra).unwrap()
+    });
+
+    println!("\n=== m68000 access-sequence gap vs SingleStepTests (MAME) ===");
+    println!(
+        "{:<22} {:>8} {:>8} {:>8} {:>7} {:>7} {:>7} {:>7}",
+        "opcode.size", "cases", "seq!=", "%seq!=", "count", "dir", "addr", "data"
+    );
+    let (mut tc, mut tm) = (0u64, 0u64);
+    let (mut t_count, mut t_dir, mut t_addr, mut t_data) = (0u64, 0u64, 0u64, 0u64);
+    for g in &gaps {
+        let m = g.mismatches();
+        if m > 0 {
+            println!(
+                "{:<22} {:>8} {:>8} {:>7.1}% {:>7} {:>7} {:>7} {:>7}",
+                g.name.replace(".json.bin", ""),
+                g.cases,
+                m,
+                100.0 * m as f64 / (g.cases.max(1) as f64),
+                g.count_mismatch,
+                g.direction_mismatch,
+                g.address_mismatch,
+                g.data_mismatch
+            );
+        }
+        tc += g.cases;
+        tm += m;
+        t_count += g.count_mismatch;
+        t_dir += g.direction_mismatch;
+        t_addr += g.address_mismatch;
+        t_data += g.data_mismatch;
+    }
+    println!("\n--- totals ---");
+    println!("files               : {}", gaps.len());
+    println!("cases               : {tc}");
+    println!(
+        "sequence mismatches : {tm} ({:.1}%)",
+        100.0 * tm as f64 / (tc.max(1) as f64)
+    );
+    println!("  by count          : {t_count}");
+    println!("  by direction      : {t_dir}");
+    println!("  by address        : {t_addr}");
+    println!("  by data           : {t_data}");
+    println!(
+        "\nInterpretation: count mismatches are dominated by the missing prefetch\n\
+         model (overlap fetches and discarded prefetches after flow changes).\n\
+         Direction/address mismatches indicate wrong access ordering (e.g. long\n\
+         write order) or wrong effective addresses."
+    );
+}
+
+#[derive(Default)]
+struct TimingFileGap {
+    name: String,
+    /// Cases whose access sequence matches (timing is only measured for these).
+    seq_match_cases: u64,
+    /// Cases whose sequence matches AND every access lands at the fixture's
+    /// exact cycle offset.
+    timing_exact_cases: u64,
+    /// Total accesses compared / total with exact offsets.
+    accesses: u64,
+    accesses_exact: u64,
+    offset_abs_delta_sum: i64,
+}
+
+#[test]
+#[ignore = "measurement, run explicitly with --ignored --nocapture"]
+fn access_timing_gap_report() {
+    let mut gaps: Vec<TimingFileGap> = Vec::new();
+    let mut current: Option<TimingFileGap> = None;
+    // Optional: M68K_GAP_FILE=Bcc.json.bin prints the first few timing-
+    // mismatching cases of that file with fixture vs core offsets.
+    let detail_target = std::env::var("M68K_GAP_FILE").ok();
+    let mut detail_shown = 0usize;
+
+    for_each_recorded_case(|path, t, recorded, executed| {
+        let fname = path.file_name().unwrap().to_string_lossy().into_owned();
+        if current.as_ref().map(|g| g.name != fname).unwrap_or(true) {
+            if let Some(g) = current.take() {
+                gaps.push(g);
+            }
+            current = Some(TimingFileGap {
+                name: fname.clone(),
+                ..Default::default()
+            });
+        }
+        let g = current.as_mut().unwrap();
+        if !executed || compare_access_sequences(&t.fixture_accesses, recorded).is_some() {
+            return;
+        }
+        g.seq_match_cases += 1;
+
+        // Reconstruct the core's view of each access's cycle offset: the sum of
+        // sync()-reported internal clocks plus the bus cycles of preceding
+        // accesses (4 clocks each, the 68000 bus cycle length).
+        let mut core_offset = 0u32;
+        let mut all_exact = true;
+        let mut core_offsets: Vec<u32> = Vec::with_capacity(recorded.len());
+        for (f, r) in t.fixture_accesses.iter().zip(recorded.iter()) {
+            core_offset += r.sync_clocks_before;
+            core_offsets.push(core_offset);
+            g.accesses += 1;
+            let delta = core_offset as i64 - f.cycle_offset as i64;
+            if delta == 0 {
+                g.accesses_exact += 1;
+            } else {
+                all_exact = false;
+                g.offset_abs_delta_sum += delta.abs();
+            }
+            core_offset += f.cycles.max(4); // advance past this bus cycle
+        }
+        if all_exact {
+            g.timing_exact_cases += 1;
+        } else if detail_target.as_deref() == Some(fname.as_str()) && detail_shown < 5 {
+            detail_shown += 1;
+            println!("\n--- {} timing mismatch: {} ---", fname, t.name);
+            println!(
+                "{:>4} {:>10} {:>10} {:>6}  access",
+                "idx", "fixture", "core", "delta"
+            );
+            for (i, (f, r)) in t.fixture_accesses.iter().zip(recorded.iter()).enumerate() {
+                println!(
+                    "{:>4} {:>10} {:>10} {:>+6}  {} {:#010X}",
+                    i,
+                    f.cycle_offset,
+                    core_offsets[i],
+                    core_offsets[i] as i64 - f.cycle_offset as i64,
+                    if r.is_write { "W" } else { "R" },
+                    r.addr
+                );
+            }
+        }
+    });
+    if let Some(g) = current.take() {
+        gaps.push(g);
+    }
+
+    gaps.sort_by(|a, b| {
+        let ra = a.accesses_exact as f64 / (a.accesses.max(1) as f64);
+        let rb = b.accesses_exact as f64 / (b.accesses.max(1) as f64);
+        ra.partial_cmp(&rb).unwrap()
+    });
+
+    println!("\n=== m68000 per-access timing gap vs SingleStepTests (MAME) ===");
+    println!("(only cases whose access sequence already matches are measured)");
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>9}",
+        "opcode.size", "seq-match", "exact", "accesses", "acc-exact", "avg|d|"
+    );
+    let (mut t_cases, mut t_exact, mut t_acc, mut t_acc_exact, mut t_delta) =
+        (0u64, 0u64, 0u64, 0u64, 0i64);
+    for g in &gaps {
+        if g.seq_match_cases > 0 && g.accesses_exact < g.accesses {
+            let inexact_accesses = g.accesses - g.accesses_exact;
+            println!(
+                "{:<22} {:>10} {:>10} {:>10} {:>10} {:>9.2}",
+                g.name.replace(".json.bin", ""),
+                g.seq_match_cases,
+                g.timing_exact_cases,
+                g.accesses,
+                g.accesses_exact,
+                g.offset_abs_delta_sum as f64 / (inexact_accesses.max(1) as f64)
+            );
+        }
+        t_cases += g.seq_match_cases;
+        t_exact += g.timing_exact_cases;
+        t_acc += g.accesses;
+        t_acc_exact += g.accesses_exact;
+        t_delta += g.offset_abs_delta_sum;
+    }
+    println!("\n--- totals ---");
+    println!("seq-matching cases   : {t_cases}");
+    println!(
+        "timing-exact cases   : {t_exact} ({:.1}%)",
+        100.0 * t_exact as f64 / (t_cases.max(1) as f64)
+    );
+    println!(
+        "accesses exact-offset: {t_acc_exact} / {t_acc} ({:.1}%)",
+        100.0 * t_acc_exact as f64 / (t_acc.max(1) as f64)
+    );
+    println!("sum |offset delta|   : {t_delta} clocks",);
+    println!(
+        "\nInterpretation: offsets are measured from instruction start; the core's\n\
+         offset for access k = sum of sync() clocks + 4 clocks per preceding bus\n\
+         cycle. Until the core implements sync(), every multi-access instruction\n\
+         reports offset 0 for later accesses and this report is the Phase 2\n\
+         scoreboard, not a regression signal."
+    );
 }
 
 // One test per SingleStepTests m68000 v1 fixture file.
@@ -711,6 +1525,12 @@ fn load_state_68000(cpu: &mut CpuCore, state: &BinState) {
     } else {
         cpu.set_sp(usp);
     }
+
+    // The fixture provides the prefetch queue contents at instruction start:
+    // [word at exec PC, word at exec PC + 2]. Real hardware fetched these
+    // during previous instructions, so the queue starts full.
+    cpu.prefetch_queue = [state.prefetch[0] as u16, state.prefetch[1] as u16];
+    cpu.prefetch_count = 2;
 }
 
 fn check_state_68000(

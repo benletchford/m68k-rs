@@ -83,11 +83,13 @@ fn divs_sign_adjustment_matches_register_direct_fixtures() {
 }
 
 #[test]
-fn flat_timing_retained_off_the_68000() {
+fn fixed_multiplier_timing_is_prescaled_off_the_68000() {
     let mut bus = LinearMemoryBus::new(0x100);
     let mut c = cpu(CpuType::M68020);
     c.set_d(1, 0xFFFF);
-    assert_eq!(c.exec_mulu(&mut bus, src_dn(1), 0), 38);
+    // The 68020 timing model scales this handler value to its measured
+    // 27-cycle fixed-cost multiplier timing in finalize_cycles().
+    assert_eq!(c.exec_mulu(&mut bus, src_dn(1), 0), 42);
     c.set_d(0, 0);
     c.set_d(1, 1);
     assert_eq!(c.exec_divu(&mut bus, src_dn(1), 0), 140);

@@ -6,6 +6,12 @@ use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::memory::{AddressBus, BusFaultKind};
 use super::op_cache::CachedOp;
 use super::types::CpuType;
+use crate::fpu::FloatX80;
+
+#[cfg(feature = "serde")]
+fn precise_bus_default() -> bool {
+    true
+}
 
 /// Flag constants for SR bits.
 pub const XFLAG_SET: u32 = 0x100;
@@ -24,7 +30,12 @@ pub const FC_SUPERVISOR_PROGRAM: u32 = 6;
 /// The main CPU state structure.
 ///
 /// Matches Musashi's `m68ki_cpu_core` layout for compatibility.
+///
+/// Every field is plain runtime or configuration state (there are no
+/// lazily built decode tables), so the whole struct round-trips through
+/// serde for host save states.
 #[derive(Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CpuCore {
     // ========== Registers ==========
     /// Data and Address registers (D0-D7, A0-A7)
@@ -46,10 +57,17 @@ pub struct CpuCore {
     pub sfc: u32,
     /// Destination Function Code (68010+)
     pub dfc: u32,
-    /// Cache Control Register (68020+)
+    /// Cache Control Register (68020+). Only the persistent control bits
+    /// are stored; the write-only clear strobes land in
+    /// `cacr_pending_ops` for the host to act on.
     pub cacr: u32,
     /// Cache Address Register (68020+)
     pub caar: u32,
+    /// CACR clear strobes (CI/CEI, and CD/CED on the 68030) accumulated
+    /// since the host last drained them. These bits trigger a cache
+    /// invalidation when written and always read back as zero, so they
+    /// are latched here instead of in `cacr`.
+    pub cacr_pending_ops: u32,
     /// Instruction Transparent Translation 0 (68040)
     pub itt0: u32,
     /// Instruction Transparent Translation 1 (68040)
@@ -62,8 +80,8 @@ pub struct CpuCore {
     pub ir: u32,
 
     // ========== FPU Registers (68881/68882/68040) ==========
-    /// FPU Data Registers (FP0-FP7) - stored as f64 for simplicity
-    pub fpr: [f64; 8],
+    /// FPU Data Registers (FP0-FP7) - 80-bit extended precision.
+    pub fpr: [FloatX80; 8],
     /// FPU Instruction Address Register
     pub fpiar: u32,
     /// FPU Status Register
@@ -101,11 +119,52 @@ pub struct CpuCore {
     /// Change-of-flow flag for T0 trace (set by BRA, JMP, JSR, RTS, etc.)
     pub change_of_flow: bool,
 
-    // ========== Prefetch ==========
-    /// Last prefetch address
-    pub pref_addr: u32,
-    /// Data in prefetch queue
-    pub pref_data: u32,
+    // ========== 68010 loop mode ==========
+    /// A DBcc that branches -4 to a loopable one-word instruction holds the
+    /// pair in the prefetch queue and re-executes without instruction
+    /// fetches (68010 loop mode). While set, the queue is reseeded from the
+    /// held words each iteration and the end-of-instruction top-up is
+    /// suppressed; any exception or interrupt (jump_vector) drops the mode.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub loop_mode: bool,
+    /// The looped one-word body instruction (queue word 0 at entry).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub loop_body_word: u16,
+    /// The looping DBcc opcode (queue word 1 at entry).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub loop_dbcc_word: u16,
+
+    // ========== Prefetch (Part E.1, 68000 only) ==========
+    /// The 68000's two-word instruction prefetch queue (IRD/IRC model).
+    ///
+    /// `prefetch_queue[0..prefetch_count]` hold the words at `pc`,
+    /// `pc + 2`. Consuming a word (see `read_imm_16`) takes from the queue
+    /// without a bus access; when the queue is empty the word is fetched
+    /// directly. At the end of every instruction the queue is topped back up
+    /// to two words (`top_up_prefetch`) -- the prefetch bus reads real
+    /// hardware performs during instruction execution. Flow-change
+    /// instructions skip the top-up: they discard the queue and refill it
+    /// from the branch target instead (`full_prefetch`), which is why taken
+    /// branches cost two bus reads at the target and why words prefetched
+    /// past a taken branch are discarded.
+    pub prefetch_queue: [u16; 2],
+    /// Number of valid words in `prefetch_queue` (0..=2), starting at `pc`.
+    pub prefetch_count: u8,
+    /// Microcode mode: when set, instruction-stream consumes skip their
+    /// accompanying prefetch ("np") bus read. Flow-change instructions set
+    /// this while consuming displacement/address words on paths that will
+    /// discard the queue and refill from the branch target -- real hardware
+    /// never prefetches ahead of a stream it is about to abandon.
+    pub consume_without_prefetch: bool,
+    /// Internal (non-bus) CPU clocks accumulated since the last bus access
+    /// (Part E.2 precise timing). Reported to the host via
+    /// `AddressBus::sync` immediately before the next access.
+    pub pending_sync_clocks: u32,
+    /// Whether instruction execution must preserve transaction-level bus
+    /// ordering and timing. Precise entry points keep this enabled; the
+    /// explicitly optimized `run_batch` path disables it for the batch.
+    #[cfg_attr(feature = "serde", serde(skip, default = "precise_bus_default"))]
+    pub(crate) precise_bus: bool,
 
     // ========== CPU Configuration ==========
     /// CPU type
@@ -120,6 +179,16 @@ pub struct CpuCore {
     pub run_mode: u32,
     /// True while processing an exception (for double-fault detection)
     pub exception_processing: bool,
+    /// Vector taken by the instruction currently being timed. Unlike the
+    /// debugger field below, this is cleared before every opcode fetch.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) instruction_exception_vector: Option<u32>,
+    /// Vector number of the most recent exception entry (trap, fault, or
+    /// interrupt -- everything routed through `jump_vector`), for the
+    /// host debugger's exception catchpoints. Polled and cleared by the
+    /// host wrapper; transient debug state, never serialized.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub last_exception_vector: Option<u32>,
 
     // ========== MMU State ==========
     /// Has PMMU
@@ -130,6 +199,11 @@ pub struct CpuCore {
     pub is_pre_68020: bool,
     /// FPU just reset
     pub fpu_just_reset: bool,
+    /// Whether a floating-point coprocessor is attached (68020/030 with an
+    /// external 68881/68882). When false, cpID-1 F-line operations raise
+    /// Line-F. The 040/060 model FPU absence separately (EC/LC types and
+    /// PCR.DFP), so this stays true for them.
+    pub fpu_present: bool,
     /// Reset cycles counter
     pub reset_cycles: u32,
 
@@ -158,24 +232,77 @@ pub struct CpuCore {
     pub nmi_pending: u32,
 
     // ========== MMU Registers ==========
-    pub mmu_crp_aptr: u32,
-    pub mmu_crp_limit: u32,
-    pub mmu_srp_aptr: u32,
-    pub mmu_srp_limit: u32,
-    pub mmu_tc: u32,
-    pub mmu_sr: u16,
+    // One canonical register set is shared by the 68030 and 68040 paths so the
+    // page-table walker and the register writes can never desync. The 68040
+    // root pointers (URP/SRP) overload the CRP/SRP address slots: `mmu_crp_aptr`
+    // is the CRP on the 030 and the URP on the 040, `mmu_srp_aptr` is the SRP on
+    // both. The two formats never coexist (the walker dispatches on `cpu_type`),
+    // and the 040 root pointers carry no limit longword, so the 040 ignores the
+    // `*_limit` fields.
+    pub mmu_crp_aptr: u32,  // CRP (030) / URP (040) address pointer
+    pub mmu_crp_limit: u32, // CRP limit/mode (030 only)
+    pub mmu_srp_aptr: u32,  // SRP address pointer (030 + 040)
+    pub mmu_srp_limit: u32, // SRP limit/mode (030 only)
+    pub mmu_tc: u32,        // Translation Control (030 PMOVE / 040 MOVEC 0x003)
+    pub mmu_sr: u32,        // MMU Status Register (030 + 040; layout per cpu_type)
     // 68030 Transparent Translation Registers
     pub mmu_tt0: u32,
     pub mmu_tt1: u32,
     // 68040-specific MMU registers
-    pub urp: u32,   // User Root Pointer (0x806)
-    pub srp: u32,   // Supervisor Root Pointer (0x807)
-    pub tc: u32,    // Translation Control (0x003)
-    pub mmusr: u32, // MMU Status Register (0x805)
     pub dacr0: u32, // Data Access Control 0 (0x008)
     pub dacr1: u32, // Data Access Control 1 (0x009)
     pub iacr0: u32, // Instruction Access Control 0 (0x00A)
     pub iacr1: u32, // Instruction Access Control 1 (0x00B)
+    // 68060-specific control registers
+    /// Processor Configuration Register (MOVEC 0x808): identification and
+    /// revision in the high half (read-only), EDEBUG/DFP/ESS in the low bits.
+    pub pcr: u32,
+    /// Bus Control Register (MOVEC 0x008 on the 060 only; the same code is
+    /// DACR0 on the 68040). Stored, not behaviorally modeled.
+    pub buscr: u32,
+    /// Address Translation Cache: a pure cache of recent page-table walks, so it
+    /// is not serialized (restored empty) and is flushed on any mapping change.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub atc: crate::mmu::Atc,
+    /// Cause of the MMU fault currently being delivered (set by
+    /// handle_mmu_fault, consumed while composing the 68060 FSLW); plain
+    /// physical bus errors leave it None. Transient within one exception.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) pending_fault_cause: Option<crate::mmu::MmuFaultCause>,
+    /// Function code forced for the current data access: MOVES reads and
+    /// writes carry SFC/DFC instead of the CPU-state-derived code, and the
+    /// MMU translates in that address space (the 68030 FCL table level and
+    /// TTR matching see the alternate code; on the 040 it selects URP vs
+    /// SRP). None for ordinary accesses; transient within one instruction.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) mmu_fc_override: Option<u8>,
+    /// One-shot faulted-read completion, from an RTE of a 68030 bus-fault
+    /// frame whose handler cleared the SSW DF bit and supplied the result
+    /// in the data input buffer: (logical address, value). Real silicon
+    /// continues the instruction using that value instead of rerunning the
+    /// data cycle (mmu.library emulates lazily-zeroed pages this way); this
+    /// restart-model core re-executes the instruction and substitutes the
+    /// value on its matching data read.
+    pub(crate) mmu_read_override: Option<(u32, u32)>,
+    /// One-shot suppressed data write: the DF-cleared write-fault analogue
+    /// of `mmu_read_override` -- the re-executed instruction's write to
+    /// this logical address is discarded (the handler already completed or
+    /// absorbed it).
+    pub(crate) mmu_write_suppress: Option<u32>,
+    /// Data value of the most recent data write, captured so a write fault
+    /// can stack it in the 030 frame's data output buffer (the handler
+    /// completes the write from there).
+    pub(crate) pending_fault_wdata: u32,
+    /// Handler-entry state captured when a mid-instruction fault dispatch
+    /// completes: (PC, SR, D0-D7/A0-A7). The aborted instruction's
+    /// remaining execution is suppressed via `faulted()` on the bus side,
+    /// but its register updates still land -- a JSR/RTS assigns `pc` on
+    /// the way out and a `movem -(a7)` keeps stepping the (now
+    /// supervisor) stack pointer -- which would corrupt the handler's
+    /// entry state. The run loop re-asserts this snapshot when it clears
+    /// the fault state. Transient within one instruction boundary.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) fault_resume: Option<(u32, u16, [u32; 16])>,
 
     // ========== Execution State ==========
     /// Remaining cycles in current timeslice
@@ -186,14 +313,18 @@ pub struct CpuCore {
     /// possible opcode word). Dropped when `cpu_type` changes; immune to
     /// self-modifying code since the fetched opcode itself is the index.
     /// Fixed-size array so `u16` indexing needs no bounds check.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) decode_table: Option<Box<[CachedOp; super::op_cache::DECODE_TABLE_SIZE]>>,
 
     // ========== Fastmem window (batch execution only) ==========
     // Captured from `AddressBus::fast_mem` on entry to `run_batch` and
     // cleared on exit; zero `fm_len` disables all fastmem paths. Stored
     // as a usize (not a pointer) so `CpuCore` stays `Send`.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_ptr: usize,
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_base: u32,
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_len: u32,
 
     // ========== Trace-JIT hot-loop filters ==========
@@ -205,19 +336,106 @@ pub struct CpuCore {
     // `trace_probe_skip` holds targets the JIT has rejected (probing them
     // can't succeed). The trace JIT resets them when it invalidates a
     // trace, so eviction can't wedge them.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_record_skip: [u32; 4],
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_probe_skip: [u32; 4],
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_record_skip_at: u8,
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_probe_skip_at: u8,
     /// True while the trace JIT is recording an executed multi-block path.
     /// Kept on the CPU so the normal instruction loop avoids a TLS lookup
     /// when no recording is active.
+    #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_recording: bool,
+
+    /// 68060 pipeline timing state: the branch cache (and, with pairing,
+    /// the pending pOEP head). Serialized - it changes cycle counts.
+    pub oep060: crate::core::timing_060::Oep060Timing,
+
+    /// 68060 escape hatch: execute the instructions the 060 removed from
+    /// silicon (MOVEP, CHK2/CMP2, CAS2, misaligned CAS, 64-bit MUL/DIV, and
+    /// the unimplemented FPU subset) natively instead of trapping for the
+    /// OS-side 68060 software package. False = faithful traps.
+    pub emulate_unimplemented_060: bool,
 
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
     pub sst_m68000_compat: bool,
 }
+
+// CACR bit assignments (68020/68030). The 68040 redefines CACR (IE/DE
+// enables only, with CINV/CPUSH instructions doing invalidation); its bits
+// are below (CACR_040_*).
+/// Enable instruction cache.
+pub const CACR_EI: u32 = 1 << 0;
+/// Freeze instruction cache (hits served, misses do not allocate).
+pub const CACR_FI: u32 = 1 << 1;
+/// Clear instruction cache entry indexed by CAAR (write-only strobe).
+pub const CACR_CEI: u32 = 1 << 2;
+/// Clear instruction cache (write-only strobe).
+pub const CACR_CI: u32 = 1 << 3;
+/// Instruction burst enable (68030; stored, no timing effect here).
+pub const CACR_IBE: u32 = 1 << 4;
+/// Enable data cache (68030).
+pub const CACR_ED: u32 = 1 << 8;
+/// Freeze data cache (68030).
+pub const CACR_FD: u32 = 1 << 9;
+/// Clear data cache entry indexed by CAAR (68030; write-only strobe).
+pub const CACR_CED: u32 = 1 << 10;
+/// Clear data cache (68030; write-only strobe).
+pub const CACR_CD: u32 = 1 << 11;
+/// Data burst enable (68030; stored, no timing effect here).
+pub const CACR_DBE: u32 = 1 << 12;
+/// Write allocate (68030; stored, the host model is write-through).
+pub const CACR_WA: u32 = 1 << 13;
+
+// CACR bit assignments (68040). The 68040 CACR has only two defined bits -
+// the cache enables - and no freeze/clear strobes: invalidation is done with
+// the CINV/CPUSH instructions instead (see decode.rs). All other bits are
+// reserved and read back as zero.
+/// Enable instruction cache (68040).
+pub const CACR_040_IE: u32 = 1 << 15;
+/// Enable data cache (68040).
+pub const CACR_040_DE: u32 = 1 << 31;
+
+// CACR bit assignments (68060). The cache enables sit at the 68040
+// positions; the 060 adds branch-cache and store-buffer controls. The
+// branch-cache clears (CABC/CUBC) are write-only strobes.
+/// Enable data cache (68060).
+pub const CACR_060_EDC: u32 = 1 << 31;
+/// No allocate mode, data cache (68060; stored only).
+pub const CACR_060_NAD: u32 = 1 << 30;
+/// Enable store buffer (68060; stored only - the host bills writes at bus rate).
+pub const CACR_060_ESB: u32 = 1 << 29;
+/// Disable CPUSH invalidation, data (68060; stored only).
+pub const CACR_060_DPI: u32 = 1 << 28;
+/// Half-cache operation mode, data (68060; stored only).
+pub const CACR_060_FOC: u32 = 1 << 27;
+/// Enable branch cache (68060).
+pub const CACR_060_EBC: u32 = 1 << 23;
+/// Clear all entries in the branch cache (68060, write-only strobe).
+pub const CACR_060_CABC: u32 = 1 << 22;
+/// Clear all user entries in the branch cache (68060, write-only strobe).
+pub const CACR_060_CUBC: u32 = 1 << 21;
+/// Enable instruction cache (68060).
+pub const CACR_060_EIC: u32 = 1 << 15;
+/// No allocate mode, instruction cache (68060; stored only).
+pub const CACR_060_NAI: u32 = 1 << 14;
+/// Half-cache operation mode, instruction (68060; stored only).
+pub const CACR_060_FIC: u32 = 1 << 13;
+
+// PCR (68060 MOVEC 0x808) bit assignments.
+/// Enable superscalar dispatch.
+pub const PCR_ESS: u32 = 1 << 0;
+/// Disable the on-chip FPU: FP instructions raise Line-F.
+pub const PCR_DFP: u32 = 1 << 1;
+/// Enable debug features (stored only).
+pub const PCR_EDEBUG: u32 = 1 << 7;
+/// Reset value: identification 0x0430 (full MC68060), revision 1, ESS and
+/// DFP clear (superscalar dispatch off until system software enables it).
+pub const PCR_060_RESET: u32 = 0x0430_0100;
 
 impl Default for CpuCore {
     fn default() -> Self {
@@ -226,6 +444,19 @@ impl Default for CpuCore {
 }
 
 impl CpuCore {
+    /// Legacy 68030/040 approximation from the handlers' corrected 68000
+    /// counts. The 68020/68EC020 is routed through its MC68020UM section-8
+    /// timing model before this function; the 68060 has a separate pipeline
+    /// engine. The 68000/68010 paths remain untouched.
+    #[inline]
+    pub(crate) fn scale_cycles_for_cpu_type(&self, cycles: i32) -> i32 {
+        use crate::core::types::CpuType;
+        match self.cpu_type {
+            CpuType::M68000 | CpuType::M68010 | CpuType::Invalid => cycles,
+            _ => ((cycles * 5 + 7) / 8).max(2),
+        }
+    }
+
     /// Create a new CPU with M68000 defaults.
     pub fn new() -> Self {
         let mut cpu = Self {
@@ -240,12 +471,13 @@ impl CpuCore {
             dfc: 0,
             cacr: 0,
             caar: 0,
+            cacr_pending_ops: 0,
             itt0: 0,
             itt1: 0,
             dtt0: 0,
             dtt1: 0,
             ir: 0,
-            fpr: [0.0; 8],
+            fpr: [FloatX80::default(); 8],
             fpiar: 0,
             fpsr: 0,
             fpcr: 0,
@@ -270,18 +502,28 @@ impl CpuCore {
             trace_probe_skip_at: 0,
             trace_recording: false,
             change_of_flow: false,
-            pref_addr: 0,
-            pref_data: 0,
+            loop_mode: false,
+            loop_body_word: 0,
+            loop_dbcc_word: 0,
+            prefetch_queue: [0; 2],
+            prefetch_count: 0,
+            consume_without_prefetch: false,
+            pending_sync_clocks: 0,
+            precise_bus: true,
             cpu_type: CpuType::M68000,
             address_mask: 0x00FFFFFF, // 24-bit for 68000
             sr_mask: 0xA71F,          // T1 -- S -- -- I2 I1 I0 -- -- -- X N Z V C
             instr_mode: 0,
             run_mode: 0,
             exception_processing: false,
+            instruction_exception_vector: None,
+            last_exception_vector: None,
             has_pmmu: false,
             pmmu_enabled: false,
             is_pre_68020: true,
-            fpu_just_reset: false,
+            // A real 6888x comes out of reset in the NULL state: FSAVE
+            // writes a NULL frame until the first FPU instruction runs.
+            fpu_just_reset: true,
             reset_cycles: 0,
             cyc_bcc_notake_b: -2,
             cyc_bcc_notake_w: 2,
@@ -302,18 +544,26 @@ impl CpuCore {
             mmu_sr: 0,
             mmu_tt0: 0,
             mmu_tt1: 0,
-            urp: 0,
-            srp: 0,
-            tc: 0,
-            mmusr: 0,
             dacr0: 0,
             dacr1: 0,
             iacr0: 0,
             iacr1: 0,
+            pcr: PCR_060_RESET,
+            buscr: 0,
+            atc: crate::mmu::Atc::default(),
+            pending_fault_cause: None,
+            mmu_fc_override: None,
+            mmu_read_override: None,
+            mmu_write_suppress: None,
+            pending_fault_wdata: 0,
+            fault_resume: None,
             cycles_remaining: 0,
             initial_cycles: 0,
             decode_table: None,
+            oep060: Default::default(),
+            emulate_unimplemented_060: false,
             sst_m68000_compat: false,
+            fpu_present: true,
         };
         cpu.set_cpu_type(CpuType::M68000);
         cpu
@@ -376,6 +626,13 @@ impl CpuCore {
                 self.sr_mask = 0xF71F;
                 self.has_pmmu = true;
             }
+            CpuType::M68060 => {
+                self.address_mask = 0xFFFFFFFF;
+                // The 68060 drops T0 (trace on change of flow, SR bit 14) and
+                // keeps the single T bit and the M bit.
+                self.sr_mask = 0xB71F;
+                self.has_pmmu = true;
+            }
             _ => {}
         }
     }
@@ -387,9 +644,17 @@ impl CpuCore {
     // Results: USP=0, ISP=4, MSP=6
 
     /// Get the current stack pointer bank index.
+    ///
+    /// The 68060 implements a single supervisor stack: the SR M bit is
+    /// storable (interrupts still clear it, system software may use it) but
+    /// it never selects a separate master-stack bank.
     #[inline]
     fn sp_index(&self) -> usize {
-        (self.s_flag | ((self.s_flag >> 1) & self.m_flag)) as usize
+        if self.cpu_type == CpuType::M68060 {
+            self.s_flag as usize
+        } else {
+            (self.s_flag | ((self.s_flag >> 1) & self.m_flag)) as usize
+        }
     }
 
     /// Backup current SP to banked storage.
@@ -438,8 +703,35 @@ impl CpuCore {
         self.run_mode = 0;
         self.instr_mode = 0;
         self.vbr = 0;
-        self.pref_addr = 0;
-        self.pref_data = 0;
+        // Reset disables and clears the on-chip caches (68020+): CACR
+        // enable/freeze bits drop and the host model must invalidate.
+        self.cacr = 0;
+        self.cacr_pending_ops |= CACR_CI | CACR_CD;
+        // 68060 control registers: identification/revision persist, the
+        // writable bits (EDEBUG/DFP/ESS) clear. Reset invalidates the
+        // branch cache along with the other caches.
+        self.pcr = PCR_060_RESET;
+        self.buscr = 0;
+        self.oep060.branch_cache.clear_all();
+        // Reset disables address translation: the TC enable bit and the
+        // TTR enable bits are cleared (030/040/060 alike), so the CPU
+        // comes up fetching physical addresses even if an OS had the MMU
+        // on when the reset hit. Root pointers are left as-is (undefined
+        // at reset); with translation off they are inert until rewritten.
+        self.mmu_tc = 0;
+        self.pmmu_enabled = false;
+        self.itt0 = 0;
+        self.itt1 = 0;
+        self.dtt0 = 0;
+        self.dtt1 = 0;
+        // The 030's PMOVE-form TT0/TT1 (stored apart from the 040 TTRs).
+        self.mmu_tt0 = 0;
+        self.mmu_tt1 = 0;
+        self.atc.flush_all();
+        self.prefetch_queue = [0; 2];
+        self.prefetch_count = 0;
+        self.consume_without_prefetch = false;
+        self.pending_sync_clocks = 0;
 
         // Condition codes after reset: clear X/N/V/C, set Z (Musashi-compatible default).
         self.x_flag = 0;
@@ -451,6 +743,232 @@ impl CpuCore {
         // Enter supervisor mode
         self.set_s_flag(SFLAG_SET);
         self.int_mask = 0x0700; // Mask all interrupts
+    }
+
+    // ========== Prefetch queue (Part E.1, 68000 only) ==========
+
+    /// Whether the two-word prefetch queue models instruction fetching.
+    /// The 68000 and 68010 share the two-word IRD/IRC queue (the 68010 adds
+    /// loop mode on top of it); later CPU types keep the direct fetch-at-PC
+    /// behavior with their cache models layered above.
+    #[inline]
+    pub fn prefetch_enabled(&self) -> bool {
+        self.precise_bus && matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010)
+    }
+
+    /// Switch between the transaction-exact interpreter contract and the
+    /// optimized batch contract. A transition invalidates transient fetch
+    /// state so neither path observes words queued by the other.
+    pub(crate) fn set_precise_bus(&mut self, precise: bool) {
+        if self.precise_bus == precise {
+            return;
+        }
+        self.precise_bus = precise;
+        self.prefetch_count = 0;
+        self.pending_sync_clocks = 0;
+        self.consume_without_prefetch = false;
+        self.loop_mode = false;
+    }
+
+    // ========== Precise per-access timing (Part E.2, 68000 only) ==========
+
+    /// Record `clocks` CPU clocks of internal (non-bus) processing. They are
+    /// reported to the host (via `AddressBus::sync`) immediately before the
+    /// next bus access, so that access lands at its hardware-exact offset.
+    #[inline]
+    pub fn internal_cycles(&mut self, clocks: u32) {
+        if self.prefetch_enabled() {
+            self.pending_sync_clocks = self.pending_sync_clocks.wrapping_add(clocks);
+        }
+    }
+
+    /// Flush accumulated internal clocks to the host right before a bus
+    /// access. Every bus-access helper calls this first.
+    #[inline]
+    pub(crate) fn flush_sync<B: AddressBus>(&mut self, bus: &mut B) {
+        if self.pending_sync_clocks > 0 {
+            let clocks = std::mem::take(&mut self.pending_sync_clocks);
+            bus.sync(clocks);
+        }
+    }
+
+    /// Mark the instruction's IPL poll point (the 68000/68010 sample their
+    /// IPL pins at ONE microcode-determined point per instruction; Moira's
+    /// POLL flag). Called right after the bus access that carries the
+    /// poll, for instructions where that access is NOT the last one --
+    /// e.g. read-modify-write instructions poll during the final prefetch
+    /// and then perform their writeback. The host keeps that access's
+    /// sample for the boundary interrupt decision and ignores later
+    /// accesses. Applies to the prefetch-queue CPUs; call sites where the
+    /// 68010 microcode polls elsewhere gate on the CPU type explicitly.
+    #[inline]
+    pub(crate) fn ipl_poll_point<B: AddressBus>(&mut self, bus: &mut B) {
+        if self.prefetch_enabled() {
+            bus.ipl_hold_sample();
+        }
+    }
+
+    /// Mark the prefetch queue as stale (after an externally forced PC
+    /// change). The next instruction-stream read fetches directly and the
+    /// next instruction-end top-up restores the queue.
+    #[inline]
+    pub fn invalidate_prefetch(&mut self) {
+        self.prefetch_count = 0;
+    }
+
+    /// Read one program-space word for the prefetch queue. Returns None when
+    /// the read faulted (bus error already triggered).
+    fn prefetch_read<B: AddressBus>(&mut self, bus: &mut B, addr: u32) -> Option<u16> {
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
+        let addr = self.address(addr);
+        match bus.try_read_word(addr) {
+            Ok(v) => Some(v),
+            Err(_) => {
+                self.trigger_bus_error(bus, addr, false, true, 2);
+                None
+            }
+        }
+    }
+
+    /// Refill the prefetch queue from the current PC: two program-space word
+    /// reads at `pc` and `pc + 2`, discarding whatever was queued. This is
+    /// what the 68000 does after every change of instruction flow (taken
+    /// branches, jumps, returns, exception entry), which is why those
+    /// instructions cost two extra bus reads at the target and why words
+    /// prefetched past a taken branch never appear on the bus as re-reads.
+    ///
+    /// An odd PC leaves the queue empty; the address error fires at the next
+    /// instruction-stream read (same point as the non-prefetch path).
+    pub fn full_prefetch<B: AddressBus>(&mut self, bus: &mut B) {
+        self.prefetch_first(bus);
+        self.prefetch_second(bus);
+    }
+
+    /// First half of a flow-change prefetch: read the word at the new PC into
+    /// the front of the queue. Some instructions (JSR/BSR) interleave other
+    /// bus accesses between the two refill reads; they call this, do their
+    /// accesses, then call `prefetch_second`.
+    pub fn prefetch_first<B: AddressBus>(&mut self, bus: &mut B) {
+        if !self.prefetch_enabled() {
+            return;
+        }
+        self.prefetch_count = 0;
+        if self.pc & 1 != 0 {
+            return;
+        }
+        if let Some(w) = self.prefetch_read(bus, self.pc) {
+            self.prefetch_queue[0] = w;
+            self.prefetch_count = 1;
+        }
+    }
+
+    /// Second half of a flow-change prefetch: read the word at PC + 2 into the
+    /// back of the queue.
+    pub fn prefetch_second<B: AddressBus>(&mut self, bus: &mut B) {
+        if !self.prefetch_enabled() || self.prefetch_count != 1 {
+            return;
+        }
+        if self.pc & 1 != 0 || self.run_mode == super::execute::RUN_MODE_BERR_AERR_RESET {
+            return;
+        }
+        if let Some(w) = self.prefetch_read(bus, self.pc.wrapping_add(2)) {
+            self.prefetch_queue[1] = w;
+            self.prefetch_count = 2;
+        }
+    }
+
+    /// Fetch one word into the back of the prefetch queue (the "np" prefetch
+    /// micro-operation). The fetch address is the first instruction-stream
+    /// word the queue does not yet hold.
+    pub fn top_up_prefetch_one<B: AddressBus>(&mut self, bus: &mut B) {
+        if self.loop_mode {
+            return;
+        }
+        if !self.prefetch_enabled() || self.pc & 1 != 0 || self.prefetch_count >= 2 {
+            return;
+        }
+        if self.run_mode == super::execute::RUN_MODE_BERR_AERR_RESET {
+            return;
+        }
+        let slot = self.prefetch_count as usize;
+        let addr = self.pc.wrapping_add(2 * slot as u32);
+        if let Some(w) = self.prefetch_read(bus, addr) {
+            self.prefetch_queue[slot] = w;
+            self.prefetch_count += 1;
+        }
+    }
+
+    /// Top the prefetch queue back up to two words at the end of an
+    /// instruction -- the final prefetch the 68000 performs after its
+    /// writes. A no-op after flow-change instructions (their refill
+    /// already filled the queue), on a stopped CPU (STOP performs no
+    /// further bus activity), and on non-prefetch CPU types.
+    pub fn top_up_prefetch<B: AddressBus>(&mut self, bus: &mut B) {
+        if self.loop_mode {
+            return;
+        }
+        if !self.prefetch_enabled() || self.pc & 1 != 0 || self.stopped != 0 {
+            return;
+        }
+        if self.run_mode == super::execute::RUN_MODE_BERR_AERR_RESET {
+            return;
+        }
+        while self.prefetch_count < 2 {
+            let before = self.prefetch_count;
+            self.top_up_prefetch_one(bus);
+            if self.prefetch_count == before {
+                return;
+            }
+        }
+    }
+
+    /// 68000 -(An) long operand read: the two predecrement micro-steps read
+    /// the LOW word first (at addr + 2), then the HIGH word (at addr).
+    pub fn read_long_predec_68000<B: AddressBus>(&mut self, bus: &mut B, addr: u32) -> u32 {
+        let lo = self.read_16(bus, addr.wrapping_add(2)) as u32;
+        let hi = self.read_16(bus, addr) as u32;
+        (hi << 16) | lo
+    }
+
+    /// 68000 long writeback for the -(Ax),-(Ay) extended-arithmetic forms
+    /// (ADDX.L/SUBX.L memory-to-memory): write the low word, perform the
+    /// final prefetch, then write the high word. The IPL poll rides the
+    /// low-word write (Moira writeM<Word, POLL> on the first write).
+    pub fn write_long_mm_interleaved_68000<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        addr: u32,
+        value: u32,
+    ) {
+        self.write_16(bus, addr.wrapping_add(2), (value & 0xFFFF) as u16);
+        self.ipl_poll_point(bus);
+        self.top_up_prefetch(bus);
+        self.write_16(bus, addr, (value >> 16) as u16);
+    }
+
+    /// Consume the next instruction-stream word from the prefetch queue
+    /// WITHOUT a prefetch refill. Used for the opcode itself (its refill was
+    /// the previous instruction's final prefetch) and for words consumed on
+    /// flow-change paths (the microcode goes straight to the jump refill
+    /// instead of prefetching ahead of a discarded stream).
+    ///
+    /// Falls back to a direct fetch when the queue is empty.
+    pub fn consume_imm_16_no_prefetch<B: AddressBus>(&mut self, bus: &mut B) -> u16 {
+        if self.prefetch_count > 0 {
+            let word = self.prefetch_queue[0];
+            self.prefetch_queue[0] = self.prefetch_queue[1];
+            self.prefetch_count -= 1;
+            self.pc = self.pc.wrapping_add(2);
+            return word;
+        }
+        match self.prefetch_read(bus, self.pc) {
+            Some(w) => {
+                self.pc = self.pc.wrapping_add(2);
+                w
+            }
+            None => 0,
+        }
     }
 
     /// Full reset: pulse reset + load SP and PC from vectors.
@@ -466,6 +984,10 @@ impl CpuCore {
 
         // Read initial PC from vector 1
         self.pc = bus.read_long(4);
+
+        // The queue holds nothing valid for the new PC; the first instruction
+        // fetch refills it (matching the 68000's post-reset double prefetch).
+        self.invalidate_prefetch();
 
         // Use reset cycles
         self.cycles_remaining -= self.cyc_reset;
@@ -554,14 +1076,16 @@ impl CpuCore {
     /// 0x805 = MMUSR, 0x806 = URP, 0x807 = SRP
     pub fn read_control_register(&self, reg: u16) -> u32 {
         match reg {
-            0x000 => self.sfc,   // Source Function Code
-            0x001 => self.dfc,   // Destination Function Code
-            0x002 => self.cacr,  // Cache Control Register
-            0x003 => self.tc,    // Translation Control (68040)
-            0x004 => self.itt0,  // Instruction TTR 0 (68040)
-            0x005 => self.itt1,  // Instruction TTR 1 (68040)
-            0x006 => self.dtt0,  // Data TTR 0 (68040)
-            0x007 => self.dtt1,  // Data TTR 1 (68040)
+            0x000 => self.sfc,    // Source Function Code
+            0x001 => self.dfc,    // Destination Function Code
+            0x002 => self.cacr,   // Cache Control Register
+            0x003 => self.mmu_tc, // Translation Control (68040)
+            0x004 => self.itt0,   // Instruction TTR 0 (68040)
+            0x005 => self.itt1,   // Instruction TTR 1 (68040)
+            0x006 => self.dtt0,   // Data TTR 0 (68040)
+            0x007 => self.dtt1,   // Data TTR 1 (68040)
+            // 0x008 is BUSCR on the 68060 and DACR0 on the 68040.
+            0x008 if self.is_060() => self.buscr,
             0x008 => self.dacr0, // Data Access Control 0 (68040)
             0x009 => self.dacr1, // Data Access Control 1 (68040)
             0x00A => self.iacr0, // Instruction Access Control 0 (68040)
@@ -592,10 +1116,11 @@ impl CpuCore {
                     self.sp[4]
                 }
             }
-            0x805 => self.mmusr, // MMU Status Register (68040)
-            0x806 => self.urp,   // User Root Pointer (68040)
-            0x807 => self.srp,   // Supervisor Root Pointer (68040)
-            _ => 0,              // Unknown register
+            0x805 => self.mmu_sr,               // MMU Status Register (68040)
+            0x806 => self.mmu_crp_aptr,         // User Root Pointer (68040; URP)
+            0x807 => self.mmu_srp_aptr,         // Supervisor Root Pointer (68040)
+            0x808 if self.is_060() => self.pcr, // Processor Configuration (68060)
+            _ => 0,                             // Unknown register
         }
     }
 
@@ -604,16 +1129,89 @@ impl CpuCore {
         match reg {
             0x000 => self.sfc = value & 7, // SFC (3 bits)
             0x001 => self.dfc = value & 7, // DFC (3 bits)
-            0x002 => self.cacr = value,    // CACR
-            0x003 => self.tc = value,      // Translation Control (68040)
-            0x004 => self.itt0 = value,    // Instruction TTR 0 (68040)
-            0x005 => self.itt1 = value,    // Instruction TTR 1 (68040)
-            0x006 => self.dtt0 = value,    // Data TTR 0 (68040)
-            0x007 => self.dtt1 = value,    // Data TTR 1 (68040)
-            0x008 => self.dacr0 = value,   // Data Access Control 0 (68040)
-            0x009 => self.dacr1 = value,   // Data Access Control 1 (68040)
-            0x00A => self.iacr0 = value,   // Instruction Access Control 0 (68040)
-            0x00B => self.iacr1 = value,   // Instruction Access Control 1 (68040)
+            0x002 => {
+                // CACR. The clear bits (CEI/CI, and CED/CD on the 68030)
+                // are write-only strobes: they trigger an invalidation,
+                // never store, and read back as zero. Persistent bits are
+                // masked to what the CPU type implements.
+                use crate::core::types::CpuType;
+                let (persist, strobes) = match self.cpu_type {
+                    CpuType::M68EC020 | CpuType::M68020 => (CACR_EI | CACR_FI, CACR_CEI | CACR_CI),
+                    CpuType::M68EC030 | CpuType::M68030 => (
+                        CACR_EI | CACR_FI | CACR_IBE | CACR_ED | CACR_FD | CACR_DBE | CACR_WA,
+                        CACR_CEI | CACR_CI | CACR_CED | CACR_CD,
+                    ),
+                    // The 68060 keeps the cache enables at the 040 positions
+                    // and adds branch-cache / store-buffer controls. CABC and
+                    // CUBC are write-only branch-cache clear strobes (wired to
+                    // the branch-cache model when it lands; accepted and
+                    // discarded until then). Cache invalidation stays with
+                    // CINV/CPUSH like the 040.
+                    CpuType::M68060 => {
+                        // The branch-cache clear strobes act immediately and
+                        // never store; disabling EBC also clears the table so
+                        // re-enabling starts cold (software is required to
+                        // clear before re-enabling anyway).
+                        if value & CACR_060_CABC != 0 {
+                            self.oep060.branch_cache.clear_all();
+                        } else if value & CACR_060_CUBC != 0 {
+                            self.oep060.branch_cache.clear_user();
+                        }
+                        if self.cacr & CACR_060_EBC != 0 && value & CACR_060_EBC == 0 {
+                            self.oep060.branch_cache.clear_all();
+                        }
+                        (
+                            CACR_060_EDC
+                                | CACR_060_NAD
+                                | CACR_060_ESB
+                                | CACR_060_DPI
+                                | CACR_060_FOC
+                                | CACR_060_EBC
+                                | CACR_060_EIC
+                                | CACR_060_NAI
+                                | CACR_060_FIC,
+                            0,
+                        )
+                    }
+                    // 68040 CACR defines only the two cache-enable bits and
+                    // has no clear strobes - invalidation is done with the
+                    // CINV/CPUSH instructions (see decode.rs). Reserved bits
+                    // read back as zero.
+                    _ => (CACR_040_IE | CACR_040_DE, 0),
+                };
+                self.cacr = value & persist;
+                self.cacr_pending_ops |= value & strobes;
+            }
+            0x003 => {
+                // Translation Control (68040). MOVEC must update pmmu_enabled
+                // (the 040 enable bit is TC[15], unlike the 030's TC[31]).
+                // The 68040 register only implements E and P: everything else
+                // reads back as zero (the 060 adds more control bits).
+                self.mmu_tc = if self.is_040() {
+                    value & 0xC000
+                } else if self.is_060() {
+                    value & 0xFFFE
+                } else {
+                    value
+                };
+                self.pmmu_enabled = self.tc_enable();
+            }
+            // The 040/060 TTRs implement base, mask, E, S, U, CM and W;
+            // the rest reads back as zero.
+            0x004 => self.itt0 = value & 0xFFFF_E364, // Instruction TTR 0
+            0x005 => self.itt1 = value & 0xFFFF_E364, // Instruction TTR 1
+            0x006 => self.dtt0 = value & 0xFFFF_E364, // Data TTR 0
+            0x007 => self.dtt1 = value & 0xFFFF_E364, // Data TTR 1
+            // 0x008 is BUSCR on the 68060 and DACR0 on the 68040.
+            0x008 if self.is_060() => {
+                // BUSCR: only the two lock bits are writable; they read
+                // back in bits 31/29 (WinUAE hardware model).
+                self.buscr = (self.buscr & 0x5000_0000) | (value & 0xA000_0000);
+            }
+            0x008 => self.dacr0 = value, // Data Access Control 0 (68040)
+            0x009 => self.dacr1 = value, // Data Access Control 1 (68040)
+            0x00A => self.iacr0 = value, // Instruction Access Control 0 (68040)
+            0x00B => self.iacr1 = value, // Instruction Access Control 1 (68040)
             0x800 => {
                 // USP
                 if self.s_flag == 0 {
@@ -640,10 +1238,57 @@ impl CpuCore {
                     self.sp[4] = value;
                 }
             }
-            0x805 => self.mmusr = value, // MMU Status Register (68040)
-            0x806 => self.urp = value,   // User Root Pointer (68040)
-            0x807 => self.srp = value,   // Supervisor Root Pointer (68040)
-            _ => {}                      // Unknown register - ignore
+            0x805 => self.mmu_sr = value, // MMU Status Register (68040)
+            0x806 => self.mmu_crp_aptr = value, // User Root Pointer (68040; URP)
+            0x807 => self.mmu_srp_aptr = value, // Supervisor Root Pointer (68040)
+            0x808 if self.is_060() => {
+                // PCR: identification and revision are read-only; only
+                // EDEBUG, DFP, and ESS are writable.
+                let writable = PCR_EDEBUG | PCR_DFP | PCR_ESS;
+                self.pcr = (self.pcr & !writable) | (value & writable);
+            }
+            _ => {} // Unknown register - ignore
+        }
+        // A write to TC, a root pointer, or a TTR can change every translation,
+        // so drop the cached ones (the 040 walker consults the ATC).
+        if matches!(reg, 0x003 | 0x004 | 0x005 | 0x006 | 0x007 | 0x806 | 0x807) {
+            self.atc.flush_all();
+        }
+    }
+
+    /// True for any 68040-family part (full / LC / EC). The 040 MMU differs
+    /// from the 030 in register layout, TC enable bit, and table format.
+    #[inline]
+    pub fn is_040(&self) -> bool {
+        matches!(
+            self.cpu_type,
+            CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040
+        )
+    }
+
+    /// Whether an instruction the 68060 dropped from silicon must take its
+    /// unimplemented trap (vector 61 for integer, the FP-unimplemented
+    /// family for FPU ops) rather than execute natively.
+    #[inline]
+    pub(crate) fn trap_unimpl_060(&self) -> bool {
+        self.cpu_type == CpuType::M68060 && !self.emulate_unimplemented_060
+    }
+
+    /// True for the 68060, which shares the 68040's MMU table format and
+    /// TC enable bit but drops PTEST/PMOVE and adds PLPA.
+    #[inline]
+    pub fn is_060(&self) -> bool {
+        self.cpu_type == CpuType::M68060
+    }
+
+    /// Whether TC's translation-enable bit is set. The bit position differs by
+    /// part: the 68040 and 68060 use `TC[15]`, the 68030 uses `TC[31]`.
+    #[inline]
+    pub fn tc_enable(&self) -> bool {
+        if self.is_040() || self.is_060() {
+            self.mmu_tc & 0x0000_8000 != 0
+        } else {
+            self.mmu_tc & 0x8000_0000 != 0
         }
     }
 
@@ -656,8 +1301,31 @@ impl CpuCore {
     }
 
     #[inline]
-    fn faulted(&self) -> bool {
+    pub(crate) fn faulted(&self) -> bool {
         self.run_mode == RUN_MODE_BERR_AERR_RESET
+    }
+
+    /// Close out an instruction that faulted mid-execution: re-assert the
+    /// handler-entry PC/SR/registers the fault dispatch established (a flow
+    /// instruction whose stack access faulted -- JSR/BSR/RTS -- still
+    /// assigns `pc` on its way out, and a predecrement MOVEM keeps stepping
+    /// A7, which would divert or corrupt the handler) and return to normal
+    /// run mode.
+    pub(crate) fn end_faulted_instruction(&mut self) {
+        if let Some((handler_pc, handler_sr, handler_dar)) = self.fault_resume.take() {
+            self.pc = handler_pc;
+            // No bank swap: handler_dar carries the post-switch A7.
+            self.set_sr_noint_nosp(handler_sr);
+            self.dar = handler_dar;
+        }
+        // A double fault mid-dispatch has parked the CPU: keep the fault
+        // run mode so `is_halted()` classifies it (a halted 68k stays dead
+        // until reset, distinct from a STOP), and let the caller stop
+        // executing rather than resume.
+        if self.stopped != 0 {
+            return;
+        }
+        self.run_mode = super::execute::RUN_MODE_NORMAL;
     }
 
     /// Trigger a 68000-style address error and mark the current instruction as faulted so that
@@ -672,12 +1340,40 @@ impl CpuCore {
         if self.faulted() {
             return;
         }
+        if std::env::var_os("M68K_DIAG_ADDRESS_ERROR").is_some() {
+            eprintln!(
+                "m68k address error: addr={address:#010X} write={write} instr={instruction} \
+                 pc={:#010X} ppc={:#010X} sp={:#010X} sr={:#06X}",
+                self.pc,
+                self.ppc,
+                self.sp(),
+                self.get_sr(),
+            );
+            let sp = self.sp();
+            let mut words = Vec::new();
+            for i in -8i32..8 {
+                let a = sp.wrapping_add((i * 2) as u32);
+                words.push(format!("{:04X}", bus.read_word(a)));
+            }
+            eprintln!(
+                "m68k stack around sp ({:#010X}-16..+16): {}",
+                sp,
+                words.join(" ")
+            );
+            eprintln!(
+                "m68k regs d0-d7={:08X?} a0-a7={:08X?} vbr={:#010X}",
+                &self.dar[0..8],
+                &self.dar[8..16],
+                self.vbr
+            );
+        }
 
         // Roll back any partially-applied register side effects from the faulting instruction.
         // The execute loop saved a snapshot at the start of the instruction.
         self.set_sr_noint_nosp(self.sr_save);
         self.dar = self.dar_save;
         let _ = self.exception_address_error(bus, address, write, instruction);
+        self.fault_resume = Some((self.pc, self.get_sr(), self.dar));
         self.run_mode = RUN_MODE_BERR_AERR_RESET;
     }
 
@@ -705,19 +1401,34 @@ impl CpuCore {
         address: u32,
         write: bool,
         instruction: bool,
+        size: u32,
     ) {
         if self.faulted() {
+            return;
+        }
+        // A fault while already delivering a fault is a double fault: halt
+        // rather than recurse -- the frame writes and vector fetch below
+        // translate like any other supervisor access, and a fault raised
+        // from one of them lands right back here.
+        if self.exception_processing {
+            self.stopped = 1;
+            self.run_mode = RUN_MODE_BERR_AERR_RESET;
             return;
         }
 
         // Roll back any partially-applied register side effects from the faulting instruction.
         self.set_sr_noint_nosp(self.sr_save);
         self.dar = self.dar_save;
-        let _ = self.exception_bus_error(bus, address, write, instruction);
+        self.exception_processing = true;
+        let cause = self.pending_fault_cause.take();
+        let _ = self.exception_bus_error(bus, address, write, instruction, size, cause);
+        self.exception_processing = false;
+        self.fault_resume = Some((self.pc, self.get_sr(), self.dar));
         self.run_mode = RUN_MODE_BERR_AERR_RESET;
     }
 
-    /// Trigger a bus error before the current instruction has had any side effects.
+    /// Trigger a bus error before the current instruction has modified
+    /// architectural state (opcode fetch and instruction-MMU walks).
     pub(crate) fn trigger_bus_error_no_rollback<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -728,9 +1439,40 @@ impl CpuCore {
         if self.faulted() {
             return;
         }
+        if self.exception_processing {
+            self.stopped = 1;
+            self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            return;
+        }
 
-        let _ = self.exception_bus_error(bus, address, write, instruction);
+        self.exception_processing = true;
+        let cause = self.pending_fault_cause.take();
+        let _ = self.exception_bus_error(bus, address, write, instruction, 2, cause);
+        self.exception_processing = false;
+        self.fault_resume = Some((self.pc, self.get_sr(), self.dar));
         self.run_mode = RUN_MODE_BERR_AERR_RESET;
+    }
+
+    /// Byte mask of the active MMU page (page size - 1). A misaligned access
+    /// whose bytes straddle this boundary runs as separate bus cycles on the
+    /// 32-bit-bus CPUs, each cycle translated on its own: the two halves live
+    /// on different virtual pages that map to unrelated physical pages.
+    /// Translating only the base address would read or write the physically
+    /// adjacent page instead of the mapped one.
+    #[inline]
+    pub(crate) fn mmu_page_mask(&self) -> u32 {
+        if self.is_040() || self.is_060() {
+            // 68040/68060 TC.P (bit 14): 0 = 4K pages, 1 = 8K pages.
+            if self.mmu_tc & 0x0000_4000 != 0 {
+                0x1FFF
+            } else {
+                0xFFF
+            }
+        } else {
+            // 68030 TC.PS (bits 23:20): page size 2^PS, PS = 8..15.
+            let ps = ((self.mmu_tc >> 20) & 0xF).clamp(8, 15);
+            (1u32 << ps) - 1
+        }
     }
 
     /// Read byte from memory (data space).
@@ -739,7 +1481,17 @@ impl CpuCore {
         if self.faulted() {
             return 0;
         }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
         let mut addr = self.address(addr);
+        if let Some((a, v)) = self.mmu_read_override
+            && a == addr
+        {
+            // RTE'd 030 bus-fault frame with DF cleared: the handler
+            // supplied this read's result in the data input buffer.
+            self.mmu_read_override = None;
+            return v as u8;
+        }
         {
             if self.has_pmmu && self.pmmu_enabled {
                 match crate::mmu::translate_address(
@@ -752,9 +1504,7 @@ impl CpuCore {
                 ) {
                     Ok(p) => addr = self.address(p),
                     Err(f) => {
-                        self.handle_mmu_fault(
-                            bus, f, /*write=*/ false, /*instruction=*/ false,
-                        );
+                        self.handle_mmu_fault(bus, f, false, false, 1);
                         return 0;
                     }
                 }
@@ -764,7 +1514,7 @@ impl CpuCore {
             Ok(v) => v,
             Err(f) => {
                 if matches!(f.kind, BusFaultKind::BusError) {
-                    self.trigger_bus_error(bus, addr, false, false);
+                    self.trigger_bus_error(bus, addr, false, false, 1);
                 }
                 0
             }
@@ -777,6 +1527,8 @@ impl CpuCore {
         if self.faulted() {
             return 0;
         }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
@@ -785,6 +1537,27 @@ impl CpuCore {
         {
             self.trigger_address_error(bus, addr, false, false);
             return 0;
+        }
+        if self.has_pmmu && self.pmmu_enabled {
+            let pm = self.mmu_page_mask();
+            if addr & pm == pm {
+                // Misaligned word straddling an MMU page: two byte cycles,
+                // each translated on its own page.
+                let hi = self.read_8(bus, addr) as u16;
+                if self.faulted() {
+                    return 0;
+                }
+                let lo = self.read_8(bus, addr.wrapping_add(1)) as u16;
+                return (hi << 8) | lo;
+            }
+        }
+        if let Some((a, v)) = self.mmu_read_override
+            && a == addr
+        {
+            // RTE'd 030 bus-fault frame with DF cleared: the handler
+            // supplied this read's result in the data input buffer.
+            self.mmu_read_override = None;
+            return v as u16;
         }
         {
             if self.has_pmmu && self.pmmu_enabled {
@@ -798,9 +1571,7 @@ impl CpuCore {
                 ) {
                     Ok(p) => addr = self.address(p),
                     Err(f) => {
-                        self.handle_mmu_fault(
-                            bus, f, /*write=*/ false, /*instruction=*/ false,
-                        );
+                        self.handle_mmu_fault(bus, f, false, false, 2);
                         return 0;
                     }
                 }
@@ -810,7 +1581,7 @@ impl CpuCore {
             Ok(v) => v,
             Err(f) => {
                 if matches!(f.kind, BusFaultKind::BusError) {
-                    self.trigger_bus_error(bus, addr, false, false);
+                    self.trigger_bus_error(bus, addr, false, false, 2);
                 }
                 0
             }
@@ -823,6 +1594,8 @@ impl CpuCore {
         if self.faulted() {
             return 0;
         }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
@@ -831,6 +1604,28 @@ impl CpuCore {
         {
             self.trigger_address_error(bus, addr, false, false);
             return 0;
+        }
+        if self.has_pmmu && self.pmmu_enabled {
+            let pm = self.mmu_page_mask();
+            if addr & pm > pm - 3 {
+                // Long straddling an MMU page: two word cycles, each
+                // translated on its own page (read_16 sub-splits further if
+                // a half is itself misaligned across the boundary).
+                let hi = self.read_16(bus, addr) as u32;
+                if self.faulted() {
+                    return 0;
+                }
+                let lo = self.read_16(bus, addr.wrapping_add(2)) as u32;
+                return (hi << 16) | lo;
+            }
+        }
+        if let Some((a, v)) = self.mmu_read_override
+            && a == addr
+        {
+            // RTE'd 030 bus-fault frame with DF cleared: the handler
+            // supplied this read's result in the data input buffer.
+            self.mmu_read_override = None;
+            return v;
         }
         {
             if self.has_pmmu && self.pmmu_enabled {
@@ -844,9 +1639,7 @@ impl CpuCore {
                 ) {
                     Ok(p) => addr = self.address(p),
                     Err(f) => {
-                        self.handle_mmu_fault(
-                            bus, f, /*write=*/ false, /*instruction=*/ false,
-                        );
+                        self.handle_mmu_fault(bus, f, false, false, 4);
                         return 0;
                     }
                 }
@@ -856,7 +1649,7 @@ impl CpuCore {
             Ok(v) => v,
             Err(f) => {
                 if matches!(f.kind, BusFaultKind::BusError) {
-                    self.trigger_bus_error(bus, addr, false, false);
+                    self.trigger_bus_error(bus, addr, false, false, 4);
                 }
                 0
             }
@@ -869,7 +1662,16 @@ impl CpuCore {
         if self.faulted() {
             return;
         }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
         let mut addr = self.address(addr);
+        if self.mmu_write_suppress == Some(addr) {
+            // RTE'd 030 bus-fault frame with DF cleared on a write fault:
+            // the handler completed or absorbed this write.
+            self.mmu_write_suppress = None;
+            return;
+        }
+        self.pending_fault_wdata = value as u32;
         {
             if self.has_pmmu && self.pmmu_enabled {
                 match crate::mmu::translate_address(
@@ -882,9 +1684,7 @@ impl CpuCore {
                 ) {
                     Ok(p) => addr = self.address(p),
                     Err(f) => {
-                        self.handle_mmu_fault(
-                            bus, f, /*write=*/ true, /*instruction=*/ false,
-                        );
+                        self.handle_mmu_fault(bus, f, true, false, 1);
                         return;
                     }
                 }
@@ -893,7 +1693,7 @@ impl CpuCore {
         if let Err(f) = bus.try_write_byte(addr, value)
             && matches!(f.kind, BusFaultKind::BusError)
         {
-            self.trigger_bus_error(bus, addr, true, false);
+            self.trigger_bus_error(bus, addr, true, false, 1);
         }
     }
 
@@ -903,6 +1703,8 @@ impl CpuCore {
         if self.faulted() {
             return;
         }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
@@ -912,6 +1714,25 @@ impl CpuCore {
             self.trigger_address_error(bus, addr, true, false);
             return;
         }
+        if self.has_pmmu && self.pmmu_enabled {
+            let pm = self.mmu_page_mask();
+            if addr & pm == pm {
+                // Misaligned word straddling an MMU page: two byte cycles,
+                // each translated (and fault-suppressed) on its own page.
+                self.write_8(bus, addr, (value >> 8) as u8);
+                if self.faulted() {
+                    return;
+                }
+                self.write_8(bus, addr.wrapping_add(1), value as u8);
+                return;
+            }
+        }
+        if self.mmu_write_suppress == Some(addr) {
+            // See write_8: DF-cleared write fault, already completed.
+            self.mmu_write_suppress = None;
+            return;
+        }
+        self.pending_fault_wdata = value as u32;
         {
             if self.has_pmmu && self.pmmu_enabled {
                 match crate::mmu::translate_address(
@@ -924,9 +1745,7 @@ impl CpuCore {
                 ) {
                     Ok(p) => addr = self.address(p),
                     Err(f) => {
-                        self.handle_mmu_fault(
-                            bus, f, /*write=*/ true, /*instruction=*/ false,
-                        );
+                        self.handle_mmu_fault(bus, f, true, false, 2);
                         return;
                     }
                 }
@@ -935,7 +1754,7 @@ impl CpuCore {
         if let Err(f) = bus.try_write_word(addr, value)
             && matches!(f.kind, BusFaultKind::BusError)
         {
-            self.trigger_bus_error(bus, addr, true, false);
+            self.trigger_bus_error(bus, addr, true, false, 2);
         }
     }
 
@@ -945,6 +1764,8 @@ impl CpuCore {
         if self.faulted() {
             return;
         }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
@@ -954,6 +1775,25 @@ impl CpuCore {
             self.trigger_address_error(bus, addr, true, false);
             return;
         }
+        if self.has_pmmu && self.pmmu_enabled {
+            let pm = self.mmu_page_mask();
+            if addr & pm > pm - 3 {
+                // Long straddling an MMU page: two word cycles, each
+                // translated (and fault-suppressed) on its own page.
+                self.write_16(bus, addr, (value >> 16) as u16);
+                if self.faulted() {
+                    return;
+                }
+                self.write_16(bus, addr.wrapping_add(2), value as u16);
+                return;
+            }
+        }
+        if self.mmu_write_suppress == Some(addr) {
+            // See write_8: DF-cleared write fault, already completed.
+            self.mmu_write_suppress = None;
+            return;
+        }
+        self.pending_fault_wdata = value;
         {
             if self.has_pmmu && self.pmmu_enabled {
                 match crate::mmu::translate_address(
@@ -966,9 +1806,7 @@ impl CpuCore {
                 ) {
                     Ok(p) => addr = self.address(p),
                     Err(f) => {
-                        self.handle_mmu_fault(
-                            bus, f, /*write=*/ true, /*instruction=*/ false,
-                        );
+                        self.handle_mmu_fault(bus, f, true, false, 4);
                         return;
                     }
                 }
@@ -977,7 +1815,7 @@ impl CpuCore {
         if let Err(f) = bus.try_write_long(addr, value)
             && matches!(f.kind, BusFaultKind::BusError)
         {
-            self.trigger_bus_error(bus, addr, true, false);
+            self.trigger_bus_error(bus, addr, true, false, 4);
         }
     }
 
@@ -987,6 +1825,7 @@ impl CpuCore {
         fault: crate::mmu::MmuFault,
         write: bool,
         instruction: bool,
+        size: u32,
     ) {
         use crate::core::exceptions::vector;
         use crate::mmu::MmuFaultKind;
@@ -995,23 +1834,35 @@ impl CpuCore {
         // 1. exception_processing flag in translate() bypasses MMU during exception handling
         // 2. Double-fault detection in take_exception() halts CPU on recursive faults
 
+        self.pending_fault_cause = Some(fault.cause);
         match fault.kind {
             MmuFaultKind::BusError => {
-                self.trigger_bus_error(bus, fault.address, write, instruction)
+                self.trigger_bus_error(bus, fault.address, write, instruction, size)
             }
             MmuFaultKind::ConfigurationError => {
                 let _ = self.take_exception(bus, vector::MMU_CONFIGURATION_ERROR);
+                self.fault_resume = Some((self.pc, self.get_sr(), self.dar));
                 self.run_mode = RUN_MODE_BERR_AERR_RESET;
             }
             MmuFaultKind::IllegalOperation => {
                 let _ = self.take_exception(bus, vector::MMU_ILLEGAL_OPERATION_ERROR);
+                self.fault_resume = Some((self.pc, self.get_sr(), self.dar));
                 self.run_mode = RUN_MODE_BERR_AERR_RESET;
             }
             MmuFaultKind::AccessLevelViolation => {
-                let _ = self.take_exception(bus, vector::MMU_ACCESS_LEVEL_VIOLATION_ERROR);
-                self.run_mode = RUN_MODE_BERR_AERR_RESET;
+                // Integrated 68030/68040 MMU faults vector to BUS_ERROR
+                // (vector 2), not the 68851 access-level vector. Route through
+                // trigger_bus_error so the instruction is rolled back and RTE
+                // can restart it once the handler fixes the mapping (the 040
+                // gets a resumable format-7 frame; the 030 long bus-fault
+                // format-A/B frame is still the minimal fallback).
+                self.trigger_bus_error(bus, fault.address, write, instruction, size);
             }
         }
+        // A faulted MOVES cycle never reaches its own override cleanup: the
+        // dispatch above is the instruction's end, so drop the SFC/DFC
+        // override here (the frame's SSW has already captured it).
+        self.mmu_fc_override = None;
     }
 
     pub(crate) fn handle_mmu_fetch_fault<B: AddressBus>(
@@ -1053,11 +1904,26 @@ impl CpuCore {
         use super::ea::AddressingMode;
         use super::types::Size;
 
+        // The 68060 has no PMOVE (MMU registers are MOVEC-only) and no
+        // 030-form PTEST/PFLUSH in this encoding space: undefined F-line.
+        // Watch item: the 040 arm below NOPs 030-form PTESTs because
+        // 68040.library issues them during setup; extend that pragmatism
+        // here if an OS's 68060 support library turns out to do the same.
+        if self.is_060() {
+            return 0;
+        }
+
         // MMU ops require PMMU-capable CPU (68030/68040).
         if !self.has_pmmu {
             return 0;
         }
+        // The 68040 has none of these 030-form encodings: real silicon
+        // raises Line-F even in user mode (the supervisor-mode PTEST/PFLUSH
+        // pragmatism below exists only for 68040.library's setup probes).
         if !self.is_supervisor() {
+            if self.is_040() {
+                return 0;
+            }
             return self.exception_privilege(bus);
         }
 
@@ -1075,17 +1941,61 @@ impl CpuCore {
                 | super::types::CpuType::M68040
         );
         if is_ptest && is_040 {
-            // PTEST on 68040 - treat as NOP
+            // 030-form PTEST on the 68040 - treat as NOP (68040.library
+            // issues these during setup; the 040 form is 0xF548).
             return 4;
         }
-        if (modes & 0xFDE0) == 0x2000
+        if is_ptest {
+            // 68030 PTEST: walk the tables for the EA in the address space
+            // named by the extension word's fc field, at most `level`
+            // descriptors deep, and report the outcome in MMUSR. With the
+            // A bit set, the physical address of the last descriptor
+            // examined lands in An -- mmu.library's lazy fault handler
+            // finds the shared descriptor slot to materialize by stepping
+            // PTEST through the levels exactly this way.
+            let level = ((modes >> 10) & 7) as u32;
+            let read = (modes & 0x0200) != 0;
+            let a_bit = (modes & 0x0100) != 0;
+            let an = ((modes >> 5) & 7) as usize;
+            let fcf = (modes & 0x1F) as u32;
+            let fc = if fcf & 0x10 != 0 {
+                fcf & 7 // immediate
+            } else if fcf & 0x08 != 0 {
+                self.d((fcf & 7) as usize) & 7 // Dn
+            } else if fcf == 1 {
+                self.dfc & 7
+            } else {
+                self.sfc & 7 // 00000 = SFC (00001 = DFC above)
+            };
+            let ea_mode = ((opcode >> 3) & 0x7) as u8;
+            let ea_reg = (opcode & 0x7) as u8;
+            let Some(am) = AddressingMode::decode(ea_mode, ea_reg) else {
+                return 0;
+            };
+            let super::ea::EaResult::Memory(addr) = self.resolve_ea(bus, am, Size::Long) else {
+                return 0;
+            };
+            let (sr, desc_addr) = crate::mmu::ptest_030(self, bus, addr, fc, !read, level);
+            self.mmu_sr = sr as u32;
+            if a_bit && level != 0 {
+                self.set_a(an, desc_addr);
+            }
+            return 8;
+        }
+        // PLOAD / PFLUSH / PFLUSHA (68030 forms): recognized but not yet
+        // fully modelled. Treat them as NOPs rather than returning 0, which
+        // the decoder would turn into a LINE-1111 trap -- AROS and the
+        // 68040.library issue these during MMU setup, so trapping crashes
+        // the boot. There is no ATC on the 030 walk, so a flush has nothing
+        // to drop.
+        if (modes & 0xFDE0) == 0x2000   // PLOAD
             || (modes & 0xE200) == 0x2000
-            || modes == 0xA000
+            || modes == 0xA000          // PFLUSHA
             || modes == 0x2800
             || (modes & 0xFFF8) == 0x2C00
-            || is_ptest
+        // PFLUSH
         {
-            return 0;
+            return 8;
         }
 
         // Decode effective address from opcode.
@@ -1147,6 +2057,12 @@ impl CpuCore {
                     self.write_resolved_ea(bus, ea, Size::Long, self.mmu_tt1);
                     4
                 }
+                0x18 => {
+                    // MMUSR / PSR (16): how a fault handler reads the PTEST
+                    // result (PMOVE PSR,<ea>).
+                    self.write_resolved_ea(bus, ea, Size::Word, self.mmu_sr & 0xFFFF);
+                    4
+                }
                 _ => 0,
             }
         } else {
@@ -1155,8 +2071,8 @@ impl CpuCore {
                     // TC (32)
                     let v = self.read_resolved_ea(bus, ea, Size::Long);
                     self.mmu_tc = v;
-                    // Enable PMMU based on TC high bit (common convention).
-                    self.pmmu_enabled = (self.mmu_tc & 0x8000_0000) != 0;
+                    // PMOVE is 68030-only, so tc_enable() reads TC[31] here.
+                    self.pmmu_enabled = self.tc_enable();
                     4
                 }
                 0x12 => {
@@ -1187,6 +2103,12 @@ impl CpuCore {
                     // TT1 (32)
                     let v = self.read_resolved_ea(bus, ea, Size::Long);
                     self.mmu_tt1 = v;
+                    4
+                }
+                0x18 => {
+                    // MMUSR / PSR (16)
+                    let v = self.read_resolved_ea(bus, ea, Size::Word);
+                    self.mmu_sr = v & 0xFFFF;
                     4
                 }
                 _ => 0,
