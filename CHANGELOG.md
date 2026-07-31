@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.3.0...m68k-v0.3.1) (2026-07-31)
+
+
+### Bug Fixes
+
+* make native JIT dependencies opt in ([39e767a](https://github.com/benletchford/m68k-rs/commit/39e767a00b6365880a71e44f0805c97aae7f9a02))
+
 ## [0.3.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.2.5...m68k-v0.3.0) (2026-07-31)
 
 
