@@ -1,7 +1,9 @@
-//! FPU operations (68040/68881-class).
+//! FPU instruction decode and execution for 68881/68882, 68040, and 68060
+//! configurations.
 //!
-//! Note: This is currently a **minimal bring-up** focused on plumbing + a few
-//! OS-critical operations. Expect expansion over time.
+//! Arithmetic uses the pure-Rust extended-precision engine, including FPCR
+//! rounding, FPSR exception state, packed-decimal formats, transcendentals,
+//! conditionals, register moves, and CPU-specific FSAVE/FRESTORE frames.
 
 use super::packed;
 use super::softfloat::{self, ExcFlags, FpCmp, Precision, RoundCtx, RoundMode};
@@ -24,8 +26,9 @@ enum FpuEa {
 
 /// Round an f64 to an integer using the FPCR rounding mode and saturate
 /// into the destination integer width, as the 6888x does for FMOVE to an
-/// integer format (out-of-range and NaN produce the most negative value
-/// and would set OPERR, which the emulated FPU does not raise).
+/// integer format. Out-of-range values and NaNs produce the most negative
+/// destination value; this conversion helper does not currently report the
+/// corresponding OPERR status.
 fn f64_to_int_saturating(value: f64, fpcr: u32, min: i64, max: i64) -> i64 {
     if value.is_nan() {
         return min;
@@ -119,10 +122,11 @@ fn words_to_bytes(w0: u32, w1: u32, w2: u32) -> [u8; 12] {
 }
 
 impl CpuCore {
-    /// 68040 FPU "op0" entrypoint (opcode pattern 0xF2xx in Musashi: `040fpu0`).
+    /// Execute a general 6888x/68040/68060 F-line operation (`0xF2xx`).
     ///
-    /// Handles the implemented 6888x/68040 ALU, FMOVE, control, and condition-code subset.
-    /// Unsupported encodings return 0 so the caller can raise the Line-F exception.
+    /// Handles arithmetic, FMOVE, control, conditional, and save/restore
+    /// operations according to the configured CPU model. Unsupported encodings
+    /// return zero so the caller can raise the Line-F exception.
     pub fn exec_fpu_op0<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         use crate::core::types::CpuType;
 
@@ -527,9 +531,10 @@ impl CpuCore {
         4
     }
 
-    /// 68040 FPU "op1" entrypoint (opcode pattern 0xF3xx in Musashi: `040fpu1`).
+    /// FPU "op1" entrypoint for the `0xF3xx` encoding group.
     ///
-    /// Implements a minimal subset: `FSAVE <ea>` and `FRESTORE <ea>` for a NULL/IDLE frame.
+    /// This group contains `FSAVE <ea>` and `FRESTORE <ea>`; frame formats
+    /// follow the configured CPU/FPU generation.
     pub fn exec_fpu_op1<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         // FSAVE/FRESTORE also take the disabled trap when PCR.DFP is set.
         if self.is_060() && (self.pcr & crate::core::cpu::PCR_DFP) != 0 {
@@ -639,9 +644,8 @@ impl CpuCore {
     /// 68060 FSAVE: the floating-point state frame carries its format in
     /// bits 15:8 of the first long word: $00 = NULL (FPU untouched since
     /// reset), $60 = IDLE. A NULL frame is a single long word - the same
-    /// one-long NULL every part since the 68881 has used, and the size
-    /// AmigaOS's hand-built task contexts rely on - while IDLE occupies
-    /// the full three long words. The EXCP frame ($E0, carrying pending-
+    /// one-long NULL used since the 68881, while IDLE occupies the full three
+    /// long words. The EXCP frame ($E0, carrying pending-
     /// exception operands) is not modeled: the softfloat FPU completes
     /// every operation before retiring.
     fn exec_fsave_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
@@ -888,10 +892,11 @@ impl CpuCore {
         self.fpsr |= aexc;
     }
 
-    /// Evaluate a 6888x conditional predicate against FPSR. The upper
-    /// half of the condition space (bit 5 (actually bit 4 of the 5-bit
-    /// field)) only differs by signalling BSUN on NaN, which the emulated
-    /// FPU does not raise, so it folds onto the lower half.
+    /// Evaluate a 6888x conditional predicate against FPSR.
+    ///
+    /// Signaling predicates (condition bit 4 set) currently evaluate like
+    /// their non-signaling counterparts; this helper does not set BSUN when
+    /// the unordered condition is present.
     fn fpu_condition(&self, condition: u8) -> bool {
         const FPCC_N: u32 = 0x0800_0000;
         const FPCC_Z: u32 = 0x0400_0000;
@@ -923,17 +928,15 @@ impl CpuCore {
 
     /// Apply a general FPU ALU operation `opmode` to destination register
     /// `dst` using the source operand `src` (an FPm register or an
-    /// <ea>/immediate operand). This is the single dispatch table shared by
+    /// `<ea>`/immediate operand). This is the single dispatch table shared by
     /// the register-source (`subop 0x0`) and memory/immediate-source (`subop
     /// 0x2`) paths so the two cannot drift apart. FMOVECR has no source
     /// operand and is handled by the callers.
     ///
-    /// Phase 0: arithmetic is still computed via an f64 bridge
-    /// (`src.to_f64()` ... `FloatX80::from_f64(result)`) so results match the
-    /// previous core exactly while the register file is the extended type;
-    /// Phase 1 swaps each arm onto the softfloat engine. The 6888x
-    /// single/double rounding-precision variants (FSxxx/FDxxx) still fold
-    /// onto their base op here.
+    /// Arithmetic is evaluated by the extended-precision softfloat and
+    /// transcendental engines. The 6888x single/double
+    /// rounding-precision variants (FSxxx/FDxxx) select their specified
+    /// result precision before the value is written back.
     fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80) -> i32 {
         match opmode {
             0x00 | 0x40 | 0x44 => {
@@ -1178,7 +1181,7 @@ impl CpuCore {
         }
     }
 
-    /// FScc <ea> trap on the 68060: the instruction is emulated by the
+    /// `FScc <ea>` trap on the 68060: the instruction is emulated by the
     /// 68060SP. Resolve the byte-sized destination EA for the frame.
     pub(crate) fn fpu_060_scc_trap<B: AddressBus>(
         &mut self,
@@ -1229,9 +1232,9 @@ impl CpuCore {
 
     /// Read the ALU/FMOVE source operand in `fmt` (0=long, 1=single,
     /// 2=extended, 4=word, 6=byte, 5=double) as an extended value. The
-    /// extended format (2) is read losslessly; the others go through an f64
-    /// bridge for now (Phase 1 replaces these with exact widening). Packed
-    /// decimal (3) is unimplemented and reports as unhandled (F-line).
+    /// extended format (2) is read losslessly. Integer, binary32, and
+    /// binary64 inputs are widened exactly to the extended register format;
+    /// packed decimal (3) is decoded by the packed-decimal engine.
     fn fpu_read_source<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -1323,9 +1326,9 @@ impl CpuCore {
     }
 
     /// Write `value` to the FMOVE destination in `fmt`. Integer formats
-    /// round per FPCR and saturate; packed decimal (3 and 7) is
-    /// unimplemented and reports as unhandled (F-line). Returns false if
-    /// the format/EA combination cannot be carried out.
+    /// round per FPCR and saturate; packed-decimal formats 3 and 7 honor
+    /// their static or dynamic k-factor. Returns false if the format/EA
+    /// combination is invalid.
     fn fpu_write_dest<B: AddressBus>(
         &mut self,
         bus: &mut B,

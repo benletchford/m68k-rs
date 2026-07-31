@@ -63,6 +63,11 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
+      - name: Build API documentation
+        env:
+          RUSTDOCFLAGS: -D warnings -D rustdoc::private_intra_doc_links
+        run: cargo doc --all-features --locked --no-deps --document-private-items
+
       - name: Run tests (default features)
         run: cargo test --locked
 

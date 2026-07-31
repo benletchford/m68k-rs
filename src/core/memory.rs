@@ -10,7 +10,9 @@ pub enum BusFaultKind {
 /// A bus-level fault that occurred during a memory access.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BusFault {
+    /// Classification of the failed bus transaction.
     pub kind: BusFaultKind,
+    /// Bus address at which the transaction failed.
     pub address: u32,
 }
 
@@ -48,12 +50,24 @@ pub struct FastMem {
     pub len: u32,
 }
 
+/// Host-provided memory and device bus used by [`CpuCore`](crate::CpuCore).
+///
+/// Multi-byte values use the 68k's big-endian byte order. The six basic
+/// read/write methods are required; the remaining hooks have conservative
+/// defaults for functional emulators and can be overridden for precise
+/// faults, timing, interrupts, caches, and batch acceleration.
 pub trait AddressBus {
+    /// Read one byte from `address`.
     fn read_byte(&mut self, address: u32) -> u8;
+    /// Read one big-endian 16-bit word from `address`.
     fn read_word(&mut self, address: u32) -> u16;
+    /// Read one big-endian 32-bit longword from `address`.
     fn read_long(&mut self, address: u32) -> u32;
+    /// Write one byte to `address`.
     fn write_byte(&mut self, address: u32, value: u8);
+    /// Write one big-endian 16-bit word to `address`.
     fn write_word(&mut self, address: u32, value: u16);
+    /// Write one big-endian 32-bit longword to `address`.
     fn write_long(&mut self, address: u32, value: u32);
 
     /// Precise-timing callback (Part E.2): called immediately before each bus
@@ -75,33 +89,54 @@ pub trait AddressBus {
     fn try_read_byte(&mut self, address: u32) -> Result<u8, BusFault> {
         Ok(self.read_byte(address))
     }
+    /// Fallible word read used for bus/MMU fault delivery.
+    ///
+    /// The default delegates to [`AddressBus::read_word`] and cannot fault.
     #[inline]
     fn try_read_word(&mut self, address: u32) -> Result<u16, BusFault> {
         Ok(self.read_word(address))
     }
+    /// Fallible longword read used for bus/MMU fault delivery.
+    ///
+    /// The default delegates to [`AddressBus::read_long`] and cannot fault.
     #[inline]
     fn try_read_long(&mut self, address: u32) -> Result<u32, BusFault> {
         Ok(self.read_long(address))
     }
+    /// Fallible byte write used for bus/MMU fault delivery.
+    ///
+    /// The default delegates to [`AddressBus::write_byte`] and cannot fault.
     #[inline]
     fn try_write_byte(&mut self, address: u32, value: u8) -> Result<(), BusFault> {
         self.write_byte(address, value);
         Ok(())
     }
+    /// Fallible word write used for bus/MMU fault delivery.
+    ///
+    /// The default delegates to [`AddressBus::write_word`] and cannot fault.
     #[inline]
     fn try_write_word(&mut self, address: u32, value: u16) -> Result<(), BusFault> {
         self.write_word(address, value);
         Ok(())
     }
+    /// Fallible longword write used for bus/MMU fault delivery.
+    ///
+    /// The default delegates to [`AddressBus::write_long`] and cannot fault.
     #[inline]
     fn try_write_long(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
         self.write_long(address, value);
         Ok(())
     }
 
+    /// Read an instruction-stream word.
+    ///
+    /// Override this when opcode/immediate fetches use a distinct bus path.
     fn read_immediate_word(&mut self, address: u32) -> u16 {
         self.read_word(address)
     }
+    /// Read an instruction-stream longword.
+    ///
+    /// Override this when opcode/immediate fetches use a distinct bus path.
     fn read_immediate_long(&mut self, address: u32) -> u32 {
         self.read_long(address)
     }
@@ -112,6 +147,10 @@ pub trait AddressBus {
     fn try_read_immediate_word(&mut self, address: u32) -> Result<u16, BusFault> {
         Ok(self.read_immediate_word(address))
     }
+    /// Fallible instruction-stream longword read.
+    ///
+    /// The default delegates to [`AddressBus::read_immediate_long`] and
+    /// cannot fault.
     #[inline]
     fn try_read_immediate_long(&mut self, address: u32) -> Result<u32, BusFault> {
         Ok(self.read_immediate_long(address))
@@ -138,6 +177,10 @@ pub trait AddressBus {
         self.last_fetch_was_cached()
     }
 
+    /// Perform an interrupt-acknowledge cycle for `level`.
+    ///
+    /// Return an explicit vector number in the low byte, or `u32::MAX` for
+    /// the level's autovector. The default requests an autovector.
     fn interrupt_acknowledge(&mut self, _level: u8) -> u32 {
         0xFFFF_FFFF
     }
@@ -162,6 +205,7 @@ pub trait AddressBus {
     /// earlier in the faulted instruction must not survive into the handler.
     fn ipl_release_sample(&mut self) {}
 
+    /// Notify attached devices that the CPU asserted the external RESET line.
     fn reset_devices(&mut self) {}
 
     /// Expose a direct window into contiguous, side-effect-free guest RAM.
@@ -178,16 +222,18 @@ pub trait AddressBus {
     }
 }
 
-/// Optional companion trait for buses that can version instruction-visible memory.
+/// Optional companion trait for buses that version instruction-visible memory.
 ///
 /// This is intentionally separate from `AddressBus`: adding methods to the hot bus trait changes
-/// code generation for opcode fetches in release builds. Future code caches/JIT paths can require
-/// this trait without slowing existing interpreter users.
+/// code generation for opcode fetches in release builds. Embedders can use it
+/// to coordinate external code caches without slowing buses that need only
+/// [`AddressBus`].
 pub trait InstructionCacheBus: AddressBus {
     /// Stable version for instruction memory at `address`, when known.
     ///
-    /// Returning `Some(version)` tells future code caches that fetches from this address may be
-    /// reused until the version changes. Returning `None` is conservative.
+    /// Returning `Some(version)` tells an instruction cache that fetches from
+    /// this address may be reused until the version changes. Returning `None`
+    /// is conservative.
     #[inline]
     fn instruction_cache_version(&mut self, _address: u32) -> Option<u64> {
         None
@@ -236,21 +282,31 @@ impl LinearMemoryBus {
     }
 
     #[inline]
+    /// Return the number of bytes in the backing buffer.
     pub fn len(&self) -> usize {
         self.memory.len()
     }
 
     #[inline]
+    /// Return whether the backing buffer is empty.
+    ///
+    /// A constructed `LinearMemoryBus` is never empty because
+    /// [`LinearMemoryBus::from_vec`] rejects an empty buffer.
     pub fn is_empty(&self) -> bool {
         self.memory.is_empty()
     }
 
     #[inline]
+    /// Borrow the complete backing buffer.
     pub fn as_slice(&self) -> &[u8] {
         &self.memory
     }
 
     #[inline]
+    /// Mutably borrow the complete backing buffer.
+    ///
+    /// Taking a mutable slice advances the instruction-memory version
+    /// conservatively because the caller may change executable bytes.
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         self.bump_instruction_version();
         &mut self.memory
@@ -269,11 +325,13 @@ impl LinearMemoryBus {
     }
 
     #[inline]
+    /// Write one big-endian word, wrapping within the backing buffer.
     pub fn write_word_at(&mut self, address: u32, value: u16) {
         self.write_word(address, value);
     }
 
     #[inline]
+    /// Write one big-endian longword, wrapping within the backing buffer.
     pub fn write_long_at(&mut self, address: u32, value: u32) {
         self.write_long(address, value);
     }

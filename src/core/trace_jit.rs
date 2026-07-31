@@ -273,7 +273,7 @@ pub(crate) enum JitTraceOp {
         src: JitEa,
         dst: JitEa,
     },
-    /// MOVEM.W (An)+,<data-register mask>. Keeping this deliberately narrow
+    /// `MOVEM.W (An)+,<data-register-mask>`. Keeping this deliberately narrow
     /// avoids the architectural corner cases of address registers in a
     /// postincrement MOVEM list.
     MovemWordPostInc {

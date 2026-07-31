@@ -1,8 +1,9 @@
-//! Opt-in trace-JIT opportunity profiling.
+//! Opt-in trace and decoded-operation profiling.
 //!
 //! Enable the `trace-profile` Cargo feature and set `M68K_TRACE_PROFILE=1`
 //! to print a report when the CPU thread exits. The normal build contains
-//! none of this module or its hot-path hooks.
+//! none of this module or its hot-path hooks. Profiling works with both the
+//! portable trace executor and the native `jit` backend.
 
 use super::types::CpuType;
 use std::cell::RefCell;
@@ -11,32 +12,56 @@ use std::fmt::Write;
 use std::hash::{BuildHasherDefault, Hasher};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Per-trace-head profiling counters.
 pub struct TraceProfileRow {
+    /// Guest program counter at which the trace starts.
     pub start_pc: u32,
+    /// CPU model active for this trace.
     pub cpu_type: CpuType,
+    /// Backward branches observed at the trace head.
     pub backward_hits: u64,
+    /// Trace-entry attempts rejected by an unsupported operation.
     pub rejected_hits: u64,
+    /// Number of trace-recording attempts.
     pub recording_attempts: u64,
+    /// Longest supported prefix before the recorded blocker.
     pub prefix_ops: u32,
+    /// Guest PC of the operation that blocked trace construction.
     pub blocker_pc: Option<u32>,
+    /// Opcode word that blocked trace construction.
     pub blocker_opcode: Option<u16>,
+    /// Number of operations in the current compiled/portable trace.
     pub compiled_ops: u32,
+    /// Number of calls into the trace executor.
+    ///
+    /// The field name is retained for compatibility; portable trace calls
+    /// are counted here as well.
     pub native_calls: u64,
+    /// Total guest instructions retired by trace execution.
     pub jit_retired: u64,
+    /// Exits caused by a guarded branch taking an unrecorded direction.
     pub guarded_branch_exits: u64,
+    /// Trace re-recordings triggered by adaptive branch behavior.
     pub adaptive_rerecords: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Execution count aggregated by decoded memory-operation opcode.
 pub struct DecodedMemProfileRow {
+    /// Guest opcode word.
     pub opcode: u16,
+    /// Number of executions through the decoded memory fast path.
     pub executions: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Execution count for one decoded memory-operation site.
 pub struct DecodedMemSiteProfileRow {
+    /// Guest program counter of the operation.
     pub pc: u32,
+    /// Guest opcode word.
     pub opcode: u16,
+    /// Number of executions through the decoded memory fast path.
     pub executions: u64,
 }
 
@@ -51,17 +76,26 @@ impl TraceProfileRow {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Snapshot of all trace and decoded-memory profiling counters.
 pub struct TraceProfileSnapshot {
+    /// Per-trace-head counters.
     pub rows: Vec<TraceProfileRow>,
+    /// Decoded memory counts aggregated by opcode.
     pub decoded_mem_ops: Vec<DecodedMemProfileRow>,
+    /// Decoded memory counts split by guest PC and opcode.
     pub decoded_mem_sites: Vec<DecodedMemSiteProfileRow>,
+    /// Total observed backward branches.
     pub backward_hits: u64,
+    /// Total rejected trace-entry opportunities.
     pub rejected_hits: u64,
+    /// Total calls into a trace executor.
     pub native_calls: u64,
+    /// Total instructions retired by trace executors.
     pub jit_retired: u64,
 }
 
 impl TraceProfileSnapshot {
+    /// Format the snapshot as a ranked, human-readable profiling report.
     pub fn report(&self) -> String {
         let mut rows = self.rows.clone();
         rows.sort_unstable_by(|a, b| {
@@ -330,10 +364,12 @@ thread_local! {
     static PROFILE: RefCell<ProfileState> = RefCell::new(ProfileState(Profile::default()));
 }
 
+/// Clear every counter in the current thread's profiler.
 pub fn reset() {
     PROFILE.with_borrow_mut(|profile| profile.0 = Profile::default());
 }
 
+/// Capture the current thread's profiling counters without resetting them.
 pub fn snapshot() -> TraceProfileSnapshot {
     PROFILE.with_borrow(|profile| profile.0.snapshot())
 }

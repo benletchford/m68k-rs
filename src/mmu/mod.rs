@@ -1,4 +1,15 @@
-//! MMU emulation (68030/68040 PMMU)
+//! PMMU emulation for the M68030, M68040, and M68060.
+//!
+//! The 68030 path implements its programmable multi-level table format,
+//! CRP/SRP selection, function-code lookup, transparent translation, PTEST,
+//! and accumulated write/supervisor protection. The 68040 and 68060 use the
+//! fixed root/pointer/page table format, instruction/data transparent
+//! translation registers, and a direct-mapped address-translation cache.
+//!
+//! Table-walk bus errors and protection failures retain enough cause detail
+//! for generation-specific exception frames. Used/modified descriptor
+//! write-back, 68030 root-descriptor limit checks, and a DT=1 page descriptor
+//! directly in the 68030 root pointer are not modeled.
 
 pub mod atc;
 mod translation;
@@ -12,9 +23,13 @@ pub(crate) use translation::ptest_030;
 pub use translation::translate;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Architectural class of an MMU operation or translation fault.
 pub enum MmuFaultKind {
+    /// Translation-control or root-pointer configuration is invalid.
     ConfigurationError,
+    /// The requested PMMU operation or descriptor form is illegal.
     IllegalOperation,
+    /// A mapping is absent or denies the attempted access.
     AccessLevelViolation,
     /// A physical bus error occurred while walking tables / fetching descriptors.
     BusError,
@@ -45,21 +60,25 @@ pub enum MmuFaultCause {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// MMU failure returned to the CPU's exception-delivery path.
 pub struct MmuFault {
+    /// Architectural fault class used to select the exception vector.
     pub kind: MmuFaultKind,
+    /// Logical or table address associated with the failure.
     pub address: u32,
+    /// Detailed translation cause used by generation-specific stack frames.
     pub cause: MmuFaultCause,
 }
 
+/// Result of an MMU translation or PMMU operation.
 pub type MmuResult<T> = Result<T, MmuFault>;
 
-/// Translate a logical address using the CPU's PMMU state (68030/68040 style).
+/// Translate a logical address using the configured CPU's PMMU state.
 ///
-/// This is currently based on the (vendored) Musashi PMMU algorithm and focuses on the common
-/// CRP/SRP + TC table-walk behavior. Access permission checks and detailed MMUSR bits are TODO.
-///
-/// The `instruction` parameter indicates whether this is an instruction fetch (true) or
-/// data access (false), used for ITT/DTT selection on 68040.
+/// `write` selects read versus write permission checking, `supervisor`
+/// selects the user/supervisor root and protection domain, and `instruction`
+/// selects instruction versus data transparent-translation registers.
+/// Disabled or absent PMMUs return the logical address unchanged.
 pub fn translate_address<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,

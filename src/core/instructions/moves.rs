@@ -1,9 +1,8 @@
-// MOVES - Move to/from Address Space (68010+)
-//
-// Opcode: 0000 1110 ssmm mrrr
-// Extension word: 1aaa rrrd 0000 0000
-//   a/rrr = register number (0-7 for Dn, A for An)
-//   d = direction (0 = register to EA, 1 = EA to register)
+//! MOVES transfers to and from an alternate address space (68010+).
+//!
+//! The extension word selects a data/address register and the transfer
+//! direction. Memory accesses use DFC for register-to-memory transfers and
+//! SFC for memory-to-register transfers, including MMU function-code lookup.
 
 use crate::core::cpu::CpuCore;
 use crate::core::ea::AddressingMode;
@@ -11,12 +10,12 @@ use crate::core::memory::AddressBus;
 use crate::core::types::Size;
 
 impl CpuCore {
-    /// MOVES - Move to/from address space using SFC/DFC.
-    /// The Amiga bus does not decode function codes, so the access itself is
-    /// a normal memory access -- but with the PMMU enabled the address space
-    /// matters: the data cycle translates under SFC/DFC (mmu_fc_override),
-    /// which selects the 030 FCL table branch / TTR matches and the 040
-    /// user-vs-supervisor root pointer.
+    /// MOVES - move to or from the address space selected by SFC or DFC.
+    ///
+    /// The memory transfer uses the normal [`AddressBus`] interface. When the
+    /// PMMU is enabled, translation uses SFC for a memory-to-register transfer
+    /// and DFC for a register-to-memory transfer instead of the current
+    /// user/supervisor data function code.
     pub fn exec_moves<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         // Check supervisor mode
         if self.s_flag == 0 {

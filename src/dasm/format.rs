@@ -1,6 +1,6 @@
 //! Instruction disassembly/formatting.
 //!
-//! Provides human-readable disassembly of M68000 instructions.
+//! Provides a human-readable summary of one M68000-family opcode word.
 
 use crate::core::types::CpuType;
 
@@ -25,9 +25,12 @@ fn size_suffix(size: u8) -> &'static str {
 
 /// Disassemble a single instruction.
 ///
-/// Returns (mnemonic_string, instruction_size_in_bytes).
-/// Note: For multi-word instructions, only the first word is analyzed here.
-/// A full disassembler would need access to the following words.
+/// Returns the formatted mnemonic and an estimated instruction size in bytes.
+///
+/// Only `opcode` is decoded. Instructions that require extension words use
+/// placeholders such as `#xx` or `<ea>`, so the returned size cannot account
+/// for every effective-address extension. `cpu_type` selects model-specific
+/// F-line formatting; `pc` is reserved for future relative-address rendering.
 pub fn disassemble(_pc: u32, opcode: u16, cpu_type: CpuType) -> (String, u32) {
     let op_hi = (opcode >> 12) & 0xF;
 

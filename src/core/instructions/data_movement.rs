@@ -151,7 +151,7 @@ impl CpuCore {
     /// high word first, then low word (long destinations). Splitting keeps
     /// the host's per-access IPL samples, so a poll point placed right
     /// after this write pins the sample taken at the FINAL word's start
-    /// (Moira's writeOp<POLL> polls before the low word of a long write).
+    /// (Moira's `writeOp<POLL>` polls before the low word of a long write).
     fn write_move_dest_68000<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -297,7 +297,7 @@ impl CpuCore {
 
     /// Execute LINK instruction.
     ///
-    /// LINK An, #<displacement>
+    /// `LINK An,#disp16`
     /// The 68040 performs LINK's A7 predecrement before reading the source
     /// register; the 68000-030 and the 68060 read the source first.
     fn link_predecrements_first(&self) -> bool {
@@ -309,6 +309,8 @@ impl CpuCore {
         )
     }
 
+    /// Execute `LINK An,#disp16`, creating a stack frame for address register
+    /// `reg`.
     pub fn exec_link<B: AddressBus>(&mut self, bus: &mut B, reg: usize) -> i32 {
         // 68000 bus order: the displacement word is consumed (with its
         // prefetch) BEFORE the An push.
@@ -671,7 +673,7 @@ impl CpuCore {
 
     /// RMW writeback whose IPL poll point is the final prefetch BEFORE the
     /// write (the 68000 logic/shift/bit/CLR/NEG/NOT/ADDQ/Scc class: Moira
-    /// `prefetch<POLL>` then writeOp). The writeback accesses do not re-latch
+    /// `prefetch<POLL>` then `writeOp`). The writeback accesses do not re-latch
     /// the boundary sample, so an interrupt that rises while the write is
     /// arbitrating is not taken until one instruction later.
     pub fn write_resolved_ea_np_poll<B: AddressBus>(

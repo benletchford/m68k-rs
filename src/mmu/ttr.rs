@@ -8,14 +8,14 @@ use crate::core::types::CpuType;
 
 /// TTR register format (68030/68040):
 /// ```text
-/// [31:24] Base Address (compared against address[31:24])
-/// [23:16] Address Mask (1 = ignore bit during comparison)
+/// `31:24` Base Address (compared against address bits `31:24`)
+/// `23:16` Address Mask (1 = ignore bit during comparison)
 /// [15]    E: Enable
 /// [14]    CI: Cache Inhibit (ignored by us)
 /// [13]    R/W: 0=read-only, 1=read/write (68030) or W (68040)
 /// [12]    RWM: R/W Mask (68030) or 0 (68040)
-/// [10:8]  FC Base (function code to match)
-/// [4:2]   FC Mask (1 = ignore FC bit)
+/// `10:8`  FC Base (function code to match)
+/// `4:2`   FC Mask (1 = ignore FC bit)
 /// ```
 const TTR_ENABLE: u32 = 0x8000;
 const TTR_BASE_MASK: u32 = 0xFF00_0000;

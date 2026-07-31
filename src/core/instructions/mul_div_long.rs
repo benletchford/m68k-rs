@@ -1,6 +1,5 @@
-//! 68020+ long multiply/divide instructions (MULU.L/MULS.L, DIVU.L/DIVS.L and remainder forms).
-//!
-//! This matches the Musashi mc68040 fixture programs (`mul_long.s`, `divu_long.s`, `divs_long.s`).
+//! 68020+ long multiply/divide instructions (MULU.L/MULS.L, DIVU.L/DIVS.L
+//! and their wide-result or remainder forms).
 
 use crate::core::cpu::CpuCore;
 use crate::core::ea::AddressingMode;
@@ -11,7 +10,7 @@ impl CpuCore {
     /// DIVU.L / DIVS.L / DIVUL.L / DIVSL.L family.
     ///
     /// Opcode word: 0x4C40..0x4C7F (EA in low 6 bits)
-    /// Extension word (Musashi-style, as observed in fixtures):
+    /// Extension word:
     /// - bit 11 (0x0800): signed (DIVS) when set, unsigned (DIVU) when clear
     /// - bit 10 (0x0400): 64-bit dividend when set (hi part in remainder reg)
     /// - bits 14..12: quotient destination register (Dq)
@@ -115,7 +114,7 @@ impl CpuCore {
     /// MULU.L / MULS.L family.
     ///
     /// Opcode word: 0x4C00..0x4C3F (EA in low 6 bits)
-    /// Extension word (Musashi-style, as observed in fixtures):
+    /// Extension word:
     /// - bit 11 (0x0800): signed (MULS) when set, unsigned (MULU) when clear
     /// - bit 10 (0x0400): 64-bit result when set (high in Dh, low in Dl)
     /// - bits 14..12: low (and primary) destination register Dl

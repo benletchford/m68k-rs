@@ -1,6 +1,6 @@
 //! 68020+ compare-and-swap instructions.
 //!
-//! Implements CAS and CAS2 (long-sized, as used by the mc68040 Musashi fixture set).
+//! Implements byte, word, and long CAS plus word and long CAS2.
 
 use crate::core::cpu::CpuCore;
 use crate::core::ea::AddressingMode;
@@ -10,7 +10,8 @@ use crate::core::types::Size;
 impl CpuCore {
     /// `CAS.<size> Dc,Du,<ea>`
     ///
-    /// Musashi fixtures only use CAS.L (opcode pattern 0x0EC0..0x0EFF).
+    /// The primary opcode selects the operand size and memory effective
+    /// address; the extension word selects the compare and update registers.
     pub fn exec_cas<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         // Extension word encodes Du and Dc.
         let ext = self.read_imm_16(bus);
@@ -93,7 +94,8 @@ impl CpuCore {
 
     /// `CAS2.<size> Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)`
     ///
-    /// Musashi fixtures use CAS2.L with two extension words.
+    /// The primary opcode selects the operand size. Two extension words select
+    /// the address, compare, and update register pairs.
     pub fn exec_cas2<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         let ext1 = self.read_imm_16(bus);
         let ext2 = self.read_imm_16(bus);
@@ -174,7 +176,7 @@ impl CpuCore {
         if rn >= 8 {
             self.a((rn - 8) as usize)
         } else {
-            // Not expected in our fixtures; treat as data register containing address.
+            // CAS2 permits either data or address registers as address sources.
             self.d(rn as usize)
         }
     }
@@ -182,7 +184,7 @@ impl CpuCore {
 
 #[inline]
 fn decode_cas2_ext(ext: u16) -> (u8, usize, usize) {
-    // Layout (as used by Musashi fixtures):
+    // Architectural extension-word layout:
     // - bits 15..12: Rn (0..15; 8..15 == A0..A7)
     // - bits 8..6: Du
     // - bits 2..0: Dc

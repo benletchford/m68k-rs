@@ -7,7 +7,9 @@
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FloatX80 {
+    /// Explicit 64-bit significand, including the integer bit at bit 63.
     pub mantissa: u64,
+    /// Sign in bit 15 and biased exponent in bits 14 through 0.
     pub sign_exp: u16,
 }
 
@@ -46,6 +48,7 @@ impl FloatX80 {
         self.sign_exp & 0x7FFF
     }
 
+    /// Return whether the value is a quiet or signaling NaN.
     pub const fn is_nan(self) -> bool {
         self.biased_exp() == 0x7FFF && (self.mantissa << 1) != 0
     }
@@ -55,14 +58,17 @@ impl FloatX80 {
         self.is_nan() && (self.mantissa & 0x4000_0000_0000_0000) == 0
     }
 
+    /// Return whether the value is positive or negative infinity.
     pub const fn is_inf(self) -> bool {
         self.biased_exp() == 0x7FFF && (self.mantissa << 1) == 0
     }
 
+    /// Return whether the value is positive or negative zero.
     pub const fn is_zero(self) -> bool {
         self.biased_exp() == 0 && self.mantissa == 0
     }
 
+    /// Return whether the value is a finite nonzero denormal.
     pub const fn is_denormal(self) -> bool {
         self.biased_exp() == 0 && self.mantissa != 0
     }
@@ -90,10 +96,11 @@ impl FloatX80 {
         (self.sign_exp, self.mantissa)
     }
 
-    /// Convert to the nearest f64. Lossy for values outside f64's range or
-    /// precision; used by the temporary arithmetic bridge and (permanently)
-    /// by the transcendental shim. Values that originated from an f64
-    /// round-trip back exactly.
+    /// Convert to the nearest `f64`.
+    ///
+    /// The conversion is lossy for values outside binary64's range or
+    /// precision. Values produced by [`FloatX80::from_f64`] round-trip
+    /// exactly, including signed zero, infinity, and NaN classification.
     pub fn to_f64(self) -> f64 {
         let sign = (self.sign_exp >> 15) & 1;
         let exp = (self.sign_exp & 0x7FFF) as i32;

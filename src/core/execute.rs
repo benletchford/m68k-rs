@@ -11,10 +11,12 @@ use super::types::{BatchExit, BatchResult, CycleBatchExit, CycleBatchResult, Ste
 
 /// Stop level constants.
 pub const STOP_LEVEL_STOP: u32 = 1;
+/// Halted after a double bus/address fault; only reset can resume execution.
 pub const STOP_LEVEL_HALT: u32 = 2;
 
 /// Run mode constants.
 pub const RUN_MODE_NORMAL: u32 = 0;
+/// Bus/address-error recovery or reset processing is active.
 pub const RUN_MODE_BERR_AERR_RESET: u32 = 1;
 
 impl CpuCore {
@@ -306,8 +308,8 @@ impl CpuCore {
     ///
     /// This is the fast path for High-Level Emulation embedders that would
     /// otherwise call [`step`](Self::step) in a loop: the whole batch runs
-    /// inside the decoded-op cache / trace-JIT inner loop, and control only
-    /// returns to the caller when it has something to do:
+    /// inside the decoded-operation and trace-execution loops, and control
+    /// returns to the caller only when it has something to do:
     ///
     /// - a trap the embedder wants to intercept (A-line/F-line/TRAP/BKPT/
     ///   illegal — surfaced exactly like [`step`](Self::step), never taken
@@ -731,8 +733,6 @@ impl CpuCore {
 
         StepResult::Ok { cycles }
     }
-
-    // step_with_trap_handler removed in favor of step_with_hle_handler.
 
     // ========== Stack Operations ==========
 

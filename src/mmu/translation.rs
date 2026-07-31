@@ -1,4 +1,4 @@
-//! Address translation (PMMU table walk)
+//! Generation-specific PMMU table walks and PTEST evaluation.
 
 use crate::core::cpu::CpuCore;
 use crate::core::memory::{AddressBus, BusFaultKind};
@@ -45,18 +45,18 @@ fn read_u32_phys<B: AddressBus>(bus: &mut B, addr: u32) -> MmuResult<u32> {
     })
 }
 
-/// Perform 68030/68040 PMMU translation.
+/// Translate one logical address through the configured 68030, 68040, or
+/// 68060 PMMU.
 ///
-/// This implementation follows the structure of Musashi's `pmmu_translate_addr()` algorithm.
-/// It currently supports:
-/// - CRP/SRP selection via TC bit 25 (0x0200_0000)
-/// - Root/table modes 2 (4-byte descriptors) and 3 (8-byte descriptors)
-/// - Early-termination descriptors (mode 1) at table A/B/C
-/// - Transparent Translation Registers (TTRs) for 68030/68040
+/// The 68030 path selects CRP/SRP and supports short and long table
+/// descriptors, early termination, indirect descriptors, function-code
+/// levels, transparent translation, write protection, and supervisor-only
+/// subtrees. The 68040/68060 path implements their fixed three-level table,
+/// indirect pages, 4/8 KiB pages, ITT/DTT bypass, protection, and ATC fills.
 ///
-/// TODO:
-/// - Access permission checks and precise MMUSR (`mmu_sr`) bits
-/// - Page descriptor root mode (root_limit & 3 == 1)
+/// If the selected CPU has no enabled PMMU, the address is returned
+/// unchanged. Translation and table-fetch failures return [`MmuFault`] with
+/// the address and cause required by the CPU's exception-frame builder.
 pub fn translate<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
@@ -431,11 +431,11 @@ pub(crate) fn ptest_030<B: AddressBus>(
 /// Perform 68040 PMMU translation.
 ///
 /// The 68040 uses a fixed three-level table (root -> pointer -> page) with
-/// 4-byte descriptors, indexed by logical bits [31:25] / [24:18] / [17:12]
-/// (4 KB pages) or [17:13] (8 KB pages, TC bit 14 set). The root pointer is
+/// 4-byte descriptors, indexed by logical bits `31:25` / `24:18` / `17:12`
+/// (4 KB pages) or `17:13` (8 KB pages, TC bit 14 set). The root pointer is
 /// URP in user mode and SRP in supervisor mode (no TC bit-25 gate -- that is
-/// 68030-only). Table-level descriptors use UDT (bits [1:0]): >=2 = resident;
-/// page descriptors use PDT (bits [1:0]): 0 = invalid, 2 = indirect, 1/3 =
+/// 68030-only). Table-level descriptors use UDT (bits `1:0`): >=2 = resident;
+/// page descriptors use PDT (bits `1:0`): 0 = invalid, 2 = indirect, 1/3 =
 /// resident.
 ///
 /// Any access through an invalid/unconfigured descriptor raises an access

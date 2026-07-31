@@ -1,22 +1,19 @@
 //! 68020+ CMP2 / CHK2 (bounds compare / bounds check).
 //!
-//! Based on the Musashi mc68040 test suite sources in
-//! `tests/fixtures/Musashi/test/mc68040/{cmp2,chk2}.s`.
-//!
-//! Encoding (as used by GNU as for 68040):
+//! Encoding:
 //!   opcode: 0000 0ss0 11 mmm rrr   (ss: 00=byte, 01=word, 10=long)
 //!   ext word:
 //!     - bit 11: 1 = CHK2 (may trap), 0 = CMP2
 //!     - bits 15..12: register specifier (0..7 = D0..D7, 8..15 = A0..A7)
-//!     - remaining bits unused in our fixtures
 //!
-//! Semantics (as required by the fixture):
+//! Semantics:
 //! - Reads a lower and upper bound from `<ea>` (two consecutive sized values).
-//! - Compares the specified register value against the bounds.
-//! - Sets C=1 when the value is out of range, else C=0.
-//! - For CHK2, triggers CHK exception (vector 6) when out of range.
-//!
-//! Note: The Musashi fixture expects CMP2.B to behave using unsigned comparisons for bounds/operand.
+//! - Compares them as signed values against the selected register. Byte and
+//!   word data-register operands are sign-extended; address registers retain
+//!   their full 32-bit value.
+//! - Sets Z when the operand equals either bound and C when it lies outside the
+//!   selected range, including the wrapped-range rule for reversed bounds.
+//! - CHK2 takes the CHK exception (vector 6) when C is set.
 
 use crate::core::cpu::{CFLAG_SET, CpuCore};
 use crate::core::ea::AddressingMode;
@@ -24,6 +21,10 @@ use crate::core::memory::AddressBus;
 use crate::core::types::Size;
 
 impl CpuCore {
+    /// Execute a 68020+ CMP2 or CHK2 bounds operation.
+    ///
+    /// CMP2 records an out-of-range operand in C; CHK2 additionally takes
+    /// the CHK vector when the comparison is out of range.
     pub fn exec_cmp2_chk2<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         let size = match (opcode >> 9) & 3 {
             0 => Size::Byte,

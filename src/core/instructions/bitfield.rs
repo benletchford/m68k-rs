@@ -26,6 +26,10 @@ struct BitFieldSpec {
 }
 
 impl CpuCore {
+    /// Execute a decoded 68020+ bit-field instruction.
+    ///
+    /// The extension word supplies the dynamic/immediate offset and width,
+    /// while `opcode` identifies the operation and effective address.
     pub fn exec_bitfield<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         // Read extension word first (before EA extension words).
         let ext = self.read_imm_16(bus);

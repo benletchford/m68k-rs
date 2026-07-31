@@ -8,18 +8,30 @@ use super::memory::AddressBus;
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(u32)]
 pub enum CpuType {
+    /// Sentinel used before a concrete processor model is selected.
     Invalid = 0,
+    /// Original 16/32-bit M68000.
     #[default]
     M68000 = 1,
+    /// M68010 with VBR, restartable faults, and loop mode.
     M68010 = 2,
+    /// Embedded 68020 variant with a 24-bit external address bus.
     M68EC020 = 3,
+    /// Full M68020.
     M68020 = 4,
+    /// M68030 without an on-chip PMMU.
     M68EC030 = 5,
+    /// Full M68030 with PMMU.
     M68030 = 6,
+    /// M68040 without an MMU or FPU.
     M68EC040 = 7,
+    /// M68040 with an MMU but without an FPU.
     M68LC040 = 8,
+    /// Full M68040 with MMU and FPU.
     M68040 = 9,
+    /// Philips SCC68070 system-controller CPU.
     SCC68070 = 10,
+    /// Full superscalar M68060.
     M68060 = 11,
 }
 
@@ -86,7 +98,10 @@ pub trait HleHandler {
     }
 }
 
-/// A no-op HLE handler that takes all exceptions (default behavior).
+/// HLE handler that declines every interception.
+///
+/// Passing this handler to [`CpuCore::step_with_hle_handler`] causes each trap
+/// to fall back to its architectural hardware exception.
 #[derive(Default, Clone, Copy)]
 pub struct NoOpHleHandler;
 
@@ -95,13 +110,17 @@ impl HleHandler for NoOpHleHandler {}
 /// Operand size for instructions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Size {
+    /// Eight-bit operand.
     Byte,
+    /// Sixteen-bit operand.
     Word,
+    /// Thirty-two-bit operand.
     Long,
 }
 
 impl Size {
     #[inline]
+    /// Return the operand width in bytes.
     pub const fn bytes(self) -> u32 {
         match self {
             Size::Byte => 1,
@@ -111,6 +130,7 @@ impl Size {
     }
 
     #[inline]
+    /// Return the operand width in bits.
     pub const fn bits(self) -> u8 {
         match self {
             Size::Byte => 8,
@@ -120,6 +140,7 @@ impl Size {
     }
 
     #[inline]
+    /// Return a low-bit mask covering the operand width.
     pub const fn mask(self) -> u32 {
         match self {
             Size::Byte => 0xFF,
@@ -129,6 +150,7 @@ impl Size {
     }
 
     #[inline]
+    /// Return the most-significant-bit mask for the operand width.
     pub const fn msb_mask(self) -> u32 {
         match self {
             Size::Byte => 0x80,
@@ -141,8 +163,8 @@ impl Size {
 /// Internal result from instruction dispatch.
 ///
 /// This is used internally by `dispatch_instruction` and `step_with_hle_handler`.
-/// It includes trap variants for internal handling - the public `StepResult`
-/// doesn't expose these since traps are handled via callbacks.
+/// It includes trap variants that [`CpuCore::step`] exposes to its caller and
+/// that [`CpuCore::step_with_hle_handler`] routes through callbacks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum InternalStepResult {
     /// Instruction executed normally.
@@ -161,8 +183,10 @@ pub(crate) enum InternalStepResult {
 
 /// Result from executing a single CPU instruction.
 ///
-/// This enum is simplified - traps are handled internally via `step_with_hle_handler()`.
-/// For HLE interception, implement `HleHandler` and use `step_with_hle_handler()`.
+/// [`CpuCore::step`] returns trap variants without taking their hardware
+/// exceptions. [`CpuCore::step_with_hle_handler`] instead offers those traps to
+/// an [`HleHandler`] and returns [`StepResult::Ok`] after either interception or
+/// architectural exception delivery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepResult {
     /// Instruction executed normally.
@@ -171,15 +195,30 @@ pub enum StepResult {
         cycles: i32,
     },
     /// A-line trap (0xAxxx opcode).
-    AlineTrap { opcode: u16 },
+    AlineTrap {
+        /// Trapping opcode word.
+        opcode: u16,
+    },
     /// F-line trap (0xFxxx opcode).
-    FlineTrap { opcode: u16 },
+    FlineTrap {
+        /// Trapping opcode word.
+        opcode: u16,
+    },
     /// TRAP #n instruction.
-    TrapInstruction { trap_num: u8 },
+    TrapInstruction {
+        /// Trap number from 0 through 15.
+        trap_num: u8,
+    },
     /// BKPT #n instruction.
-    Breakpoint { bp_num: u8 },
+    Breakpoint {
+        /// Breakpoint number encoded by the instruction.
+        bp_num: u8,
+    },
     /// Illegal instruction.
-    IllegalInstruction { opcode: u16 },
+    IllegalInstruction {
+        /// Illegal opcode word.
+        opcode: u16,
+    },
     /// CPU is stopped (STOP instruction executed).
     Stopped,
 }
@@ -216,17 +255,35 @@ pub enum BatchExit {
     Stopped,
     /// Execution reached a PC in the caller's watch list. The instruction
     /// at the watched PC has **not** been executed yet.
-    WatchedPc { pc: u32 },
+    WatchedPc {
+        /// Watched program-counter value.
+        pc: u32,
+    },
     /// A-line trap (0xAxxx opcode).
-    AlineTrap { opcode: u16 },
+    AlineTrap {
+        /// Trapping opcode word.
+        opcode: u16,
+    },
     /// F-line trap (0xFxxx opcode).
-    FlineTrap { opcode: u16 },
+    FlineTrap {
+        /// Trapping opcode word.
+        opcode: u16,
+    },
     /// TRAP #n instruction.
-    TrapInstruction { trap_num: u8 },
+    TrapInstruction {
+        /// Trap number from 0 through 15.
+        trap_num: u8,
+    },
     /// BKPT #n instruction.
-    Breakpoint { bp_num: u8 },
+    Breakpoint {
+        /// Breakpoint number encoded by the instruction.
+        bp_num: u8,
+    },
     /// Illegal instruction.
-    IllegalInstruction { opcode: u16 },
+    IllegalInstruction {
+        /// Illegal opcode word.
+        opcode: u16,
+    },
 }
 
 /// Result of a [`CpuCore::run_batch`](crate::CpuCore::run_batch) call.
@@ -258,15 +315,30 @@ pub enum CycleBatchExit {
     /// interrupt on entry.
     Stopped,
     /// A-line trap (0xAxxx opcode).
-    AlineTrap { opcode: u16 },
+    AlineTrap {
+        /// Trapping opcode word.
+        opcode: u16,
+    },
     /// F-line trap (0xFxxx opcode).
-    FlineTrap { opcode: u16 },
+    FlineTrap {
+        /// Trapping opcode word.
+        opcode: u16,
+    },
     /// TRAP #n instruction.
-    TrapInstruction { trap_num: u8 },
+    TrapInstruction {
+        /// Trap number from 0 through 15.
+        trap_num: u8,
+    },
     /// BKPT #n instruction.
-    Breakpoint { bp_num: u8 },
+    Breakpoint {
+        /// Breakpoint number encoded by the instruction.
+        bp_num: u8,
+    },
     /// Illegal instruction.
-    IllegalInstruction { opcode: u16 },
+    IllegalInstruction {
+        /// Illegal opcode word.
+        opcode: u16,
+    },
 }
 
 /// Result of [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles).

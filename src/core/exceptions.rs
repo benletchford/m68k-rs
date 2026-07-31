@@ -9,21 +9,37 @@ use super::types::CpuType;
 
 /// Exception vector numbers.
 pub mod vector {
+    /// Reset vector-table entry containing the initial supervisor stack pointer.
     pub const RESET_SSP: u32 = 0;
+    /// Reset vector-table entry containing the initial program counter.
     pub const RESET_PC: u32 = 1;
+    /// Bus-error exception vector.
     pub const BUS_ERROR: u32 = 2;
+    /// Address-error exception vector.
     pub const ADDRESS_ERROR: u32 = 3;
+    /// Illegal-instruction exception vector.
     pub const ILLEGAL_INSTRUCTION: u32 = 4;
+    /// Integer divide-by-zero exception vector.
     pub const ZERO_DIVIDE: u32 = 5;
+    /// CHK/CHK2 bounds exception vector.
     pub const CHK: u32 = 6;
+    /// TRAPV/TRAPcc exception vector.
     pub const TRAPV: u32 = 7;
+    /// Privilege-violation exception vector.
     pub const PRIVILEGE_VIOLATION: u32 = 8;
+    /// Instruction-trace exception vector.
     pub const TRACE: u32 = 9;
+    /// Line-A emulator exception vector.
     pub const LINE_1010: u32 = 10;
+    /// Line-F emulator and coprocessor exception vector.
     pub const LINE_1111: u32 = 11;
+    /// Invalid exception-frame format vector (68010+).
     pub const FORMAT_ERROR: u32 = 14;
+    /// Uninitialized interrupt-vector exception.
     pub const UNINITIALIZED_INTERRUPT: u32 = 15;
+    /// Spurious-interrupt vector.
     pub const SPURIOUS_INTERRUPT: u32 = 24;
+    /// Base vector for `TRAP #0` through `TRAP #15`.
     pub const TRAP_BASE: u32 = 32;
 
     /// 68060: integer instructions removed from silicon (MOVEP, CHK2/CMP2,
@@ -38,9 +54,11 @@ pub mod vector {
     /// FMOVEM.L #imm) - pre-instruction, format $0.
     pub const FP_UNIMPLEMENTED_EA: u32 = 60;
 
-    // 68020+ MMU exceptions (vector numbers per 68k docs; used by 68030/68040 PMMU).
+    /// 68020+ MMU configuration-error vector.
     pub const MMU_CONFIGURATION_ERROR: u32 = 56;
+    /// 68020+ MMU illegal-operation vector.
     pub const MMU_ILLEGAL_OPERATION_ERROR: u32 = 57;
+    /// 68020+ MMU access-level-violation vector.
     pub const MMU_ACCESS_LEVEL_VIOLATION_ERROR: u32 = 58;
 }
 
@@ -118,9 +136,13 @@ fn fslw_060(
 
 /// Function code bits for exception stack frames.
 pub mod fc {
+    /// User-data address space.
     pub const USER_DATA: u16 = 1;
+    /// User-program address space.
     pub const USER_PROGRAM: u16 = 2;
+    /// Supervisor-data address space.
     pub const SUPERVISOR_DATA: u16 = 5;
+    /// Supervisor-program address space.
     pub const SUPERVISOR_PROGRAM: u16 = 6;
 }
 
@@ -707,6 +729,13 @@ impl CpuCore {
         }
     }
 
+    /// Determine whether the instruction that just retired requests a trace
+    /// exception and clear the one-instruction flow-change latch.
+    ///
+    /// T1 traces every instruction. On the 68020 and later, T0 traces only
+    /// flow-changing or pipeline-synchronizing instructions. The decision
+    /// uses [`CpuCore::sr_save`], the status register captured before the
+    /// instruction, so an RTE that restores a trace bit does not trace itself.
     pub fn check_trace(&mut self) -> bool {
         // T1 trace: trace after every instruction
         // T0 trace: trace only on change-of-flow (68020+)

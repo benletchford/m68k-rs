@@ -12,8 +12,8 @@
 //! count here never double-bills a bus access. The classification is
 //! deliberately pessimistic where the manual's rules are finer than an
 //! opcode-word decode can see (pessimism under-pairs; it never over-pairs).
-//! The per-instruction constants are calibration knobs - see the timing-test
-//! ADF rows and docs/internals/cpu.md.
+//! The per-instruction constants are estimates for pipeline effects that the
+//! opcode classification alone cannot derive.
 
 use super::cpu::CpuCore;
 use std::sync::OnceLock;
@@ -66,6 +66,7 @@ impl Info060 {
         Self((class as u16) << CLASS_SHIFT | (cycles & CYCLES_MASK) << CYCLES_SHIFT | flags)
     }
 
+    /// Return the instruction's operand-execution-pipeline dispatch class.
     pub fn class(self) -> OepClass {
         match (self.0 >> CLASS_SHIFT) & 3 {
             0 => OepClass::PoepSoep,
@@ -75,17 +76,18 @@ impl Info060 {
         }
     }
 
+    /// Return the packed primary-pipeline occupancy in clocks.
     pub fn cycles(self) -> i32 {
         i32::from((self.0 >> CYCLES_SHIFT) & CYCLES_MASK)
     }
 
+    /// Return whether the packed entry contains `flag`.
     pub fn has(self, flag: u16) -> bool {
         self.0 & flag != 0
     }
 }
 
-// Calibration knobs (all approximate pending timing-test/WinUAE cross-checks;
-// see docs/internals/cpu.md "68060 timing").
+// Pipeline-effect estimates kept separate from the opcode classification.
 /// Taken Bcc/BRA/BSR without branch-cache help: pipeline refill.
 pub const CYC_060_BRANCH_TAKEN: i32 = 7;
 /// Not-taken conditional branch.
@@ -136,6 +138,7 @@ impl BranchCache060 {
         ((pc >> 1) & 0xFF) as usize
     }
 
+    /// Invalidate every branch-cache entry (CACR.CABC).
     pub fn clear_all(&mut self) {
         self.state.iter_mut().for_each(|s| *s = 0);
     }
@@ -200,6 +203,7 @@ pub struct PendingHead060 {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Oep060Timing {
+    /// Direct-mapped 68060 branch-prediction cache.
     pub branch_cache: BranchCache060,
     /// Retrospective pairing: the previous instruction, when it left an
     /// sOEP slot open. None after any pipeline break.
