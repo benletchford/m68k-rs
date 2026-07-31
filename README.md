@@ -30,6 +30,14 @@ Add to your `Cargo.toml`:
 m68k = "0.3"
 ```
 
+The default build has no JIT compiler dependency. Native applications that use
+`run_batch()` can enable Cranelift compilation explicitly:
+
+```toml
+[dependencies]
+m68k = { version = "0.3", features = ["jit"] }
+```
+
 ### Basic Usage
 
 ```rust
@@ -160,7 +168,7 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 | **`step_with_hle_handler()`** | One instruction | Same precise path as `step()` | Offers traps to `HleHandler`; unhandled traps take the hardware exception |
 | **`execute()`** | CPU cycles | Precise path; whole instructions may overshoot the requested cycles | Takes traps as hardware exceptions and returns consumed cycles |
 | **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps like `step()` and reports STOP separately |
-| **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
+| **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and portable or `jit`-enabled native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
 
 Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
 machine scheduler needs to advance the CPU by a clock budget without losing
@@ -293,9 +301,10 @@ Accuracy and throughput are separate, deliberate contracts:
   `run_for_cycles` use the interpreter and ordinary `AddressBus` calls. These
   paths preserve bus-visible prefetch, access ordering, internal-clock
   synchronization, fault state, and model-specific cycle accounting.
-- **Throughput execution** — `run_batch` reuses decoded operations and compiles
-  eligible hot backward-branch traces with Cranelift on native targets. A bus
-  may expose a contiguous `FastMem` window to keep eligible RAM operands
+- **Throughput execution** — `run_batch` reuses decoded operations and executes
+  eligible hot backward-branch traces through a portable micro-op loop. The
+  opt-in `jit` feature compiles those traces with Cranelift on native targets.
+  A bus may expose a contiguous `FastMem` window to keep eligible RAM operands
   inside the trace. Guarded exits and self-modifying-code checks fall back
   without partially committing an instruction.
 

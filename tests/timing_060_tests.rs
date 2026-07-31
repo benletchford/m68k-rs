@@ -459,6 +459,7 @@ fn no_fold_across_a_trap_or_taken_branch() {
 }
 
 #[test]
+#[cfg(feature = "serde")]
 fn pairing_state_survives_serialization() {
     let (mut cpu, mut bus) = setup(CpuType::M68060);
     enable_ess(&mut cpu, &mut bus);

@@ -1,9 +1,10 @@
 //! Trace execution for hot simple-op loops.
 //!
-//! Native targets lower hot traces to Cranelift machine code. WebAssembly targets keep the same
-//! trace detection and validation path, but execute the trace through a compact Rust micro-op loop.
+//! Native targets with the `jit` feature lower hot traces to Cranelift machine code. Other builds
+//! keep the same trace detection and validation path, but execute the trace through a compact Rust
+//! micro-op loop.
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use super::cpu::{CFLAG_SET, VFLAG_SET};
 use super::cpu::{CpuCore, NFLAG_SET};
 use super::execute::RUN_MODE_BERR_AERR_RESET;
@@ -11,22 +12,22 @@ use super::mem_ops::{BitSource, DecodedMemOp, FastEa};
 use super::memory::AddressBus;
 use super::op_cache::{BinaryOp, BitOp, CachedRunResult, DecodedSimpleOp, is_pre_68020};
 use super::types::{CpuType, Size};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_codegen::Context;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_codegen::ir::{
     AbiParam, Block, BlockArg, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
     condcodes::IntCC, types,
 };
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_jit::{JITBuilder, JITModule};
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_module::{Linkage, Module, default_libcall_names};
 use std::cell::{Cell, RefCell};
 use std::fmt;
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use std::mem::{offset_of, size_of, transmute};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -48,16 +49,16 @@ const TRACE_MAX_ADAPTIVE_RERECORDS: u8 = 1;
 /// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
 pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 /// Original one-pass compiled trace entry point.
 type TraceOnceFn = unsafe extern "C" fn(*mut CpuCore) -> u64;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 /// Counted self-loop entry point. Keeping repeated guest iterations inside
 /// generated code avoids an ABI round trip for every tiny loop.
 type TraceLoopFn = unsafe extern "C" fn(*mut CpuCore, u32) -> u64;
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 #[derive(Clone, Copy)]
 enum NativeTraceFn {
     Once(TraceOnceFn),
@@ -230,7 +231,7 @@ pub(crate) enum JitTraceOp {
         condition: u8,
         reg: u8,
     },
-    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    #[cfg_attr(all(feature = "jit", not(target_family = "wasm")), allow(dead_code))]
     ShiftReg {
         reg: u8,
         size: Size,
@@ -347,12 +348,12 @@ struct CompiledTrace {
     /// without re-validating: trace stores that would touch code bail out
     /// before committing, and nothing observable happens between
     /// iterations.
-    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    #[cfg_attr(all(feature = "jit", not(target_family = "wasm")), allow(dead_code))]
     self_loop: bool,
     /// The native body was generated as a counted loop. Short read/write
     /// MoveMem loops deliberately retain the original one-pass body: the
     /// extra loop-carried state costs more than the saved call boundary.
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     native_loop: bool,
     /// Contains memory ops: only executable while a fastmem window is active
     /// (i.e. inside `run_batch`).
@@ -361,9 +362,9 @@ struct CompiledTrace {
     /// this range bail so self-modification is observed like the
     /// interpreter would. Baked into the compiled function on native
     /// targets; read at execution time by the portable path.
-    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    #[cfg_attr(all(feature = "jit", not(target_family = "wasm")), allow(dead_code))]
     code_start: u32,
-    #[cfg_attr(not(target_family = "wasm"), allow(dead_code))]
+    #[cfg_attr(all(feature = "jit", not(target_family = "wasm")), allow(dead_code))]
     code_end: u32,
     /// A recorded interior branch is a path prediction eligible for adaptive
     /// rerecording. Cleared after the one allowed rerecord so completed traces
@@ -372,12 +373,12 @@ struct CompiledTrace {
     adaptive_calls: Cell<u32>,
     adaptive_guard_exits: Cell<u32>,
     adaptive_rerecords: u8,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func: NativeTraceFn,
 }
 
 impl CompiledTrace {
-    #[cfg(all(not(target_family = "wasm"), test))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm"), test))]
     unsafe fn call_native(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
         match self.func {
             NativeTraceFn::Once(func) => unsafe { func(cpu) },
@@ -424,11 +425,11 @@ enum TraceSlot {
 }
 
 pub(crate) struct TraceJit {
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     module: Option<JITModule>,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func_ctx: FunctionBuilderContext,
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     next_func: u32,
     slots: Vec<TraceSlot>,
     recording: Option<TraceRecording>,
@@ -437,12 +438,12 @@ pub(crate) struct TraceJit {
 impl fmt::Debug for TraceJit {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut debug = f.debug_struct("TraceJit");
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         {
             debug.field("native_enabled", &self.module.is_some());
             debug.field("next_func", &self.next_func);
         }
-        #[cfg(target_family = "wasm")]
+        #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         {
             debug.field("native_enabled", &false);
         }
@@ -452,16 +453,16 @@ impl fmt::Debug for TraceJit {
 
 impl TraceJit {
     fn new() -> Self {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         let module = JITBuilder::new(default_libcall_names())
             .ok()
             .map(JITModule::new);
         Self {
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             module,
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             func_ctx: FunctionBuilderContext::new(),
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             next_func: 0,
             slots: (0..TRACE_CACHE_SIZE).map(|_| TraceSlot::Empty).collect(),
             recording: None,
@@ -488,7 +489,7 @@ impl TraceJit {
         single_iter: bool,
         watch_pcs: &[u32],
     ) -> Option<(CachedRunResult, u32)> {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         self.module.as_ref()?;
 
         if cpu.has_pmmu && cpu.pmmu_enabled || cpu.cycles_remaining <= 0 {
@@ -623,7 +624,7 @@ impl TraceJit {
             // checked guest accesses; carrying native loop state made that
             // case 3.5% slower at the median, so retain the old one-pass
             // function and repeat it in this already-validated Rust entry.
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             let batch_self_loop = trace.native_loop;
             // How many whole iterations fit in both budgets. The guards
             // above ensure at least one; the instruction budget is the
@@ -638,7 +639,7 @@ impl TraceJit {
             let mut cycles_total = 0i64;
             let mut retired = 0u32;
             let mut full_iters = 0u32;
-            #[cfg(not(target_family = "wasm"))]
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             let (guarded_branch_exit, partial_call_this_entry) = if batch_self_loop {
                 let NativeTraceFn::Loop(func) = trace.func else {
                     unreachable!("a batched trace must have a counted entry point")
@@ -707,7 +708,7 @@ impl TraceJit {
                     }
                 }
             };
-            #[cfg(target_family = "wasm")]
+            #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
             let (guarded_branch_exit, partial_call_this_entry) = loop {
                 let packed =
                     execute_portable_trace(cpu, &trace.ops, trace.code_start, trace.code_end);
@@ -814,7 +815,7 @@ impl TraceJit {
     }
 
     fn record_trace_target(&mut self, pc: u32, cpu_type: CpuType) {
-        #[cfg(not(target_family = "wasm"))]
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         if self.module.is_none() {
             return;
         }
@@ -1102,7 +1103,7 @@ impl TraceJit {
         })
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     fn compile_ops(&mut self, params: CompileParams<'_>) -> Option<CompiledTrace> {
         let CompileParams {
             start_pc,
@@ -1402,7 +1403,7 @@ impl TraceJit {
         })
     }
 
-    #[cfg(target_family = "wasm")]
+    #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
     fn compile_ops(&mut self, params: CompileParams<'_>) -> Option<CompiledTrace> {
         Some(CompiledTrace {
             pc: params.start_pc,
@@ -1443,9 +1444,9 @@ struct CompileParams<'a> {
     needs_window: bool,
     code_start: u32,
     code_end: u32,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    #[cfg_attr(any(not(feature = "jit"), target_family = "wasm"), allow(dead_code))]
     aligned_only: bool,
-    #[cfg_attr(target_family = "wasm", allow(dead_code))]
+    #[cfg_attr(any(not(feature = "jit"), target_family = "wasm"), allow(dead_code))]
     address_mask: u32,
 }
 
@@ -2122,7 +2123,7 @@ fn decode_jit_ea(mode: u16, reg: u16, extension: u16, cpu_type: CpuType) -> Opti
 /// Interpreted trace execution (wasm and unit tests). Same contract as a
 /// compiled native trace: returns `(ops_retired << 32) | cycles`, and a
 /// mem-op bail sets `pc` to the un-executed op.
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_trace(
     cpu: &mut CpuCore,
     ops: &[TraceBuildOp],
@@ -2162,7 +2163,7 @@ fn execute_portable_trace(
 
 /// Execute one trace op; `None` means a mem-op check failed and nothing
 /// from this op was committed.
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_op(
     cpu: &mut CpuCore,
     op: TraceBuildOp,
@@ -2195,7 +2196,7 @@ fn execute_portable_op(
     Some(execute_portable_reg_op(cpu, op))
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_movem_word_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
     let JitTraceOp::MovemWordPostInc {
         base,
@@ -2239,7 +2240,7 @@ fn execute_portable_movem_word_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -
     Some(cycles)
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_indirect_jsr(cpu: &mut CpuCore, trace: TraceBuildOp, reg: u8) -> Option<i32> {
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
@@ -2256,7 +2257,7 @@ fn execute_portable_indirect_jsr(cpu: &mut CpuCore, trace: TraceBuildOp, reg: u8
     }
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_an_disp(
     cpu: &mut CpuCore,
     trace: TraceBuildOp,
@@ -2347,7 +2348,7 @@ fn execute_portable_an_disp(
     }
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
     let JitTraceOp::AluMemToReg { op, size, src, dst } = trace.op else {
         return None;
@@ -2373,7 +2374,7 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
     }
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_add_reg_to_postinc(
     cpu: &mut CpuCore,
     trace: TraceBuildOp,
@@ -2408,7 +2409,7 @@ fn execute_portable_add_reg_to_postinc(
 
 /// Portable MoveMem, mirroring `emit_move_mem` exactly: all checks before
 /// any commit; window reads/writes via the fastmem scratch fields.
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_move_mem(
     cpu: &mut CpuCore,
     size: Size,
@@ -2565,7 +2566,7 @@ fn execute_portable_move_mem(
     Some(JitTraceOp::MoveMem { size, src, dst }.max_cycles())
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
     match op.op {
         JitTraceOp::Nop => 4,
@@ -2927,7 +2928,7 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
     }
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn portable_read_reg(cpu: &CpuCore, reg: JitDirectReg, size: Size) -> u32 {
     match reg {
         JitDirectReg::Data(reg) => cpu.dar[reg as usize] & size.mask(),
@@ -2935,14 +2936,14 @@ fn portable_read_reg(cpu: &CpuCore, reg: JitDirectReg, size: Size) -> u32 {
     }
 }
 
-#[cfg(any(target_family = "wasm", test))]
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn portable_write_data_reg(cpu: &mut CpuCore, reg: u8, size: Size, value: u32) {
     let reg = reg as usize;
     let mask = size.mask();
     cpu.dar[reg] = (cpu.dar[reg] & !mask) | (value & mask);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_jit_op(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3338,7 +3339,7 @@ fn emit_jit_op(
 }
 
 /// Window/bounds context shared by all mem ops in one trace function.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 struct MemEnv {
     fm_ptr: Value,
     fm_ptr_ty: Type,
@@ -3350,28 +3351,28 @@ struct MemEnv {
     code_end: u32,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 #[derive(Clone, Copy)]
 struct BailAt {
     ops_before: RetiredBefore,
     cycles_before: Value,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 #[derive(Clone, Copy)]
 enum RetiredBefore {
     Constant(u32),
     Dynamic(Value),
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 struct BailReq {
     block: Block,
     pc: u32,
     at: BailAt,
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 struct MoveMemOp {
     pc: u32,
     size: Size,
@@ -3380,7 +3381,7 @@ struct MoveMemOp {
 }
 
 /// Branch to `bail` when `bad` holds; continue emitting in a fresh block.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn branch_guard(builder: &mut FunctionBuilder<'_>, bail: Block, bad: Value) {
     let cont = builder.create_block();
     builder.ins().brif(bad, bail, &[], cont, &[]);
@@ -3390,7 +3391,7 @@ fn branch_guard(builder: &mut FunctionBuilder<'_>, bail: Block, bad: Value) {
 /// Alignment + window-range checks for an access of `size` at raw address
 /// `addr`. Returns `(window_offset, masked_address)`; branches to `bail`
 /// on any miss.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn checked_window_off(
     builder: &mut FunctionBuilder<'_>,
     env: &MemEnv,
@@ -3411,7 +3412,7 @@ fn checked_window_off(
     (off, masked)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn window_host_addr(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value) -> Value {
     let off_ptr = if env.fm_ptr_ty == types::I32 {
         off
@@ -3422,7 +3423,7 @@ fn window_host_addr(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value)
 }
 
 /// Big-endian sized load from the window; result is a zero-extended I32.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn window_load(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value, size: Size) -> Value {
     let addr = window_host_addr(builder, env, off);
     let mut flags = MemFlags::new();
@@ -3447,7 +3448,7 @@ fn window_load(builder: &mut FunctionBuilder<'_>, env: &MemEnv, off: Value, size
 /// Emit a data-register-only MOVEM.W (An)+. A single check covers the
 /// contiguous register list before any register or address state changes;
 /// the individual big-endian loads are then safe to emit without guards.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_movem_word_postinc(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3517,7 +3518,7 @@ fn emit_movem_word_postinc(
 }
 
 /// Big-endian sized store of (sized) `value` into the window.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn window_store(
     builder: &mut FunctionBuilder<'_>,
     env: &MemEnv,
@@ -3545,7 +3546,7 @@ fn window_store(
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn guard_store_not_code(
     builder: &mut FunctionBuilder<'_>,
     env: &MemEnv,
@@ -3567,7 +3568,7 @@ fn guard_store_not_code(
 /// Emit a read-only memory-to-register ALU operation. All address checks run
 /// before flags are committed, so a miss can re-execute the instruction via
 /// full dispatch without rolling back architectural state.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_alu_mem_to_reg(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3622,7 +3623,7 @@ fn emit_alu_mem_to_reg(
 
 /// Emit ADD.W/L Dn,(An)+. The window, alignment, and self-modification
 /// guards all run before memory, address-register, or flag state is changed.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_add_reg_to_postinc(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3662,7 +3663,7 @@ fn emit_add_reg_to_postinc(
 /// pointer, flow state, or PC changes, so a miss can re-execute the call via
 /// full dispatch. A successful call ends this non-self-loop trace; writing
 /// into its code is therefore safe because any later entry revalidates it.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_indirect_jsr(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3695,7 +3696,7 @@ fn emit_indirect_jsr(
 /// Emit displacement-memory operations with the displacement baked into the
 /// trace, leaving only the live An value and fastmem bounds to check at
 /// runtime.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_an_disp_mem(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3804,7 +3805,7 @@ fn emit_an_disp_mem(
 /// checks run before anything commits; each check branches to a bail block
 /// that sets `pc = op.pc` and returns the ops retired before this one, so a
 /// bailing instruction re-executes through full dispatch.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_move_mem(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -3971,7 +3972,7 @@ fn emit_move_mem(
     )
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn load_reg(builder: &mut FunctionBuilder<'_>, cpu: Value, reg: JitDirectReg) -> Value {
     let index = match reg {
         JitDirectReg::Data(reg) => reg as usize,
@@ -3984,7 +3985,7 @@ fn load_reg(builder: &mut FunctionBuilder<'_>, cpu: Value, reg: JitDirectReg) ->
     )
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_reg(builder: &mut FunctionBuilder<'_>, cpu: Value, reg: JitDirectReg, value: Value) {
     let index = match reg {
         JitDirectReg::Data(reg) => reg as usize,
@@ -3998,12 +3999,12 @@ fn store_reg(builder: &mut FunctionBuilder<'_>, cpu: Value, reg: JitDirectReg, v
     );
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn cycles_const(builder: &mut FunctionBuilder<'_>, cycles: i32) -> Value {
     builder.ins().iconst(types::I32, cycles as i64)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn swap_regs(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4016,7 +4017,7 @@ fn swap_regs(
     store_reg(builder, cpu, right, left_value);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn load_reg_sized(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4027,7 +4028,7 @@ fn load_reg_sized(
     mask_value(builder, value, size)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn write_data_reg_sized(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4048,7 +4049,7 @@ fn write_data_reg_sized(
     store_reg(builder, cpu, JitDirectReg::Data(reg), result);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn mask_value(builder: &mut FunctionBuilder<'_>, value: Value, size: Size) -> Value {
     if size == Size::Long {
         value
@@ -4058,19 +4059,19 @@ fn mask_value(builder: &mut FunctionBuilder<'_>, value: Value, size: Size) -> Va
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn sign_extend_byte(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
     let shifted = builder.ins().ishl_imm(value, 24);
     builder.ins().sshr_imm(shifted, 24)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn sign_extend_word(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
     let shifted = builder.ins().ishl_imm(value, 16);
     builder.ins().sshr_imm(shifted, 16)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn size_mask(size: Size) -> u32 {
     match size {
         Size::Byte => 0xFF,
@@ -4079,7 +4080,7 @@ fn size_mask(size: Size) -> u32 {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn size_msb(size: Size) -> u32 {
     match size {
         Size::Byte => 0x80,
@@ -4088,14 +4089,14 @@ fn size_msb(size: Size) -> u32 {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn set_logic_flags(builder: &mut FunctionBuilder<'_>, cpu: Value, value: Value, size: Size) {
     set_logic_flags_nv(builder, cpu, value, size);
     store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
     store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn set_logic_flags_nv(builder: &mut FunctionBuilder<'_>, cpu: Value, value: Value, size: Size) {
     let value = mask_value(builder, value, size);
     let msb = iconst_u32(builder, size_msb(size));
@@ -4105,7 +4106,7 @@ fn set_logic_flags_nv(builder: &mut FunctionBuilder<'_>, cpu: Value, value: Valu
     store_value_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), value);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn set_add_flags(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4147,7 +4148,7 @@ fn set_add_flags(
     store_value_u32(builder, cpu, offset_of!(CpuCore, x_flag), c);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn set_sub_flags(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4188,7 +4189,7 @@ fn set_sub_flags(
     store_value_u32(builder, cpu, offset_of!(CpuCore, x_flag), c);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn set_cmp_flags(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4218,7 +4219,7 @@ fn set_cmp_flags(
     store_value_u32(builder, cpu, offset_of!(CpuCore, c_flag), c);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_addx(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4247,7 +4248,7 @@ fn emit_addx(
     result
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_subx(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4274,7 +4275,7 @@ fn emit_subx(
     result
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn set_addx_subx_common_flags(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4310,7 +4311,7 @@ fn set_addx_subx_common_flags(
     store_value_u32(builder, cpu, offset_of!(CpuCore, v_flag), v);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn extend_flag_value(builder: &mut FunctionBuilder<'_>, cpu: Value) -> Value {
     let x_flag = load_u32(builder, cpu, offset_of!(CpuCore, x_flag));
     let has_x = builder.ins().icmp_imm(IntCC::NotEqual, x_flag, 0);
@@ -4319,18 +4320,18 @@ fn extend_flag_value(builder: &mut FunctionBuilder<'_>, cpu: Value) -> Value {
     builder.ins().select(has_x, one, zero)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 /// Logical NOT for the 0/1 booleans produced by `icmp`.
 ///
 /// `bnot` is bitwise and must not be used here: `bnot(0x01) == 0xFE`,
 /// which is still non-zero and therefore still "true" to `select`/`brif`.
 /// Flipping the low bit keeps the value a canonical 0/1 boolean.
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn not_bool(builder: &mut FunctionBuilder<'_>, value: Value) -> Value {
     builder.ins().bxor_imm(value, 1)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_condition(builder: &mut FunctionBuilder<'_>, cpu: Value, cond: u8) -> Value {
     let c = flag_is_set(builder, cpu, offset_of!(CpuCore, c_flag));
     let z = flag_is_zero_set(builder, cpu);
@@ -4373,7 +4374,7 @@ fn emit_condition(builder: &mut FunctionBuilder<'_>, cpu: Value, cond: u8) -> Va
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_branch(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4405,7 +4406,7 @@ fn emit_branch(
     builder.ins().select(taken, taken_cycles, not_taken_cycles)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 #[allow(clippy::too_many_arguments)]
 fn emit_guarded_branch(
     builder: &mut FunctionBuilder<'_>,
@@ -4468,7 +4469,7 @@ fn emit_guarded_branch(
     op_cycles
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_dbcc(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
@@ -4513,19 +4514,19 @@ fn emit_dbcc(
         .select(condition_true, true_cycles, false_cycles)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn flag_is_set(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize) -> Value {
     let flag = load_u32(builder, cpu, offset);
     builder.ins().icmp_imm(IntCC::NotEqual, flag, 0)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn flag_is_zero_set(builder: &mut FunctionBuilder<'_>, cpu: Value) -> Value {
     let not_z = load_u32(builder, cpu, offset_of!(CpuCore, not_z_flag));
     builder.ins().icmp_imm(IntCC::Equal, not_z, 0)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn bool_const(builder: &mut FunctionBuilder<'_>, value: bool) -> Value {
     let zero = iconst_u32(builder, 0);
     if value {
@@ -4535,44 +4536,44 @@ fn bool_const(builder: &mut FunctionBuilder<'_>, value: bool) -> Value {
     }
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn flag_from_nonzero(builder: &mut FunctionBuilder<'_>, value: Value, flag: u32) -> Value {
     let condition = builder.ins().icmp_imm(IntCC::NotEqual, value, 0);
     select_flag(builder, condition, flag)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn select_flag(builder: &mut FunctionBuilder<'_>, condition: Value, flag: u32) -> Value {
     let flag_value = iconst_u32(builder, flag);
     let zero = iconst_u32(builder, 0);
     builder.ins().select(condition, flag_value, zero)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn load_u32(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize) -> Value {
     builder
         .ins()
         .load(types::I32, MemFlags::trusted(), cpu, offset as i32)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn load_u8(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize) -> Value {
     builder
         .ins()
         .load(types::I8, MemFlags::trusted(), cpu, offset as i32)
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_pc(builder: &mut FunctionBuilder<'_>, cpu: Value, pc: u32) {
     store_u32(builder, cpu, offset_of!(CpuCore, pc), pc);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_pc_value(builder: &mut FunctionBuilder<'_>, cpu: Value, pc: Value) {
     store_value_u32(builder, cpu, offset_of!(CpuCore, pc), pc);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_bool(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize, value: bool) {
     let value = builder.ins().iconst(types::I8, i64::from(value as u8));
     builder
@@ -4580,25 +4581,25 @@ fn store_bool(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize, valu
         .store(MemFlags::trusted(), value, cpu, offset as i32);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_u32(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize, value: u32) {
     let value = iconst_u32(builder, value);
     store_value_u32(builder, cpu, offset, value);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_value_u32(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize, value: Value) {
     store_value(builder, cpu, offset, value);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_value(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize, value: Value) {
     builder
         .ins()
         .store(MemFlags::trusted(), value, cpu, offset as i32);
 }
 
-#[cfg(not(target_family = "wasm"))]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn iconst_u32(builder: &mut FunctionBuilder<'_>, value: u32) -> Value {
     builder.ins().iconst(types::I32, value as i32 as i64)
 }
@@ -4829,7 +4830,7 @@ mod portable_tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_movem_word_postincrement_matches_portable_and_bails_atomically() {
         let ops = vec![
@@ -5115,7 +5116,7 @@ mod portable_tests {
         assert_eq!(cpu.get_ccr(), 0x02, "V set; X/N/Z/C clear");
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_add_displacement_matches_interpreter_result() {
         let cases = [
@@ -5220,7 +5221,7 @@ mod portable_tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_sub_displacement_matches_interpreter_result() {
         for cpu_type in [CpuType::M68000, CpuType::M68040] {
@@ -5279,7 +5280,7 @@ mod portable_tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn indirect_jsr_profitability_threshold_is_enforced() {
         let ops_for = |count: usize| {
@@ -5330,7 +5331,7 @@ mod portable_tests {
         );
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_indirect_jsr_commits_only_after_stack_check() {
         let ops = vec![
@@ -5616,7 +5617,7 @@ mod portable_tests {
         assert_eq!(cpu.ir, 0x60FC);
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_self_loop_batches_iterations_and_accumulates_progress() {
         let ops = vec![
@@ -5785,7 +5786,7 @@ mod portable_tests {
         assert_eq!(cpu.ir, 0xE188);
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_trace_accepts_only_supported_immediate_shift_forms() {
         let asr = DecodedSimpleOp::decode(CpuType::M68040, 0xE247)
@@ -5829,7 +5830,7 @@ mod portable_tests {
         assert!(register_asr.is_none());
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_immediate_asr_matches_interpreter() {
         let cases = [
@@ -5922,7 +5923,7 @@ mod portable_tests {
         }
     }
 
-    #[cfg(not(target_family = "wasm"))]
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_immediate_lsl_matches_interpreter() {
         let cases = [

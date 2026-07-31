@@ -63,7 +63,10 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
-      - name: Run tests
+      - name: Run tests (default features)
+        run: cargo test --locked
+
+      - name: Run tests (all features)
         run: cargo test --all-features --locked
 
       - name: Verify crate package
