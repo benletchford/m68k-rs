@@ -51,12 +51,6 @@ jobs:
             target/
           key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
-      - name: Check commit messages
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-        run: python3 scripts/check_conventional_commits.py "${BASE_SHA}" "${HEAD_SHA}"
-
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -76,6 +70,16 @@ jobs:
 
       - name: Verify crate package
         run: cargo package --locked
+
+      - name: Check commit messages
+        uses: crate-ci/committed@faeed42f2e10c244533a01525f13c4d8b6ce383f # v1.1.11
+        with:
+          commits: >-
+            ${{ github.event_name == 'pull_request'
+              && format('{0}..{1}', github.event.pull_request.base.sha, github.event.pull_request.head.sha)
+              || github.event_name == 'push'
+              && format('{0}..{1}', github.event.before, github.sha)
+              || github.sha }}
 
   release_please:
     name: Release Please
