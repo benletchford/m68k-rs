@@ -3,16 +3,17 @@
 //! The MC68020 User's Manual section 8.2 publishes three timing columns:
 //! best case (instruction overlap), cache case (cached instruction stream
 //! without overlap), and worst case (uncached stream without overlap).
-//! Copperline does not yet model the 020 execution-stage overlap, so an
+//! The core does not model the 020 execution-stage overlap, so an
 //! instruction selects Cache Case only when all of its opcode, extension,
 //! and immediate words hit the instruction cache; any miss selects Worst
 //! Case.
 //!
 //! The published totals include zero-wait, aligned transfers on a 32-bit
-//! bus. Copperline bills the real target bus while the instruction executes;
-//! the host advances only the part of this total not already consumed by
-//! those accesses. Consequently chip-RAM arbitration and narrower buses can
-//! extend a table time, but a table entry never hides a real wait.
+//! bus. The core bills transfers through [`AddressBus`](super::memory::AddressBus)
+//! while an instruction executes and charges only the portion of the table
+//! total not already consumed by those accesses. Consequently wait states and
+//! narrower buses can extend a table time, but a table entry never hides a
+//! real wait.
 //!
 //! Full-format indexed extension words cannot be distinguished from the
 //! brief form after the instruction has retired. Indexed entries therefore
@@ -25,10 +26,7 @@
 //! stages, so the target instruction cannot begin until the pipe refills from
 //! the cache. The manual accounts for that in the *following* instruction's
 //! head, which a per-instruction model with no overlap stage cannot express,
-//! so the cost is charged where the flush happens. Without it a `dbra` loop
-//! runs 6 clocks per iteration instead of 8 (`timing-test` rows 4, 5, 7, 14,
-//! 28, 29, 30, all 25% fast against the A1200 reference in
-//! `timing-test/README.md`).
+//! so the cost is charged where the flush happens.
 
 use super::cpu::CpuCore;
 use super::types::Size;

@@ -1,6 +1,7 @@
-//! Effective Address resolution.
+//! Effective-address resolution.
 //!
-//! Implements all M68000 addressing modes.
+//! Implements the M68000-family addressing modes, including the full indexed
+//! extension format introduced with the M68020.
 
 use super::cpu::CpuCore;
 use super::execute::RUN_MODE_BERR_AERR_RESET;

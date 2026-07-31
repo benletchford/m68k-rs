@@ -1,6 +1,4 @@
-//! CPU core state structure.
-//!
-//! Mirrors Musashi's `m68ki_cpu_core` for complete M68000 family emulation.
+//! Architectural CPU state, configuration, and memory-access helpers.
 
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::memory::{AddressBus, BusFaultKind};
@@ -15,25 +13,33 @@ fn precise_bus_default() -> bool {
 
 /// Flag constants for SR bits.
 pub const XFLAG_SET: u32 = 0x100;
+/// Internal representation of a set negative (N) flag.
 pub const NFLAG_SET: u32 = 0x80;
+/// Internal representation of a set overflow (V) flag.
 pub const VFLAG_SET: u32 = 0x80;
+/// Internal representation of a set carry (C) flag.
 pub const CFLAG_SET: u32 = 0x100;
+/// Internal representation of supervisor mode.
 pub const SFLAG_SET: u32 = 4;
+/// Internal representation of the 68020+ master-stack bit.
 pub const MFLAG_SET: u32 = 2;
 
 /// Function codes for memory access.
 pub const FC_USER_DATA: u32 = 1;
+/// User-program function code.
 pub const FC_USER_PROGRAM: u32 = 2;
+/// Supervisor-data function code.
 pub const FC_SUPERVISOR_DATA: u32 = 5;
+/// Supervisor-program function code.
 pub const FC_SUPERVISOR_PROGRAM: u32 = 6;
 
 /// The main CPU state structure.
 ///
-/// Matches Musashi's `m68ki_cpu_core` layout for compatibility.
-///
-/// Every field is plain runtime or configuration state (there are no
-/// lazily built decode tables), so the whole struct round-trips through
-/// serde for host save states.
+/// Public fields expose architectural registers and host-visible
+/// configuration. With the `serde` feature, state that affects subsequent
+/// architectural behavior and timing is serialized; runtime-only decode
+/// tables, FastMem pointers, fault-delivery scratch state, and trace caches
+/// are skipped and reconstructed when execution resumes.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CpuCore {
@@ -228,7 +234,13 @@ pub struct CpuCore {
     pub cyc_reset: i32,
 
     // ========== Virtual IRQ ==========
+    /// Reserved virtual-interrupt state retained for host compatibility.
+    ///
+    /// Normal interrupt delivery uses [`CpuCore::set_irq`].
     pub virq_state: u32,
+    /// Reserved pending-NMI latch retained for host compatibility.
+    ///
+    /// Level-7 interrupt delivery uses [`CpuCore::set_irq`].
     pub nmi_pending: u32,
 
     // ========== MMU Registers ==========
@@ -239,20 +251,32 @@ pub struct CpuCore {
     // both. The two formats never coexist (the walker dispatches on `cpu_type`),
     // and the 040 root pointers carry no limit longword, so the 040 ignores the
     // `*_limit` fields.
-    pub mmu_crp_aptr: u32,  // CRP (030) / URP (040) address pointer
-    pub mmu_crp_limit: u32, // CRP limit/mode (030 only)
-    pub mmu_srp_aptr: u32,  // SRP address pointer (030 + 040)
-    pub mmu_srp_limit: u32, // SRP limit/mode (030 only)
-    pub mmu_tc: u32,        // Translation Control (030 PMOVE / 040 MOVEC 0x003)
-    pub mmu_sr: u32,        // MMU Status Register (030 + 040; layout per cpu_type)
+    /// 68030 CRP address pointer, or the 68040/68060 user root pointer.
+    pub mmu_crp_aptr: u32,
+    /// 68030 CRP limit and descriptor-mode longword.
+    pub mmu_crp_limit: u32,
+    /// Supervisor root-pointer address for the 68030, 68040, and 68060.
+    pub mmu_srp_aptr: u32,
+    /// 68030 SRP limit and descriptor-mode longword.
+    pub mmu_srp_limit: u32,
+    /// Translation Control register (68030 PMOVE; 68040/68060 MOVEC).
+    pub mmu_tc: u32,
+    /// MMU Status Register; its bit layout follows [`CpuCore::cpu_type`].
+    pub mmu_sr: u32,
     // 68030 Transparent Translation Registers
+    /// 68030 Transparent Translation Register 0.
     pub mmu_tt0: u32,
+    /// 68030 Transparent Translation Register 1.
     pub mmu_tt1: u32,
     // 68040-specific MMU registers
-    pub dacr0: u32, // Data Access Control 0 (0x008)
-    pub dacr1: u32, // Data Access Control 1 (0x009)
-    pub iacr0: u32, // Instruction Access Control 0 (0x00A)
-    pub iacr1: u32, // Instruction Access Control 1 (0x00B)
+    /// 68040 Data Access Control Register 0 (MOVEC selector `0x008`).
+    pub dacr0: u32,
+    /// 68040 Data Access Control Register 1 (MOVEC selector `0x009`).
+    pub dacr1: u32,
+    /// 68040 Instruction Access Control Register 0 (MOVEC selector `0x00A`).
+    pub iacr0: u32,
+    /// 68040 Instruction Access Control Register 1 (MOVEC selector `0x00B`).
+    pub iacr1: u32,
     // 68060-specific control registers
     /// Processor Configuration Register (MOVEC 0x808): identification and
     /// revision in the high half (read-only), EDEBUG/DFP/ESS in the low bits.
@@ -934,7 +958,7 @@ impl CpuCore {
     /// 68000 long writeback for the -(Ax),-(Ay) extended-arithmetic forms
     /// (ADDX.L/SUBX.L memory-to-memory): write the low word, perform the
     /// final prefetch, then write the high word. The IPL poll rides the
-    /// low-word write (Moira writeM<Word, POLL> on the first write).
+    /// low-word write (Moira `writeM<Word, POLL>` on the first write).
     pub fn write_long_mm_interleaved_68000<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -1892,14 +1916,18 @@ impl CpuCore {
         }
     }
 
-    /// Execute COP0 / PMMU op0 (0xF0xx) style instructions.
+    /// Execute a COP0/PMMU `0xF0xx` instruction.
     ///
-    /// Currently supports only PMOVE to/from a subset of PMMU registers:
-    /// - TC (32-bit)
-    /// - SRP (64-bit) (limit:aptr)
-    /// - CRP (64-bit) (limit:aptr)
+    /// On the 68030 this implements PTEST and PMOVE for TC, SRP, CRP,
+    /// TT0, TT1, and MMUSR/PSR. PLOAD and PFLUSH-family encodings are
+    /// recognized as compatibility no-ops because the 68030 walker does
+    /// not retain translations in an ATC. The 68040 accepts the 030-form
+    /// PTEST probes used by 68040.library as no-ops; its architectural MMU
+    /// controls use MOVEC and dedicated opcodes. The 68060 rejects this
+    /// encoding group.
     ///
-    /// Returns 0 if not recognized/supported (caller should treat as LINE 1111).
+    /// Returns zero for an invalid or unsupported encoding so the caller
+    /// can take the Line-F exception.
     pub fn exec_mmu_op0<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         use super::ea::AddressingMode;
         use super::types::Size;
@@ -1930,9 +1958,8 @@ impl CpuCore {
         // Extension word immediately after opcode.
         let modes = self.read_imm_16(bus);
 
-        // Only handle PMOVE-family encodings for now.
-        // Reject known-but-unimplemented ops (PLOAD/PFLUSH/PTEST/etc).
-        // However, on 68040 treat PTEST as NOP since we don't have real MMU.
+        // Decode PTEST before the PMOVE register family. On the 68040,
+        // accept the 030-form compatibility probe as a NOP.
         let is_ptest = (modes & 0xE000) == 0x8000;
         let is_040 = matches!(
             self.cpu_type,
@@ -2185,26 +2212,32 @@ impl CpuCore {
     // ========== Flag Helpers ==========
 
     #[inline]
+    /// Return whether the extend (X) condition-code bit is set.
     pub fn flag_x(&self) -> bool {
         self.x_flag != 0
     }
     #[inline]
+    /// Return whether the negative (N) condition-code bit is set.
     pub fn flag_n(&self) -> bool {
         self.n_flag != 0
     }
     #[inline]
+    /// Return whether the zero (Z) condition-code bit is set.
     pub fn flag_z(&self) -> bool {
         self.not_z_flag == 0
     }
     #[inline]
+    /// Return whether the overflow (V) condition-code bit is set.
     pub fn flag_v(&self) -> bool {
         self.v_flag != 0
     }
     #[inline]
+    /// Return whether the carry (C) condition-code bit is set.
     pub fn flag_c(&self) -> bool {
         self.c_flag != 0
     }
     #[inline]
+    /// Return whether the CPU is currently in supervisor mode.
     pub fn is_supervisor(&self) -> bool {
         self.s_flag != 0
     }

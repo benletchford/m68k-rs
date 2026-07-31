@@ -1,11 +1,9 @@
-// MOVE16 - 16-byte Aligned Block Transfer (68040/68060)
-//
-// Five forms:
-//   0xF600 (Ay)+,(xxx).L    0xF608 (xxx).L,(Ay)+
-//   0xF610 (Ay),(xxx).L     0xF618 (xxx).L,(Ay)
-//   0xF620 (Ax)+,(Ay)+  with extension word 1yyy 0000 0000 0000
-// Both addresses are forced to 16-byte alignment (the low four bits are
-// ignored; there is no address error).
+//! MOVE16 16-byte aligned block transfers (68040/68060).
+//!
+//! The five encodings cover `(Ay)+,(xxx).L`, `(xxx).L,(Ay)+`,
+//! `(Ay),(xxx).L`, `(xxx).L,(Ay)`, and `(Ax)+,(Ay)+`. Both addresses are
+//! forced to 16-byte alignment: the low four bits are ignored and do not
+//! raise an address error.
 
 use crate::core::cpu::CpuCore;
 use crate::core::memory::AddressBus;

@@ -3,10 +3,11 @@
 //! Each function reduces its argument, evaluates a Taylor/atanh series in the
 //! double-double layer (`dd.rs`) -- whose coefficients are exact rationals, so
 //! no minimax tooling is needed -- and rounds the ~128-bit result to 64-bit
-//! extended under the caller's FPCR mode, setting INEX/OPERR/DZ. Accuracy is
-//! faithful to ~64 bits (validated by identities and exact anchors); it is not
-//! chip-bit-exact (the 6888x uses its own CORDIC/polynomial microcode, and a
-//! bare 68040 traps these to a software FPSP). FMOD/FREM are exact.
+//! extended under the caller's FPCR mode, setting INEX/OPERR/DZ. The test suite
+//! checks finite normal results against 200-bit `astro-float` references with a
+//! one-ULP tolerance across all FPCR rounding modes. Results are not
+//! chip-bit-exact: the 6888x uses its own CORDIC/polynomial microcode, and a
+//! bare 68040 traps these operations to a software FPSP. FMOD/FREM are exact.
 
 use super::dd::{self, Df};
 use super::softfloat::{self, ExcFlags, FpCmp, RoundCtx, RoundMode};

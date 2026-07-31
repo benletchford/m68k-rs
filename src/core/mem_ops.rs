@@ -118,7 +118,7 @@ pub(crate) enum DecodedMemOp {
         src: FastEa,
         dst: FastEa,
     },
-    /// MOVEM.W (An)+,<register list>. The fast path accepts data-register-
+    /// `MOVEM.W (An)+,<register-list>`. The fast path accepts data-register-
     /// only masks at execution time; other lists fall back atomically.
     MovemWordPostInc {
         base: u8,

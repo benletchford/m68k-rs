@@ -7,7 +7,7 @@
 //! The value is  (-1)^SM * D0.D1D2...D16 * 10^((-1)^SE * e2e1e0).
 //! An exponent field of $FFF encodes Inf (zero mantissa) or NaN.
 //!
-//! Decimal<->binary scaling goes through the floatx80 engine (powers of ten
+//! Decimal-to-binary scaling goes through the floatx80 engine (powers of ten
 //! built by exponentiation-by-squaring); the leading decimal exponent for the
 //! binary->decimal direction is estimated with an f64 log10. This is the
 //! 6888x "round to a decimal string" behavior, which is inherently inexact;

@@ -1,9 +1,10 @@
 //! Decoded simple operation cache.
 //!
-//! This is the first JIT-facing execution substrate: cache a small decoded micro-op for
-//! simple one-word instructions that do not touch memory, read extension words, trap, or need
-//! rollback. One-word short branches are included because their fetch timing is fully local to
-//! the current instruction.
+//! Caches compact decoded operations for simple one-word instructions and
+//! FastMem-backed memory operations. The same operations feed the portable
+//! trace executor and, with the `jit` feature on native targets, Cranelift.
+//! One-word short branches are included because their fetch timing is fully
+//! local to the current instruction.
 //! Instruction fetch still occurs at the normal instruction boundary, so bus/address-error timing
 //! stays aligned with the interpreter.
 
