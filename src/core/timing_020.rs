@@ -27,12 +27,21 @@
 //! the cache. The manual accounts for that in the *following* instruction's
 //! head, which a per-instruction model with no overlap stage cannot express,
 //! so the cost is charged where the flush happens.
+//!
+//! The refill constant is calibrated against real hardware: a 68EC020 at
+//! 14.19 MHz (Amiga 1200) measures 7 clocks per cached taken `dbra` in three
+//! independent E-clock-referenced loop tests, i.e. the manual's cache-case 6
+//! plus 1, and every other measured loop (`move`, shift, `mulu`, paired ops)
+//! agrees with the same +1 once the loop branch is accounted for. A refill of
+//! 2 reproduced FS-UAE, which the same disk shows over-billing each taken
+//! branch by one clock against the real machine.
 
 use super::cpu::CpuCore;
 use super::types::Size;
 
-/// Clocks a taken branch loses refilling the 020's instruction pipeline.
-const TAKEN_BRANCH_REFILL: i32 = 2;
+/// Clocks a taken branch loses refilling the 020's instruction pipeline
+/// (real-A1200 calibrated: cached taken dbra = 7 clocks total).
+const TAKEN_BRANCH_REFILL: i32 = 1;
 
 #[derive(Clone, Copy)]
 struct Case {
