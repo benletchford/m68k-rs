@@ -84,6 +84,11 @@ pub struct CpuCore {
     pub dtt1: u32,
     /// Instruction Register (current opcode)
     pub ir: u32,
+    /// Data register left in the execution unit's result latch by the
+    /// previous instruction (a register-to-register MOVE), for the 68020
+    /// result-forwarding refund; see `timing_020.rs`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) result_latch_020: Option<u8>,
 
     // ========== FPU Registers (68881/68882/68040) ==========
     /// FPU Data Registers (FP0-FP7) - 80-bit extended precision.
@@ -501,6 +506,7 @@ impl CpuCore {
             dtt0: 0,
             dtt1: 0,
             ir: 0,
+            result_latch_020: None,
             fpr: [FloatX80::default(); 8],
             fpiar: 0,
             fpsr: 0,

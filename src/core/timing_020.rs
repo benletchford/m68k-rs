@@ -745,12 +745,18 @@ impl CpuCore {
     /// just retired. Instructions not covered by the integer tables (notably
     /// coprocessor operations and full-format indexed detail) retain the old
     /// conservative scale until a dedicated model exists.
-    pub(crate) fn cycles_020(&self, raw: i32, fetch_cached: bool) -> i32 {
+    pub(crate) fn cycles_020(&mut self, raw: i32, fetch_cached: bool) -> i32 {
+        let is_020 = matches!(
+            self.cpu_type,
+            super::types::CpuType::M68EC020 | super::types::CpuType::M68020
+        );
         if let Some(cycles) = exception_cycles(self, raw, fetch_cached) {
+            self.result_latch_020 = None;
             return cycles;
         }
 
         let op = self.ir as u16;
+        let forwarded = self.result_latch_020.take();
         let cycles = match op >> 12 {
             0x0 => group_0(self, op, fetch_cached),
             0x1 => Some(move_cycles(op, Size::Byte, fetch_cached)),
@@ -764,7 +770,41 @@ impl CpuCore {
             0xE => group_e(op, fetch_cached),
             _ => None,
         };
-        cycles.unwrap_or_else(|| legacy_fallback(raw))
+        let mut cycles = cycles.unwrap_or_else(|| legacy_fallback(raw));
+        if is_020 {
+            if let Some(dest) = reg_to_reg_move_dest(op) {
+                // The moved value is produced through the execution unit's
+                // result latch; leave its register for the next instruction.
+                self.result_latch_020 = Some(dest);
+                if fetch_cached && forwarded == Some((op & 7) as u8) {
+                    // Result forwarding: the source is still in the result
+                    // latch from the immediately preceding register-to-
+                    // register MOVE, so the operand's register-file read
+                    // micro-cycle is skipped. A real 68EC020 runs the RAW-
+                    // dependent pair `move.w d2,d0 + move.w d0,d1` one clock
+                    // per loop iteration faster than the independent pair
+                    // `move.w d2,d0 + move.w d3,d1` (Copperline timing-test
+                    // rows 29 and 28: 10 against 11 clocks including the
+                    // loop dbra), which only a forwarding path can produce.
+                    // Only the measured register-to-register MOVE case is
+                    // refunded; wider forwarding is deliberately not
+                    // modelled without hardware data.
+                    cycles = (cycles - 1).max(1);
+                }
+            }
+        }
+        cycles
+    }
+}
+
+/// Destination register of a register-to-register MOVE (`MOVE.B/W/L Dx,Dy`),
+/// the shape whose result-forwarding refund is measured on real hardware.
+const fn reg_to_reg_move_dest(op: u16) -> Option<u8> {
+    let group = op >> 12;
+    if (group == 1 || group == 2 || group == 3) && (op >> 3) & 7 == 0 && (op >> 6) & 7 == 0 {
+        Some(((op >> 9) & 7) as u8)
+    } else {
+        None
     }
 }
 
@@ -776,6 +816,33 @@ mod tests {
         let mut cpu = CpuCore::new();
         cpu.ir = u32::from(op);
         cpu.cycles_020(raw, cached)
+    }
+
+    #[test]
+    fn result_forwarding_refunds_one_clock_on_a_raw_reg_move_pair() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(crate::core::types::CpuType::M68EC020);
+        cpu.ir = 0x3002; // MOVE.W D2,D0
+        assert_eq!(cpu.cycles_020(4, true), 2);
+        cpu.ir = 0x3200; // MOVE.W D0,D1: source still in the result latch
+        assert_eq!(cpu.cycles_020(4, true), 1);
+        cpu.ir = 0x3203; // MOVE.W D3,D1: independent, full register read
+        assert_eq!(cpu.cycles_020(4, true), 2);
+
+        // A non-MOVE between the pair clears the latch: no refund across it.
+        cpu.ir = 0x3002; // MOVE.W D2,D0
+        assert_eq!(cpu.cycles_020(4, true), 2);
+        cpu.ir = 0xD280; // ADD.L D0,D1
+        assert_eq!(cpu.cycles_020(4, true), 2);
+        cpu.ir = 0x3200; // MOVE.W D0,D1: D0 is stale in the latch
+        assert_eq!(cpu.cycles_020(4, true), 2);
+
+        // An uncached stream gets no refund (only the cached case is
+        // measured).
+        cpu.ir = 0x3002;
+        let _ = cpu.cycles_020(4, false);
+        cpu.ir = 0x3200;
+        assert_eq!(cpu.cycles_020(4, false), 3);
     }
 
     #[test]
