@@ -177,6 +177,26 @@ pub trait AddressBus {
         self.last_fetch_was_cached()
     }
 
+    /// Take a pending request to return from cycle-scheduled execution at
+    /// the next retired-instruction boundary.
+    ///
+    /// [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) calls this
+    /// after an instruction completes normally and before it fetches or
+    /// executes another instruction. Returning `true` makes the runner exit
+    /// with
+    /// [`CycleBatchExit::BoundaryRequested`](crate::CycleBatchExit::BoundaryRequested).
+    /// The completed instruction's cycles and retirement count are included
+    /// in the result.
+    ///
+    /// Implementations should consume the request when returning `true`, so
+    /// execution can resume without a separate acknowledgement call. A bus
+    /// can retain any associated host work in its own queue until the caller
+    /// processes the boundary exit. The default reports no request.
+    #[inline]
+    fn take_boundary_request(&mut self) -> bool {
+        false
+    }
+
     /// Perform an interrupt-acknowledge cycle for `level`.
     ///
     /// Return an explicit vector number in the low byte, or `u32::MAX` for

@@ -176,14 +176,22 @@ fn stop_is_distinct_and_the_stop_instruction_is_counted() {
 #[derive(Clone)]
 struct EventBus {
     memory: Vec<u8>,
+    overlay_memory: Vec<u8>,
+    overlay_enabled: bool,
     resets: u32,
+    boundary_write_address: Option<u32>,
+    boundary_requested: bool,
 }
 
 impl EventBus {
     fn new() -> Self {
         Self {
             memory: vec![0; 0x10000],
+            overlay_memory: vec![0; 0x10000],
+            overlay_enabled: false,
             resets: 0,
+            boundary_write_address: None,
+            boundary_requested: false,
         }
     }
 
@@ -194,11 +202,22 @@ impl EventBus {
     fn load_long(&mut self, address: u32, value: u32) {
         self.write_long(address, value);
     }
+
+    fn load_overlay_word(&mut self, address: u32, value: u16) {
+        let [hi, lo] = value.to_be_bytes();
+        self.overlay_memory[address as usize & 0xFFFF] = hi;
+        self.overlay_memory[address.wrapping_add(1) as usize & 0xFFFF] = lo;
+    }
 }
 
 impl AddressBus for EventBus {
     fn read_byte(&mut self, address: u32) -> u8 {
-        self.memory[address as usize & 0xFFFF]
+        let index = address as usize & 0xFFFF;
+        if self.overlay_enabled && (0x1000..0x2000).contains(&address) {
+            self.overlay_memory[index]
+        } else {
+            self.memory[index]
+        }
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
@@ -225,6 +244,9 @@ impl AddressBus for EventBus {
         let [hi, lo] = value.to_be_bytes();
         self.write_byte(address, hi);
         self.write_byte(address.wrapping_add(1), lo);
+        if self.boundary_write_address == Some(address) {
+            self.boundary_requested = true;
+        }
     }
 
     fn write_long(&mut self, address: u32, value: u32) {
@@ -237,9 +259,55 @@ impl AddressBus for EventBus {
         u32::MAX
     }
 
+    fn take_boundary_request(&mut self) -> bool {
+        std::mem::take(&mut self.boundary_requested)
+    }
+
     fn reset_devices(&mut self) {
         self.resets += 1;
     }
+}
+
+#[test]
+fn bus_request_returns_after_the_current_instruction_and_before_the_next() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x3080); // MOVE.W D0,(A0)
+    bus.load_word(0x1002, 0x7201); // Old mapping: MOVEQ #1,D1
+    bus.load_word(0x1004, 0x4E71); // NOP
+    bus.load_overlay_word(0x1002, 0x7202); // New mapping: MOVEQ #2,D1
+    bus.load_overlay_word(0x1004, 0x4E71);
+    bus.boundary_write_address = Some(0x4000);
+
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_a(0, 0x4000);
+    cpu.set_d(0, 0xABCD);
+
+    // The boundary reason wins even though this instruction crosses the
+    // one-cycle budget.
+    let result = cpu.run_for_cycles(&mut bus, 1);
+
+    assert_eq!(result.cycles, 8);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(bus.read_word(0x4000), 0xABCD);
+    assert_eq!(cpu.d(1), 0);
+    assert_eq!(cpu.pc, 0x1002);
+
+    // The 68000 prefetched the old opcode as part of the requesting
+    // instruction. Apply the mapping change and discard that stale word
+    // before resuming.
+    bus.overlay_enabled = true;
+    cpu.invalidate_prefetch();
+
+    // The request was consumed by the boundary check, so resuming starts
+    // with the instruction that follows the requesting write, fetched from
+    // the new mapping.
+    let resumed = cpu.run_for_cycles(&mut bus, 1);
+    assert_eq!(resumed.cycles, 4);
+    assert_eq!(resumed.instructions, 1);
+    assert_eq!(resumed.exit, CycleBatchExit::BudgetExhausted);
+    assert_eq!(cpu.d(1), 2);
+    assert_eq!(cpu.pc, 0x1004);
 }
 
 #[test]
