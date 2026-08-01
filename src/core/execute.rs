@@ -197,6 +197,10 @@ impl CpuCore {
     ///   before the first handler instruction executes.
     /// - A non-positive budget returns immediately with
     ///   [`CycleBatchExit::BudgetExhausted`].
+    /// - A bus boundary request is polled after each normally completed
+    ///   instruction. It includes that instruction in both totals and takes
+    ///   precedence over simultaneous budget exhaustion. STOP and surfaced
+    ///   traps retain their existing exit reasons.
     pub fn run_for_cycles<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -254,6 +258,13 @@ impl CpuCore {
                             cycles: self.initial_cycles - self.cycles_remaining,
                             instructions,
                             exit: CycleBatchExit::Stopped,
+                        };
+                    }
+                    if bus.take_boundary_request() {
+                        return CycleBatchResult {
+                            cycles: self.initial_cycles - self.cycles_remaining,
+                            instructions,
+                            exit: CycleBatchExit::BoundaryRequested,
                         };
                     }
                 }

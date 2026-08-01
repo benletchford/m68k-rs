@@ -167,7 +167,7 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 | **`step()`** | One instruction | Transaction-accurate `AddressBus` accesses and cycles | Surfaces A-line, F-line, `TRAP`, `BKPT`, and illegal instructions without taking their exception |
 | **`step_with_hle_handler()`** | One instruction | Same precise path as `step()` | Offers traps to `HleHandler`; unhandled traps take the hardware exception |
 | **`execute()`** | CPU cycles | Precise path; whole instructions may overshoot the requested cycles | Takes traps as hardware exceptions and returns consumed cycles |
-| **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps like `step()` and reports STOP separately |
+| **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps, STOP, and bus-requested instruction boundaries separately |
 | **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and portable or `jit`-enabled native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
 
 Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
@@ -185,6 +185,9 @@ match result.exit {
     CycleBatchExit::Stopped => {
         // Wait for a serviceable interrupt.
     }
+    CycleBatchExit::BoundaryRequested => {
+        // Apply work queued by the bus before resuming the CPU.
+    }
     event => {
         // Handle a surfaced trap. The trapping instruction is not included
         // in result.instructions and no exception-entry cycles were charged.
@@ -192,6 +195,18 @@ match result.exit {
     }
 }
 ```
+
+An `AddressBus` can return `true` from `take_boundary_request()` when a bus
+access discovers host work that must run after the current instruction and
+before another one executes. The request is checked after the instruction's
+cycles and retirement have been counted, and it takes precedence over cycle
+budget exhaustion. Implementations should consume the request while retaining
+the associated work until the host handles the boundary exit.
+
+The 68000 and 68010 may already have instruction words in their hardware
+prefetch queue at this boundary. If the host work changes instruction-visible
+memory or mapping and those queued words must not be used, call
+`cpu.invalidate_prefetch()` before resuming.
 
 Use **`step_with_hle_handler()`** when patching selected guest OS calls while
 allowing every unhandled trap to follow hardware behavior. Use
