@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.3.2...m68k-v0.4.0) (2026-08-01)
+
+
+### Features
+
+* add bus-requested cycle boundaries ([#48](https://github.com/benletchford/m68k-rs/issues/48)) ([70ead97](https://github.com/benletchford/m68k-rs/commit/70ead97e05c22fcfe5101c7567e9fe1ebb88b412))
+
 ## [0.3.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.3.1...m68k-v0.3.2) (2026-07-31)
 
 
