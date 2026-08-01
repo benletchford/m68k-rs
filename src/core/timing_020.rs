@@ -772,25 +772,25 @@ impl CpuCore {
         };
         let mut cycles = cycles.unwrap_or_else(|| legacy_fallback(raw));
         if is_020 {
-            if let Some(dest) = reg_to_reg_move_dest(op) {
-                // The moved value is produced through the execution unit's
-                // result latch; leave its register for the next instruction.
-                self.result_latch_020 = Some(dest);
-                if fetch_cached && forwarded == Some((op & 7) as u8) {
-                    // Result forwarding: the source is still in the result
-                    // latch from the immediately preceding register-to-
-                    // register MOVE, so the operand's register-file read
-                    // micro-cycle is skipped. A real 68EC020 runs the RAW-
-                    // dependent pair `move.w d2,d0 + move.w d0,d1` one clock
-                    // per loop iteration faster than the independent pair
-                    // `move.w d2,d0 + move.w d3,d1` (Copperline timing-test
-                    // rows 29 and 28: 10 against 11 clocks including the
-                    // loop dbra), which only a forwarding path can produce.
-                    // Only the measured register-to-register MOVE case is
-                    // refunded; wider forwarding is deliberately not
-                    // modelled without hardware data.
-                    cycles = (cycles - 1).max(1);
-                }
+            // A register-to-register MOVE leaves its value in the execution
+            // unit's result latch for the next instruction; anything else
+            // leaves the latch cleared (it was taken above).
+            self.result_latch_020 = reg_to_reg_move_dest(op);
+            if self.result_latch_020.is_some() && fetch_cached && forwarded == Some((op & 7) as u8)
+            {
+                // Result forwarding: the source is still in the result
+                // latch from the immediately preceding register-to-register
+                // MOVE, so the operand's register-file read micro-cycle is
+                // skipped. A real 68EC020 runs the RAW-dependent pair
+                // `move.w d2,d0 + move.w d0,d1` one clock per loop
+                // iteration faster than the independent pair
+                // `move.w d2,d0 + move.w d3,d1` (Copperline timing-test
+                // rows 29 and 28: 10 against 11 clocks including the loop
+                // dbra), which only a forwarding path can produce. Only the
+                // measured register-to-register MOVE case is refunded;
+                // wider forwarding is deliberately not modelled without
+                // hardware data.
+                cycles = (cycles - 1).max(1);
             }
         }
         cycles
