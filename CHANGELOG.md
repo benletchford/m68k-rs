@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.4.0...m68k-v0.5.0) (2026-08-02)
+
+
+### Features
+
+* calibrate 020 taken-branch refill and model result forwarding from real hardware ([0b9117a](https://github.com/benletchford/m68k-rs/commit/0b9117a83217a61fc3096bbf4860d59bd0fdf8d5))
+
 ## [0.4.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.3.2...m68k-v0.4.0) (2026-08-01)
 
 
