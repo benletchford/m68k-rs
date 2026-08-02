@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.0...m68k-v0.5.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* remove 020 result forwarding and make the DBcc refill alignment dependent ([ebe891f](https://github.com/benletchford/m68k-rs/commit/ebe891f0e808c693f18ed97b75edb9105f7a32f2))
+
 ## [0.5.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.4.0...m68k-v0.5.0) (2026-08-02)
 
 
