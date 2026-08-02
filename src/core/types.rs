@@ -311,12 +311,12 @@ pub enum CycleBatchExit {
     /// The requested cycle budget was met or crossed at an instruction or
     /// interrupt boundary.
     BudgetExhausted,
-    /// The address bus requested a return after the most recently retired
-    /// instruction.
+    /// The address bus requested a return after a completed instruction or
+    /// entry interrupt.
     ///
-    /// The instruction's cycles and retirement count are included in the
-    /// result. This exit takes precedence when the instruction also meets or
-    /// crosses the cycle budget.
+    /// Completed work is included in the result. Interrupt entry contributes
+    /// cycles but no retired instruction. This exit takes precedence when the
+    /// completed work also meets or crosses the cycle budget.
     BoundaryRequested,
     /// The CPU executed STOP, or was already stopped with no serviceable
     /// interrupt on entry.

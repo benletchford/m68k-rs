@@ -180,6 +180,7 @@ struct EventBus {
     overlay_enabled: bool,
     resets: u32,
     boundary_write_address: Option<u32>,
+    boundary_on_interrupt_acknowledge: bool,
     boundary_requested: bool,
 }
 
@@ -191,6 +192,7 @@ impl EventBus {
             overlay_enabled: false,
             resets: 0,
             boundary_write_address: None,
+            boundary_on_interrupt_acknowledge: false,
             boundary_requested: false,
         }
     }
@@ -256,6 +258,9 @@ impl AddressBus for EventBus {
     }
 
     fn interrupt_acknowledge(&mut self, _level: u8) -> u32 {
+        if self.boundary_on_interrupt_acknowledge {
+            self.boundary_requested = true;
+        }
         u32::MAX
     }
 
@@ -357,6 +362,52 @@ fn entry_interrupt_is_charged_without_counting_an_instruction() {
     assert_eq!(result.cycles, 44);
     assert_eq!(result.instructions, 0);
     assert_eq!(result.exit, CycleBatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x2000);
+}
+
+#[test]
+fn entry_interrupt_boundary_returns_before_the_handler_instruction() {
+    let mut bus = EventBus::new();
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x7001); // MOVEQ #1,D0
+    bus.boundary_on_interrupt_acknowledge = true;
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_irq(3);
+
+    let result = cpu.run_for_cycles(&mut bus, 100);
+
+    assert_eq!(result.cycles, 44);
+    assert_eq!(result.instructions, 0);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.pc, 0x2000);
+    assert_eq!(cpu.d(0), 0);
+
+    // The request was consumed, so resuming starts with the first handler
+    // instruction rather than returning the same boundary again.
+    let resumed = cpu.run_for_cycles(&mut bus, 1);
+    assert_eq!(resumed.cycles, 4);
+    assert_eq!(resumed.instructions, 1);
+    assert_eq!(resumed.exit, CycleBatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x2002);
+    assert_eq!(cpu.d(0), 1);
+}
+
+#[test]
+fn entry_interrupt_boundary_precedes_budget_exhaustion() {
+    let mut bus = EventBus::new();
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x4E71);
+    bus.boundary_on_interrupt_acknowledge = true;
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_irq(3);
+
+    let result = cpu.run_for_cycles(&mut bus, 1);
+
+    assert_eq!(result.cycles, 44);
+    assert_eq!(result.instructions, 0);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
     assert_eq!(cpu.pc, 0x2000);
 }
 

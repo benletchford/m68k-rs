@@ -197,11 +197,13 @@ match result.exit {
 ```
 
 An `AddressBus` can return `true` from `take_boundary_request()` when a bus
-access discovers host work that must run after the current instruction and
-before another one executes. The request is checked after the instruction's
-cycles and retirement have been counted, and it takes precedence over cycle
-budget exhaustion. Implementations should consume the request while retaining
-the associated work until the host handles the boundary exit.
+access discovers host work that must run after the current instruction or
+interrupt entry and before another instruction executes. The request is
+checked after a normally completed instruction and after an interrupt serviced
+on batch entry. Completed cycles are included; interrupt entry does not add to
+the retirement count. The request takes precedence over cycle budget
+exhaustion. Implementations should consume the request while retaining the
+associated work until the host handles the boundary exit.
 
 The 68000 and 68010 may already have instruction words in their hardware
 prefetch queue at this boundary. If the host work changes instruction-visible
