@@ -100,6 +100,11 @@ pub(crate) enum JitEa {
         scale: u8,
         displacement: i8,
     },
+    /// Absolute-short memory address, sign-extended when the trace is
+    /// recorded so execution does not read the instruction stream.
+    AbsWord(u32),
+    /// Absolute-long memory address captured from the two extension words.
+    AbsLong(u32),
 }
 
 impl JitEa {
@@ -111,6 +116,8 @@ impl JitEa {
                 | Self::PreDec(_)
                 | Self::Disp(_, _)
                 | Self::Index { .. }
+                | Self::AbsWord(_)
+                | Self::AbsLong(_)
         )
     }
 }
@@ -200,11 +207,36 @@ pub(crate) enum JitTraceOp {
         size: Size,
         cycles: i32,
     },
+    /// ORI/ANDI/SUBI/ADDI/EORI/CMPI with a data-register destination. The
+    /// immediate extension words are captured while recording.
+    BinaryImmediateDataReg {
+        op: JitBinaryOp,
+        immediate: u32,
+        dst: u8,
+        size: Size,
+        cycles: i32,
+    },
+    /// MULU.W/MULS.W with a data-register source. Memory-source forms retain
+    /// the checked interpreter path.
+    MulWordDataReg {
+        src: u8,
+        dst: u8,
+        signed: bool,
+        m68000_timing: bool,
+    },
     AddrDataReg {
         op: JitAddrOp,
         src: JitDirectReg,
         dst: u8,
         size: Size,
+    },
+    /// LEA `(An)`/`d16(An),Am`. The displacement is captured while recording,
+    /// so execution is pure address-register arithmetic.
+    LeaAn {
+        base: u8,
+        dst: u8,
+        displacement: i16,
+        cycles: i32,
     },
     AddSubxReg {
         src: u8,
@@ -288,6 +320,11 @@ pub(crate) enum JitTraceOp {
         size: Size,
         src: JitEa,
         dst: u8,
+    },
+    /// Read-only TST through a checked fast-memory effective address.
+    TstMem {
+        size: Size,
+        src: JitEa,
     },
     /// ADD.W/L Dn,(An)+ store/accumulate operations.
     AddRegToPostInc {
@@ -1064,6 +1101,7 @@ impl TraceJit {
                 JitTraceOp::MoveMem { .. }
                     | JitTraceOp::MovemWordPostInc { .. }
                     | JitTraceOp::AluMemToReg { .. }
+                    | JitTraceOp::TstMem { .. }
                     | JitTraceOp::AddRegToPostInc { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::AnDispAddqSubq { .. }
@@ -1270,6 +1308,10 @@ impl TraceJit {
                     JitTraceOp::AluMemToReg { .. } => {
                         let env = mem_env.as_ref().expect("AluMemToReg implies a window env");
                         emit_alu_mem_to_reg(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::TstMem { .. } => {
+                        let env = mem_env.as_ref().expect("TstMem implies a window env");
+                        emit_tst_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::AddRegToPostInc { .. } => {
                         let env = mem_env
@@ -1577,11 +1619,21 @@ impl JitTraceOp {
             Self::AddqSubqReg { .. } => 8,
             Self::AddqSubqAddr { .. } => 8,
             Self::BinaryDataReg { cycles, .. } => cycles,
+            Self::BinaryImmediateDataReg { cycles, .. } => cycles,
+            // MC68000 multiply timing depends on the source bits. Use its
+            // slowest possible result for headroom; later supported CPUs use
+            // the interpreter's fixed pre-scaled value.
+            Self::MulWordDataReg {
+                m68000_timing: true,
+                ..
+            } => 70,
+            Self::MulWordDataReg { .. } => 42,
             Self::AddrDataReg {
                 op: JitAddrOp::Cmpa,
                 ..
             } => 6,
             Self::AddrDataReg { .. } => 8,
+            Self::LeaAn { cycles, .. } => cycles,
             Self::AddSubxReg { .. } => 8,
             Self::BitReg {
                 op: JitBitOp::Test, ..
@@ -1644,6 +1696,20 @@ impl JitTraceOp {
                             10
                         }
                     }
+                    JitEa::AbsWord(_) => {
+                        if long {
+                            12
+                        } else {
+                            8
+                        }
+                    }
+                    JitEa::AbsLong(_) => {
+                        if long {
+                            16
+                        } else {
+                            12
+                        }
+                    }
                 };
                 let dst_c = match dst {
                     JitEa::Disp(_, _) => {
@@ -1660,6 +1726,20 @@ impl JitTraceOp {
                             10
                         }
                     }
+                    JitEa::AbsWord(_) => {
+                        if long {
+                            12
+                        } else {
+                            8
+                        }
+                    }
+                    JitEa::AbsLong(_) => {
+                        if long {
+                            16
+                        } else {
+                            12
+                        }
+                    }
                     _ if dst.is_mem() => {
                         if long {
                             8
@@ -1673,6 +1753,15 @@ impl JitTraceOp {
             }
             Self::MovemWordPostInc { cycles, .. } => cycles,
             Self::AluMemToReg { .. } => 24,
+            // TST is a four-cycle operation plus the indexed EA read
+            // (M68000UM); byte and word reads have the same EA cost.
+            Self::TstMem { size, .. } => {
+                if size == Size::Long {
+                    18
+                } else {
+                    14
+                }
+            }
             Self::AddRegToPostInc { size, .. } => {
                 if size == Size::Long {
                     20
@@ -1724,6 +1813,9 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_indirect_jsr_trace_op(pc, opcode) {
         return Some(op);
     }
+    if let Some(op) = decode_binary_immediate_data_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
     if let Some(op) = decode_an_disp_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
@@ -1748,6 +1840,59 @@ fn decode_trace_op<B: AddressBus>(
         extension2: None,
         pc,
         op,
+    })
+}
+
+/// Decode the register-direct subset of the immediate ALU family. Once the
+/// extension words have been captured, these operations cannot fault and do
+/// not need effective-address handling inside the trace.
+fn decode_binary_immediate_data_reg_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluImm {
+        op,
+        size,
+        dst: FastEa::DataReg(dst),
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    let (immediate, extension2) = if size == Size::Long {
+        let low = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+        (((u32::from(extension)) << 16) | u32::from(low), Some(low))
+    } else {
+        (u32::from(extension) & size.mask(), None)
+    };
+    let op = match op {
+        BinaryOp::Add => JitBinaryOp::Add,
+        BinaryOp::Sub => JitBinaryOp::Sub,
+        BinaryOp::And => JitBinaryOp::And,
+        BinaryOp::Or => JitBinaryOp::Or,
+        BinaryOp::Eor => JitBinaryOp::Eor,
+        BinaryOp::Cmp => JitBinaryOp::Cmp,
+    };
+    let cycles = if size == Size::Long {
+        if op == JitBinaryOp::Cmp { 14 } else { 16 }
+    } else {
+        8
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(extension),
+        extension2,
+        pc,
+        op: JitTraceOp::BinaryImmediateDataReg {
+            op,
+            immediate,
+            dst,
+            size,
+            cycles,
+        },
     })
 }
 
@@ -1871,7 +2016,7 @@ fn decode_an_disp_trace_op<B: AddressBus>(
         } => {
             let displacement = read_ext(2, bus)?;
             (
-                displacement,
+                Some(displacement),
                 None,
                 JitTraceOp::AnDispUnary {
                     op: JitUnaryOp::Tst,
@@ -1881,13 +2026,21 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 },
             )
         }
+        DecodedMemOp::Tst {
+            size,
+            ea: FastEa::AnIndex(reg),
+        } => {
+            let extension = read_ext(2, bus)?;
+            let src = decode_jit_ea(6, u16::from(reg), extension, cpu_type)?;
+            (Some(extension), None, JitTraceOp::TstMem { size, src })
+        }
         DecodedMemOp::Clr {
             size,
             ea: FastEa::AnDisp(reg),
         } => {
             let displacement = read_ext(2, bus)?;
             (
-                displacement,
+                Some(displacement),
                 None,
                 JitTraceOp::AnDispUnary {
                     op: JitUnaryOp::Clr,
@@ -1905,7 +2058,7 @@ fn decode_an_disp_trace_op<B: AddressBus>(
         } => {
             let displacement = read_ext(2, bus)?;
             (
-                displacement,
+                Some(displacement),
                 None,
                 JitTraceOp::AnDispAddqSubq {
                     data,
@@ -1931,7 +2084,7 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 BitSource::Reg(bit_reg) => {
                     let displacement = read_ext(2, bus)?;
                     (
-                        displacement,
+                        Some(displacement),
                         None,
                         JitTraceOp::AnDispBit {
                             op,
@@ -1945,7 +2098,7 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                     let bit_word = read_ext(2, bus)?;
                     let displacement = read_ext(4, bus)?;
                     (
-                        bit_word,
+                        Some(bit_word),
                         Some(displacement),
                         JitTraceOp::AnDispBit {
                             op,
@@ -1957,20 +2110,50 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 }
             }
         }
+        DecodedMemOp::Lea {
+            reg: dst,
+            ea: FastEa::AnInd(base),
+        } => (
+            None,
+            None,
+            JitTraceOp::LeaAn {
+                base,
+                dst,
+                displacement: 0,
+                cycles: 4,
+            },
+        ),
+        DecodedMemOp::Lea {
+            reg: dst,
+            ea: FastEa::AnDisp(base),
+        } => {
+            let displacement = read_ext(2, bus)?;
+            (
+                Some(displacement),
+                None,
+                JitTraceOp::LeaAn {
+                    base,
+                    dst,
+                    displacement: displacement as i16,
+                    cycles: if is_pre_68020(cpu_type) { 8 } else { 4 },
+                },
+            )
+        }
         _ => return None,
     };
     Some(TraceBuildOp {
         opcode,
-        extension: Some(extension),
+        extension,
         extension2,
         pc,
         op,
     })
 }
 
-/// MOVE/MOVEA (groups 1-3) using register, register-indirect, or d16(An)
-/// EAs. At least one side must be memory; displacement words are captured
-/// in execution order for validation and self-modification checks.
+/// MOVE/MOVEA (groups 1-3) using register, register-indirect, d16(An), brief
+/// indexed, or absolute EAs. At least one side must be memory; extension
+/// words are captured in execution order for validation and
+/// self-modification checks.
 fn decode_move_mem_trace_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -1985,23 +2168,32 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     };
     let src_mode = (opcode >> 3) & 7;
     let dst_mode = (opcode >> 6) & 7;
-    let mut next_ext = pc.wrapping_add(2);
-    let mut extensions = [None, None];
+    let mut extensions = [0u16; 2];
     let mut extension_count = 0usize;
-    let mut read_ea_ext = |mode: u16| -> Option<u16> {
-        if mode != 5 && mode != 6 {
-            return Some(0);
+    let mut read_ext = || -> Option<u16> {
+        if extension_count == extensions.len() {
+            return None;
         }
-        let value = bus.try_read_word(cpu.address(next_ext)).ok()?;
-        next_ext = next_ext.wrapping_add(2);
-        extensions[extension_count] = Some(value);
+        let address = pc.wrapping_add(2 + 2 * extension_count as u32);
+        let value = bus.try_read_word(cpu.address(address)).ok()?;
+        extensions[extension_count] = value;
         extension_count += 1;
         Some(value)
     };
-    let src_ext = read_ea_ext(src_mode)?;
-    let dst_ext = read_ea_ext(dst_mode)?;
-    let src = decode_jit_ea(src_mode, opcode & 7, src_ext, cpu.cpu_type)?;
-    let dst = decode_jit_ea(dst_mode, (opcode >> 9) & 7, dst_ext, cpu.cpu_type)?;
+    let mut decode_ea = |mode: u16, reg: u16| -> Option<JitEa> {
+        match (mode, reg) {
+            (5 | 6, _) => decode_jit_ea(mode, reg, read_ext()?, cpu.cpu_type),
+            (7, 0) => Some(JitEa::AbsWord(read_ext()? as i16 as i32 as u32)),
+            (7, 1) => {
+                let high = read_ext()?;
+                let low = read_ext()?;
+                Some(JitEa::AbsLong((u32::from(high) << 16) | u32::from(low)))
+            }
+            _ => decode_jit_ea(mode, reg, 0, cpu.cpu_type),
+        }
+    };
+    let src = decode_ea(src_mode, opcode & 7)?;
+    let dst = decode_ea(dst_mode, (opcode >> 9) & 7)?;
     // The measured loop only needs indexed reads. Indexed stores can be
     // added when a profile demonstrates that their extra emitter paths pay.
     if matches!(dst, JitEa::Index { .. }) {
@@ -2016,8 +2208,8 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     }
     Some(TraceBuildOp {
         opcode,
-        extension: extensions[0],
-        extension2: extensions[1],
+        extension: (extension_count >= 1).then_some(extensions[0]),
+        extension2: (extension_count >= 2).then_some(extensions[1]),
         pc,
         op: JitTraceOp::MoveMem { size, src, dst },
     })
@@ -2178,6 +2370,9 @@ fn execute_portable_op(
     }
     if matches!(op.op, JitTraceOp::AluMemToReg { .. }) {
         return execute_portable_alu_mem_to_reg(cpu, op);
+    }
+    if matches!(op.op, JitTraceOp::TstMem { .. }) {
+        return execute_portable_tst_mem(cpu, op);
     }
     if matches!(op.op, JitTraceOp::AddRegToPostInc { .. }) {
         return execute_portable_add_reg_to_postinc(cpu, op, code_start, code_end);
@@ -2375,6 +2570,25 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_tst_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::TstMem { size, src } = trace.op else {
+        return None;
+    };
+    let ea = match src {
+        JitEa::Index { base, .. } => FastEa::AnIndex(base),
+        _ => return None,
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::Tst { size, ea }) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_add_reg_to_postinc(
     cpu: &mut CpuCore,
     trace: TraceBuildOp,
@@ -2444,6 +2658,24 @@ fn execute_portable_move_mem(
             }
         }
     };
+    let write = |cpu: &mut CpuCore, off: u32, value: u32| unsafe {
+        let p = (cpu.fm_ptr as *mut u8).add(off as usize);
+        match size {
+            Size::Byte => *p = value as u8,
+            Size::Word => {
+                let bytes = (value as u16).to_be_bytes();
+                *p = bytes[0];
+                *p.add(1) = bytes[1];
+            }
+            Size::Long => {
+                let bytes = value.to_be_bytes();
+                *p = bytes[0];
+                *p.add(1) = bytes[1];
+                *p.add(2) = bytes[2];
+                *p.add(3) = bytes[3];
+            }
+        }
+    };
 
     let mut staged: Option<(usize, u32)> = None;
     let value = match src {
@@ -2488,6 +2720,7 @@ fn execute_portable_move_mem(
                 .wrapping_add(displacement as i32 as u32);
             read(cpu, locate(cpu, a)?)
         }
+        JitEa::AbsWord(address) | JitEa::AbsLong(address) => read(cpu, locate(cpu, address)?),
     };
 
     let dst_base = |cpu: &CpuCore, r: u8| match staged {
@@ -2540,24 +2773,19 @@ fn execute_portable_move_mem(
             if let Some(v) = new_reg {
                 cpu.dar[8 + r as usize] = v;
             }
-            unsafe {
-                let p = (cpu.fm_ptr as *mut u8).add(off as usize);
-                match size {
-                    Size::Byte => *p = value as u8,
-                    Size::Word => {
-                        let b = (value as u16).to_be_bytes();
-                        *p = b[0];
-                        *p.add(1) = b[1];
-                    }
-                    Size::Long => {
-                        let b = value.to_be_bytes();
-                        *p = b[0];
-                        *p.add(1) = b[1];
-                        *p.add(2) = b[2];
-                        *p.add(3) = b[3];
-                    }
-                }
+            write(cpu, off, value);
+            cpu.set_logic_flags(value, size);
+        }
+        JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
+            let off = locate(cpu, address)?;
+            let masked = address & cpu.address_mask;
+            if masked < code_end && masked.wrapping_add(bytes) > code_start {
+                return None;
             }
+            if let Some((idx, value)) = staged {
+                cpu.dar[idx] = value;
+            }
+            write(cpu, off, value);
             cpu.set_logic_flags(value, size);
         }
         JitEa::Index { .. } => return None,
@@ -2723,6 +2951,74 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             }
             cycles
         }
+        JitTraceOp::BinaryImmediateDataReg {
+            op: binary_op,
+            immediate,
+            dst,
+            size,
+            cycles,
+        } => {
+            let dst_value = cpu.dar[dst as usize] & size.mask();
+            match binary_op {
+                JitBinaryOp::Add => {
+                    let result = dst_value.wrapping_add(immediate);
+                    cpu.set_add_flags(immediate, dst_value, result, size);
+                    portable_write_data_reg(cpu, dst, size, result);
+                }
+                JitBinaryOp::Sub => {
+                    let result = dst_value.wrapping_sub(immediate);
+                    cpu.set_sub_flags(immediate, dst_value, result, size);
+                    portable_write_data_reg(cpu, dst, size, result);
+                }
+                JitBinaryOp::And => {
+                    let result = immediate & dst_value;
+                    cpu.set_logic_flags(result, size);
+                    portable_write_data_reg(cpu, dst, size, result);
+                }
+                JitBinaryOp::Or => {
+                    let result = immediate | dst_value;
+                    cpu.set_logic_flags(result, size);
+                    portable_write_data_reg(cpu, dst, size, result);
+                }
+                JitBinaryOp::Eor => {
+                    let result = immediate ^ dst_value;
+                    cpu.set_logic_flags(result, size);
+                    portable_write_data_reg(cpu, dst, size, result);
+                }
+                JitBinaryOp::Cmp => {
+                    let result = dst_value.wrapping_sub(immediate);
+                    cpu.set_cmp_flags(immediate, dst_value, result, size);
+                }
+            }
+            cycles
+        }
+        JitTraceOp::MulWordDataReg {
+            src,
+            dst,
+            signed,
+            m68000_timing,
+        } => {
+            let src_word = cpu.dar[src as usize] as u16;
+            let dst_word = cpu.dar[dst as usize] as u16;
+            let result = if signed {
+                (i32::from(src_word as i16) * i32::from(dst_word as i16)) as u32
+            } else {
+                u32::from(src_word) * u32::from(dst_word)
+            };
+            cpu.dar[dst as usize] = result;
+            cpu.set_logic_flags(result, Size::Long);
+            if m68000_timing {
+                let variable = if signed {
+                    let shifted = u32::from(src_word) << 1;
+                    ((shifted ^ (shifted >> 1)) & 0xFFFF).count_ones()
+                } else {
+                    src_word.count_ones()
+                };
+                38 + 2 * variable as i32
+            } else {
+                42
+            }
+        }
         JitTraceOp::AddrDataReg { op, src, dst, size } => {
             let mut src = portable_read_reg(cpu, src, size);
             if size == Size::Word {
@@ -2745,6 +3041,16 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                     6
                 }
             }
+        }
+        JitTraceOp::LeaAn {
+            base,
+            dst,
+            displacement,
+            cycles,
+        } => {
+            cpu.dar[8 + dst as usize] =
+                cpu.dar[8 + base as usize].wrapping_add(displacement as i32 as u32);
+            cycles
         }
         JitTraceOp::AddSubxReg {
             src,
@@ -2916,6 +3222,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         }
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is handled by execute_portable_alu_mem_to_reg")
+        }
+        JitTraceOp::TstMem { .. } => {
+            unreachable!("TstMem is handled by execute_portable_tst_mem")
         }
         JitTraceOp::AddRegToPostInc { .. } => {
             unreachable!("AddRegToPostInc is handled by execute_portable_add_reg_to_postinc")
@@ -3129,6 +3438,84 @@ fn emit_jit_op(
             }
             cycles_const(builder, op.op.max_cycles())
         }
+        JitTraceOp::BinaryImmediateDataReg {
+            op: binary_op,
+            immediate,
+            dst,
+            size,
+            ..
+        } => {
+            let src_value = iconst_u32(builder, immediate);
+            let dst_value = load_reg_sized(builder, cpu, JitDirectReg::Data(dst), size);
+            match binary_op {
+                JitBinaryOp::Add => {
+                    let result = builder.ins().iadd(dst_value, src_value);
+                    write_data_reg_sized(builder, cpu, dst, size, result);
+                    set_add_flags(builder, cpu, src_value, dst_value, result, size);
+                }
+                JitBinaryOp::Sub => {
+                    let result = builder.ins().isub(dst_value, src_value);
+                    write_data_reg_sized(builder, cpu, dst, size, result);
+                    set_sub_flags(builder, cpu, src_value, dst_value, result, size);
+                }
+                JitBinaryOp::And => {
+                    let result = builder.ins().band(dst_value, src_value);
+                    write_data_reg_sized(builder, cpu, dst, size, result);
+                    set_logic_flags(builder, cpu, result, size);
+                }
+                JitBinaryOp::Or => {
+                    let result = builder.ins().bor(dst_value, src_value);
+                    write_data_reg_sized(builder, cpu, dst, size, result);
+                    set_logic_flags(builder, cpu, result, size);
+                }
+                JitBinaryOp::Eor => {
+                    let result = builder.ins().bxor(dst_value, src_value);
+                    write_data_reg_sized(builder, cpu, dst, size, result);
+                    set_logic_flags(builder, cpu, result, size);
+                }
+                JitBinaryOp::Cmp => {
+                    let result = builder.ins().isub(dst_value, src_value);
+                    set_cmp_flags(builder, cpu, src_value, dst_value, result, size);
+                }
+            }
+            cycles_const(builder, op.op.max_cycles())
+        }
+        JitTraceOp::MulWordDataReg {
+            src,
+            dst,
+            signed,
+            m68000_timing,
+        } => {
+            let src_word = load_reg_sized(builder, cpu, JitDirectReg::Data(src), Size::Word);
+            let dst_word = load_reg_sized(builder, cpu, JitDirectReg::Data(dst), Size::Word);
+            let (src_value, dst_value) = if signed {
+                (
+                    sign_extend_word(builder, src_word),
+                    sign_extend_word(builder, dst_word),
+                )
+            } else {
+                (src_word, dst_word)
+            };
+            let result = builder.ins().imul(src_value, dst_value);
+            store_reg(builder, cpu, JitDirectReg::Data(dst), result);
+            set_logic_flags(builder, cpu, result, Size::Long);
+
+            if m68000_timing {
+                let bits = if signed {
+                    let shifted = builder.ins().ishl_imm(src_word, 1);
+                    let previous = builder.ins().ushr_imm(shifted, 1);
+                    let transitions = builder.ins().bxor(shifted, previous);
+                    builder.ins().band_imm(transitions, 0xFFFF)
+                } else {
+                    src_word
+                };
+                let variable = builder.ins().popcnt(bits);
+                let doubled = builder.ins().ishl_imm(variable, 1);
+                builder.ins().iadd_imm(doubled, 38)
+            } else {
+                cycles_const(builder, 42)
+            }
+        }
         JitTraceOp::AddrDataReg {
             op: addr_op,
             src,
@@ -3160,6 +3547,17 @@ fn emit_jit_op(
                     cycles_const(builder, 6)
                 }
             }
+        }
+        JitTraceOp::LeaAn {
+            base,
+            dst,
+            displacement,
+            ..
+        } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let address = builder.ins().iadd_imm(base, displacement as i64);
+            store_reg(builder, cpu, JitDirectReg::Addr(dst), address);
+            cycles_const(builder, op.op.max_cycles())
         }
         JitTraceOp::AddSubxReg {
             src,
@@ -3312,6 +3710,9 @@ fn emit_jit_op(
         }
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is emitted by emit_alu_mem_to_reg")
+        }
+        JitTraceOp::TstMem { .. } => {
+            unreachable!("TstMem is emitted by emit_tst_mem")
         }
         JitTraceOp::AddRegToPostInc { .. } => {
             unreachable!("AddRegToPostInc is emitted by emit_add_reg_to_postinc")
@@ -3563,6 +3964,60 @@ fn guard_store_not_code(
         .icmp_imm(IntCC::UnsignedGreaterThan, past, env.code_start as i64);
     let bad = builder.ins().band(lt_end, gt_start);
     branch_guard(builder, bail, bad);
+}
+
+/// Emit a read-only brief-indexed TST. The extension word is decoded while
+/// recording, so the hot path performs only the live address calculation,
+/// checked load, and condition-code update.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_tst_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::TstMem {
+        size,
+        src:
+            JitEa::Index {
+                base,
+                index,
+                index_long,
+                scale,
+                displacement,
+            },
+    } = trace.op
+    else {
+        unreachable!("memory TST decoder admitted an unsupported EA")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    let raw_index = load_reg(builder, cpu, index);
+    let index = if index_long {
+        raw_index
+    } else {
+        let word = builder.ins().ireduce(types::I16, raw_index);
+        builder.ins().sextend(types::I32, word)
+    };
+    let index = if scale == 0 {
+        index
+    } else {
+        builder.ins().ishl_imm(index, i64::from(scale))
+    };
+    let address = builder.ins().iadd(base, index);
+    let address = builder.ins().iadd_imm(address, displacement as i64);
+    let (off, _) = checked_window_off(builder, env, bail, address, size);
+    let value = window_load(builder, env, off, size);
+    set_logic_flags(builder, cpu, value, size);
+    cycles_const(builder, trace.op.max_cycles())
 }
 
 /// Emit a read-only memory-to-register ALU operation. All address checks run
@@ -3842,6 +4297,11 @@ fn emit_move_mem(
             let (off, _) = checked_window_off(builder, env, bail, a, size);
             window_load(builder, env, off, size)
         }
+        JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
+            let address = iconst_u32(builder, address);
+            let (off, _) = checked_window_off(builder, env, bail, address, size);
+            window_load(builder, env, off, size)
+        }
         JitEa::PostInc(r) => {
             let a = load_an(builder, r);
             let (off, _) = checked_window_off(builder, env, bail, a, size);
@@ -3955,6 +4415,14 @@ fn emit_move_mem(
             if let Some(v) = new_reg {
                 store_reg(builder, cpu, JitDirectReg::Addr(r), v);
             }
+            window_store(builder, env, off, size, value);
+            set_logic_flags(builder, cpu, value, size);
+        }
+        JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
+            let address = iconst_u32(builder, address);
+            let (off, masked) = checked_window_off(builder, env, bail, address, size);
+            guard_store_not_code(builder, env, bail, masked, size);
+            commit_staged(builder);
             window_store(builder, env, off, size, value);
             set_logic_flags(builder, cpu, value, size);
         }
@@ -4611,6 +5079,251 @@ fn trace_cache_index(pc: u32) -> usize {
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+
+    #[test]
+    fn decodes_register_source_word_multiply() {
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        let mut mem = super::super::memory::LinearMemoryBus::new(0x1_0000);
+        mem.write_word(0x6004, 0xC0C3);
+        let op = decode_trace_op(&cpu, &mut mem, 0x6004, CpuType::M68040).expect("MULU.W D3,D0");
+        assert!(matches!(
+            op.op,
+            JitTraceOp::MulWordDataReg {
+                src: 3,
+                dst: 0,
+                signed: false,
+                m68000_timing: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn register_word_multiply_matches_interpreter_and_decoded_cache() {
+        use super::super::ea::AddressingMode;
+
+        for cpu_type in [CpuType::M68000, CpuType::M68010, CpuType::M68040] {
+            for signed in [false, true] {
+                for source in [0x0000u32, 0x8001, 0xFFFF] {
+                    let opcode = 0xC000 | (1 << 9) | ((if signed { 7 } else { 3 }) << 6) | 5;
+                    let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+
+                    let mut expected = cpu();
+                    expected.set_cpu_type(cpu_type);
+                    expected.set_d(5, source);
+                    expected.set_d(1, 0x8003);
+                    expected.set_ccr(0x1F);
+                    let expected_cycles = if signed {
+                        expected.exec_muls(&mut bus, AddressingMode::DataDirect(5), 1)
+                    } else {
+                        expected.exec_mulu(&mut bus, AddressingMode::DataDirect(5), 1)
+                    };
+
+                    let decoded = DecodedSimpleOp::decode(cpu_type, opcode)
+                        .expect("register-source word multiply must be cached");
+                    let mut actual = cpu();
+                    actual.set_cpu_type(cpu_type);
+                    actual.set_d(5, source);
+                    actual.set_d(1, 0x8003);
+                    actual.set_ccr(0x1F);
+                    let actual_cycles = decoded.execute(&mut actual, &mut bus);
+
+                    assert_eq!(
+                        actual_cycles, expected_cycles,
+                        "{cpu_type:?} signed={signed}"
+                    );
+                    assert_eq!(actual.d(1), expected.d(1), "{cpu_type:?} signed={signed}");
+                    assert_eq!(
+                        actual.get_ccr(),
+                        expected.get_ccr(),
+                        "{cpu_type:?} signed={signed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn immediate_data_register_alu_matches_interpreter() {
+        let operations = [
+            (JitBinaryOp::Or, 0x0000),
+            (JitBinaryOp::And, 0x0200),
+            (JitBinaryOp::Sub, 0x0400),
+            (JitBinaryOp::Add, 0x0600),
+            (JitBinaryOp::Eor, 0x0A00),
+            (JitBinaryOp::Cmp, 0x0C00),
+        ];
+        let cases = [
+            (Size::Byte, 0x81u32, 0xA5A5_557Fu32),
+            (Size::Word, 0x8001u32, 0xA5A5_7FFFu32),
+            (Size::Long, 0x8000_0001u32, 0x7FFF_FFFFu32),
+        ];
+
+        for (binary_op, opcode_base) in operations {
+            for (size, immediate, initial) in cases {
+                let size_bits = match size {
+                    Size::Byte => 0,
+                    Size::Word => 1,
+                    Size::Long => 2,
+                };
+                let opcode = opcode_base | (size_bits << 6) | 3;
+                let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+                bus.write_word(0x0100, opcode);
+                if size == Size::Long {
+                    bus.write_word(0x0102, (immediate >> 16) as u16);
+                    bus.write_word(0x0104, immediate as u16);
+                } else {
+                    bus.write_word(0x0102, immediate as u16);
+                }
+                let op = decode_trace_op(&cpu(), &mut bus, 0x0100, CpuType::M68040)
+                    .expect("register immediate must decode");
+
+                let mut expected = cpu();
+                expected.set_cpu_type(CpuType::M68040);
+                expected.set_d(3, initial);
+                expected.set_ccr(0x1F);
+                assert!(matches!(
+                    expected.step(&mut bus),
+                    super::super::types::StepResult::Ok { .. }
+                ));
+
+                let mut actual = cpu();
+                actual.set_cpu_type(CpuType::M68040);
+                actual.set_d(3, initial);
+                actual.set_ccr(0x1F);
+                assert_eq!(
+                    execute_portable_op(&mut actual, op, 0x0100, 0x0100 + op.length() as u32),
+                    Some(op.op.max_cycles()),
+                    "{binary_op:?} {size:?}"
+                );
+                assert_eq!(actual.d(3), expected.d(3), "{binary_op:?} {size:?}");
+                assert_eq!(
+                    actual.get_ccr(),
+                    expected.get_ccr(),
+                    "{binary_op:?} {size:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn absolute_movea_and_displacement_lea_preserve_flags() {
+        let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        decode_bus.write_word(0x0100, 0x2079); // MOVEA.L $00000200,A0
+        decode_bus.write_word(0x0102, 0x0000);
+        decode_bus.write_word(0x0104, 0x0200);
+        decode_bus.write_word(0x0106, 0x43E8); // LEA -$0100(A0),A1
+        decode_bus.write_word(0x0108, 0xFF00);
+        let movea = decode_trace_op(&cpu(), &mut decode_bus, 0x0100, CpuType::M68040).unwrap();
+        let lea = decode_trace_op(&cpu(), &mut decode_bus, 0x0106, CpuType::M68040).unwrap();
+
+        let mut actual = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0200..0x0204].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        attach_window(&mut actual, &mut mem);
+        actual.set_ccr(0x1F);
+
+        assert!(execute_portable_op(&mut actual, movea, 0x0100, 0x0106).is_some());
+        assert!(execute_portable_op(&mut actual, lea, 0x0106, 0x010A).is_some());
+        assert_eq!(actual.a(0), 0x1234_5678);
+        assert_eq!(actual.a(1), 0x1234_5578);
+        assert_eq!(actual.get_ccr(), 0x1F, "MOVEA and LEA do not affect CCR");
+    }
+
+    #[test]
+    fn indexed_tst_bails_without_changing_flags() {
+        let op = TraceBuildOp {
+            opcode: 0x4A70,
+            extension: Some(0x0800),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::TstMem {
+                size: Size::Word,
+                src: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(0),
+                    index_long: true,
+                    scale: 0,
+                    displacement: 0,
+                },
+            },
+        };
+        let mut actual = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0x0800u16.to_be_bytes());
+        attach_window(&mut actual, &mut mem);
+        actual.set_a(0, 0x00FF_F000);
+        actual.set_d(0, 4);
+        actual.set_ccr(0x1F);
+
+        assert_eq!(execute_portable_op(&mut actual, op, 0x0100, 0x0104), None);
+        assert_eq!(actual.pc, 0x0100);
+        assert_eq!(actual.get_ccr(), 0x1F);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_guarded_indexed_scan_reaches_its_terminal_bound() {
+        const START: u32 = 0x0100;
+        let words = [
+            0x7038, // MOVEQ #56,D0
+            0xC0C3, // MULU.W D3,D0
+            0x2079, 0x0000, 0x0300, // MOVEA.L $00000300,A0
+            0x41E8, 0x002A, // LEA 42(A0),A0
+            0x4A70, 0x0800, // TST.W 0(A0,D0.L)
+            0x6F00, 0x00EC, // BLE.W latch (common path)
+        ];
+        let latch_words = [
+            0x5243, // ADDQ.W #1,D3
+            0x0C43, 0x0080, // CMPI.W #128,D3
+            0x6D00, 0xFEF8, // BLT.W start
+        ];
+        let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x3000);
+        for (index, word) in words.iter().enumerate() {
+            decode_bus.write_word(START + index as u32 * 2, *word);
+        }
+        for (index, word) in latch_words.iter().enumerate() {
+            decode_bus.write_word(0x0200 + index as u32 * 2, *word);
+        }
+        let pcs = [
+            0x0100, 0x0102, 0x0104, 0x010A, 0x010E, 0x0112, 0x0200, 0x0202, 0x0206,
+        ];
+        let mut ops: Vec<_> = pcs
+            .iter()
+            .map(|&pc| decode_trace_op(&cpu(), &mut decode_bus, pc, CpuType::M68040).unwrap())
+            .collect();
+        let JitTraceOp::Branch { expected_taken, .. } = &mut ops[5].op else {
+            panic!("interior BLE must decode as a branch");
+        };
+        *expected_taken = Some(true);
+
+        let mut actual = cpu();
+        let mut mem = vec![0u8; 0x3000];
+        for (index, word) in words.iter().enumerate() {
+            let at = START as usize + index * 2;
+            mem[at..at + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        for (index, word) in latch_words.iter().enumerate() {
+            let at = 0x0200 + index * 2;
+            mem[at..at + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        mem[0x0300..0x0304].copy_from_slice(&0x0000_0400u32.to_be_bytes());
+        attach_window(&mut actual, &mut mem);
+        actual.set_cpu_type(CpuType::M68040);
+        actual.pc = START;
+        actual.set_d(3, 0);
+
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&actual, START, CpuType::M68040, ops, Some(START))
+            .expect("bounded indexed scan should compile");
+        assert!(compiled.native_loop);
+        let packed = unsafe { compiled.call_native(&mut actual, 1_000) };
+
+        assert_eq!((packed >> 32) as u32, 128 * 9);
+        assert_eq!(actual.d(3) as u16, 128);
+        assert_eq!(actual.pc, 0x020A);
+    }
 
     fn cpu() -> CpuCore {
         let mut cpu = CpuCore::new();
