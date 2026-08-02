@@ -811,6 +811,20 @@ const fn reg_to_reg_move_dest(op: u16) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::memory::{AddressBus, LinearMemoryBus};
+    use crate::core::types::{CpuType, HleHandler, StepResult};
+
+    fn prime_result_latch(cpu: &mut CpuCore) {
+        cpu.ir = 0x3002; // MOVE.W D2,D0
+        assert_eq!(cpu.cycles_020(4, true), 2);
+    }
+
+    fn assert_result_latch_cleared(cpu: &mut CpuCore) {
+        assert_eq!(cpu.result_latch_020, None);
+        cpu.instruction_exception_vector = None;
+        cpu.ir = 0x3200; // MOVE.W D0,D1
+        assert_eq!(cpu.cycles_020(4, true), 2);
+    }
 
     fn timed(op: u16, raw: i32, cached: bool) -> i32 {
         let mut cpu = CpuCore::new();
@@ -821,7 +835,7 @@ mod tests {
     #[test]
     fn result_forwarding_refunds_one_clock_on_a_raw_reg_move_pair() {
         let mut cpu = CpuCore::new();
-        cpu.set_cpu_type(crate::core::types::CpuType::M68EC020);
+        cpu.set_cpu_type(CpuType::M68EC020);
         cpu.ir = 0x3002; // MOVE.W D2,D0
         assert_eq!(cpu.cycles_020(4, true), 2);
         cpu.ir = 0x3200; // MOVE.W D0,D1: source still in the result latch
@@ -843,6 +857,75 @@ mod tests {
         let _ = cpu.cycles_020(4, false);
         cpu.ir = 0x3200;
         assert_eq!(cpu.cycles_020(4, false), 3);
+    }
+
+    #[test]
+    fn execution_boundaries_clear_the_result_latch() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68EC020);
+
+        prime_result_latch(&mut cpu);
+        cpu.set_cpu_type(CpuType::M68020);
+        assert_result_latch_cleared(&mut cpu);
+
+        prime_result_latch(&mut cpu);
+        cpu.pulse_reset();
+        assert_result_latch_cleared(&mut cpu);
+
+        prime_result_latch(&mut cpu);
+        cpu.set_precise_bus(false);
+        cpu.set_precise_bus(true);
+        assert_result_latch_cleared(&mut cpu);
+
+        prime_result_latch(&mut cpu);
+        let mut bus = LinearMemoryBus::new(0x100);
+        cpu.jump_vector(&mut bus, 4);
+        assert_result_latch_cleared(&mut cpu);
+
+        prime_result_latch(&mut cpu);
+        cpu.stop(0x2700);
+        assert_result_latch_cleared(&mut cpu);
+
+        prime_result_latch(&mut cpu);
+        cpu.halt();
+        assert_result_latch_cleared(&mut cpu);
+    }
+
+    #[test]
+    fn surfaced_and_hle_handled_traps_clear_the_result_latch() {
+        struct AssertClearedHandler;
+
+        impl HleHandler for AssertClearedHandler {
+            fn handle_aline(
+                &mut self,
+                cpu: &mut CpuCore,
+                _bus: &mut dyn AddressBus,
+                _opcode: u16,
+            ) -> bool {
+                assert_eq!(cpu.result_latch_020, None);
+                true
+            }
+        }
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68EC020);
+        let mut bus = LinearMemoryBus::new(0x100);
+        bus.write_word_at(0, 0xA000);
+
+        prime_result_latch(&mut cpu);
+        assert!(matches!(
+            cpu.step(&mut bus),
+            StepResult::AlineTrap { opcode: 0xA000 }
+        ));
+        assert_result_latch_cleared(&mut cpu);
+
+        cpu.pc = 0;
+        prime_result_latch(&mut cpu);
+        assert!(matches!(
+            cpu.step_with_hle_handler(&mut bus, &mut AssertClearedHandler),
+            StepResult::Ok { .. }
+        ));
+        assert_result_latch_cleared(&mut cpu);
     }
 
     #[test]

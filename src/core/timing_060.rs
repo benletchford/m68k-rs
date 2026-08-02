@@ -704,8 +704,8 @@ impl CpuCore {
         true
     }
 
-    /// Clear any open pairing window: called at every exception entry
-    /// (jump_vector), on HLE-handled traps, reset, and STOP.
+    /// Clear any open pairing window. Execution-boundary callers use
+    /// `clear_execution_pipeline_state` so every CPU model is reset together.
     #[inline]
     pub(crate) fn break_060_pipeline(&mut self) {
         self.oep060.pending_head = None;

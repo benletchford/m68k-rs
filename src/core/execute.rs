@@ -569,6 +569,10 @@ impl CpuCore {
             opcode_fetch_cached
         };
 
+        if !matches!(result, InternalStepResult::Ok { .. }) {
+            self.clear_execution_pipeline_state();
+        }
+
         let res = match result {
             InternalStepResult::Ok { cycles } => StepResult::Ok {
                 cycles: self.finalize_cycles(cycles, fetch_cached),
@@ -676,6 +680,13 @@ impl CpuCore {
             opcode_fetch_cached
         };
 
+        // A surfaced or HLE-handled trap still represents an architectural
+        // execution boundary. Clear timing state before invoking callbacks,
+        // since a handler may itself resume execution.
+        if !matches!(result, InternalStepResult::Ok { .. }) {
+            self.clear_execution_pipeline_state();
+        }
+
         // Handle trap results via callbacks, fallback to exception if not handled
         let cycles = match result {
             InternalStepResult::Ok { cycles } => self.finalize_cycles(cycles, fetch_cached),
@@ -683,9 +694,6 @@ impl CpuCore {
                 if !handler.handle_aline(self, bus, opcode) {
                     self.take_aline_exception(bus)
                 } else {
-                    // On real hardware this is an exception: no pairing
-                    // window survives it.
-                    self.break_060_pipeline();
                     0 // HLE handled, 0 cycles for now
                 }
             }
@@ -693,7 +701,6 @@ impl CpuCore {
                 if !handler.handle_fline(self, bus, opcode) {
                     self.take_fline_exception(bus)
                 } else {
-                    self.break_060_pipeline();
                     0
                 }
             }
@@ -787,8 +794,8 @@ impl CpuCore {
 
     /// Jump to an exception vector.
     pub fn jump_vector<B: AddressBus>(&mut self, bus: &mut B, vector: u32) {
-        // Any exception entry breaks an open 68060 pairing window.
-        self.break_060_pipeline();
+        // Any exception entry breaks open execution-pipeline state.
+        self.clear_execution_pipeline_state();
         // An earlier poll-point hold must not survive into the handler:
         // the refill below is a fresh IPL poll point (Moira jumpToVector
         // polls during the final refill read).
@@ -973,12 +980,13 @@ impl CpuCore {
 
     /// Halt the CPU.
     pub fn halt(&mut self) {
+        self.clear_execution_pipeline_state();
         self.stopped |= STOP_LEVEL_HALT;
     }
 
     /// Stop the CPU (STOP instruction).
     pub fn stop(&mut self, new_sr: u16) {
-        self.break_060_pipeline();
+        self.clear_execution_pipeline_state();
         self.set_sr(new_sr);
         self.stopped |= STOP_LEVEL_STOP;
     }
