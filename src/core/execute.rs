@@ -198,9 +198,10 @@ impl CpuCore {
     /// - A non-positive budget returns immediately with
     ///   [`CycleBatchExit::BudgetExhausted`].
     /// - A bus boundary request is polled after each normally completed
-    ///   instruction. It includes that instruction in both totals and takes
-    ///   precedence over simultaneous budget exhaustion. STOP and surfaced
-    ///   traps retain their existing exit reasons.
+    ///   instruction and after interrupt entry on batch entry. Completed work
+    ///   is included in the totals, and the request takes precedence over
+    ///   simultaneous budget exhaustion. STOP and surfaced traps retain their
+    ///   existing exit reasons.
     pub fn run_for_cycles<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -228,7 +229,14 @@ impl CpuCore {
 
         // Interrupts are instruction-boundary events. Service one before the
         // first fetch, including when it wakes a stopped CPU.
-        self.check_and_service_interrupts(bus);
+        let serviced_entry_interrupt = self.check_and_service_interrupts(bus);
+        if serviced_entry_interrupt && bus.take_boundary_request() {
+            return CycleBatchResult {
+                cycles: self.initial_cycles - self.cycles_remaining,
+                instructions: 0,
+                exit: CycleBatchExit::BoundaryRequested,
+            };
+        }
 
         let mut instructions = 0;
         loop {
@@ -834,8 +842,8 @@ impl CpuCore {
 
     // ========== Interrupt Handling ==========
 
-    /// Check and service pending interrupts.
-    fn check_and_service_interrupts<B: AddressBus>(&mut self, bus: &mut B) {
+    /// Check and service pending interrupts, returning whether one was taken.
+    fn check_and_service_interrupts<B: AddressBus>(&mut self, bus: &mut B) -> bool {
         // NMI (level 7) always triggers, others compare to mask
         let mask_level = (self.int_mask >> 8) & 7;
         let int_level = self.int_level & 7;
@@ -847,6 +855,9 @@ impl CpuCore {
             // We clear cpu.int_level here; the test harness will re-poll and set it
             // again in the next step if another interrupt is pending.
             self.int_level = 0;
+            true
+        } else {
+            false
         }
     }
 
