@@ -493,9 +493,8 @@ mod tests {
         reset();
         let mut bus = LinearMemoryBus::new(0x1000);
         bus.write_word(0, 0x5280); // ADDQ.L #1,D0: traceable prefix
-        bus.write_word(2, 0x0640); // ADDI.W #1,D0: untraceable blocker
-        bus.write_word(4, 0x0001);
-        bus.write_word(6, 0x60F8); // BRA.S $0000
+        bus.write_word(2, 0x4AC0); // TAS D0: untraceable blocker
+        bus.write_word(4, 0x60FA); // BRA.S $0000
 
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68040);
@@ -514,7 +513,7 @@ mod tests {
         assert_eq!(row.recording_attempts, 1);
         assert_eq!(row.prefix_ops, 1);
         assert_eq!(row.blocker_pc, Some(2));
-        assert_eq!(row.blocker_opcode, Some(0x0640));
+        assert_eq!(row.blocker_opcode, Some(0x4AC0));
         assert_eq!(row.projected_dispatches(), row.rejected_hits);
     }
 

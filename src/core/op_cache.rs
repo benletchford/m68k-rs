@@ -84,6 +84,12 @@ pub(crate) enum DecodedSimpleOp {
         size: Size,
         cycles: i32,
     },
+    MulWordDataReg {
+        src: u8,
+        dst: u8,
+        signed: bool,
+        m68000_timing: bool,
+    },
     AddrDataReg {
         op: AddrOp,
         src: DirectReg,
@@ -363,6 +369,17 @@ impl DecodedSimpleOp {
                 size,
                 cycles,
             }),
+            Self::MulWordDataReg {
+                src,
+                dst,
+                signed,
+                m68000_timing,
+            } => Some(JitTraceOp::MulWordDataReg {
+                src,
+                dst,
+                signed,
+                m68000_timing,
+            }),
             Self::AddrDataReg { op, src, dst, size } => Some(JitTraceOp::AddrDataReg {
                 op: jit_addr_op(op),
                 src: jit_direct_reg(src),
@@ -588,6 +605,37 @@ impl DecodedSimpleOp {
                     }
                 }
                 cycles
+            }
+            Self::MulWordDataReg {
+                src,
+                dst,
+                signed,
+                m68000_timing,
+            } => {
+                let src_word = cpu.dar[src as usize] as u16;
+                let dst_word = cpu.dar[dst as usize] as u16;
+                let result = if signed {
+                    (i32::from(src_word as i16) * i32::from(dst_word as i16)) as u32
+                } else {
+                    u32::from(src_word) * u32::from(dst_word)
+                };
+                cpu.dar[dst as usize] = result;
+                cpu.set_logic_flags(result, Size::Long);
+
+                if m68000_timing {
+                    let variable = if signed {
+                        // The 68000 signed multiplier counts transitions in
+                        // the 17-bit sequence formed by the source and a
+                        // trailing zero. Later CPUs use fixed timing.
+                        let shifted = u32::from(src_word) << 1;
+                        ((shifted ^ (shifted >> 1)) & 0xFFFF).count_ones()
+                    } else {
+                        src_word.count_ones()
+                    };
+                    38 + 2 * variable as i32
+                } else {
+                    42
+                }
             }
             Self::AddrDataReg { op, src, dst, size } => {
                 let dst = dst as usize;
@@ -872,6 +920,15 @@ fn decode_group_alu_reg(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleO
             _ => None,
         },
         0xC => {
+            if matches!(op_mode, 3 | 7) && ea_mode == 0 {
+                return Some(DecodedSimpleOp::MulWordDataReg {
+                    src: ea_reg,
+                    dst: reg,
+                    signed: op_mode == 7,
+                    m68000_timing: cpu_type == CpuType::M68000,
+                });
+            }
+
             if op_mode <= 2 {
                 return Some(DecodedSimpleOp::BinaryDataReg {
                     op: BinaryOp::And,

@@ -747,6 +747,74 @@ fn bench_trace_branch_bias() {
     );
 }
 
+/// Measure a compiler-shaped bounded record scan with a predicted interior
+/// branch and a conditional loop latch. An outer two-instruction loop resets
+/// the index so the benchmark repeatedly exercises both the hot path and the
+/// terminal exit instead of turning the scan into an unbounded synthetic loop.
+///
+/// The measured 68k sequence is equivalent to this C-shaped loop:
+///
+/// ```c
+/// struct Record {
+///     uint8_t prefix[42];
+///     int16_t state;
+///     uint8_t suffix[12];
+/// };
+///
+/// for (int16_t i = 0; i < 128; ++i) {
+///     struct Record *records = *record_table;
+///     if (records[(uint16_t)i].state > 0)
+///         uncommon_path();
+/// }
+/// ```
+fn bench_guarded_indexed_scan() {
+    const CODE_BASE: u32 = 0x6000;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0x7600, // outer: MOVEQ #0,D3
+        0x7038, // scan: MOVEQ #56,D0
+        0xC0C3, // MULU.W D3,D0
+        0x2079, 0x0000, 0x4000, // MOVEA.L $00004000,A0
+        0x41E8, 0x002A, // LEA 42(A0),A0
+        0x4A70, 0x0800, // TST.W 0(A0,D0.L)
+        0x6F02, // BLE.S latch (common path)
+        0x4E71, // uncommon-path placeholder
+        0x5243, // latch: ADDQ.W #1,D3
+        0x0C43, 0x0080, // CMPI.W #128,D3
+        0x6D00, 0xFFE2, // BLT.W scan
+        0x7600, // MOVEQ #0,D3
+        0x60DC, // BRA.S scan
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_long(0x4000, 0x5000);
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0xF000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     guarded indexed scan    {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -854,6 +922,10 @@ fn main() {
     }
     if only.as_deref() == Some("trace-branch-bias") {
         bench_trace_branch_bias();
+        return;
+    }
+    if only.as_deref() == Some("guarded-indexed-scan") {
+        bench_guarded_indexed_scan();
         return;
     }
     if only.as_deref() == Some("immediate-shifts") {
