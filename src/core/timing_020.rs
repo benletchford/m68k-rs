@@ -28,19 +28,28 @@
 //! head, which a per-instruction model with no overlap stage cannot express,
 //! so the cost is charged where the flush happens.
 //!
-//! The refill constant is calibrated against real hardware: a 68EC020 at
-//! 14.19 MHz (Amiga 1200) measures 7 clocks per cached taken `dbra` in three
-//! independent E-clock-referenced loop tests, i.e. the manual's cache-case 6
-//! plus 1, and every other measured loop (`move`, shift, `mulu`, paired ops)
-//! agrees with the same +1 once the loop branch is accounted for. A refill of
-//! 2 reproduced FS-UAE, which the same disk shows over-billing each taken
-//! branch by one clock against the real machine.
+//! The refill cost is calibrated against real hardware: a 68EC020 at
+//! 14.19 MHz (Amiga 1200), measured over thirty cached loops referenced to
+//! the CIA E-clock, pays it only when the branch opcode word is
+//! longword-aligned. A cached taken `dbra` costs 7 clocks at `pc % 4 == 0`
+//! and 6 clocks - the manual's cache case - at `pc % 4 == 2`. Every measured
+//! loop follows `6 + 2 * body_instructions + refill`, with no exception among
+//! the thirty, and the loop *head* alignment varies freely within each refill
+//! class, so it is the branch's own alignment that decides the cost and not
+//! the target's. The mechanism is presumed to be the longword granularity of
+//! instruction fetch: a branch whose opcode and displacement straddle two
+//! longwords has already had the second one fetched when it retires.
+//!
+//! Only `DBcc` was measured. `Bcc`/`BSR` keep the flat refill until a probe
+//! covers them; see `TAKEN_BRANCH_REFILL`.
 
 use super::cpu::CpuCore;
 use super::types::Size;
 
-/// Clocks a taken branch loses refilling the 020's instruction pipeline
-/// (real-A1200 calibrated: cached taken dbra = 7 clocks total).
+/// Clocks a taken branch loses refilling the 020's instruction pipeline when
+/// its alignment is unmeasured (`Bcc`, `BSR`). Real hardware shows the cost is
+/// alignment dependent for `DBcc` ([`CpuCore::taken_branch_refill`]); these
+/// forms are billed the longword-aligned cost until a probe measures them.
 const TAKEN_BRANCH_REFILL: i32 = 1;
 
 #[derive(Clone, Copy)]
@@ -645,7 +654,8 @@ fn group_5(cpu: &CpuCore, op: u16, cached: bool) -> Option<i32> {
         } else if cpu.d(reg as usize) as u16 == 0xFFFF {
             Case::new(10, 10)
         } else {
-            Case::new(6 + TAKEN_BRANCH_REFILL, 9 + TAKEN_BRANCH_REFILL)
+            let refill = cpu.taken_branch_refill();
+            Case::new(6 + refill, 9 + refill)
         };
         return Some(case.pick(cached));
     }
@@ -746,17 +756,11 @@ impl CpuCore {
     /// coprocessor operations and full-format indexed detail) retain the old
     /// conservative scale until a dedicated model exists.
     pub(crate) fn cycles_020(&mut self, raw: i32, fetch_cached: bool) -> i32 {
-        let is_020 = matches!(
-            self.cpu_type,
-            super::types::CpuType::M68EC020 | super::types::CpuType::M68020
-        );
         if let Some(cycles) = exception_cycles(self, raw, fetch_cached) {
-            self.result_latch_020 = None;
             return cycles;
         }
 
         let op = self.ir as u16;
-        let forwarded = self.result_latch_020.take();
         let cycles = match op >> 12 {
             0x0 => group_0(self, op, fetch_cached),
             0x1 => Some(move_cycles(op, Size::Byte, fetch_cached)),
@@ -770,162 +774,28 @@ impl CpuCore {
             0xE => group_e(op, fetch_cached),
             _ => None,
         };
-        let mut cycles = cycles.unwrap_or_else(|| legacy_fallback(raw));
-        if is_020 {
-            // A register-to-register MOVE leaves its value in the execution
-            // unit's result latch for the next instruction; anything else
-            // leaves the latch cleared (it was taken above).
-            self.result_latch_020 = reg_to_reg_move_dest(op);
-            if self.result_latch_020.is_some() && fetch_cached && forwarded == Some((op & 7) as u8)
-            {
-                // Result forwarding: the source is still in the result
-                // latch from the immediately preceding register-to-register
-                // MOVE, so the operand's register-file read micro-cycle is
-                // skipped. A real 68EC020 runs the RAW-dependent pair
-                // `move.w d2,d0 + move.w d0,d1` one clock per loop
-                // iteration faster than the independent pair
-                // `move.w d2,d0 + move.w d3,d1` (Copperline timing-test
-                // rows 29 and 28: 10 against 11 clocks including the loop
-                // dbra), which only a forwarding path can produce. Only the
-                // measured register-to-register MOVE case is refunded;
-                // wider forwarding is deliberately not modelled without
-                // hardware data.
-                cycles = (cycles - 1).max(1);
-            }
-        }
-        cycles
+        cycles.unwrap_or_else(|| legacy_fallback(raw))
     }
-}
 
-/// Destination register of a register-to-register MOVE (`MOVE.B/W/L Dx,Dy`),
-/// the shape whose result-forwarding refund is measured on real hardware.
-const fn reg_to_reg_move_dest(op: u16) -> Option<u8> {
-    let group = op >> 12;
-    if (group == 1 || group == 2 || group == 3) && (op >> 3) & 7 == 0 && (op >> 6) & 7 == 0 {
-        Some(((op >> 9) & 7) as u8)
-    } else {
-        None
+    /// Refill clocks for a taken `DBcc`, which real hardware charges only when
+    /// the branch opcode word is longword-aligned.
+    ///
+    /// `ppc` is the address of the instruction being timed: the execution loop
+    /// latches it before the fetch and the PC has already moved on by the time
+    /// the instruction retires.
+    fn taken_branch_refill(&self) -> i32 {
+        i32::from(self.ppc.is_multiple_of(4))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::memory::{AddressBus, LinearMemoryBus};
-    use crate::core::types::{CpuType, HleHandler, StepResult};
-
-    fn prime_result_latch(cpu: &mut CpuCore) {
-        cpu.ir = 0x3002; // MOVE.W D2,D0
-        assert_eq!(cpu.cycles_020(4, true), 2);
-    }
-
-    fn assert_result_latch_cleared(cpu: &mut CpuCore) {
-        assert_eq!(cpu.result_latch_020, None);
-        cpu.instruction_exception_vector = None;
-        cpu.ir = 0x3200; // MOVE.W D0,D1
-        assert_eq!(cpu.cycles_020(4, true), 2);
-    }
 
     fn timed(op: u16, raw: i32, cached: bool) -> i32 {
         let mut cpu = CpuCore::new();
         cpu.ir = u32::from(op);
         cpu.cycles_020(raw, cached)
-    }
-
-    #[test]
-    fn result_forwarding_refunds_one_clock_on_a_raw_reg_move_pair() {
-        let mut cpu = CpuCore::new();
-        cpu.set_cpu_type(CpuType::M68EC020);
-        cpu.ir = 0x3002; // MOVE.W D2,D0
-        assert_eq!(cpu.cycles_020(4, true), 2);
-        cpu.ir = 0x3200; // MOVE.W D0,D1: source still in the result latch
-        assert_eq!(cpu.cycles_020(4, true), 1);
-        cpu.ir = 0x3203; // MOVE.W D3,D1: independent, full register read
-        assert_eq!(cpu.cycles_020(4, true), 2);
-
-        // A non-MOVE between the pair clears the latch: no refund across it.
-        cpu.ir = 0x3002; // MOVE.W D2,D0
-        assert_eq!(cpu.cycles_020(4, true), 2);
-        cpu.ir = 0xD280; // ADD.L D0,D1
-        assert_eq!(cpu.cycles_020(4, true), 2);
-        cpu.ir = 0x3200; // MOVE.W D0,D1: D0 is stale in the latch
-        assert_eq!(cpu.cycles_020(4, true), 2);
-
-        // An uncached stream gets no refund (only the cached case is
-        // measured).
-        cpu.ir = 0x3002;
-        let _ = cpu.cycles_020(4, false);
-        cpu.ir = 0x3200;
-        assert_eq!(cpu.cycles_020(4, false), 3);
-    }
-
-    #[test]
-    fn execution_boundaries_clear_the_result_latch() {
-        let mut cpu = CpuCore::new();
-        cpu.set_cpu_type(CpuType::M68EC020);
-
-        prime_result_latch(&mut cpu);
-        cpu.set_cpu_type(CpuType::M68020);
-        assert_result_latch_cleared(&mut cpu);
-
-        prime_result_latch(&mut cpu);
-        cpu.pulse_reset();
-        assert_result_latch_cleared(&mut cpu);
-
-        prime_result_latch(&mut cpu);
-        cpu.set_precise_bus(false);
-        cpu.set_precise_bus(true);
-        assert_result_latch_cleared(&mut cpu);
-
-        prime_result_latch(&mut cpu);
-        let mut bus = LinearMemoryBus::new(0x100);
-        cpu.jump_vector(&mut bus, 4);
-        assert_result_latch_cleared(&mut cpu);
-
-        prime_result_latch(&mut cpu);
-        cpu.stop(0x2700);
-        assert_result_latch_cleared(&mut cpu);
-
-        prime_result_latch(&mut cpu);
-        cpu.halt();
-        assert_result_latch_cleared(&mut cpu);
-    }
-
-    #[test]
-    fn surfaced_and_hle_handled_traps_clear_the_result_latch() {
-        struct AssertClearedHandler;
-
-        impl HleHandler for AssertClearedHandler {
-            fn handle_aline(
-                &mut self,
-                cpu: &mut CpuCore,
-                _bus: &mut dyn AddressBus,
-                _opcode: u16,
-            ) -> bool {
-                assert_eq!(cpu.result_latch_020, None);
-                true
-            }
-        }
-
-        let mut cpu = CpuCore::new();
-        cpu.set_cpu_type(CpuType::M68EC020);
-        let mut bus = LinearMemoryBus::new(0x100);
-        bus.write_word_at(0, 0xA000);
-
-        prime_result_latch(&mut cpu);
-        assert!(matches!(
-            cpu.step(&mut bus),
-            StepResult::AlineTrap { opcode: 0xA000 }
-        ));
-        assert_result_latch_cleared(&mut cpu);
-
-        cpu.pc = 0;
-        prime_result_latch(&mut cpu);
-        assert!(matches!(
-            cpu.step_with_hle_handler(&mut bus, &mut AssertClearedHandler),
-            StepResult::Ok { .. }
-        ));
-        assert_result_latch_cleared(&mut cpu);
     }
 
     #[test]
@@ -964,13 +834,36 @@ mod tests {
     }
 
     #[test]
+    fn taken_dbcc_pays_the_refill_only_when_longword_aligned() {
+        // Real-A1200 measurement: a cached taken dbra costs 7 clocks with the
+        // opcode at pc % 4 == 0 and 6 with it at pc % 4 == 2. Thirty measured
+        // loops fit `6 + 2 * body_instructions + refill` with no exception.
+        let mut cpu = CpuCore::new();
+        cpu.ir = 0x51C8; // DBF D0,<disp>
+        cpu.dar[0] = 7;
+
+        cpu.ppc = 0x3000;
+        assert_eq!(cpu.cycles_020(12, true), 7);
+        cpu.ppc = 0x3002;
+        assert_eq!(cpu.cycles_020(12, true), 6);
+
+        // The alignment rides on the branch itself, not on its target: an
+        // aligned dbra keeps the refill wherever the loop head sits.
+        cpu.ppc = 0x3004;
+        assert_eq!(cpu.cycles_020(12, true), 7);
+        cpu.ppc = 0x3006;
+        assert_eq!(cpu.cycles_020(12, true), 6);
+    }
+
+    #[test]
     fn dbcc_distinguishes_loop_expiry_and_true_condition() {
         let mut cpu = CpuCore::new();
         // Looping: the branch is taken, so it also pays the pipeline refill.
         cpu.ir = 0x51C8; // DBF D0,<disp>
         cpu.dar[0] = 7;
-        assert_eq!(cpu.cycles_020(12, true), 6 + TAKEN_BRANCH_REFILL);
-        assert_eq!(cpu.cycles_020(12, false), 9 + TAKEN_BRANCH_REFILL);
+        cpu.ppc = 0;
+        assert_eq!(cpu.cycles_020(12, true), 6 + 1);
+        assert_eq!(cpu.cycles_020(12, false), 9 + 1);
 
         // Both fall-through exits leave the pipeline intact: table entry only.
         cpu.dar[0] = 0xFFFF;
