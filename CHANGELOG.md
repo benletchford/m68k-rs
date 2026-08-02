@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.1...m68k-v0.5.2) (2026-08-02)
+
+
+### Bug Fixes
+
+* honor bus boundaries after interrupt entry ([1e7124b](https://github.com/benletchford/m68k-rs/commit/1e7124ba3c9dfa7b6ad272e4d8dd03664f77f1ad))
+
 ## [0.5.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.0...m68k-v0.5.1) (2026-08-02)
 
 
