@@ -10,7 +10,7 @@ use super::cpu::{CpuCore, NFLAG_SET};
 use super::execute::RUN_MODE_BERR_AERR_RESET;
 use super::mem_ops::{BitSource, DecodedMemOp, FastEa};
 use super::memory::AddressBus;
-use super::op_cache::{BinaryOp, BitOp, CachedRunResult, DecodedSimpleOp, is_pre_68020};
+use super::op_cache::{AddrOp, BinaryOp, BitOp, CachedRunResult, DecodedSimpleOp, is_pre_68020};
 use super::types::{CpuType, Size};
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_codegen::Context;
@@ -325,6 +325,14 @@ pub(crate) enum JitTraceOp {
     TstMem {
         size: Size,
         src: JitEa,
+    },
+    /// CMPA.W/L through `(An)` or `d16(An)`. Unlike ordinary CMP, the
+    /// destination is always the full address register and a word source is
+    /// sign-extended before the 32-bit comparison.
+    AddrCmpMemToReg {
+        size: Size,
+        src: JitEa,
+        dst: u8,
     },
     /// ADD.W/L Dn,(An)+ store/accumulate operations.
     AddRegToPostInc {
@@ -1088,9 +1096,12 @@ impl TraceJit {
         // enough independent work to cover the fixed cost.
         if !self_loop
             && !ends_in_indirect_jsr
-            && ops
-                .iter()
-                .any(|op| matches!(op.op, JitTraceOp::AluMemToReg { .. }))
+            && ops.iter().any(|op| {
+                matches!(
+                    op.op,
+                    JitTraceOp::AluMemToReg { .. } | JitTraceOp::AddrCmpMemToReg { .. }
+                )
+            })
         {
             return None;
         }
@@ -1102,6 +1113,7 @@ impl TraceJit {
                     | JitTraceOp::MovemWordPostInc { .. }
                     | JitTraceOp::AluMemToReg { .. }
                     | JitTraceOp::TstMem { .. }
+                    | JitTraceOp::AddrCmpMemToReg { .. }
                     | JitTraceOp::AddRegToPostInc { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::AnDispAddqSubq { .. }
@@ -1312,6 +1324,19 @@ impl TraceJit {
                     JitTraceOp::TstMem { .. } => {
                         let env = mem_env.as_ref().expect("TstMem implies a window env");
                         emit_tst_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::AddrCmpMemToReg { .. } => {
+                        let env = mem_env
+                            .as_ref()
+                            .expect("AddrCmpMemToReg implies a window env");
+                        emit_addr_cmp_mem_to_reg(
+                            &mut builder,
+                            cpu_ptr,
+                            *op,
+                            env,
+                            &mut bails,
+                            bail_at,
+                        )
                     }
                     JitTraceOp::AddRegToPostInc { .. } => {
                         let env = mem_env
@@ -1762,6 +1787,7 @@ impl JitTraceOp {
                     14
                 }
             }
+            Self::AddrCmpMemToReg { .. } => 24,
             Self::AddRegToPostInc { size, .. } => {
                 if size == Size::Long {
                     20
@@ -1820,6 +1846,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_alu_mem_to_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_addr_cmp_mem_to_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_add_reg_to_postinc_trace_op(pc, opcode, cpu_type) {
@@ -2278,6 +2307,45 @@ fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
     })
 }
 
+/// Decode read-only address-register compares through the two simplest
+/// address-register-relative memory forms. CMPA differs from CMP in two
+/// important ways: it always compares against all 32 destination bits, and
+/// its word source is sign-extended to 32 bits. Keeping it separate from the
+/// ordinary memory-to-data-register ALU op makes those rules explicit and
+/// avoids admitting the mutating ADDA/SUBA forms.
+fn decode_addr_cmp_mem_to_reg_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluAddr {
+        op: AddrOp::Cmpa,
+        size,
+        src,
+        dst,
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    let (src, extension) = match src {
+        FastEa::AnInd(reg) => (JitEa::Ind(reg), None),
+        FastEa::AnDisp(reg) => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (JitEa::Disp(reg, extension as i16), Some(extension))
+        }
+        _ => return None,
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension,
+        extension2: None,
+        pc,
+        op: JitTraceOp::AddrCmpMemToReg { size, src, dst },
+    })
+}
+
 fn decode_jit_ea(mode: u16, reg: u16, extension: u16, cpu_type: CpuType) -> Option<JitEa> {
     Some(match mode & 7 {
         0 => JitEa::Data(reg as u8),
@@ -2373,6 +2441,9 @@ fn execute_portable_op(
     }
     if matches!(op.op, JitTraceOp::TstMem { .. }) {
         return execute_portable_tst_mem(cpu, op);
+    }
+    if matches!(op.op, JitTraceOp::AddrCmpMemToReg { .. }) {
+        return execute_portable_addr_cmp_mem_to_reg(cpu, op);
     }
     if matches!(op.op, JitTraceOp::AddRegToPostInc { .. }) {
         return execute_portable_add_reg_to_postinc(cpu, op, code_start, code_end);
@@ -2581,6 +2652,34 @@ fn execute_portable_tst_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i3
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
     if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::Tst { size, ea }) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_addr_cmp_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::AddrCmpMemToReg { size, src, dst } = trace.op else {
+        return None;
+    };
+    let src = match src {
+        JitEa::Ind(reg) => FastEa::AnInd(reg),
+        JitEa::Disp(reg, _) => FastEa::AnDisp(reg),
+        _ => return None,
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::AluAddr {
+            op: AddrOp::Cmpa,
+            size,
+            src,
+            dst,
+        },
+    ) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -3226,6 +3325,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::TstMem { .. } => {
             unreachable!("TstMem is handled by execute_portable_tst_mem")
         }
+        JitTraceOp::AddrCmpMemToReg { .. } => {
+            unreachable!("AddrCmpMemToReg is handled by execute_portable_addr_cmp_mem_to_reg")
+        }
         JitTraceOp::AddRegToPostInc { .. } => {
             unreachable!("AddRegToPostInc is handled by execute_portable_add_reg_to_postinc")
         }
@@ -3714,6 +3816,9 @@ fn emit_jit_op(
         JitTraceOp::TstMem { .. } => {
             unreachable!("TstMem is emitted by emit_tst_mem")
         }
+        JitTraceOp::AddrCmpMemToReg { .. } => {
+            unreachable!("AddrCmpMemToReg is emitted by emit_addr_cmp_mem_to_reg")
+        }
         JitTraceOp::AddRegToPostInc { .. } => {
             unreachable!("AddRegToPostInc is emitted by emit_add_reg_to_postinc")
         }
@@ -4073,6 +4178,49 @@ fn emit_alu_mem_to_reg(
         }
         _ => unreachable!("unsupported memory-to-register ALU operation"),
     }
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit CMPA.W/L from checked guest memory. Address calculation and the
+/// fast-memory bounds/alignment checks precede every flag write, so a failed
+/// window access can fall back and re-execute the instruction atomically.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_addr_cmp_mem_to_reg(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::AddrCmpMemToReg { size, src, dst } = trace.op else {
+        unreachable!("expected memory-to-address-register compare trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let address = match src {
+        JitEa::Ind(reg) => load_reg(builder, cpu, JitDirectReg::Addr(reg)),
+        JitEa::Disp(reg, displacement) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            builder.ins().iadd_imm(base, displacement as i64)
+        }
+        _ => unreachable!("address compare decoder admitted unsupported EA"),
+    };
+    let (off, _) = checked_window_off(builder, env, bail, address, size);
+    let src_value = window_load(builder, env, off, size);
+    let src_value = if size == Size::Word {
+        sign_extend_word(builder, src_value)
+    } else {
+        src_value
+    };
+    let dst_value = load_reg(builder, cpu, JitDirectReg::Addr(dst));
+    let result = builder.ins().isub(dst_value, src_value);
+    set_cmp_flags(builder, cpu, src_value, dst_value, result, Size::Long);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -5629,6 +5777,19 @@ mod portable_tests {
             }
         ));
 
+        mem.write_word(0x0100, 0xB7E9); // CMPA.L $0010(A1),A3
+        mem.write_word(0x0102, 0x0010);
+        let address_compare = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68040).unwrap();
+        assert_eq!(address_compare.extension, Some(0x0010));
+        assert!(matches!(
+            address_compare.op,
+            JitTraceOp::AddrCmpMemToReg {
+                size: Size::Long,
+                src: JitEa::Disp(1, 0x0010),
+                dst: 3,
+            }
+        ));
+
         mem.write_word(0x0100, 0xDE6D); // ADD.W $0010(A5),D7
         mem.write_word(0x0102, 0x0010);
         let add = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
@@ -5742,6 +5903,108 @@ mod portable_tests {
         assert!(execute_portable_op(&mut cpu, op, 0x0100, 0x0102).is_some());
         assert_eq!(cpu.d(1), 0x1234_567F, "CMP does not write its destination");
         assert_eq!(cpu.get_ccr(), 0x1B, "X/N/V/C set and Z clear");
+    }
+
+    #[test]
+    fn portable_cmpa_word_memory_sign_extends_and_preserves_destination_and_x() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        mem[0x0210..0x0212].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(1, 0x0200);
+        cpu.set_a(3, 0);
+        cpu.set_ccr(0x10);
+
+        let op = TraceBuildOp {
+            opcode: 0xB6E9,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AddrCmpMemToReg {
+                size: Size::Word,
+                src: JitEa::Disp(1, 0x0010),
+                dst: 3,
+            },
+        };
+        assert_eq!(execute_portable_op(&mut cpu, op, 0x0100, 0x0104), Some(24));
+        assert_eq!(cpu.a(3), 0, "CMPA must not write its destination");
+        assert_eq!(cpu.pc, 0x0104);
+        assert_eq!(
+            cpu.get_ccr(),
+            0x11,
+            "word source is sign-extended; X is preserved"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_cmpa_displacement_matches_portable_and_bails_atomically() {
+        let cmp = TraceBuildOp {
+            opcode: 0xB7E9,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AddrCmpMemToReg {
+                size: Size::Long,
+                src: JitEa::Disp(1, 0x0010),
+                dst: 3,
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let ops = vec![cmp, branch];
+
+        let mut expected = cpu();
+        let mut expected_mem = vec![0u8; 0x1000];
+        expected_mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        expected_mem[0x0210..0x0214].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        attach_window(&mut expected, &mut expected_mem);
+        expected.set_cpu_type(CpuType::M68040);
+        expected.set_a(1, 0x0200);
+        expected.set_a(3, 0x1234_5678);
+        expected.set_ccr(0x10);
+        let expected_packed = execute_portable_trace(&mut expected, &ops, 0x0100, 0x0106);
+
+        let mut actual = cpu();
+        let mut actual_mem = vec![0u8; 0x1000];
+        actual_mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        actual_mem[0x0210..0x0214].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        attach_window(&mut actual, &mut actual_mem);
+        actual.set_cpu_type(CpuType::M68040);
+        actual.set_a(1, 0x0200);
+        actual.set_a(3, 0x1234_5678);
+        actual.set_ccr(0x10);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops, Some(0x0100))
+            .expect("CMPA loop should compile");
+        let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(actual.a(3), expected.a(3));
+        assert_eq!(actual.get_ccr(), expected.get_ccr());
+        assert_eq!(actual.pc, expected.pc);
+
+        actual.set_a(1, 0x00FF_FFF8);
+        actual.set_a(3, 0xABCD_EF01);
+        actual.set_ccr(0x15);
+        actual.pc = 0x0100;
+        let packed = unsafe { compiled.call_native(&mut actual, 1) };
+        assert_eq!(packed, 0);
+        assert_eq!(actual.pc, 0x0100);
+        assert_eq!(actual.a(3), 0xABCD_EF01);
+        assert_eq!(actual.get_ccr(), 0x15);
     }
 
     #[test]
