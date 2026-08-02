@@ -84,6 +84,11 @@ pub struct CpuCore {
     pub dtt1: u32,
     /// Instruction Register (current opcode)
     pub ir: u32,
+    /// Data register left in the execution unit's result latch by the
+    /// previous instruction (a register-to-register MOVE), for the 68020
+    /// result-forwarding refund; see `timing_020.rs`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) result_latch_020: Option<u8>,
 
     // ========== FPU Registers (68881/68882/68040) ==========
     /// FPU Data Registers (FP0-FP7) - 80-bit extended precision.
@@ -501,6 +506,7 @@ impl CpuCore {
             dtt0: 0,
             dtt1: 0,
             ir: 0,
+            result_latch_020: None,
             fpr: [FloatX80::default(); 8],
             fpiar: 0,
             fpsr: 0,
@@ -601,6 +607,7 @@ impl CpuCore {
 
     /// Set CPU type and configure appropriate masks/timing.
     pub fn set_cpu_type(&mut self, cpu_type: CpuType) {
+        self.clear_execution_pipeline_state();
         self.cpu_type = cpu_type;
         self.is_pre_68020 = matches!(
             cpu_type,
@@ -720,6 +727,7 @@ impl CpuCore {
 
     /// Pulse reset (initialize CPU state without loading vectors).
     pub fn pulse_reset(&mut self) {
+        self.clear_execution_pipeline_state();
         self.stopped = 0;
         self.t1_flag = 0;
         self.t0_flag = 0;
@@ -787,11 +795,20 @@ impl CpuCore {
         if self.precise_bus == precise {
             return;
         }
+        self.clear_execution_pipeline_state();
         self.precise_bus = precise;
         self.prefetch_count = 0;
         self.pending_sync_clocks = 0;
         self.consume_without_prefetch = false;
         self.loop_mode = false;
+    }
+
+    /// Clear timing-model state that cannot survive a reset, exception, or
+    /// transition between execution engines.
+    #[inline]
+    pub(crate) fn clear_execution_pipeline_state(&mut self) {
+        self.result_latch_020 = None;
+        self.break_060_pipeline();
     }
 
     // ========== Precise per-access timing (Part E.2, 68000 only) ==========
