@@ -472,7 +472,7 @@ fn cpu_type_from_repr(value: u32) -> CpuType {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{AddressBus, CpuCore, LinearMemoryBus};
+    use crate::{AddressBus, BatchExit, CpuCore, LinearMemoryBus};
 
     #[test]
     fn report_ranks_stranded_dispatches_not_raw_hits() {
@@ -549,6 +549,98 @@ mod tests {
         #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         assert!(row.native_calls > 0);
         assert!(row.jit_retired > 0);
+    }
+
+    #[test]
+    fn full_dispatch_instruction_can_complete_a_recorded_loop() {
+        reset();
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.write_word(0, 0x4C98); // MOVEM.W (A0)+,D1 (full dispatcher)
+        bus.write_word(2, 0x0002);
+        bus.write_word(4, 0x60FA); // BRA.S $0000
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(0, 0x0100);
+        cpu.pc = 0;
+        let result = cpu.run_batch(&mut bus, 120, &[]);
+        assert_eq!(result.instructions, 120);
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0)
+            .expect("MOVEM loop head was profiled");
+        assert_eq!(row.compiled_ops, 2);
+        assert_eq!(row.blocker_pc, None);
+        assert!(row.jit_retired > 0);
+    }
+
+    fn warm_full_dispatch_recording(cpu: &mut CpuCore, bus: &mut LinearMemoryBus) {
+        bus.write_word(0, 0x4C98); // MOVEM.W (A0)+,D1 (full dispatcher)
+        bus.write_word(2, 0x0002);
+        bus.write_word(4, 0x60FA); // BRA.S $0000
+
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(0, 0x0100);
+        cpu.pc = 0;
+        let result = cpu.run_batch(bus, 4, &[]);
+        assert_eq!(result.exit, BatchExit::BudgetExhausted);
+        assert_eq!(result.instructions, 4);
+        assert_eq!(cpu.pc, 0);
+        assert!(!cpu.trace_recording);
+    }
+
+    #[test]
+    fn budget_exit_ends_recording_after_full_dispatch_instruction() {
+        reset();
+        let mut bus = LinearMemoryBus::new(0x1000);
+        let mut cpu = CpuCore::new();
+        warm_full_dispatch_recording(&mut cpu, &mut bus);
+
+        let result = cpu.run_batch(&mut bus, 1, &[]);
+
+        assert_eq!(result.exit, BatchExit::BudgetExhausted);
+        assert_eq!(result.instructions, 1);
+        assert_eq!(cpu.pc, 4);
+        assert!(!cpu.trace_recording);
+    }
+
+    #[test]
+    fn watched_exit_ends_recording_after_full_dispatch_instruction() {
+        reset();
+        let mut bus = LinearMemoryBus::new(0x1000);
+        let mut cpu = CpuCore::new();
+        warm_full_dispatch_recording(&mut cpu, &mut bus);
+
+        let result = cpu.run_batch(&mut bus, 10, &[4]);
+
+        assert_eq!(result.exit, BatchExit::WatchedPc { pc: 4 });
+        assert_eq!(result.instructions, 1);
+        assert_eq!(cpu.pc, 4);
+        assert!(!cpu.trace_recording);
+    }
+
+    #[test]
+    fn surfaced_trap_ends_full_dispatch_recording() {
+        reset();
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.write_word(0, 0x5280); // ADDQ.L #1,D0
+        bus.write_word(2, 0x0C80); // CMPI.L #3,D0
+        bus.write_word(4, 0x0000);
+        bus.write_word(6, 0x0003);
+        bus.write_word(8, 0x66F6); // BNE.S $0000 (taken twice)
+        bus.write_word(10, 0xA123); // surfaced A-line trap
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0;
+        let result = cpu.run_batch(&mut bus, 100, &[]);
+
+        assert_eq!(result.exit, BatchExit::AlineTrap { opcode: 0xA123 });
+        assert_eq!(cpu.d(0), 3);
+        assert!(!cpu.trace_recording);
     }
 
     #[test]

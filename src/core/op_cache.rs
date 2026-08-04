@@ -1124,10 +1124,6 @@ impl CpuCore {
                     }
                 }
                 CachedOp::Complex => {
-                    #[cfg(not(feature = "trace-profile"))]
-                    trace_jit::stop_recording(self);
-                    #[cfg(feature = "trace-profile")]
-                    trace_jit::stop_recording_at_blocker(self, self.ppc, opcode);
                     return BatchInnerExit::Miss(opcode);
                 }
             }

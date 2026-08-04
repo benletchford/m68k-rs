@@ -1581,27 +1581,6 @@ pub(crate) fn stop_recording(cpu: &mut CpuCore) {
     }
 }
 
-/// End a recording because the decoded fast loop reached an opcode that it
-/// cannot execute. Profiling builds retain the stranded prefix and blocker;
-/// ordinary builds are identical to `stop_recording`.
-#[cfg(feature = "trace-profile")]
-pub(crate) fn stop_recording_at_blocker(cpu: &mut CpuCore, pc: u32, opcode: u16) {
-    if cpu.trace_recording {
-        TRACE_JIT.with_borrow_mut(|jit| {
-            if let Some(recording) = jit.recording.as_ref() {
-                super::trace_profile::note_blocker(
-                    recording.start_pc,
-                    recording.cpu_type,
-                    recording.ops.len(),
-                    pc,
-                    opcode,
-                );
-            }
-            jit.finish_recording(cpu, pc);
-        });
-    }
-}
-
 /// Note that execution just took a backward branch to `cpu.pc` (a potential
 /// trace head) and return whether the caller should probe the trace cache.
 ///

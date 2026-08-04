@@ -594,6 +594,10 @@ impl CpuCore {
             self.cycles_remaining = i32::MAX / 2;
 
             if retired >= max_instructions {
+                // A full-dispatch instruction may have just extended a path
+                // recording before exhausting this outer batch's budget.
+                // The caller may mutate guest state before the next batch.
+                trace_jit::stop_recording(self);
                 return BatchResult {
                     instructions: retired,
                     exit: BatchExit::BudgetExhausted,
@@ -677,6 +681,10 @@ impl CpuCore {
                 }
             };
             if let Some(exit) = exit {
+                // The caller may emulate a surfaced trap and resume at an
+                // unrelated guest PC. Never let an in-progress path recording
+                // cross that host-controlled execution boundary.
+                trace_jit::stop_recording(self);
                 return BatchResult {
                     instructions: retired,
                     exit,
@@ -688,9 +696,21 @@ impl CpuCore {
             // frame and jumped to the handler; skip trace/interrupt checks
             // for the faulting instruction (mirrors `execute`).
             if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                // The fault handler is not the sequential continuation of the
+                // instruction being recorded. Discard the partial path before
+                // execution resumes at the exception vector.
+                trace_jit::stop_recording(self);
                 self.run_mode = RUN_MODE_NORMAL;
                 probe_on_entry = true;
             } else {
+                // A complex opcode leaves the decoded fast path and executes
+                // through the full dispatcher above. Offer that successfully
+                // executed instruction to an in-progress trace just as the
+                // decoded paths do. The trace decoder remains the authority
+                // on whether the exact opcode/extension form is safe to
+                // replay; an unsupported operation simply ends recording.
+                trace_jit::record_executed(self, bus, self.ppc, self.pc);
+
                 // Mirrors `execute`: only backward branches can reach a
                 // trace head, so straight-line dispatches re-enter the
                 // fast loop without a trace-cache probe.
@@ -707,6 +727,7 @@ impl CpuCore {
             }
 
             if self.stopped != 0 {
+                trace_jit::stop_recording(self);
                 return BatchResult {
                     instructions: retired,
                     exit: BatchExit::Stopped,
@@ -714,6 +735,9 @@ impl CpuCore {
             }
 
             if !watch_pcs.is_empty() && watch_pcs.contains(&self.pc) {
+                // Match the decoded fast path: a watched-PC return is a host
+                // boundary, so a partial recording cannot survive it.
+                trace_jit::stop_recording(self);
                 return BatchResult {
                     instructions: retired,
                     exit: BatchExit::WatchedPc { pc: self.pc },
