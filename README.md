@@ -35,7 +35,7 @@ The default build has no JIT compiler dependency. Native applications that use
 
 ```toml
 [dependencies]
-m68k = { version = "0.3", features = ["jit"] }
+m68k = { version = "0.7", features = ["jit"] }
 ```
 
 ### Basic Usage
