@@ -105,6 +105,8 @@ fn fslw_060(
 ) -> u32 {
     use crate::mmu::MmuFaultCause;
     let mut w = if write { fslw::RW_W } else { fslw::RW_R };
+    // As on the 68040, there is no three-byte size encoding (0b11 is a line
+    // transfer), so a three-byte operand reports as a long.
     w |= match size {
         1 => 0b01 << fslw::SIZE_SHIFT,
         2 => 0b10 << fslw::SIZE_SHIFT,
@@ -462,6 +464,8 @@ impl CpuCore {
                 // gurus instead of demand-faulting.
                 let rw = if write { 0 } else { 0x0100 }; // SSW bit 8: 1 = read
                 let atc = if cause.is_some() { 0x0400u16 } else { 0 }; // SSW bit 10
+                // The 68040 bus has no three-byte encoding (SZ 11 is a line
+                // transfer), so a three-byte operand reports as a long here.
                 let sz = match size {
                     1 => 0x0020, // byte
                     2 => 0x0040, // word
@@ -532,9 +536,13 @@ impl CpuCore {
                     if !write {
                         ssw |= 0x0040; // RW: read
                     }
+                    // SIZ 11 is the three-byte transfer the 68020/68030 bus
+                    // performs for a dynamically sized access or a bit-field
+                    // operand spanning three bytes.
                     ssw |= match size {
                         1 => 0x0010, // SIZ 01: byte
                         2 => 0x0020, // SIZ 10: word
+                        3 => 0x0030, // SIZ 11: three byte
                         _ => 0x0000, // SIZ 00: long
                     };
                 } else {

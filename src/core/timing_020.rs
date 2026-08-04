@@ -710,10 +710,9 @@ fn group_e(cpu: &CpuCore, op: u16, cached: bool) -> Option<i32> {
         // The rows are independent of the operand's transfer width: the
         // A1200 moves any span up to four bytes across its 32-bit chip
         // bus in one cycle, so they hold whether the executor asks for a
-        // byte, a word or a long. The one exception is a three-byte span,
-        // which the executor composes from a word and a byte for want of
-        // a three-byte AddressBus transfer; a cycle-billing host charges
-        // that span one access more than the silicon does.
+        // byte, a word, three bytes or a long. Every span is one access,
+        // three bytes included (AddressBus::try_read_three_bytes), so a
+        // host that bills per access bills one operand cycle for all four.
         //
         // BFFFO and the five-byte rows of the non-BFSET forms keep the
         // MC68020UM relative deltas and are not yet hardware-measured.

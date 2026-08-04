@@ -332,10 +332,10 @@ fn bf_extract_mem_window_msb0<B: AddressBus>(
     // width is therefore the model to hold, being the one that touches
     // only what the instruction selects.
     //
-    // AddressBus has no three-byte transfer, so a three-byte span composes
-    // a word and a byte. It reads the right bytes and only those, at the
-    // cost of one extra access on hosts that bill per access - the one
-    // place this shape departs from the measured single operand cycle.
+    // Each span is one access, three bytes included: read_24 goes through
+    // the AddressBus three-byte hook, so a host that bills bus cycles
+    // charges the single operand cycle the hardware measures rather than a
+    // word plus a byte.
     //
     // The window is 40-bit big-endian aligned (byte 0 of the span in bits
     // 39..32) so the callers' fixed shift arithmetic holds for every span,
@@ -343,10 +343,7 @@ fn bf_extract_mem_window_msb0<B: AddressBus>(
     let mut window = match bytes_len {
         1 => (cpu.read_8(bus, start_addr) as u64) << 32,
         2 => (cpu.read_16(bus, start_addr) as u64) << 24,
-        3 => {
-            ((cpu.read_16(bus, start_addr) as u64) << 24)
-                | ((cpu.read_8(bus, start_addr.wrapping_add(2)) as u64) << 16)
-        }
+        3 => (cpu.read_24(bus, start_addr) as u64) << 16,
         _ => (cpu.read_32(bus, start_addr) as u64) << 8,
     };
     if bytes_len == 5 {
@@ -369,10 +366,7 @@ fn bf_store_mem_window<B: AddressBus>(
     match bytes_len {
         1 => cpu.write_8(bus, start_addr, (window >> 32) as u8),
         2 => cpu.write_16(bus, start_addr, (window >> 24) as u16),
-        3 => {
-            cpu.write_16(bus, start_addr, (window >> 24) as u16);
-            cpu.write_8(bus, start_addr.wrapping_add(2), (window >> 16) as u8);
-        }
+        3 => cpu.write_24(bus, start_addr, (window >> 16) as u32),
         _ => cpu.write_32(bus, start_addr, (window >> 8) as u32),
     }
     if bytes_len == 5 {

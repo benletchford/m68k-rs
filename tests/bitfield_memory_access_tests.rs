@@ -1,15 +1,17 @@
 //! Memory-form bit-field instructions access exactly the bytes their field
-//! spans, at the transfer size that span needs (MC68020UM 5.3.1), and never
-//! touch a neighbouring byte. A field within four bytes is one operand cycle
-//! and a five-byte span two (8.2.14); a real A1200 measures spans of one,
-//! two, three and four bytes at identical cost with only the five-byte span
-//! adding an access (Copperline timing-test/bfprobe.asm).
+//! spans, in one transfer of the size that span needs - byte, word, three
+//! bytes or long (MC68020UM 5.3.1) - and never touch a neighbouring byte. A
+//! field within four bytes is one operand cycle and a five-byte span two
+//! (8.2.14); a real A1200 measures spans of one, two, three and four bytes at
+//! identical cost with only the five-byte span adding an access (Copperline
+//! timing-test/bfprobe.asm).
 //!
 //! Widening the operand to a long would read and write up to three bytes
 //! outside the field, which is observable on memory-mapped registers and
 //! moves the fault boundary past the end of a mapped region. These tests pin
 //! the touched byte set, not just the access count, so that cannot come back.
 
+use m68k::core::memory::BusFault;
 use m68k::{AddressBus, CpuCore, CpuType, LinearMemoryBus};
 
 /// Wraps LinearMemoryBus and records every data access as (address, size).
@@ -68,6 +70,27 @@ impl AddressBus for CountingBus {
     fn write_long(&mut self, address: u32, value: u32) {
         self.writes.push((address, 4));
         self.inner.write_long(address, value)
+    }
+    // A host that bills bus cycles overrides both variants of the three-byte
+    // hook: the core calls the fallible one, and the infallible one is what
+    // any direct bus user sees.
+    fn read_three_bytes(&mut self, address: u32) -> u32 {
+        self.reads.push((address, 3));
+        let hi = self.inner.read_word(address) as u32;
+        let lo = self.inner.read_byte(address.wrapping_add(2)) as u32;
+        (hi << 8) | lo
+    }
+    fn write_three_bytes(&mut self, address: u32, value: u32) {
+        self.writes.push((address, 3));
+        self.inner.write_word(address, (value >> 8) as u16);
+        self.inner.write_byte(address.wrapping_add(2), value as u8);
+    }
+    fn try_read_three_bytes(&mut self, address: u32) -> Result<u32, BusFault> {
+        Ok(self.read_three_bytes(address))
+    }
+    fn try_write_three_bytes(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
+        self.write_three_bytes(address, value);
+        Ok(())
     }
     // Opcode and extension words are not operand traffic.
     fn read_immediate_word(&mut self, address: u32) -> u16 {
@@ -145,17 +168,18 @@ fn two_byte_span_is_a_single_word_transfer() {
 }
 
 #[test]
-fn three_byte_span_never_reaches_the_fourth_byte() {
-    // BFEXTU (A0){4:16},D3: bits 4..19 span DATA..DATA+2. AddressBus has no
-    // three-byte transfer, so this composes a word and a byte - the right
-    // bytes and only those. Rounding up to a long would touch DATA+3.
+fn three_byte_span_is_a_single_three_byte_transfer() {
+    // BFEXTU (A0){4:16},D3: bits 4..19 span DATA..DATA+2. The real A1200
+    // charges this span the same single operand cycle as one, two and four
+    // bytes, so it must be one access - not a word plus a byte. Rounding up
+    // to a long instead would touch DATA+3.
     let (cpu, mut bus) = run_bitfield(
         0xE9D0,
         0x3110,
         0,
         &[(DATA, 0x0A), (DATA + 1, 0xBC), (DATA + 2, 0xD0)],
     );
-    assert_eq!(bus.reads, vec![(DATA, 2), (DATA + 2, 1)]);
+    assert_eq!(bus.reads, vec![(DATA, 3)]);
     assert!(bus.writes.is_empty());
     assert_eq!(bus.bytes_touched(), span(DATA, 3));
     assert_eq!(cpu.d(3), 0xABCD);
@@ -163,12 +187,76 @@ fn three_byte_span_never_reaches_the_fourth_byte() {
 }
 
 #[test]
-fn three_byte_modify_span_writes_back_only_its_three_bytes() {
-    // BFSET (A0){4:16}: the modify form of the same span.
+fn three_byte_modify_span_is_one_transfer_each_way() {
+    // BFSET (A0){4:16}: the modify form of the same span, one read-modify-
+    // write of three bytes.
     let (_, mut bus) = run_bitfield(0xEED0, 0x0110, 0, &[]);
-    assert_eq!(bus.reads, vec![(DATA, 2), (DATA + 2, 1)]);
-    assert_eq!(bus.writes, vec![(DATA, 2), (DATA + 2, 1)]);
+    assert_eq!(bus.reads, vec![(DATA, 3)]);
+    assert_eq!(bus.writes, vec![(DATA, 3)]);
     assert_eq!(bus.bytes_touched(), span(DATA, 3));
+    assert_eq!(bus.inner.read_byte(DATA + 3), SENTINEL);
+}
+
+#[test]
+fn a_bus_without_the_three_byte_hook_still_gets_exactly_its_three_bytes() {
+    // The hook is a default method, so a bus written before it existed keeps
+    // working: the composed word plus byte reads the same bytes and no
+    // others, and costs that bus one extra access rather than correctness.
+    struct DefaultHooksBus {
+        inner: LinearMemoryBus,
+        reads: Vec<(u32, u32)>,
+    }
+    impl AddressBus for DefaultHooksBus {
+        fn read_byte(&mut self, address: u32) -> u8 {
+            self.reads.push((address, 1));
+            self.inner.read_byte(address)
+        }
+        fn read_word(&mut self, address: u32) -> u16 {
+            self.reads.push((address, 2));
+            self.inner.read_word(address)
+        }
+        fn read_long(&mut self, address: u32) -> u32 {
+            self.reads.push((address, 4));
+            self.inner.read_long(address)
+        }
+        fn write_byte(&mut self, address: u32, value: u8) {
+            self.inner.write_byte(address, value)
+        }
+        fn write_word(&mut self, address: u32, value: u16) {
+            self.inner.write_word(address, value)
+        }
+        fn write_long(&mut self, address: u32, value: u32) {
+            self.inner.write_long(address, value)
+        }
+        fn read_immediate_word(&mut self, address: u32) -> u16 {
+            self.inner.read_word(address)
+        }
+        fn read_immediate_long(&mut self, address: u32) -> u32 {
+            self.inner.read_long(address)
+        }
+    }
+
+    let mut bus = DefaultHooksBus {
+        inner: LinearMemoryBus::new(0x10000),
+        reads: Vec::new(),
+    };
+    for addr in DATA..(DATA + 8) {
+        bus.inner.load(addr, &[SENTINEL]);
+    }
+    bus.inner.load(CODE, &0xE9D0u16.to_be_bytes()); // BFEXTU (A0){4:16},D3
+    bus.inner.load(CODE + 2, &0x3110u16.to_be_bytes());
+    bus.inner.load(DATA, &[0x0A, 0xBC, 0xD0]);
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68020);
+    cpu.pc = CODE;
+    cpu.set_sr(0x2700);
+    cpu.set_a(7, 0x8000);
+    cpu.set_a(0, DATA);
+    bus.reads.clear();
+    cpu.step(&mut bus);
+
+    assert_eq!(bus.reads, vec![(DATA, 2), (DATA + 2, 1)]);
+    assert_eq!(cpu.d(3), 0xABCD);
     assert_eq!(bus.inner.read_byte(DATA + 3), SENTINEL);
 }
 
