@@ -188,6 +188,12 @@ pub struct CpuCore {
     /// debugger field below, this is cleared before every opcode fetch.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) instruction_exception_vector: Option<u32>,
+    /// True when the bit-field instruction currently being timed spanned a
+    /// five-byte memory window (MC68020UM 8.2.14 bills those one operand
+    /// cycle higher than fields within four bytes). Set by the memory-form
+    /// bit-field executor, consumed by the 020 timing model on retirement.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) bitfield_mem_wide_span: bool,
     /// Vector number of the most recent exception entry (trap, fault, or
     /// interrupt -- everything routed through `jump_vector`), for the
     /// host debugger's exception catchpoints. Polled and cleared by the
@@ -540,6 +546,7 @@ impl CpuCore {
             run_mode: 0,
             exception_processing: false,
             instruction_exception_vector: None,
+            bitfield_mem_wide_span: false,
             last_exception_vector: None,
             has_pmmu: false,
             pmmu_enabled: false,
@@ -1689,6 +1696,72 @@ impl CpuCore {
         }
     }
 
+    /// Read a three-byte operand from memory (data space), returned in the
+    /// low 24 bits.
+    ///
+    /// The 68020/68030 transfer an operand at the size it spans - byte, word,
+    /// three-byte or long (MC68020UM 5.3.1). Only the memory bit-field
+    /// instructions produce a three-byte operand, so only the 68020 and later
+    /// reach this path; the 68000/68010 have no three-byte transfer.
+    #[inline]
+    pub fn read_24<B: AddressBus>(&mut self, bus: &mut B, addr: u32) -> u32 {
+        if self.faulted() {
+            return 0;
+        }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
+        let mut addr = self.address(addr);
+        if self.has_pmmu && self.pmmu_enabled {
+            let pm = self.mmu_page_mask();
+            if addr & pm > pm - 2 {
+                // Three-byte operand straddling an MMU page: a word cycle and
+                // a byte cycle, each translated on its own page (read_16
+                // sub-splits further if its half straddles the boundary).
+                let hi = self.read_16(bus, addr) as u32;
+                if self.faulted() {
+                    return 0;
+                }
+                let lo = self.read_8(bus, addr.wrapping_add(2)) as u32;
+                return (hi << 8) | lo;
+            }
+        }
+        if let Some((a, v)) = self.mmu_read_override
+            && a == addr
+        {
+            // RTE'd 030 bus-fault frame with DF cleared: the handler
+            // supplied this read's result in the data input buffer.
+            self.mmu_read_override = None;
+            return v & 0x00FF_FFFF;
+        }
+        {
+            if self.has_pmmu && self.pmmu_enabled {
+                match crate::mmu::translate_address(
+                    self,
+                    bus,
+                    addr,
+                    /*write=*/ false,
+                    self.is_supervisor(),
+                    /*instruction=*/ false,
+                ) {
+                    Ok(p) => addr = self.address(p),
+                    Err(f) => {
+                        self.handle_mmu_fault(bus, f, false, false, 3);
+                        return 0;
+                    }
+                }
+            }
+        }
+        match bus.try_read_three_bytes(addr) {
+            Ok(v) => v & 0x00FF_FFFF,
+            Err(f) => {
+                if matches!(f.kind, BusFaultKind::BusError) {
+                    self.trigger_bus_error(bus, addr, false, false, 3);
+                }
+                0
+            }
+        }
+    }
+
     /// Write byte to memory (data space).
     #[inline]
     pub fn write_8<B: AddressBus>(&mut self, bus: &mut B, addr: u32, value: u8) {
@@ -1788,6 +1861,64 @@ impl CpuCore {
             && matches!(f.kind, BusFaultKind::BusError)
         {
             self.trigger_bus_error(bus, addr, true, false, 2);
+        }
+    }
+
+    /// Write the low 24 bits of `value` to memory (data space) as a
+    /// three-byte operand.
+    ///
+    /// See [`CpuCore::read_24`]: the memory bit-field instructions are the
+    /// only producers of a three-byte operand.
+    #[inline]
+    pub fn write_24<B: AddressBus>(&mut self, bus: &mut B, addr: u32, value: u32) {
+        if self.faulted() {
+            return;
+        }
+        // Part E.2: report internal clocks elapsed before this bus access.
+        self.flush_sync(bus);
+        let mut addr = self.address(addr);
+        if self.has_pmmu && self.pmmu_enabled {
+            let pm = self.mmu_page_mask();
+            if addr & pm > pm - 2 {
+                // Three-byte operand straddling an MMU page: a word cycle and
+                // a byte cycle, each translated (and fault-suppressed) on its
+                // own page.
+                self.write_16(bus, addr, (value >> 8) as u16);
+                if self.faulted() {
+                    return;
+                }
+                self.write_8(bus, addr.wrapping_add(2), value as u8);
+                return;
+            }
+        }
+        if self.mmu_write_suppress == Some(addr) {
+            // See write_8: DF-cleared write fault, already completed.
+            self.mmu_write_suppress = None;
+            return;
+        }
+        self.pending_fault_wdata = value & 0x00FF_FFFF;
+        {
+            if self.has_pmmu && self.pmmu_enabled {
+                match crate::mmu::translate_address(
+                    self,
+                    bus,
+                    addr,
+                    /*write=*/ true,
+                    self.is_supervisor(),
+                    /*instruction=*/ false,
+                ) {
+                    Ok(p) => addr = self.address(p),
+                    Err(f) => {
+                        self.handle_mmu_fault(bus, f, true, false, 3);
+                        return;
+                    }
+                }
+            }
+        }
+        if let Err(f) = bus.try_write_three_bytes(addr, value & 0x00FF_FFFF)
+            && matches!(f.kind, BusFaultKind::BusError)
+        {
+            self.trigger_bus_error(bus, addr, true, false, 3);
         }
     }
 

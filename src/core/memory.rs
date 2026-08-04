@@ -128,6 +128,64 @@ pub trait AddressBus {
         Ok(())
     }
 
+    /// Read a big-endian three-byte operand from `address`, returned in the
+    /// low 24 bits.
+    ///
+    /// The 68020/68030 transfer an operand at the size it spans - byte, word,
+    /// three-byte or long (MC68020UM 5.3.1) - so a bit field covering three
+    /// bytes is a single operand transfer, not a word plus a byte. The
+    /// default composes one anyway, which is correct for every bus that only
+    /// moves data; hosts that bill bus cycles or count transactions should
+    /// override it so the access costs what the hardware charges.
+    ///
+    /// The 68040/68060 bus has no three-byte encoding. A host modelling one
+    /// may split the access however that processor does, provided it still
+    /// touches only these three bytes.
+    ///
+    /// The core reaches this through [`AddressBus::try_read_three_bytes`];
+    /// override that variant as well on a bus that reports faults.
+    #[inline]
+    fn read_three_bytes(&mut self, address: u32) -> u32 {
+        let hi = self.read_word(address) as u32;
+        let lo = self.read_byte(address.wrapping_add(2)) as u32;
+        (hi << 8) | lo
+    }
+
+    /// Write the low 24 bits of `value` as a big-endian three-byte operand.
+    ///
+    /// See [`AddressBus::read_three_bytes`] for when the core uses this and
+    /// why a host may want to override it.
+    #[inline]
+    fn write_three_bytes(&mut self, address: u32, value: u32) {
+        self.write_word(address, (value >> 8) as u16);
+        self.write_byte(address.wrapping_add(2), value as u8);
+    }
+
+    /// Fallible three-byte read used for bus/MMU fault delivery. **This is
+    /// the variant the core calls**, so a host that bills bus cycles must
+    /// override it (as well as [`AddressBus::read_three_bytes`]) for the
+    /// billing to take effect.
+    ///
+    /// The default composes the fallible word and byte reads rather than
+    /// delegating to the infallible variant, so an existing bus keeps
+    /// reporting a fault on whichever half of the operand fails.
+    #[inline]
+    fn try_read_three_bytes(&mut self, address: u32) -> Result<u32, BusFault> {
+        let hi = self.try_read_word(address)? as u32;
+        let lo = self.try_read_byte(address.wrapping_add(2))? as u32;
+        Ok((hi << 8) | lo)
+    }
+
+    /// Fallible three-byte write used for bus/MMU fault delivery.
+    ///
+    /// See [`AddressBus::try_read_three_bytes`]: this is the variant the core
+    /// calls, and the default composes the fallible word and byte writes.
+    #[inline]
+    fn try_write_three_bytes(&mut self, address: u32, value: u32) -> Result<(), BusFault> {
+        self.try_write_word(address, (value >> 8) as u16)?;
+        self.try_write_byte(address.wrapping_add(2), value as u8)
+    }
+
     /// Read an instruction-stream word.
     ///
     /// Override this when opcode/immediate fetches use a distinct bus path.

@@ -134,6 +134,10 @@ impl CpuCore {
 
                 let (field, mut window, bytes_len) =
                     bf_extract_mem_window_msb0(self, bus, start_addr, bit_in_byte, spec.width);
+                // Retain the span for the 020 timing model: the MC68020UM
+                // bills a five-byte field one operand cycle above a field
+                // within four bytes.
+                self.bitfield_mem_wide_span = bytes_len == 5;
 
                 match op {
                     0x8 => {
@@ -310,10 +314,40 @@ fn bf_extract_mem_window_msb0<B: AddressBus>(
     width: u32,
 ) -> (u32, u64, usize) {
     let bytes_len = (bit_in_byte + width).div_ceil(8) as usize;
-    // Always read 5 bytes (40 bits) for simplicity; only write back bytes_len.
-    let mut window = 0u64;
-    for i in 0..5u32 {
-        window = (window << 8) | cpu.read_8(bus, start_addr.wrapping_add(i)) as u64;
+    // The operand access covers exactly the bytes the field spans and no
+    // others. A 68020 transfers an operand at the size it needs - byte,
+    // word, three-byte or long (MC68020UM 5.3.1) - so a field within four
+    // bytes is one operand cycle (8.2.14) without the processor ever
+    // driving a byte outside the field. Widening the transfer to a long
+    // would read and write up to three neighbouring bytes, which is
+    // observable on memory-mapped registers and moves the fault boundary
+    // past the end of a mapped region.
+    //
+    // The real-A1200 bfprobe column (Copperline timing-test/bfprobe.asm)
+    // measures spans of one, two, three and four bytes at exactly the same
+    // cost, with only a five-byte span adding an access. That confirms the
+    // single operand cycle, but it cannot pin the transfer width: the
+    // A1200's chip RAM is 32 bits wide, so every span up to four bytes is
+    // one bus cycle whatever size the processor asks for. The spanned
+    // width is therefore the model to hold, being the one that touches
+    // only what the instruction selects.
+    //
+    // Each span is one access, three bytes included: read_24 goes through
+    // the AddressBus three-byte hook, so a host that bills bus cycles
+    // charges the single operand cycle the hardware measures rather than a
+    // word plus a byte.
+    //
+    // The window is 40-bit big-endian aligned (byte 0 of the span in bits
+    // 39..32) so the callers' fixed shift arithmetic holds for every span,
+    // and bf_store_mem_window writes back exactly the same bytes.
+    let mut window = match bytes_len {
+        1 => (cpu.read_8(bus, start_addr) as u64) << 32,
+        2 => (cpu.read_16(bus, start_addr) as u64) << 24,
+        3 => (cpu.read_24(bus, start_addr) as u64) << 16,
+        _ => (cpu.read_32(bus, start_addr) as u64) << 8,
+    };
+    if bytes_len == 5 {
+        window |= cpu.read_8(bus, start_addr.wrapping_add(4)) as u64;
     }
     let shift = 40 - (bit_in_byte + width);
     let field = ((window >> shift) as u32) & bf_mask(width);
@@ -327,9 +361,15 @@ fn bf_store_mem_window<B: AddressBus>(
     window: u64,
     bytes_len: usize,
 ) {
-    for i in 0..bytes_len {
-        let shift = (4 - i) * 8;
-        let b = ((window >> shift) & 0xFF) as u8;
-        cpu.write_8(bus, start_addr.wrapping_add(i as u32), b);
+    // Mirror the extract exactly, so the read-modify-write drives back
+    // only the bytes the field spans and never a neighbour.
+    match bytes_len {
+        1 => cpu.write_8(bus, start_addr, (window >> 32) as u8),
+        2 => cpu.write_16(bus, start_addr, (window >> 24) as u16),
+        3 => cpu.write_24(bus, start_addr, (window >> 16) as u32),
+        _ => cpu.write_32(bus, start_addr, (window >> 8) as u32),
+    }
+    if bytes_len == 5 {
+        cpu.write_8(bus, start_addr.wrapping_add(4), (window & 0xFF) as u8);
     }
 }
