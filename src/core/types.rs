@@ -300,8 +300,19 @@ pub struct BatchResult {
     pub exit: BatchExit,
 }
 
-/// Reason a [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) call
-/// returned.
+/// Control returned by an instruction-boundary hook passed to
+/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleBatchControl {
+    /// Continue execution after applying the hook's CPU and bus updates.
+    Continue,
+    /// Return from the runner before another instruction is fetched.
+    Return,
+}
+
+/// Reason a [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) or
+/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook)
+/// call returned.
 ///
 /// Trap variants have exactly the same CPU/PC state as [`StepResult`]: the
 /// trapping opcode has been fetched and `pc` points past it, but no hardware
@@ -311,8 +322,8 @@ pub enum CycleBatchExit {
     /// The requested cycle budget was met or crossed at an instruction or
     /// interrupt boundary.
     BudgetExhausted,
-    /// The address bus requested a return after a completed instruction or
-    /// entry interrupt.
+    /// The address bus or instruction-boundary hook requested a return after
+    /// a completed instruction, or the bus requested one after an entry interrupt.
     ///
     /// Completed work is included in the result. Interrupt entry contributes
     /// cycles but no retired instruction. This exit takes precedence when the
@@ -348,7 +359,8 @@ pub enum CycleBatchExit {
     },
 }
 
-/// Result of [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles).
+/// Result of [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) or
+/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleBatchResult {
     /// Actual CPU cycles consumed. This may exceed the requested budget

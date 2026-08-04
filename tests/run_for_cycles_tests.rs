@@ -1,4 +1,6 @@
-use m68k::{AddressBus, CpuCore, CpuType, CycleBatchExit, LinearMemoryBus, StepResult};
+use m68k::{
+    AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, LinearMemoryBus, StepResult,
+};
 
 fn cpu_at(cpu_type: CpuType, pc: u32) -> CpuCore {
     let mut cpu = CpuCore::new();
@@ -173,6 +175,105 @@ fn stop_is_distinct_and_the_stop_instruction_is_counted() {
     assert_eq!(result.exit, CycleBatchExit::Stopped);
 }
 
+#[test]
+fn hook_return_precedes_budget_and_resume_starts_at_next_instruction() {
+    let mut bus = bus_with(&[
+        (0x1000, 0x4E71), // NOP
+        (0x1002, 0x4E71), // NOP
+        (0x1004, 0x4E71), // NOP
+    ]);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut observations = Vec::new();
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 1, |cpu, _bus, cycles| {
+        observations.push((cpu.ppc, cpu.pc, cycles));
+        CycleBatchControl::Return
+    });
+
+    assert_eq!(observations, vec![(0x1000, 0x1002, 4)]);
+    assert_eq!(result.cycles, 4);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.pc, 0x1002);
+
+    let resumed = cpu.run_for_cycles(&mut bus, 1);
+    assert_eq!(resumed.cycles, 4);
+    assert_eq!(resumed.instructions, 1);
+    assert_eq!(resumed.exit, CycleBatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1004);
+}
+
+#[test]
+fn always_continue_hook_matches_the_original_runner() {
+    let words = [
+        (0x1000, 0x5280), // ADDQ.L #1,D0
+        (0x1002, 0x60FC), // BRA.S $1000
+    ];
+    let mut plain_bus = bus_with(&words);
+    let mut hooked_bus = bus_with(&words);
+    let mut plain_cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut hooked_cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut hook_calls = 0;
+
+    let plain = plain_cpu.run_for_cycles(&mut plain_bus, 50);
+    let hooked = hooked_cpu.run_for_cycles_with_hook(&mut hooked_bus, 50, |_, _, cycles| {
+        assert!(cycles > 0);
+        hook_calls += 1;
+        CycleBatchControl::Continue
+    });
+
+    assert_eq!(hooked, plain);
+    assert_eq!(hook_calls, hooked.instructions);
+    assert_cpu_state_eq(&hooked_cpu, &plain_cpu);
+}
+
+#[test]
+fn hook_reports_data_dependent_instruction_cycles_individually() {
+    let mut bus = bus_with(&[
+        (0x1000, 0xC0C1), // MULU.W D1,D0
+        (0x1002, 0xC0C1), // MULU.W D1,D0
+        (0x1004, 0x4E71),
+    ]);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_d(0, 2);
+    cpu.set_d(1, 1);
+    let mut observed_cycles = Vec::new();
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 1_000, |cpu, _, cycles| {
+        observed_cycles.push(cycles);
+        if observed_cycles.len() == 1 {
+            // 68000 MULU timing depends on the number of set bits in the source.
+            cpu.set_d(1, 0xFFFF);
+            CycleBatchControl::Continue
+        } else {
+            CycleBatchControl::Return
+        }
+    });
+
+    assert_eq!(observed_cycles.len(), 2);
+    assert!(observed_cycles[1] > observed_cycles[0]);
+    assert_eq!(result.cycles, observed_cycles.iter().sum());
+    assert_eq!(result.instructions, 2);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+}
+
+#[test]
+fn stop_retains_its_exit_without_invoking_the_hook() {
+    let mut bus = bus_with(&[(0x1000, 0x4E72), (0x1002, 0x2700)]);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut hook_calls = 0;
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 100, |_, _, _| {
+        hook_calls += 1;
+        CycleBatchControl::Return
+    });
+
+    assert_eq!(hook_calls, 0);
+    assert_eq!(result.cycles, 4);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.exit, CycleBatchExit::Stopped);
+}
+
 #[derive(Clone)]
 struct EventBus {
     memory: Vec<u8>,
@@ -271,6 +372,118 @@ impl AddressBus for EventBus {
     fn reset_devices(&mut self) {
         self.resets += 1;
     }
+}
+
+#[test]
+fn hook_updates_bus_state_before_the_next_instruction() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x4E71); // NOP
+    bus.load_word(0x1002, 0x1210); // MOVE.B (A0),D1
+    bus.load_word(0x1004, 0x4E71); // NOP
+    bus.write_byte(0x4000, 0x11);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_a(0, 0x4000);
+    let mut observations = Vec::new();
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 100, |cpu, bus, cycles| {
+        observations.push((cpu.ppc, cycles));
+        if cpu.ppc == 0x1000 {
+            bus.write_byte(0x4000, 0x7B);
+            CycleBatchControl::Continue
+        } else {
+            CycleBatchControl::Return
+        }
+    });
+
+    assert_eq!(observations, vec![(0x1000, 4), (0x1002, 8)]);
+    assert_eq!(result.cycles, 12);
+    assert_eq!(result.instructions, 2);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.d(1) & 0xFF, 0x7B);
+    assert_eq!(cpu.pc, 0x1004);
+}
+
+#[test]
+fn irq_raised_by_hook_is_taken_before_the_next_ordinary_instruction() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x4E71); // NOP
+    bus.load_word(0x1002, 0x7201); // MOVEQ #1,D1 (must not execute first)
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x7007); // handler: MOVEQ #7,D0
+    bus.load_word(0x2002, 0x4E71);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    let mut observations = Vec::new();
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 100, |cpu, _bus, cycles| {
+        observations.push((cpu.ppc, cycles));
+        if cpu.ppc == 0x1000 {
+            cpu.set_irq(3);
+            CycleBatchControl::Continue
+        } else {
+            CycleBatchControl::Return
+        }
+    });
+
+    assert_eq!(observations, vec![(0x1000, 4), (0x2000, 4)]);
+    assert_eq!(result.cycles, 52); // NOP + level-3 entry + handler MOVEQ
+    assert_eq!(result.instructions, 2);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.d(0), 7);
+    assert_eq!(cpu.d(1), 0);
+    assert_eq!(cpu.pc, 0x2002);
+}
+
+#[test]
+fn bus_boundary_precedes_an_irq_newly_raised_by_the_hook() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x3080); // MOVE.W D0,(A0)
+    bus.load_word(0x1002, 0x4E71);
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x4E71);
+    bus.boundary_write_address = Some(0x4000);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_a(0, 0x4000);
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 100, |cpu, _, _| {
+        cpu.set_irq(3);
+        CycleBatchControl::Continue
+    });
+
+    assert_eq!(result.cycles, 8);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.pc, 0x1002);
+
+    let resumed = cpu.run_for_cycles(&mut bus, 1);
+    assert_eq!(resumed.cycles, 44);
+    assert_eq!(resumed.instructions, 0);
+    assert_eq!(resumed.exit, CycleBatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x2000);
+}
+
+#[test]
+fn entry_interrupt_boundary_does_not_invoke_instruction_hook() {
+    let mut bus = EventBus::new();
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x4E71);
+    bus.boundary_on_interrupt_acknowledge = true;
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_irq(3);
+    let mut hook_calls = 0;
+
+    let result = cpu.run_for_cycles_with_hook(&mut bus, 100, |_, _, _| {
+        hook_calls += 1;
+        CycleBatchControl::Continue
+    });
+
+    assert_eq!(hook_calls, 0);
+    assert_eq!(result.cycles, 44);
+    assert_eq!(result.instructions, 0);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.pc, 0x2000);
 }
 
 #[test]

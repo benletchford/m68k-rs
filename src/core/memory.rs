@@ -180,9 +180,10 @@ pub trait AddressBus {
     /// Take a pending request to return from cycle-scheduled execution at
     /// the next completed instruction or interrupt-entry boundary.
     ///
-    /// [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) calls this
-    /// after an instruction completes normally or an entry interrupt is
-    /// serviced, and before it fetches or executes another instruction.
+    /// [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) and
+    /// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook)
+    /// call this after an instruction completes normally or an entry interrupt
+    /// is serviced, and before fetching or executing another instruction.
     /// Returning `true` makes the runner exit with
     /// [`CycleBatchExit::BoundaryRequested`](crate::CycleBatchExit::BoundaryRequested).
     /// Completed work is included in the result: an instruction contributes
