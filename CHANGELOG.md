@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.7.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.6.0...m68k-v0.7.0) (2026-08-04)
+
+
+### Features
+
+* add exact-width memory bit-field bus accesses ([d4ad107](https://github.com/benletchford/m68k-rs/commit/d4ad10793271fecc6f0c381d7c89cc3e38449c45))
+* expose interrupt-entry cycle boundaries ([04a3bb0](https://github.com/benletchford/m68k-rs/commit/04a3bb07a907d7792eb7d445fce48066c6e5a6cf))
+
+
+### Performance Improvements
+
+* continue trace recording through full dispatch ([aba25ec](https://github.com/benletchford/m68k-rs/commit/aba25ec5dd0d41705ed0cb6b46e9690a46928ac8))
+* JIT packed lookup generator loops ([95c25ac](https://github.com/benletchford/m68k-rs/commit/95c25acdda9d2691769157787c5834822f29d57b))
+
 ## [0.6.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.3...m68k-v0.6.0) (2026-08-04)
 
 
