@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.2...m68k-v0.5.3) (2026-08-04)
+
+
+### Performance Improvements
+
+* JIT guarded indexed scans ([72f69e2](https://github.com/benletchford/m68k-rs/commit/72f69e2857346c5536f394d4b447c0ac8775fac3))
+
 ## [0.5.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.1...m68k-v0.5.2) (2026-08-02)
 
 
