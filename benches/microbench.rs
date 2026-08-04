@@ -923,6 +923,69 @@ fn bench_displacement_address_compare() {
     );
 }
 
+/// Measure a read-only compare through a compiler-shaped brief indexed
+/// address in the middle of an otherwise traceable record loop. Keeping the
+/// surrounding work in the benchmark measures the trace boundary rather than
+/// letting native-call overhead dominate a two-instruction self-loop:
+///
+/// ```c
+/// do {
+///     uint32_t accumulator = seed3 + seed4 + seed5;
+///     if (*(int16_t *)((uint8_t *)records + (int16_t)offset + 4) == value) {
+///         ++accumulator;
+///     }
+/// } while (running);
+/// ```
+fn bench_indexed_value_compare() {
+    const CODE_BASE: u32 = 0x6E00;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0x7600, // MOVEQ #0,D3
+        0x7801, // MOVEQ #1,D4
+        0x7A02, // MOVEQ #2,D5
+        0x7C03, // MOVEQ #3,D6
+        0x7E04, // MOVEQ #4,D7
+        0x2003, // MOVE.L D3,D0
+        0xD084, // ADD.L D4,D0
+        0xD085, // ADD.L D5,D0
+        0xB270, 0x2004, // CMP.W 4(A0,D2.W),D1
+        0x6602, // BNE.S skip increment (recorded not taken)
+        0x5280, // ADDQ.L #1,D0
+        0x60E6, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_word_at(0x4206, 0x1234);
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x4200);
+        cpu.set_a(7, 0xF000);
+        cpu.set_d(1, 0x1234);
+        cpu.set_d(2, 2);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     indexed value compare   {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -1038,6 +1101,10 @@ fn main() {
     }
     if only.as_deref() == Some("displacement-address-compare") {
         bench_displacement_address_compare();
+        return;
+    }
+    if only.as_deref() == Some("indexed-value-compare") {
+        bench_indexed_value_compare();
         return;
     }
     if only.as_deref() == Some("immediate-shifts") {
