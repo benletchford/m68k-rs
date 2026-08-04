@@ -27,7 +27,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-m68k = "0.3"
+m68k = "0.7"
 ```
 
 The default build has no JIT compiler dependency. Native applications that use
