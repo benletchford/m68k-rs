@@ -425,11 +425,11 @@ impl DecodedSimpleOp {
                 }
                 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
                 {
-                    // Native traces lower the immediate-count shift forms
-                    // exercised by measured hot regions. Keep other variants
-                    // on the decoded interpreter until their flag handling is
-                    // lowered and measured independently.
-                    if !count_is_register && matches!((op, direction), (0, 0) | (1, 1)) {
+                    // Native traces lower the measured immediate-count right
+                    // arithmetic/logical and left logical forms. Keep other
+                    // variants on the decoded interpreter until their flag
+                    // handling is lowered and measured independently.
+                    if !count_is_register && matches!((op, direction), (0, 0) | (1, 0) | (1, 1)) {
                         Some(JitTraceOp::ShiftReg {
                             reg,
                             size,

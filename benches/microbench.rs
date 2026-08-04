@@ -332,6 +332,71 @@ fn bench_memory_sub_trace() {
     bench_batch_loop_at("batch", "SUB.W d16(A5),D4 p10", &words, 200_000_000, 0x7A00);
 }
 
+/// Measure a compiler-shaped unsigned fixed-point state update. Dividing the
+/// fixed-point values by 256 becomes `LSR.L #8`; updating a field in place
+/// becomes `ADD.L D0,d16(A1)`.
+///
+/// ```c
+/// struct State {
+///     uint8_t *base;
+///     uint32_t step;
+///     uint32_t accumulator;
+///     uint16_t *cursor;
+/// };
+///
+/// state->accumulator += state->step >> 8;
+/// state->cursor = (uint16_t *)(state->base
+///                           + 2 * (state->accumulator >> 8));
+/// ```
+fn bench_fixed_point_state_update() {
+    const CODE_BASE: u32 = 0x7C00;
+    const STATE_BASE: u32 = 0x4000;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0x2029, 0x0010, // MOVE.L 16(A1),D0
+        0xE088, // LSR.L #8,D0
+        0xD1A9, 0x0018, // ADD.L D0,24(A1)
+        0x2029, 0x0018, // MOVE.L 24(A1),D0
+        0xE088, // LSR.L #8,D0
+        0xD080, // ADD.L D0,D0
+        0x2069, 0x0008, // MOVEA.L 8(A1),A0
+        0xD1C0, // ADDA.L D0,A0
+        0x2348, 0x0020, // MOVE.L A0,32(A1)
+        0x60E2, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_long(STATE_BASE + 0x08, 0x5000);
+    bus.write_long(STATE_BASE + 0x10, 0x0200);
+    bus.write_long(STATE_BASE + 0x18, 0x0100);
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(1, STATE_BASE);
+        cpu.set_a(7, 0xF000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     fixed-point update      {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 #[derive(Clone, Copy)]
 enum IndirectJsrMix {
     Register,
@@ -985,6 +1050,10 @@ fn main() {
     }
     if only.as_deref() == Some("memory-sub") {
         bench_memory_sub_trace();
+        return;
+    }
+    if only.as_deref() == Some("fixed-point-update") {
+        bench_fixed_point_state_update();
         return;
     }
     if only.as_deref() == Some("indirect-jsr") {
