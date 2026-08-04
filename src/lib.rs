@@ -28,8 +28,10 @@
 //! [`CpuCore::step`] and [`CpuCore::execute`] preserve transaction-level bus
 //! ordering and expose internal-clock gaps through [`AddressBus::sync`].
 //! [`CpuCore::run_for_cycles`] retains cycle accounting with lower dispatch
-//! overhead, while [`CpuCore::run_batch`] is an instruction-budgeted
-//! throughput path that can use [`FastMem`].
+//! overhead. [`CpuCore::run_for_cycles_with_hook`] additionally lets a host
+//! synchronize devices and IRQ state between instructions, while
+//! [`CpuCore::run_batch`] is an instruction-budgeted throughput path that can
+//! use [`FastMem`].
 //!
 //! # Cargo features
 //!
@@ -61,6 +63,6 @@ pub use core::cpu::{
 };
 pub use core::memory::{AddressBus, FastMem, LinearMemoryBus};
 pub use core::types::{
-    BatchExit, BatchResult, CpuType, CycleBatchExit, CycleBatchResult, HleHandler, NoOpHleHandler,
-    Size, StepResult,
+    BatchExit, BatchResult, CpuType, CycleBatchControl, CycleBatchExit, CycleBatchResult,
+    HleHandler, NoOpHleHandler, Size, StepResult,
 };

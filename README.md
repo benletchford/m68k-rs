@@ -168,6 +168,7 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 | **`step_with_hle_handler()`** | One instruction | Same precise path as `step()` | Offers traps to `HleHandler`; unhandled traps take the hardware exception |
 | **`execute()`** | CPU cycles | Precise path; whole instructions may overshoot the requested cycles | Takes traps as hardware exceptions and returns consumed cycles |
 | **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps, STOP, and bus-requested instruction boundaries separately |
+| **`run_for_cycles_with_hook()`** | CPU cycles | Same precise path, with host synchronization after each normally completed instruction | The hook can continue or request an instruction-boundary return |
 | **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and portable or `jit`-enabled native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
 
 Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
@@ -209,6 +210,32 @@ The 68000 and 68010 may already have instruction words in their hardware
 prefetch queue at this boundary. If the host work changes instruction-visible
 memory or mapping and those queued words must not be used, call
 `cpu.invalidate_prefetch()` before resuming.
+
+Use **`run_for_cycles_with_hook()`** when devices or IRQ lines must be updated
+between instructions rather than after an aggregate batch:
+
+```rust
+use m68k::CycleBatchControl;
+
+let result = cpu.run_for_cycles_with_hook(&mut bus, 512, |cpu, bus, cycles| {
+    bus.advance_devices(cycles);
+    cpu.set_irq(bus.interrupt_level());
+
+    if bus.monitor_requested() {
+        CycleBatchControl::Return
+    } else {
+        CycleBatchControl::Continue
+    }
+});
+```
+
+The hook receives the cycles for the just-completed instruction and can inspect
+`cpu.ppc` and `cpu.pc`. Its CPU and bus updates are applied before another
+instruction is fetched. A hook-requested return uses
+`CycleBatchExit::BoundaryRequested`, includes the completed instruction exactly
+once, and resumes at the following instruction. Interrupt-entry cycles are
+included in `result.cycles` but are not reported as instruction cycles to the
+hook. The original `run_for_cycles()` path has no runtime hook check.
 
 Use **`step_with_hle_handler()`** when patching selected guest OS calls while
 allowing every unhandled trap to follow hardware behavior. Use
@@ -305,7 +332,7 @@ m68k/
 | `LinearMemoryBus` / `FastMem` | Ready-made flat memory and optional direct-RAM window |
 | `HleHandler` | Trap interception callbacks |
 | `StepResult` | Single-instruction result |
-| `CycleBatchResult` / `CycleBatchExit` | Precise cycle-scheduled execution result |
+| `CycleBatchResult` / `CycleBatchExit` / `CycleBatchControl` | Precise cycle-scheduled execution result and hook control |
 | `BatchResult` / `BatchExit` | High-throughput instruction-batch result |
 | `CpuCore::is_stopped()` | STOP state check |
 | `CpuCore::is_halted()` | Double-fault halt check |

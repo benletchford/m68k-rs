@@ -7,7 +7,9 @@ use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
 use super::op_cache::BatchInnerExit;
 use super::trace_jit;
-use super::types::{BatchExit, BatchResult, CycleBatchExit, CycleBatchResult, StepResult};
+use super::types::{
+    BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult, StepResult,
+};
 
 /// Stop level constants.
 pub const STOP_LEVEL_STOP: u32 = 1;
@@ -207,6 +209,62 @@ impl CpuCore {
         bus: &mut B,
         cycle_budget: i32,
     ) -> CycleBatchResult {
+        self.run_for_cycles_inner::<B, _, false>(bus, cycle_budget, &mut |_, _, _| {
+            CycleBatchControl::Continue
+        })
+    }
+
+    /// Execute complete instructions with host synchronization after each
+    /// normally completed instruction.
+    ///
+    /// The hook receives the CPU, bus, and cycles consumed by the just-completed
+    /// instruction. [`CpuCore::ppc`](Self::ppc) identifies that instruction;
+    /// [`CpuCore::pc`](Self::pc) identifies the next instruction or an exception
+    /// handler selected while the instruction completed. CPU and bus changes
+    /// made by the hook are visible before another instruction is fetched.
+    ///
+    /// Returning [`CycleBatchControl::Return`] exits with
+    /// [`CycleBatchExit::BoundaryRequested`]. The completed instruction and its
+    /// cycles remain included in the result, and no further interrupt entry or
+    /// instruction executes. Returning [`CycleBatchControl::Continue`] allows a
+    /// newly serviceable interrupt to be taken before the next instruction.
+    /// Interrupt-entry cycles are included in the batch total but are not passed
+    /// to the hook as instruction cycles.
+    ///
+    /// The hook is not called for surfaced traps, STOP, interrupt entry, or an
+    /// already-stopped CPU. Bus boundary requests and STOP retain their existing
+    /// precedence over budget exhaustion. A bus request raised by an instruction
+    /// or the hook is honored before a newly raised interrupt is serviced.
+    ///
+    /// The hook must not call CPU execution methods or modify the runner's cycle
+    /// bookkeeping fields; doing so would invalidate the returned totals.
+    ///
+    /// Use [`run_for_cycles`](Self::run_for_cycles) when synchronization is not
+    /// required; its hook branch is disabled at compile time.
+    pub fn run_for_cycles_with_hook<B, F>(
+        &mut self,
+        bus: &mut B,
+        cycle_budget: i32,
+        mut hook: F,
+    ) -> CycleBatchResult
+    where
+        B: AddressBus,
+        F: FnMut(&mut CpuCore, &mut B, i32) -> CycleBatchControl,
+    {
+        self.run_for_cycles_inner::<B, F, true>(bus, cycle_budget, &mut hook)
+    }
+
+    #[inline]
+    fn run_for_cycles_inner<B, F, const CALL_HOOK: bool>(
+        &mut self,
+        bus: &mut B,
+        cycle_budget: i32,
+        hook: &mut F,
+    ) -> CycleBatchResult
+    where
+        B: AddressBus,
+        F: FnMut(&mut CpuCore, &mut B, i32) -> CycleBatchControl,
+    {
         self.set_precise_bus(true);
         self.initial_cycles = cycle_budget;
 
@@ -268,7 +326,31 @@ impl CpuCore {
                             exit: CycleBatchExit::Stopped,
                         };
                     }
-                    if bus.take_boundary_request() {
+
+                    let hook_control = if CALL_HOOK {
+                        hook(self, bus, cycles)
+                    } else {
+                        CycleBatchControl::Continue
+                    };
+
+                    // Preserve the bus boundary before performing additional
+                    // CPU work requested by a hook update. This also consumes a
+                    // request raised from inside the hook.
+                    if bus.take_boundary_request() || hook_control == CycleBatchControl::Return {
+                        return CycleBatchResult {
+                            cycles: self.initial_cycles - self.cycles_remaining,
+                            instructions,
+                            exit: CycleBatchExit::BoundaryRequested,
+                        };
+                    }
+
+                    // step() has already serviced any interrupt pending at its
+                    // ordinary end-of-instruction sample. A hook can create a
+                    // new serviceable interrupt, so sample again before fetch.
+                    if CALL_HOOK
+                        && self.check_and_service_interrupts(bus)
+                        && bus.take_boundary_request()
+                    {
                         return CycleBatchResult {
                             cycles: self.initial_cycles - self.cycles_remaining,
                             instructions,
