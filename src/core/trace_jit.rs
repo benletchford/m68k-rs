@@ -960,7 +960,16 @@ impl TraceJit {
         let cpu_type = recording.cpu_type;
         let adaptive_rerecords = recording.adaptive_rerecords;
         #[cfg(feature = "trace-profile")]
-        let recorded_ops = recording.ops.len();
+        let recorded_shape = recording
+            .ops
+            .iter()
+            .map(|op| super::trace_profile::TraceShapeOp {
+                pc: op.pc,
+                opcode: op.opcode,
+                extension: op.extension,
+                extension2: op.extension2,
+            })
+            .collect();
         self.slots[idx] =
             match self.compile_decoded_ops(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc)) {
                 Some(mut trace) => {
@@ -980,7 +989,7 @@ impl TraceJit {
             };
         #[cfg(feature = "trace-profile")]
         if matches!(self.slots[idx], TraceSlot::Compiled(_)) {
-            super::trace_profile::note_compiled(start_pc, cpu_type, recorded_ops);
+            super::trace_profile::note_compiled(start_pc, cpu_type, recorded_shape);
         }
     }
 
@@ -1004,13 +1013,37 @@ impl TraceJit {
 
         let Some(mut op) = decode_trace_op(cpu, bus, executed_pc, cpu_type) else {
             #[cfg(feature = "trace-profile")]
-            super::trace_profile::note_blocker(
-                start_pc,
-                cpu_type,
-                recording.ops.len(),
-                executed_pc,
-                cpu.ir as u16,
-            );
+            {
+                // Diagnostics read through the fastmem window only. The
+                // profiler must not add bus transactions: on buses where a
+                // read is host-visible (MMIO, watchpoints, fault counters),
+                // extra reads would change guest-observable behavior.
+                let memory_opcode = super::mem_ops::peek_window_word(cpu, executed_pc);
+                let next_word = super::mem_ops::peek_window_word(cpu, executed_pc.wrapping_add(2));
+                let next_word2 = super::mem_ops::peek_window_word(cpu, executed_pc.wrapping_add(4));
+                let prefix = recording
+                    .ops
+                    .iter()
+                    .map(|op| super::trace_profile::TraceShapeOp {
+                        pc: op.pc,
+                        opcode: op.opcode,
+                        extension: op.extension,
+                        extension2: op.extension2,
+                    })
+                    .collect();
+                super::trace_profile::note_blocker(
+                    start_pc,
+                    cpu_type,
+                    prefix,
+                    super::trace_profile::TraceBlocker {
+                        pc: executed_pc,
+                        executed_opcode: cpu.ir as u16,
+                        memory_opcode,
+                        next_word,
+                        next_word2,
+                    },
+                );
+            }
             self.finish_recording(cpu, executed_pc);
             return;
         };
@@ -6663,6 +6696,119 @@ mod portable_tests {
         assert_eq!(bailed.pc, 0x0100);
         assert_eq!(bailed.dar, before);
         assert_eq!(bailed.get_ccr(), 0x10);
+    }
+
+    /// Word-read counting bus for the profiling bus-access regression.
+    #[cfg(feature = "trace-profile")]
+    struct CountingBus {
+        memory: Vec<u8>,
+        word_reads: std::collections::BTreeMap<u32, u32>,
+    }
+
+    #[cfg(feature = "trace-profile")]
+    impl super::super::memory::AddressBus for CountingBus {
+        fn read_byte(&mut self, address: u32) -> u8 {
+            self.memory[address as usize & 0xFFF]
+        }
+
+        fn read_word(&mut self, address: u32) -> u16 {
+            *self.word_reads.entry(address).or_default() += 1;
+            let addr = address as usize & 0xFFF;
+            u16::from_be_bytes([self.memory[addr], self.memory[addr + 1]])
+        }
+
+        fn read_long(&mut self, address: u32) -> u32 {
+            let high = self.read_word(address);
+            let low = self.read_word(address.wrapping_add(2));
+            (u32::from(high) << 16) | u32::from(low)
+        }
+
+        fn write_byte(&mut self, address: u32, value: u8) {
+            self.memory[address as usize & 0xFFF] = value;
+        }
+
+        fn write_word(&mut self, address: u32, value: u16) {
+            let addr = address as usize & 0xFFF;
+            self.memory[addr..addr + 2].copy_from_slice(&value.to_be_bytes());
+        }
+
+        fn write_long(&mut self, address: u32, value: u32) {
+            let addr = address as usize & 0xFFF;
+            self.memory[addr..addr + 4].copy_from_slice(&value.to_be_bytes());
+        }
+    }
+
+    /// Recording-failure diagnostics must not add bus transactions: the one
+    /// bus read is the decoder's own opcode read, and the blocker's memory
+    /// opcode and following words come from the fastmem window alone.
+    #[cfg(feature = "trace-profile")]
+    #[test]
+    fn recording_failure_diagnostics_add_no_bus_reads() {
+        super::super::trace_profile::reset();
+
+        let swap = TraceBuildOp {
+            opcode: 0x4840,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::Swap { reg: 0 },
+        };
+
+        let run = |cpu: &mut CpuCore| {
+            let mut bus = CountingBus {
+                memory: vec![0u8; 0x1000],
+                word_reads: std::collections::BTreeMap::new(),
+            };
+            bus.memory[0x0102..0x0104].copy_from_slice(&0xC0FCu16.to_be_bytes());
+            bus.memory[0x0104..0x0106].copy_from_slice(&0x0005u16.to_be_bytes());
+            let mut jit = TraceJit::new();
+            jit.recording = Some(TraceRecording {
+                start_pc: 0x0100,
+                cpu_type: CpuType::M68040,
+                ops: vec![swap],
+                adaptive_rerecords: 0,
+            });
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.trace_recording = true;
+            cpu.ir = 0xC0FC;
+            jit.record_executed(cpu, &mut bus, 0x0102, 0x0106);
+            bus.word_reads
+        };
+
+        // Headless: no window is attached, so diagnostics are unavailable
+        // and the failure still costs exactly one decoder opcode read.
+        let mut headless = cpu();
+        let reads = run(&mut headless);
+        assert_eq!(reads.get(&0x0102), Some(&1), "one decoder opcode read");
+        assert_eq!(reads.len(), 1, "no other bus reads: {reads:?}");
+
+        // With a window attached, the diagnostics come from the window and
+        // the bus still sees exactly the one decoder opcode read.
+        super::super::trace_profile::reset();
+        let mut windowed = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0xC0FCu16.to_be_bytes());
+        mem[0x0104..0x0106].copy_from_slice(&0x0005u16.to_be_bytes());
+        mem[0x0106..0x0108].copy_from_slice(&0x60F8u16.to_be_bytes());
+        attach_window(&mut windowed, &mut mem);
+        let reads = run(&mut windowed);
+        assert_eq!(reads.get(&0x0102), Some(&1), "one decoder opcode read");
+        assert_eq!(reads.len(), 1, "diagnostics must use the window: {reads:?}");
+
+        let snapshot = super::super::trace_profile::snapshot();
+        let shape = snapshot
+            .failed_shapes
+            .iter()
+            .find(|row| row.start_pc == 0x0100)
+            .expect("the failure was recorded");
+        assert_eq!(shape.blocker_pc, 0x0102);
+        assert_eq!(shape.executed_opcode, 0xC0FC);
+        assert_eq!(shape.memory_opcode, Some(0xC0FC));
+        assert_eq!(shape.next_word, Some(0x0005));
+        assert_eq!(shape.next_word2, Some(0x60F8));
+        assert_eq!(shape.prefix_ops, 1);
+        assert_eq!(shape.prefix[0].pc, 0x0100);
+        assert_eq!(shape.prefix[0].opcode, 0x4840);
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]

@@ -1323,6 +1323,17 @@ fn store(cpu: &mut CpuCore, win: Win, loc: &Loc, size: Size, value: u32) {
 /// Returns `false` (with zero state changes) when the op must fall back to
 /// full dispatch: window misses, pre-68020 misaligned accesses, 68020+
 /// full-format extensions, or no window at all.
+/// Side-effect-free diagnostic read of a guest word through the attached
+/// fastmem window. Returns `None` when no window is attached or the address
+/// is outside it. The `AddressBus` is never involved, so callers cannot add
+/// host-visible bus transactions.
+#[cfg(feature = "trace-profile")]
+pub(crate) fn peek_window_word(cpu: &CpuCore, addr: u32) -> Option<u16> {
+    let win = Win::from_cpu(cpu)?;
+    let off = win.off(cpu.address(addr), 2)?;
+    Some(win.read(off, Size::Word) as u16)
+}
+
 pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     let Some(win) = Win::from_cpu(cpu) else {
         return false;
