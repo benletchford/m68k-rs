@@ -1,5 +1,6 @@
 use m68k::{
-    AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, LinearMemoryBus, StepResult,
+    AddressBus, CpuCore, CpuType, CycleBatchControl, CycleBatchExit, CycleBoundaryEvent,
+    LinearMemoryBus, StepResult,
 };
 
 fn cpu_at(cpu_type: CpuType, pc: u32) -> CpuCore {
@@ -480,6 +481,179 @@ fn entry_interrupt_boundary_does_not_invoke_instruction_hook() {
     });
 
     assert_eq!(hook_calls, 0);
+    assert_eq!(result.cycles, 44);
+    assert_eq!(result.instructions, 0);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.pc, 0x2000);
+}
+
+#[test]
+fn boundary_hook_reports_entry_interrupt_and_resumes_at_handler() {
+    let mut bus = EventBus::new();
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x7001); // handler: MOVEQ #1,D0
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_irq(3);
+    let mut observations = Vec::new();
+
+    let result = cpu.run_for_cycles_with_boundary_hook(&mut bus, 100, |cpu, _, event| {
+        observations.push((event, cpu.pc, cpu.d(0)));
+        CycleBatchControl::Return
+    });
+
+    assert_eq!(
+        observations,
+        vec![(CycleBoundaryEvent::InterruptEntry { cycles: 44 }, 0x2000, 0,)]
+    );
+    assert_eq!(result.cycles, 44);
+    assert_eq!(result.instructions, 0);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+
+    let resumed = cpu.run_for_cycles(&mut bus, 1);
+    assert_eq!(resumed.cycles, 4);
+    assert_eq!(resumed.instructions, 1);
+    assert_eq!(cpu.d(0), 1);
+    assert_eq!(cpu.pc, 0x2002);
+}
+
+#[test]
+fn hook_created_irq_reports_entry_before_the_handler_instruction() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x4E71); // NOP
+    bus.load_word(0x1002, 0x7201); // MOVEQ #1,D1 (must not execute)
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x1210); // handler: MOVE.B (A0),D1
+    bus.load_word(0x2002, 0x4E71);
+    bus.write_byte(0x4000, 0x11);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_a(0, 0x4000);
+    let mut observations = Vec::new();
+
+    let result = cpu.run_for_cycles_with_boundary_hook(&mut bus, 100, |cpu, bus, event| {
+        observations.push((event, cpu.ppc, cpu.pc));
+        match event {
+            CycleBoundaryEvent::Instruction { .. } if cpu.ppc == 0x1000 => {
+                cpu.set_irq(3);
+                CycleBatchControl::Continue
+            }
+            CycleBoundaryEvent::InterruptEntry { .. } => {
+                bus.write_byte(0x4000, 0x7B);
+                CycleBatchControl::Continue
+            }
+            CycleBoundaryEvent::Instruction { .. } => CycleBatchControl::Return,
+        }
+    });
+
+    assert_eq!(
+        observations,
+        vec![
+            (
+                CycleBoundaryEvent::Instruction { cycles: 4 },
+                0x1000,
+                0x1002,
+            ),
+            (
+                CycleBoundaryEvent::InterruptEntry { cycles: 44 },
+                0x1000,
+                0x2000,
+            ),
+            (
+                CycleBoundaryEvent::Instruction { cycles: 8 },
+                0x2000,
+                0x2002,
+            ),
+        ]
+    );
+    assert_eq!(result.cycles, 56);
+    assert_eq!(result.instructions, 2);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.d(1) & 0xFF, 0x7B);
+    assert_eq!(cpu.pc, 0x2002);
+}
+
+#[test]
+fn instruction_boundary_precedes_an_irq_unmasked_by_that_instruction() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x46FC); // MOVE.W #$2000,SR
+    bus.load_word(0x1002, 0x2000); // lower interrupt mask from 3 to 0
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x4E71);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2300); // level 3 remains masked on batch entry
+    cpu.set_irq(3);
+    let mut observations = Vec::new();
+
+    let result = cpu.run_for_cycles_with_boundary_hook(&mut bus, 100, |cpu, _, event| {
+        observations.push((event, cpu.pc));
+        match event {
+            CycleBoundaryEvent::Instruction { .. } => CycleBatchControl::Continue,
+            CycleBoundaryEvent::InterruptEntry { .. } => CycleBatchControl::Return,
+        }
+    });
+
+    assert_eq!(observations.len(), 2);
+    assert!(matches!(
+        observations[0],
+        (CycleBoundaryEvent::Instruction { .. }, 0x1004)
+    ));
+    assert_eq!(
+        observations[1],
+        (CycleBoundaryEvent::InterruptEntry { cycles: 44 }, 0x2000)
+    );
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert_eq!(cpu.pc, 0x2000);
+}
+
+#[test]
+fn stop_that_unmasks_an_irq_reports_only_the_interrupt_boundary() {
+    let mut bus = EventBus::new();
+    bus.load_word(0x1000, 0x4E72); // STOP #$2000
+    bus.load_word(0x1002, 0x2000);
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x4E71);
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2300); // level 3 remains masked on batch entry
+    cpu.set_irq(3);
+    let mut events = Vec::new();
+
+    let result = cpu.run_for_cycles_with_boundary_hook(&mut bus, 100, |_, _, event| {
+        events.push(event);
+        CycleBatchControl::Return
+    });
+
+    assert_eq!(
+        events,
+        vec![CycleBoundaryEvent::InterruptEntry { cycles: 44 }]
+    );
+    assert_eq!(result.instructions, 1);
+    assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);
+    assert!(!cpu.is_stopped());
+    assert_eq!(cpu.pc, 0x2000);
+}
+
+#[test]
+fn entry_bus_request_still_returns_after_the_boundary_event() {
+    let mut bus = EventBus::new();
+    bus.load_long(0x6C, 0x2000); // level-3 autovector
+    bus.load_word(0x2000, 0x4E71);
+    bus.boundary_on_interrupt_acknowledge = true;
+    let mut cpu = cpu_at(CpuType::M68000, 0x1000);
+    cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+    cpu.set_irq(3);
+    let mut events = Vec::new();
+
+    let result = cpu.run_for_cycles_with_boundary_hook(&mut bus, 100, |_, _, event| {
+        events.push(event);
+        CycleBatchControl::Continue
+    });
+
+    assert_eq!(
+        events,
+        vec![CycleBoundaryEvent::InterruptEntry { cycles: 44 }]
+    );
     assert_eq!(result.cycles, 44);
     assert_eq!(result.instructions, 0);
     assert_eq!(result.exit, CycleBatchExit::BoundaryRequested);

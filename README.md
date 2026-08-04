@@ -169,6 +169,7 @@ fn emulate(cpu: &mut CpuCore, bus: &mut impl AddressBus) {
 | **`execute()`** | CPU cycles | Precise path; whole instructions may overshoot the requested cycles | Takes traps as hardware exceptions and returns consumed cycles |
 | **`run_for_cycles()`** | CPU cycles | Precise path with actual cycle and instruction totals | Surfaces traps, STOP, and bus-requested instruction boundaries separately |
 | **`run_for_cycles_with_hook()`** | CPU cycles | Same precise path, with host synchronization after each normally completed instruction | The hook can continue or request an instruction-boundary return |
+| **`run_for_cycles_with_boundary_hook()`** | CPU cycles | Same precise path, with separate instruction and interrupt-entry events | The hook can synchronize or return before the first handler instruction |
 | **`run_batch()`** | Instructions | Throughput path using decoded-op caching, optional direct RAM, and portable or `jit`-enabled native hot-loop traces | Surfaces traps, STOP, watched PCs, or budget exhaustion |
 
 Use **`step()`** for debugger-style control. Use **`run_for_cycles()`** when a
@@ -236,6 +237,27 @@ instruction is fetched. A hook-requested return uses
 once, and resumes at the following instruction. Interrupt-entry cycles are
 included in `result.cycles` but are not reported as instruction cycles to the
 hook. The original `run_for_cycles()` path has no runtime hook check.
+
+Use **`run_for_cycles_with_boundary_hook()`** when the host must also advance
+devices for interrupt-entry cycles before the first handler instruction:
+
+```rust
+use m68k::{CycleBatchControl, CycleBoundaryEvent};
+
+let result = cpu.run_for_cycles_with_boundary_hook(&mut bus, 512, |cpu, bus, event| {
+    let cycles = match event {
+        CycleBoundaryEvent::Instruction { cycles }
+        | CycleBoundaryEvent::InterruptEntry { cycles } => cycles,
+    };
+    bus.advance_devices(cycles);
+    cpu.set_irq(bus.interrupt_level());
+    CycleBatchControl::Continue
+});
+```
+
+Interrupt entry contributes no retired instruction. Returning from its event
+stops before the first handler instruction, and resuming executes that
+instruction normally.
 
 Use **`step_with_hle_handler()`** when patching selected guest OS calls while
 allowing every unhandled trap to follow hardware behavior. Use
@@ -332,7 +354,7 @@ m68k/
 | `LinearMemoryBus` / `FastMem` | Ready-made flat memory and optional direct-RAM window |
 | `HleHandler` | Trap interception callbacks |
 | `StepResult` | Single-instruction result |
-| `CycleBatchResult` / `CycleBatchExit` / `CycleBatchControl` | Precise cycle-scheduled execution result and hook control |
+| `CycleBatchResult` / `CycleBatchExit` / `CycleBatchControl` / `CycleBoundaryEvent` | Precise cycle-scheduled execution result, hook control, and boundary kind |
 | `BatchResult` / `BatchExit` | High-throughput instruction-batch result |
 | `CpuCore::is_stopped()` | STOP state check |
 | `CpuCore::is_halted()` | Double-fault halt check |

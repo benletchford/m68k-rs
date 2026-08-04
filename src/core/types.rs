@@ -300,8 +300,27 @@ pub struct BatchResult {
     pub exit: BatchExit,
 }
 
-/// Control returned by an instruction-boundary hook passed to
-/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook).
+/// Boundary reported by
+/// [`CpuCore::run_for_cycles_with_boundary_hook`](crate::CpuCore::run_for_cycles_with_boundary_hook).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CycleBoundaryEvent {
+    /// A normally completed instruction retired.
+    Instruction {
+        /// Cycles consumed by the instruction, including any internally
+        /// taken synchronous exception.
+        cycles: i32,
+    },
+    /// Interrupt entry completed without retiring an instruction.
+    InterruptEntry {
+        /// Cycles consumed by interrupt entry.
+        cycles: i32,
+    },
+}
+
+/// Control returned by a cycle-boundary hook passed to
+/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook)
+/// or
+/// [`CpuCore::run_for_cycles_with_boundary_hook`](crate::CpuCore::run_for_cycles_with_boundary_hook).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CycleBatchControl {
     /// Continue execution after applying the hook's CPU and bus updates.
@@ -310,8 +329,10 @@ pub enum CycleBatchControl {
     Return,
 }
 
-/// Reason a [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) or
-/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook)
+/// Reason a [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles),
+/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook),
+/// or
+/// [`CpuCore::run_for_cycles_with_boundary_hook`](crate::CpuCore::run_for_cycles_with_boundary_hook)
 /// call returned.
 ///
 /// Trap variants have exactly the same CPU/PC state as [`StepResult`]: the
@@ -322,8 +343,8 @@ pub enum CycleBatchExit {
     /// The requested cycle budget was met or crossed at an instruction or
     /// interrupt boundary.
     BudgetExhausted,
-    /// The address bus or instruction-boundary hook requested a return after
-    /// a completed instruction, or the bus requested one after an entry interrupt.
+    /// The address bus or a cycle-boundary hook requested a return after a
+    /// completed instruction or interrupt entry.
     ///
     /// Completed work is included in the result. Interrupt entry contributes
     /// cycles but no retired instruction. This exit takes precedence when the
@@ -360,7 +381,7 @@ pub enum CycleBatchExit {
 }
 
 /// Result of [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) or
-/// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook).
+/// one of its hook-enabled variants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CycleBatchResult {
     /// Actual CPU cycles consumed. This may exceed the requested budget

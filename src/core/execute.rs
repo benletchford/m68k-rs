@@ -8,7 +8,8 @@ use super::memory::AddressBus;
 use super::op_cache::BatchInnerExit;
 use super::trace_jit;
 use super::types::{
-    BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult, StepResult,
+    BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult,
+    CycleBoundaryEvent, StepResult,
 };
 
 /// Stop level constants.
@@ -209,7 +210,7 @@ impl CpuCore {
         bus: &mut B,
         cycle_budget: i32,
     ) -> CycleBatchResult {
-        self.run_for_cycles_inner::<B, _, false>(bus, cycle_budget, &mut |_, _, _| {
+        self.run_for_cycles_inner::<B, _, false, false>(bus, cycle_budget, &mut |_, _, _| {
             CycleBatchControl::Continue
         })
     }
@@ -251,11 +252,80 @@ impl CpuCore {
         B: AddressBus,
         F: FnMut(&mut CpuCore, &mut B, i32) -> CycleBatchControl,
     {
-        self.run_for_cycles_inner::<B, F, true>(bus, cycle_budget, &mut hook)
+        self.run_for_cycles_inner::<B, _, true, false>(bus, cycle_budget, &mut |cpu, bus, event| {
+            match event {
+                CycleBoundaryEvent::Instruction { cycles } => hook(cpu, bus, cycles),
+                CycleBoundaryEvent::InterruptEntry { .. } => {
+                    unreachable!("the instruction hook does not receive interrupt entry")
+                }
+            }
+        })
+    }
+
+    /// Execute complete instructions with host synchronization after every
+    /// instruction and interrupt-entry boundary.
+    ///
+    /// The hook receives [`CycleBoundaryEvent::Instruction`] after an
+    /// instruction retires and [`CycleBoundaryEvent::InterruptEntry`] after
+    /// interrupt entry completes. An interrupt-entry event occurs before the
+    /// first handler instruction is fetched or executed, contributes cycles
+    /// but no retired instruction, and can request a return. CPU and bus
+    /// changes made for either event are visible before execution continues.
+    ///
+    /// A bus boundary request raised during interrupt entry remains pending
+    /// while the hook runs and forces [`CycleBatchExit::BoundaryRequested`]
+    /// afterward. Use [`run_for_cycles_with_hook`](Self::run_for_cycles_with_hook)
+    /// when only retired instructions need synchronization, or
+    /// [`run_for_cycles`](Self::run_for_cycles) when no synchronization hook is
+    /// required.
+    pub fn run_for_cycles_with_boundary_hook<B, F>(
+        &mut self,
+        bus: &mut B,
+        cycle_budget: i32,
+        mut hook: F,
+    ) -> CycleBatchResult
+    where
+        B: AddressBus,
+        F: FnMut(&mut CpuCore, &mut B, CycleBoundaryEvent) -> CycleBatchControl,
+    {
+        self.run_for_cycles_inner::<B, F, true, true>(bus, cycle_budget, &mut hook)
     }
 
     #[inline]
-    fn run_for_cycles_inner<B, F, const CALL_HOOK: bool>(
+    fn service_interrupt_boundary<B, F, const CALL_INTERRUPT_HOOK: bool>(
+        &mut self,
+        bus: &mut B,
+        hook: &mut F,
+    ) -> Option<CycleBatchControl>
+    where
+        B: AddressBus,
+        F: FnMut(&mut CpuCore, &mut B, CycleBoundaryEvent) -> CycleBatchControl,
+    {
+        let before_interrupt = self.cycles_remaining;
+        if !self.check_and_service_interrupts(bus) {
+            return None;
+        }
+        let entry_cycles = before_interrupt - self.cycles_remaining;
+        Some(if CALL_INTERRUPT_HOOK {
+            hook(
+                self,
+                bus,
+                CycleBoundaryEvent::InterruptEntry {
+                    cycles: entry_cycles,
+                },
+            )
+        } else {
+            CycleBatchControl::Continue
+        })
+    }
+
+    #[inline]
+    fn run_for_cycles_inner<
+        B,
+        F,
+        const CALL_INSTRUCTION_HOOK: bool,
+        const CALL_INTERRUPT_HOOK: bool,
+    >(
         &mut self,
         bus: &mut B,
         cycle_budget: i32,
@@ -263,7 +333,7 @@ impl CpuCore {
     ) -> CycleBatchResult
     where
         B: AddressBus,
-        F: FnMut(&mut CpuCore, &mut B, i32) -> CycleBatchControl,
+        F: FnMut(&mut CpuCore, &mut B, CycleBoundaryEvent) -> CycleBatchControl,
     {
         self.set_precise_bus(true);
         self.initial_cycles = cycle_budget;
@@ -287,8 +357,10 @@ impl CpuCore {
 
         // Interrupts are instruction-boundary events. Service one before the
         // first fetch, including when it wakes a stopped CPU.
-        let serviced_entry_interrupt = self.check_and_service_interrupts(bus);
-        if serviced_entry_interrupt && bus.take_boundary_request() {
+        if let Some(hook_control) =
+            self.service_interrupt_boundary::<B, F, CALL_INTERRUPT_HOOK>(bus, hook)
+            && (bus.take_boundary_request() || hook_control == CycleBatchControl::Return)
+        {
             return CycleBatchResult {
                 cycles: self.initial_cycles - self.cycles_remaining,
                 instructions: 0,
@@ -313,13 +385,45 @@ impl CpuCore {
                 };
             }
 
-            match self.step(bus) {
+            // Hook-enabled runners must expose the instruction boundary before
+            // servicing an interrupt made pending by that instruction or its
+            // hook. `step()` normally services the current level on return, so
+            // defer it locally and restore it before invoking the hook.
+            let deferred_irq = if CALL_INSTRUCTION_HOOK {
+                std::mem::take(&mut self.int_level)
+            } else {
+                0
+            };
+            let step_result = self.step(bus);
+            if CALL_INSTRUCTION_HOOK {
+                self.int_level = deferred_irq;
+            }
+
+            match step_result {
                 StepResult::Ok { cycles } => {
                     self.cycles_remaining -= cycles;
                     instructions += 1;
                     // STOP is an observable exit even when its own cycles
-                    // simultaneously exhaust the budget.
+                    // simultaneously exhaust the budget. If STOP itself
+                    // unmasked a pending interrupt, service that entry first
+                    // without turning STOP into an ordinary instruction-hook
+                    // event.
                     if self.stopped != 0 {
+                        if CALL_INSTRUCTION_HOOK
+                            && let Some(interrupt_control) = self
+                                .service_interrupt_boundary::<B, F, CALL_INTERRUPT_HOOK>(bus, hook)
+                        {
+                            if bus.take_boundary_request()
+                                || interrupt_control == CycleBatchControl::Return
+                            {
+                                return CycleBatchResult {
+                                    cycles: self.initial_cycles - self.cycles_remaining,
+                                    instructions,
+                                    exit: CycleBatchExit::BoundaryRequested,
+                                };
+                            }
+                            continue;
+                        }
                         return CycleBatchResult {
                             cycles: self.initial_cycles - self.cycles_remaining,
                             instructions,
@@ -327,8 +431,8 @@ impl CpuCore {
                         };
                     }
 
-                    let hook_control = if CALL_HOOK {
-                        hook(self, bus, cycles)
+                    let hook_control = if CALL_INSTRUCTION_HOOK {
+                        hook(self, bus, CycleBoundaryEvent::Instruction { cycles })
                     } else {
                         CycleBatchControl::Continue
                     };
@@ -344,12 +448,14 @@ impl CpuCore {
                         };
                     }
 
-                    // step() has already serviced any interrupt pending at its
-                    // ordinary end-of-instruction sample. A hook can create a
-                    // new serviceable interrupt, so sample again before fetch.
-                    if CALL_HOOK
-                        && self.check_and_service_interrupts(bus)
-                        && bus.take_boundary_request()
+                    // Service the level restored above, including an interrupt
+                    // newly raised by the instruction hook, before the next
+                    // fetch.
+                    if CALL_INSTRUCTION_HOOK
+                        && let Some(interrupt_control) =
+                            self.service_interrupt_boundary::<B, F, CALL_INTERRUPT_HOOK>(bus, hook)
+                        && (bus.take_boundary_request()
+                            || interrupt_control == CycleBatchControl::Return)
                     {
                         return CycleBatchResult {
                             cycles: self.initial_cycles - self.cycles_remaining,

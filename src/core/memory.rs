@@ -240,6 +240,8 @@ pub trait AddressBus {
     ///
     /// [`CpuCore::run_for_cycles`](crate::CpuCore::run_for_cycles) and
     /// [`CpuCore::run_for_cycles_with_hook`](crate::CpuCore::run_for_cycles_with_hook)
+    /// and
+    /// [`CpuCore::run_for_cycles_with_boundary_hook`](crate::CpuCore::run_for_cycles_with_boundary_hook)
     /// call this after an instruction completes normally or an entry interrupt
     /// is serviced, and before fetching or executing another instruction.
     /// Returning `true` makes the runner exit with
