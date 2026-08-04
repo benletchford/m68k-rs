@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.3...m68k-v0.6.0) (2026-08-04)
+
+
+### Features
+
+* add instruction-boundary cycle hooks ([#62](https://github.com/benletchford/m68k-rs/issues/62)) ([af37111](https://github.com/benletchford/m68k-rs/commit/af3711149ad2b4c1cd49511d09a6e98bd48bc758))
+
 ## [0.5.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.5.2...m68k-v0.5.3) (2026-08-04)
 
 
