@@ -689,30 +689,59 @@ fn group_6(cpu: &CpuCore, op: u16, cached: bool) -> i32 {
     }
 }
 
-fn group_e(op: u16, cached: bool) -> Option<i32> {
+fn group_e(cpu: &CpuCore, op: u16, cached: bool) -> Option<i32> {
     let mode = (op >> 3) & 7;
     let reg = op & 7;
 
     if op & 0x00C0 == 0x00C0 && (op >> 8) & 0xF >= 8 {
         let selector = (op >> 8) & 0xF;
+        // Internal (non-bus) costs calibrated against the real-A1200
+        // bfprobe column (Copperline timing-test/bfprobe.asm, 2026-08-03).
+        // A memory form whose field lies within four bytes performs one
+        // operand cycle - a read, plus a write for the modify forms - and
+        // a five-byte span adds a second one; the host bills those
+        // accesses, so these rows carry only the remainder. On the
+        // reference A1200 an 8192-iteration BFSET (An){0:1} + DBcc loop
+        // measures 28.10 clocks (BFTST 24.12, BFEXTU and BFINS 28.10, the
+        // five-byte BFSET 44.32, register-form BFSET 20.02), with the
+        // dynamic offset free and the DBcc alignment clock absorbed by
+        // the operand access.
+        //
+        // The rows are independent of the operand's transfer width: the
+        // A1200 moves any span up to four bytes across its 32-bit chip
+        // bus in one cycle, so they hold whether the executor asks for a
+        // byte, a word or a long. The one exception is a three-byte span,
+        // which the executor composes from a word and a byte for want of
+        // a three-byte AddressBus transfer; a cycle-billing host charges
+        // that span one access more than the silicon does.
+        //
+        // BFFFO and the five-byte rows of the non-BFSET forms keep the
+        // MC68020UM relative deltas and are not yet hardware-measured.
         let base = if mode == 0 {
             match selector {
                 0x8 => Case::new(6, 7),
                 0x9 | 0xB => Case::new(8, 8),
-                0xA | 0xC | 0xE => Case::new(12, 12),
+                0xA | 0xC | 0xE => Case::new(14, 14), // real: BFSET Dn loop 20.02
                 0xD => Case::new(18, 18),
                 0xF => Case::new(10, 10),
                 _ => return None,
             }
-        } else {
-            // Use the five-byte row: the executor can span five bytes and
-            // does not retain the extension-derived span after retirement.
+        } else if cpu.bitfield_mem_wide_span {
             match selector {
-                0x8 => Case::new(15, 16),
-                0x9 | 0xB => Case::new(18, 18),
-                0xA | 0xC | 0xE => Case::new(24, 24),
-                0xD => Case::new(32, 32),
-                0xF => Case::new(20, 21),
+                0x8 => Case::new(26, 27),             // BFTST: <5B + 12
+                0x9 | 0xB => Case::new(30, 30),       // BFEXT: <5B + 12
+                0xA | 0xC | 0xE => Case::new(34, 34), // real: 44.32 clk loop
+                0xD => Case::new(42, 42),             // BFFFO: <5B + 12
+                0xF => Case::new(34, 34),             // BFINS: <5B + 12
+                _ => return None,
+            }
+        } else {
+            match selector {
+                0x8 => Case::new(14, 15),             // real: 24.12 clk loop
+                0x9 | 0xB => Case::new(18, 18),       // real: 28.10 clk loop
+                0xA | 0xC | 0xE => Case::new(22, 22), // real: 28.10 clk loop
+                0xD => Case::new(30, 30),             // BFFFO: UM +8 over SET
+                0xF => Case::new(22, 22),             // real: 28.10 clk loop
                 _ => return None,
             }
         };
@@ -771,7 +800,7 @@ impl CpuCore {
             0x6 => Some(group_6(self, op, fetch_cached)),
             0x7 => Some(Case::new(2, 3).pick(fetch_cached)),
             0x8 | 0x9 | 0xB | 0xC | 0xD => dyadic(op, fetch_cached),
-            0xE => group_e(op, fetch_cached),
+            0xE => group_e(self, op, fetch_cached),
             _ => None,
         };
         cycles.unwrap_or_else(|| legacy_fallback(raw))
@@ -893,6 +922,86 @@ mod tests {
         assert_eq!(cpu.cycles_020(10, true), 6 + TAKEN_BRANCH_REFILL);
         cpu.change_of_flow = false;
         assert_eq!(cpu.cycles_020(10, true), 4);
+    }
+
+    fn bitfield_timed(op: u16, cached: bool, wide_span: bool) -> i32 {
+        let mut cpu = CpuCore::new();
+        cpu.ir = u32::from(op);
+        cpu.bitfield_mem_wide_span = wide_span;
+        cpu.cycles_020(12, cached)
+    }
+
+    #[test]
+    fn bitfield_register_rows_hold_the_measured_internal_cost() {
+        // Register forms perform no operand access, so the row is the whole
+        // instruction. Real A1200: a BFSET Dn{0:1} + DBcc loop is 20.02
+        // clocks (bfprobe row 4), against 14 here plus the taken DBcc.
+        for cached in [true, false] {
+            assert_eq!(bitfield_timed(0xEEC0, cached, false), 14); // BFSET Dn
+            assert_eq!(bitfield_timed(0xEAC0, cached, false), 14); // BFCHG Dn
+            assert_eq!(bitfield_timed(0xECC0, cached, false), 14); // BFCLR Dn
+        }
+        assert_eq!(bitfield_timed(0xE8C0, true, false), 6); // BFTST Dn
+        assert_eq!(bitfield_timed(0xE8C0, false, false), 7);
+        assert_eq!(bitfield_timed(0xE9C0, true, false), 8); // BFEXTU Dn
+        assert_eq!(bitfield_timed(0xEBC0, true, false), 8); // BFEXTS Dn
+        assert_eq!(bitfield_timed(0xEDC0, true, false), 18); // BFFFO Dn
+        assert_eq!(bitfield_timed(0xEFC0, true, false), 10); // BFINS Dn
+
+        // The span flag is a memory-operand property and must not reach the
+        // register rows, whatever the previous memory bit-field left behind.
+        assert_eq!(bitfield_timed(0xEEC0, true, true), 14);
+    }
+
+    #[test]
+    fn bitfield_memory_rows_within_four_bytes_hold_the_measured_cost() {
+        // (A0) adds the mode-2 word EA, Case(2, 3). Real A1200 loops:
+        // BFSET/BFINS/BFEXTU 28.10 clocks, BFTST 24.12 (bfprobe rows 2, 11,
+        // 10, 9). The remainder below is what the core charges on top of the
+        // one operand cycle the host bills.
+        assert_eq!(bitfield_timed(0xEED0, true, false), 24); // BFSET (A0)
+        assert_eq!(bitfield_timed(0xEED0, false, false), 25);
+        assert_eq!(bitfield_timed(0xEAD0, true, false), 24); // BFCHG (A0)
+        assert_eq!(bitfield_timed(0xECD0, true, false), 24); // BFCLR (A0)
+        assert_eq!(bitfield_timed(0xEFD0, true, false), 24); // BFINS (A0)
+        assert_eq!(bitfield_timed(0xEFD0, false, false), 25);
+        assert_eq!(bitfield_timed(0xE8D0, true, false), 16); // BFTST (A0)
+        assert_eq!(bitfield_timed(0xE8D0, false, false), 18);
+        assert_eq!(bitfield_timed(0xE9D0, true, false), 20); // BFEXTU (A0)
+        assert_eq!(bitfield_timed(0xE9D0, false, false), 21);
+        assert_eq!(bitfield_timed(0xEBD0, true, false), 20); // BFEXTS (A0)
+        assert_eq!(bitfield_timed(0xEDD0, true, false), 32); // BFFFO (A0)
+        assert_eq!(bitfield_timed(0xEDD0, false, false), 33);
+    }
+
+    #[test]
+    fn bitfield_five_byte_span_costs_one_operand_cycle_more() {
+        // Real A1200: the five-byte BFSET loop is 44.32 clocks against 28.10
+        // for a span within four bytes (bfprobe rows 7 and 2). The extra
+        // operand cycle the span needs is billed by the host; the internal
+        // remainder rises by 12 across every form.
+        assert_eq!(bitfield_timed(0xEED0, true, true), 36); // BFSET (A0)
+        assert_eq!(bitfield_timed(0xEED0, false, true), 37);
+        assert_eq!(bitfield_timed(0xEAD0, true, true), 36); // BFCHG (A0)
+        assert_eq!(bitfield_timed(0xECD0, true, true), 36); // BFCLR (A0)
+        assert_eq!(bitfield_timed(0xEFD0, true, true), 36); // BFINS (A0)
+        assert_eq!(bitfield_timed(0xE8D0, true, true), 28); // BFTST (A0)
+        assert_eq!(bitfield_timed(0xE8D0, false, true), 30);
+        assert_eq!(bitfield_timed(0xE9D0, true, true), 32); // BFEXTU (A0)
+        assert_eq!(bitfield_timed(0xEBD0, true, true), 32); // BFEXTS (A0)
+        assert_eq!(bitfield_timed(0xEDD0, true, true), 44); // BFFFO (A0)
+
+        // Every form pays exactly one operand cycle's worth more than its
+        // within-four-bytes row, which is the shape the UM publishes.
+        for op in [
+            0xEED0u16, 0xEAD0, 0xECD0, 0xEFD0, 0xE8D0, 0xE9D0, 0xEBD0, 0xEDD0,
+        ] {
+            assert_eq!(
+                bitfield_timed(op, true, true) - bitfield_timed(op, true, false),
+                12,
+                "opcode {op:04X} five-byte delta"
+            );
+        }
     }
 
     #[test]
