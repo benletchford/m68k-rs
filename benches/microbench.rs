@@ -815,6 +815,49 @@ fn bench_guarded_indexed_scan() {
     );
 }
 
+/// Measure a compiler-shaped address bound check whose longword limit lives
+/// in a stack-frame-style displacement slot. The unconditional latch keeps
+/// the CMPA memory form at the hot trace boundary without adding unrelated
+/// address-register mutation to the measurement.
+fn bench_displacement_address_compare() {
+    const CODE_BASE: u32 = 0x6C00;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0xB7E9, 0x0010, // CMPA.L 16(A1),A3
+        0x60FA, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_long(0x4010, 0x5000);
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(1, 0x4000);
+        cpu.set_a(3, 0x5000);
+        cpu.set_a(7, 0xF000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     displacement CMPA      {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -926,6 +969,10 @@ fn main() {
     }
     if only.as_deref() == Some("guarded-indexed-scan") {
         bench_guarded_indexed_scan();
+        return;
+    }
+    if only.as_deref() == Some("displacement-address-compare") {
+        bench_displacement_address_compare();
         return;
     }
     if only.as_deref() == Some("immediate-shifts") {
