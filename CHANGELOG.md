@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.7.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.7.1...m68k-v0.7.2) (2026-08-05)
+
+
+### Performance Improvements
+
+* JIT indexed immediate word compares ([bfe4a2d](https://github.com/benletchford/m68k-rs/commit/bfe4a2d9839cc3dd18942552829c541cdbd0f09d))
+
 ## [0.7.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.7.0...m68k-v0.7.1) (2026-08-05)
 
 
