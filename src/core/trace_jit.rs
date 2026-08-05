@@ -350,7 +350,7 @@ pub(crate) enum JitTraceOp {
         src: JitEa,
         dst: u8,
     },
-    /// ADD.W/L Dn,<ea> store/accumulate operations through measured writable
+    /// ADD.W/L Dn,`<ea>` store/accumulate operations through measured writable
     /// address-register-relative forms.
     AddRegToMem {
         size: Size,
@@ -4471,7 +4471,7 @@ fn emit_addr_cmp_mem_to_reg(
     cycles_const(builder, trace.op.max_cycles())
 }
 
-/// Emit ADD.W/L Dn,<ea>. The window, alignment, and self-modification guards
+/// Emit ADD.W/L Dn,`<ea>`. The window, alignment, and self-modification guards
 /// all run before memory, address-register, or flag state is changed.
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_add_reg_to_mem(
