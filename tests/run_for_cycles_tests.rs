@@ -962,3 +962,84 @@ fn boundary_hook_decoded_subset_observes_hook_cpu_state_changes() {
     assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
     assert_eq!(decoded_cpu.d(1), 2);
 }
+
+#[test]
+fn boundary_hook_decoded_subset_matches_step_when_hook_raises_irq() {
+    for cpu_type in [CpuType::M68000, CpuType::M68020, CpuType::M68040] {
+        let mut initial_bus = EventBus::new();
+        initial_bus.load_word(0x1000, 0x7001); // MOVEQ #1,D0: fast-path target
+        initial_bus.load_word(0x1002, 0x7201); // MOVEQ #1,D1: must not execute
+        initial_bus.load_long(0x6C, 0x2000); // level-3 autovector
+        initial_bus.load_word(0x2000, 0x4E71); // handler entry: must not execute
+        initial_bus.boundary_on_interrupt_acknowledge = true;
+
+        let mut precise_bus = initial_bus.clone();
+        let mut decoded_bus = initial_bus;
+        let mut precise_cpu = cpu_at(cpu_type, 0x1000);
+        let mut decoded_cpu = cpu_at(cpu_type, 0x1000);
+        precise_cpu.set_sr(0x2000); // supervisor, interrupt mask 0
+        decoded_cpu.set_sr(0x2000);
+
+        let mut precise_instruction_events = Vec::new();
+        let precise =
+            precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |cpu, _, cycles| {
+                precise_instruction_events.push(CycleBoundaryEvent::Instruction { cycles });
+                if cpu.ppc == 0x1000 {
+                    cpu.set_irq(3);
+                }
+                CycleBatchControl::Continue
+            });
+        assert_eq!(precise_instruction_events.len(), 1, "{cpu_type:?}");
+        let mut precise_events = precise_instruction_events;
+        let instruction_cycles = match precise_events[0] {
+            CycleBoundaryEvent::Instruction { cycles } => cycles,
+            CycleBoundaryEvent::InterruptEntry { .. } => unreachable!(),
+        };
+        precise_events.push(CycleBoundaryEvent::InterruptEntry {
+            cycles: precise.cycles - instruction_cycles,
+        });
+
+        let mut decoded_events = Vec::new();
+        let decoded = decoded_cpu.run_for_cycles_with_boundary_hook(
+            &mut decoded_bus,
+            100,
+            |cpu, _, event| {
+                decoded_events.push(event);
+                if matches!(event, CycleBoundaryEvent::Instruction { .. }) && cpu.ppc == 0x1000 {
+                    cpu.set_irq(3);
+                }
+                CycleBatchControl::Continue
+            },
+        );
+
+        assert_eq!(decoded, precise, "{cpu_type:?}");
+        assert_eq!(decoded_events, precise_events, "{cpu_type:?}");
+        assert_eq!(
+            decoded_events,
+            vec![
+                CycleBoundaryEvent::Instruction {
+                    cycles: instruction_cycles,
+                },
+                CycleBoundaryEvent::InterruptEntry {
+                    cycles: precise.cycles - instruction_cycles,
+                },
+            ],
+            "{cpu_type:?}"
+        );
+        assert_eq!(decoded.instructions, 1, "{cpu_type:?}");
+        assert_eq!(
+            decoded.exit,
+            CycleBatchExit::BoundaryRequested,
+            "{cpu_type:?}"
+        );
+        assert_eq!(decoded_cpu.pc, 0x2000, "{cpu_type:?}");
+        assert_eq!(decoded_cpu.d(1), 0, "{cpu_type:?}");
+        assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+        assert_eq!(decoded_bus.memory, precise_bus.memory, "{cpu_type:?}");
+        assert_eq!(
+            &decoded_bus.memory[0x7F00..0x8000],
+            &precise_bus.memory[0x7F00..0x8000],
+            "{cpu_type:?} stack frame"
+        );
+    }
+}
