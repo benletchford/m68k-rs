@@ -5,7 +5,7 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::BatchInnerExit;
+use super::op_cache::{BatchInnerExit, DecodedSimpleOp};
 use super::trace_jit;
 use super::types::{
     BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult,
@@ -394,7 +394,11 @@ impl CpuCore {
             } else {
                 0
             };
-            let step_result = self.step(bus);
+            let step_result = if CALL_INSTRUCTION_HOOK && CALL_INTERRUPT_HOOK {
+                self.step_with_dispatch(bus, CpuCore::dispatch_boundary_hook_decoded)
+            } else {
+                self.step(bus)
+            };
             if CALL_INSTRUCTION_HOOK {
                 self.int_level = deferred_irq;
             }
@@ -848,6 +852,47 @@ impl CpuCore {
         }
 
         res
+    }
+
+    /// Execute the narrow decoded subset allowed by the boundary-hook runner.
+    ///
+    /// 命令取得後にのみ呼び出す。対象外は同じ取得済み opcode を既存 dispatcher
+    /// へ渡すため、fetch/prefetch を再実行しない。
+    fn dispatch_boundary_hook_decoded<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+    ) -> super::types::InternalStepResult {
+        use super::types::{CpuType, InternalStepResult};
+
+        // Trace 状態では通常 dispatch が trace 例外と model 固有処理を担当する。
+        if self.run_mode != RUN_MODE_NORMAL || (self.t1_flag | self.t0_flag) != 0 {
+            return dispatch_instruction(self, bus, opcode);
+        }
+
+        let fast_op = match (
+            self.cpu_type,
+            DecodedSimpleOp::decode(self.cpu_type, opcode),
+        ) {
+            // 68040 の NOP には T0 pipeline-sync の通常処理があるため除外する。
+            (
+                CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030,
+                Some(op @ DecodedSimpleOp::Nop),
+            ) => op,
+            (
+                CpuType::M68000
+                | CpuType::M68010
+                | CpuType::M68020
+                | CpuType::M68030
+                | CpuType::M68040,
+                Some(op @ DecodedSimpleOp::Moveq { .. }),
+            ) => op,
+            _ => return dispatch_instruction(self, bus, opcode),
+        };
+
+        InternalStepResult::Ok {
+            cycles: fast_op.execute(self, bus),
+        }
     }
 
     /// Execute a single instruction with HLE trap handling (CPU + bus access).
