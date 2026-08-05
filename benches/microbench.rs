@@ -986,6 +986,58 @@ fn bench_indexed_value_compare() {
     );
 }
 
+/// Mirror `bench_indexed_value_compare` with an immediate-to-memory CMPI.W so
+/// the two generated traces differ only in the measured comparison. The
+/// memory word equals the immediate, keeping the recorded branch not taken.
+fn bench_indexed_immediate_compare() {
+    const CODE_BASE: u32 = 0x6E00;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0x7600, // MOVEQ #0,D3
+        0x7801, // MOVEQ #1,D4
+        0x7A02, // MOVEQ #2,D5
+        0x7C03, // MOVEQ #3,D6
+        0x7E04, // MOVEQ #4,D7
+        0x2003, // MOVE.L D3,D0
+        0xD084, // ADD.L D4,D0
+        0xD085, // ADD.L D5,D0
+        0x0C70, 0x1234, 0x2004, // CMPI.W #$1234,4(A0,D2.W)
+        0x6602, // BNE.S skip increment (recorded not taken)
+        0x5280, // ADDQ.L #1,D0
+        0x60E4, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_word_at(0x4206, 0x1234);
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x4200);
+        cpu.set_a(7, 0xF000);
+        cpu.set_d(2, 2);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     indexed immediate cmp   {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -1105,6 +1157,10 @@ fn main() {
     }
     if only.as_deref() == Some("indexed-value-compare") {
         bench_indexed_value_compare();
+        return;
+    }
+    if only.as_deref() == Some("indexed-immediate-compare") {
+        bench_indexed_immediate_compare();
         return;
     }
     if only.as_deref() == Some("immediate-shifts") {
