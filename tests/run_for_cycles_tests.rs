@@ -284,6 +284,8 @@ struct EventBus {
     boundary_write_address: Option<u32>,
     boundary_on_interrupt_acknowledge: bool,
     boundary_requested: bool,
+    record_word_reads: bool,
+    word_reads: Vec<u32>,
 }
 
 impl EventBus {
@@ -296,6 +298,8 @@ impl EventBus {
             boundary_write_address: None,
             boundary_on_interrupt_acknowledge: false,
             boundary_requested: false,
+            record_word_reads: false,
+            word_reads: Vec::new(),
         }
     }
 
@@ -312,6 +316,11 @@ impl EventBus {
         self.overlay_memory[address as usize & 0xFFFF] = hi;
         self.overlay_memory[address.wrapping_add(1) as usize & 0xFFFF] = lo;
     }
+
+    fn start_recording_word_reads(&mut self) {
+        self.word_reads.clear();
+        self.record_word_reads = true;
+    }
 }
 
 impl AddressBus for EventBus {
@@ -325,6 +334,9 @@ impl AddressBus for EventBus {
     }
 
     fn read_word(&mut self, address: u32) -> u16 {
+        if self.record_word_reads {
+            self.word_reads.push(address);
+        }
         u16::from_be_bytes([
             self.read_byte(address),
             self.read_byte(address.wrapping_add(1)),
@@ -835,4 +847,118 @@ fn cycle_batch_matches_step_after_fast_path_warmup() {
     assert_eq!(result.instructions, instructions);
     assert_eq!(result.exit, CycleBatchExit::BudgetExhausted);
     assert_cpu_state_eq(&batch_cpu, &step_cpu);
+}
+
+#[test]
+fn boundary_hook_decoded_subset_matches_step_for_each_supported_cpu_model() {
+    let words = [
+        (0x1000, 0x4E71), // NOP
+        (0x1002, 0x7001), // MOVEQ #1,D0
+        (0x1004, 0x4E71), // NOP
+        (0x1006, 0x76FE), // MOVEQ #-2,D3
+    ];
+
+    for cpu_type in [
+        CpuType::M68000,
+        CpuType::M68010,
+        CpuType::M68020,
+        CpuType::M68030,
+        CpuType::M68040,
+    ] {
+        let mut precise_bus = bus_with(&words);
+        let mut decoded_bus = bus_with(&words);
+        let mut precise_cpu = cpu_at(cpu_type, 0x1000);
+        let mut decoded_cpu = cpu_at(cpu_type, 0x1000);
+        let mut precise_hooks = 0;
+        let mut decoded_hooks = 0;
+
+        let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 16, |_, _, _| {
+            precise_hooks += 1;
+            CycleBatchControl::Continue
+        });
+        let decoded =
+            decoded_cpu.run_for_cycles_with_boundary_hook(&mut decoded_bus, 16, |_, _, event| {
+                if matches!(event, CycleBoundaryEvent::Instruction { .. }) {
+                    decoded_hooks += 1;
+                }
+                CycleBatchControl::Continue
+            });
+
+        assert_eq!(decoded, precise, "{cpu_type:?}");
+        assert_eq!(decoded_hooks, precise_hooks, "{cpu_type:?}");
+        assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+    }
+}
+
+#[test]
+fn boundary_hook_decoded_subset_falls_back_without_changing_fetch_order() {
+    let mut initial_bus = EventBus::new();
+    initial_bus.load_word(0x1000, 0x7001); // MOVEQ #1,D0
+    initial_bus.load_word(0x1002, 0x5280); // ADDQ.L #1,D0: unsupported
+    initial_bus.load_word(0x1004, 0x4E71); // NOP
+    initial_bus.load_word(0x1006, 0x76FE); // MOVEQ #-2,D3
+    initial_bus.start_recording_word_reads();
+
+    let mut precise_bus = initial_bus.clone();
+    let mut decoded_bus = initial_bus;
+    let mut precise_cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut decoded_cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut precise_hooks = 0;
+    let mut decoded_hooks = 0;
+
+    let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 20, |_, _, _| {
+        precise_hooks += 1;
+        CycleBatchControl::Continue
+    });
+    let decoded =
+        decoded_cpu.run_for_cycles_with_boundary_hook(&mut decoded_bus, 20, |_, _, event| {
+            if matches!(event, CycleBoundaryEvent::Instruction { .. }) {
+                decoded_hooks += 1;
+            }
+            CycleBatchControl::Continue
+        });
+
+    assert_eq!(decoded, precise);
+    assert_eq!(decoded_hooks, precise_hooks);
+    assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+    assert_eq!(decoded_bus.word_reads, precise_bus.word_reads);
+}
+
+#[test]
+fn boundary_hook_decoded_subset_observes_hook_cpu_state_changes() {
+    let words = [
+        (0x1000, 0x4E71), // NOP
+        (0x1002, 0x7001), // skipped by the hook's PC update
+        (0x1004, 0x7202), // MOVEQ #2,D1
+        (0x1006, 0x4E71), // M68040 fallback
+    ];
+    let mut precise_bus = bus_with(&words);
+    let mut decoded_bus = bus_with(&words);
+    let mut precise_cpu = cpu_at(CpuType::M68020, 0x1000);
+    let mut decoded_cpu = cpu_at(CpuType::M68020, 0x1000);
+
+    let update_after_first_instruction = |cpu: &mut CpuCore| {
+        if cpu.ppc == 0x1000 {
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_sr(cpu.get_sr() | 1);
+            cpu.pc = 0x1004;
+            cpu.invalidate_prefetch();
+        }
+    };
+    let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 12, |cpu, _, _| {
+        update_after_first_instruction(cpu);
+        CycleBatchControl::Continue
+    });
+
+    let decoded =
+        decoded_cpu.run_for_cycles_with_boundary_hook(&mut decoded_bus, 12, |cpu, _, event| {
+            if matches!(event, CycleBoundaryEvent::Instruction { .. }) {
+                update_after_first_instruction(cpu);
+            }
+            CycleBatchControl::Continue
+        });
+
+    assert_eq!(decoded, precise);
+    assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+    assert_eq!(decoded_cpu.d(1), 2);
 }
