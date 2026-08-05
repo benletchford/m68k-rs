@@ -385,11 +385,7 @@ MIT License - see [LICENSE](LICENSE) for details.
 
 ## Contributing
 
-Contributions are welcome! Please ensure:
-
-1. All tests pass: `cargo test`
-2. No clippy warnings: `cargo clippy -- -D warnings`
-3. Code is formatted: `cargo fmt`
+Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md)
 
 ## Acknowledgments
 
