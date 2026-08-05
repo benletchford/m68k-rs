@@ -337,6 +337,13 @@ pub(crate) enum JitTraceOp {
         src: JitEa,
         dst: u8,
     },
+    /// Read-only `CMPI.W #imm,d8(An,Xn)` through checked fast memory. Both
+    /// extension words are captured while recording, so the trace performs
+    /// only the live indexed-address calculation, load, and comparison.
+    CmpiWordMem {
+        immediate: u16,
+        src: JitEa,
+    },
     /// Read-only TST through a checked fast-memory effective address.
     TstMem {
         size: Size,
@@ -1116,7 +1123,9 @@ impl TraceJit {
             && ops.iter().any(|op| {
                 matches!(
                     op.op,
-                    JitTraceOp::AluMemToReg { .. } | JitTraceOp::AddrCmpMemToReg { .. }
+                    JitTraceOp::AluMemToReg { .. }
+                        | JitTraceOp::CmpiWordMem { .. }
+                        | JitTraceOp::AddrCmpMemToReg { .. }
                 )
             })
         {
@@ -1129,6 +1138,7 @@ impl TraceJit {
                 JitTraceOp::MoveMem { .. }
                     | JitTraceOp::MovemWordPostInc { .. }
                     | JitTraceOp::AluMemToReg { .. }
+                    | JitTraceOp::CmpiWordMem { .. }
                     | JitTraceOp::TstMem { .. }
                     | JitTraceOp::AddrCmpMemToReg { .. }
                     | JitTraceOp::AddRegToMem { .. }
@@ -1337,6 +1347,10 @@ impl TraceJit {
                     JitTraceOp::AluMemToReg { .. } => {
                         let env = mem_env.as_ref().expect("AluMemToReg implies a window env");
                         emit_alu_mem_to_reg(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::CmpiWordMem { .. } => {
+                        let env = mem_env.as_ref().expect("CmpiWordMem implies a window env");
+                        emit_cmpi_word_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::TstMem { .. } => {
                         let env = mem_env.as_ref().expect("TstMem implies a window env");
@@ -1769,6 +1783,9 @@ impl JitTraceOp {
             }
             Self::MovemWordPostInc { cycles, .. } => cycles,
             Self::AluMemToReg { .. } => 24,
+            // MC68000 CMPI.W uses an eight-cycle base plus the ten-cycle
+            // brief-indexed effective-address read.
+            Self::CmpiWordMem { .. } => 18,
             // TST is a four-cycle operation plus the indexed EA read
             // (M68000UM); byte and word reads have the same EA cost.
             Self::TstMem { size, .. } => {
@@ -1830,6 +1847,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_binary_immediate_data_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_cmpi_word_mem_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_addr_cmp_immediate_trace_op(cpu, bus, pc, opcode, cpu_type) {
@@ -1948,6 +1968,36 @@ fn decode_binary_immediate_data_reg_trace_op<B: AddressBus>(
             size,
             cycles,
         },
+    })
+}
+
+/// Decode the measured indexed word-memory form of CMPI. Unlike the other
+/// immediate ALU operations, CMPI does not write its effective address, so a
+/// checked fast-memory read can bail before any architectural state changes.
+fn decode_cmpi_word_mem_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluImm {
+        op: BinaryOp::Cmp,
+        size: Size::Word,
+        dst: FastEa::AnIndex(base),
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    let immediate = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    let ea_extension = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+    let src = decode_jit_ea(6, u16::from(base), ea_extension, cpu_type)?;
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(immediate),
+        extension2: Some(ea_extension),
+        pc,
+        op: JitTraceOp::CmpiWordMem { immediate, src },
     })
 }
 
@@ -2536,6 +2586,9 @@ fn execute_portable_op(
     if matches!(op.op, JitTraceOp::AluMemToReg { .. }) {
         return execute_portable_alu_mem_to_reg(cpu, op);
     }
+    if matches!(op.op, JitTraceOp::CmpiWordMem { .. }) {
+        return execute_portable_cmpi_word_mem(cpu, op);
+    }
     if matches!(op.op, JitTraceOp::TstMem { .. }) {
         return execute_portable_tst_mem(cpu, op);
     }
@@ -2759,6 +2812,32 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
     if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::AluToReg { op, size, src, dst }) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_cmpi_word_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::CmpiWordMem {
+        src: JitEa::Index { base, .. },
+        ..
+    } = trace.op
+    else {
+        return None;
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::AluImm {
+            op: BinaryOp::Cmp,
+            size: Size::Word,
+            dst: FastEa::AnIndex(base),
+        },
+    ) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -3491,6 +3570,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is handled by execute_portable_alu_mem_to_reg")
         }
+        JitTraceOp::CmpiWordMem { .. } => {
+            unreachable!("CmpiWordMem is handled by execute_portable_cmpi_word_mem")
+        }
         JitTraceOp::TstMem { .. } => {
             unreachable!("TstMem is handled by execute_portable_tst_mem")
         }
@@ -4038,6 +4120,9 @@ fn emit_jit_op(
         JitTraceOp::AluMemToReg { .. } => {
             unreachable!("AluMemToReg is emitted by emit_alu_mem_to_reg")
         }
+        JitTraceOp::CmpiWordMem { .. } => {
+            unreachable!("CmpiWordMem is emitted by emit_cmpi_word_mem")
+        }
         JitTraceOp::TstMem { .. } => {
             unreachable!("TstMem is emitted by emit_tst_mem")
         }
@@ -4425,6 +4510,62 @@ fn emit_alu_mem_to_reg(
         }
         _ => unreachable!("unsupported memory-to-register ALU operation"),
     }
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit indexed CMPI.W as a checked read followed by a register-only flag
+/// update. A failed address/window/alignment check reaches the side exit
+/// before any condition code is changed, so full dispatch can retry it.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_cmpi_word_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::CmpiWordMem {
+        immediate,
+        src:
+            JitEa::Index {
+                base,
+                index,
+                index_long,
+                scale,
+                displacement,
+            },
+    } = trace.op
+    else {
+        unreachable!("indexed CMPI decoder admitted an unsupported EA")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    let raw_index = load_reg(builder, cpu, index);
+    let index = if index_long {
+        raw_index
+    } else {
+        let word = builder.ins().ireduce(types::I16, raw_index);
+        builder.ins().sextend(types::I32, word)
+    };
+    let index = if scale == 0 {
+        index
+    } else {
+        builder.ins().ishl_imm(index, i64::from(scale))
+    };
+    let address = builder.ins().iadd(base, index);
+    let address = builder.ins().iadd_imm(address, displacement as i64);
+    let (off, _) = checked_window_off(builder, env, bail, address, Size::Word);
+    let dst_value = window_load(builder, env, off, Size::Word);
+    let immediate = iconst_u32(builder, u32::from(immediate));
+    let result = builder.ins().isub(dst_value, immediate);
+    set_cmp_flags(builder, cpu, immediate, dst_value, result, Size::Word);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -6378,6 +6519,150 @@ mod portable_tests {
         assert_eq!(cpu.d(2), 2);
         assert_eq!(cpu.pc, 0x0104);
         assert_eq!(cpu.get_ccr(), 0x1B, "X/N/V/C set and Z clear");
+    }
+
+    #[test]
+    fn indexed_cmpi_word_decode_and_portable_execution_preserve_memory_and_x() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0100..0x0102].copy_from_slice(&0x0C70u16.to_be_bytes());
+        mem[0x0102..0x0104].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        mem[0x0104..0x0106].copy_from_slice(&0x0000u16.to_be_bytes());
+        mem[0x0202..0x0204].copy_from_slice(&0u16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(0, 0x0200);
+        cpu.set_d(0, 2);
+        cpu.set_ccr(0x10);
+
+        let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        decode_bus.write_word(0x0100, 0x0C70);
+        decode_bus.write_word(0x0102, 0xFFFF);
+        decode_bus.write_word(0x0104, 0x0000);
+        let trace = decode_trace_op(&cpu, &mut decode_bus, 0x0100, CpuType::M68040)
+            .expect("indexed CMPI.W should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::CmpiWordMem {
+                immediate: 0xFFFF,
+                src: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(0),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 0,
+                },
+            }
+        ));
+        assert_eq!(trace.extension, Some(0xFFFF));
+        assert_eq!(trace.extension2, Some(0x0000));
+        assert_eq!(
+            execute_portable_op(&mut cpu, trace, 0x0100, 0x0106),
+            Some(18)
+        );
+        assert_eq!(&mem[0x0202..0x0204], &[0, 0], "CMPI is read-only");
+        assert_eq!(cpu.get_ccr(), 0x11, "X is preserved while C is set");
+        assert_eq!(cpu.pc, 0x0106);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_indexed_cmpi_word_matches_portable_and_bails_atomically() {
+        let cmp = TraceBuildOp {
+            opcode: 0x0C70,
+            extension: Some(0xFFFF),
+            extension2: Some(0x0000),
+            pc: 0x0100,
+            op: JitTraceOp::CmpiWordMem {
+                immediate: 0xFFFF,
+                src: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(0),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 0,
+                },
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60F8,
+            extension: None,
+            extension2: None,
+            pc: 0x0106,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -8,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let prepare = |mem: &mut [u8], value: u16| {
+            mem[0x0102..0x0104].copy_from_slice(&0xFFFFu16.to_be_bytes());
+            mem[0x0104..0x0106].copy_from_slice(&0x0000u16.to_be_bytes());
+            mem[0x0202..0x0204].copy_from_slice(&value.to_be_bytes());
+            let mut cpu = cpu();
+            attach_window(&mut cpu, mem);
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_a(0, 0x0200);
+            cpu.set_d(0, 2);
+            cpu.set_ccr(0x10);
+            cpu
+        };
+
+        // Memory values covering the NZVC matrix of `dst - 0xFFFF`; X is
+        // preserved in every case.
+        let cases = [
+            (0x0000u16, 0x11), // borrow only: C
+            (0xFFFF, 0x14),    // equal operands: Z
+            (0x7FFF, 0x1B),    // signed overflow: N, V, C
+            (0x8000, 0x19),    // negative without overflow: N, C
+        ];
+        for (value, expected_ccr) in cases {
+            let ops = vec![cmp, branch];
+            let mut expected_mem = vec![0u8; 0x1000];
+            let mut expected = prepare(&mut expected_mem, value);
+            let expected_packed = execute_portable_trace(&mut expected, &ops, 0x0100, 0x0108);
+            assert_eq!(
+                expected.get_ccr(),
+                expected_ccr,
+                "portable CCR comparing {value:#06x}"
+            );
+
+            let mut actual_mem = vec![0u8; 0x1000];
+            let mut actual = prepare(&mut actual_mem, value);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops, Some(0x0100))
+                .expect("indexed CMPI.W loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(actual_packed, expected_packed);
+            assert_eq!(actual.pc, expected.pc);
+            assert_eq!(actual.dar, expected.dar);
+            assert_eq!(actual.get_ccr(), expected.get_ccr());
+            assert_eq!(actual_mem, expected_mem);
+        }
+
+        // A0 placed so the word read falls outside the window: the native
+        // side exit must retire nothing and leave all state untouched.
+        let mut bail_mem = vec![0u8; 0x1000];
+        let mut bailed = prepare(&mut bail_mem, 0x0000);
+        bailed.set_a(0, 0x0FFE);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(
+                &bailed,
+                0x0100,
+                CpuType::M68040,
+                vec![cmp, branch],
+                Some(0x0100),
+            )
+            .expect("indexed CMPI.W loop should compile");
+        let before = bailed.dar;
+        let packed = unsafe { compiled.call_native(&mut bailed, 1) };
+        assert_eq!(packed, 0, "bail retires no instructions or cycles");
+        assert_eq!(bailed.pc, 0x0100);
+        assert_eq!(bailed.dar, before);
+        assert_eq!(bailed.get_ccr(), 0x10);
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
