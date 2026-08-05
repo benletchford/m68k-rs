@@ -756,7 +756,20 @@ impl CpuCore {
     /// automatically in this mode. For HLE interception with automatic fallback
     /// to exceptions, use `step_with_hle_handler()`.
     pub fn step<B: AddressBus>(&mut self, bus: &mut B) -> StepResult {
-        use crate::core::types::{InternalStepResult, StepResult};
+        self.step_with_dispatch(bus, dispatch_instruction)
+    }
+
+    /// Execute one precise instruction using the supplied post-fetch dispatcher.
+    ///
+    /// The helper owns the normal `step()` prologue and epilogue so internal
+    /// callers can select a dispatcher after the precise opcode fetch without
+    /// fetching the opcode twice.
+    fn step_with_dispatch<B, F>(&mut self, bus: &mut B, dispatch: F) -> StepResult
+    where
+        B: AddressBus,
+        F: FnOnce(&mut CpuCore, &mut B, u16) -> super::types::InternalStepResult,
+    {
+        use crate::core::types::InternalStepResult;
 
         self.set_precise_bus(true);
         if self.stopped != 0 {
@@ -779,7 +792,7 @@ impl CpuCore {
         }
 
         let opcode_fetch_cached = bus.last_fetch_was_cached();
-        let result = dispatch_instruction(self, bus, self.ir as u16);
+        let result = dispatch(self, bus, self.ir as u16);
         let fetch_cached = if matches!(
             self.cpu_type,
             super::types::CpuType::M68EC020 | super::types::CpuType::M68020
