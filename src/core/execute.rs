@@ -856,8 +856,9 @@ impl CpuCore {
 
     /// Execute the narrow decoded subset allowed by the boundary-hook runner.
     ///
-    /// 命令取得後にのみ呼び出す。対象外は同じ取得済み opcode を既存 dispatcher
-    /// へ渡すため、fetch/prefetch を再実行しない。
+    /// Called only after the precise opcode fetch. Unsupported operations pass the
+    /// same fetched opcode to the existing dispatcher without repeating fetch or
+    /// prefetch work.
     fn dispatch_boundary_hook_decoded<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -865,7 +866,8 @@ impl CpuCore {
     ) -> super::types::InternalStepResult {
         use super::types::{CpuType, InternalStepResult};
 
-        // Trace 状態では通常 dispatch が trace 例外と model 固有処理を担当する。
+        // Trace states remain on the normal dispatcher so it can preserve trace
+        // exceptions and model-specific behavior.
         if self.run_mode != RUN_MODE_NORMAL || (self.t1_flag | self.t0_flag) != 0 {
             return dispatch_instruction(self, bus, opcode);
         }
@@ -874,7 +876,8 @@ impl CpuCore {
             self.cpu_type,
             DecodedSimpleOp::decode(self.cpu_type, opcode),
         ) {
-            // 68040 の NOP には T0 pipeline-sync の通常処理があるため除外する。
+            // M68040 NOP is excluded because the normal path performs T0 pipeline
+            // synchronization.
             (
                 CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030,
                 Some(op @ DecodedSimpleOp::Nop),
