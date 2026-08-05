@@ -372,6 +372,14 @@ pub(crate) enum JitTraceOp {
         reg: u8,
         displacement: i16,
     },
+    /// `PEA (d16,An)`: push the effective address through the checked
+    /// window. The address is computed from the pre-decrement stack pointer
+    /// state, no condition code changes, and every check precedes the store
+    /// and the A7 update so a bail commits nothing.
+    PeaDisp {
+        reg: u8,
+        displacement: i16,
+    },
     /// ADDQ/SUBQ through a checked address-register-relative memory EA.
     MemAddqSubq {
         data: u32,
@@ -1176,6 +1184,7 @@ impl TraceJit {
                     | JitTraceOp::AddrCmpMemToReg { .. }
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
+                    | JitTraceOp::PeaDisp { .. }
                     | JitTraceOp::MemAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
                     | JitTraceOp::IndirectJsr { .. }
@@ -1417,6 +1426,10 @@ impl TraceJit {
                     JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
                         let env = mem_env.as_ref().expect("AnDisp implies a window env");
                         emit_an_disp_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::PeaDisp { .. } => {
+                        let env = mem_env.as_ref().expect("PeaDisp implies a window env");
+                        emit_pea_disp(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     _ => emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only),
                 };
@@ -1839,6 +1852,9 @@ impl JitTraceOp {
             // These ops only execute in instruction-budgeted fastmem mode;
             // conservative cycle maxima preserve the trace headroom guard.
             Self::MemAddqSubq { .. } | Self::AnDispUnary { .. } | Self::AnDispBit { .. } => 24,
+            // MC68000 PEA (d16,An): twelve-cycle push plus the four-cycle
+            // displacement extension fetch.
+            Self::PeaDisp { .. } => 16,
         }
     }
 
@@ -2223,6 +2239,19 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 JitTraceOp::AnDispUnary {
                     op: JitUnaryOp::Clr,
                     size,
+                    reg,
+                    displacement: displacement as i16,
+                },
+            )
+        }
+        DecodedMemOp::Pea {
+            ea: FastEa::AnDisp(reg),
+        } => {
+            let displacement = read_ext(2, bus)?;
+            (
+                Some(displacement),
+                None,
+                JitTraceOp::PeaDisp {
                     reg,
                     displacement: displacement as i16,
                 },
@@ -2634,6 +2663,9 @@ fn execute_portable_op(
     if matches!(op.op, JitTraceOp::MemAddqSubq { .. }) {
         return execute_portable_mem_addq_subq(cpu, op, code_start, code_end);
     }
+    if matches!(op.op, JitTraceOp::PeaDisp { .. }) {
+        return execute_portable_pea_disp(cpu, op, code_start, code_end);
+    }
     if matches!(
         op.op,
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. }
@@ -2743,6 +2775,36 @@ fn execute_portable_mem_addq_subq(
             size,
             ea,
             is_sub,
+        },
+    ) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_pea_disp(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::PeaDisp { reg, .. } = trace.op else {
+        return None;
+    };
+    let sp = cpu.dar[15].wrapping_sub(4);
+    let masked = sp & cpu.address_mask;
+    if masked < code_end && masked.wrapping_add(4) > code_start {
+        return None;
+    }
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::Pea {
+            ea: FastEa::AnDisp(reg),
         },
     ) {
         Some(trace.op.max_cycles())
@@ -3621,6 +3683,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
             unreachable!("AnDisp ops are handled by execute_portable_an_disp")
         }
+        JitTraceOp::PeaDisp { .. } => {
+            unreachable!("PeaDisp is handled by execute_portable_pea_disp")
+        }
     }
 }
 
@@ -4170,6 +4235,9 @@ fn emit_jit_op(
         }
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
             unreachable!("AnDisp ops are emitted by emit_an_disp_mem")
+        }
+        JitTraceOp::PeaDisp { .. } => {
+            unreachable!("PeaDisp is emitted by emit_pea_disp")
         }
         JitTraceOp::IndirectJsr { .. } => {
             unreachable!("IndirectJsr is emitted by emit_indirect_jsr")
@@ -4867,6 +4935,45 @@ fn emit_an_disp_mem(
         }
         _ => unreachable!(),
     }
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit `PEA (d16,An)`: the pushed address is computed from the
+/// pre-decrement register state, then the decremented stack slot passes the
+/// alignment/window/code-overlap checks before the store and the A7 update,
+/// so a failed check bails with nothing committed. PEA changes no condition
+/// codes.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_pea_disp(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::PeaDisp { reg, displacement } = trace.op else {
+        unreachable!("expected PEA displacement trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+    let address = builder.ins().iadd_imm(base, displacement as i64);
+    let sp = if reg == 7 {
+        base
+    } else {
+        load_reg(builder, cpu, JitDirectReg::Addr(7))
+    };
+    let new_sp = builder.ins().iadd_imm(sp, -4);
+    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    guard_store_not_code(builder, env, bail, masked, Size::Long);
+    window_store(builder, env, off, Size::Long, address);
+    store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -6809,6 +6916,187 @@ mod portable_tests {
         assert_eq!(shape.prefix_ops, 1);
         assert_eq!(shape.prefix[0].pc, 0x0100);
         assert_eq!(shape.prefix[0].opcode, 0x4840);
+    }
+
+    #[test]
+    fn pea_displacement_decode_and_portable_execution_push_without_flags() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0100..0x0102].copy_from_slice(&0x486Du16.to_be_bytes());
+        mem[0x0102..0x0104].copy_from_slice(&0x0040u16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(5, 0x0300);
+        cpu.set_a(7, 0x0800);
+        cpu.set_ccr(0x1F);
+
+        let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        decode_bus.write_word(0x0100, 0x486D);
+        decode_bus.write_word(0x0102, 0x0040);
+        let trace = decode_trace_op(&cpu, &mut decode_bus, 0x0100, CpuType::M68040)
+            .expect("PEA (d16,An) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::PeaDisp {
+                reg: 5,
+                displacement: 0x40,
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x0040));
+        assert_eq!(trace.extension2, None);
+        assert_eq!(
+            execute_portable_op(&mut cpu, trace, 0x0100, 0x0104),
+            Some(16)
+        );
+        assert_eq!(cpu.dar[15], 0x07FC);
+        assert_eq!(&mem[0x07FC..0x0800], &0x0340u32.to_be_bytes());
+        assert_eq!(cpu.get_ccr(), 0x1F, "PEA changes no condition codes");
+        assert_eq!(cpu.pc, 0x0104);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_pea_displacement_matches_portable_and_bails_atomically() {
+        let pea = TraceBuildOp {
+            opcode: 0x486D,
+            extension: Some(0x0040),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::PeaDisp {
+                reg: 5,
+                displacement: 0x40,
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+
+        let prepare = |mem: &mut [u8], opcode: u16, ext: u16| {
+            mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+            mem[0x0102..0x0104].copy_from_slice(&ext.to_be_bytes());
+            mem[0x0104..0x0106].copy_from_slice(&0x60FAu16.to_be_bytes());
+            let mut cpu = cpu();
+            attach_window(&mut cpu, mem);
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_a(5, 0x0300);
+            cpu.set_a(7, 0x0800);
+            cpu.set_ccr(0x15);
+            cpu
+        };
+
+        let mut expected_mem = vec![0u8; 0x1000];
+        let mut expected = prepare(&mut expected_mem, 0x486D, 0x0040);
+        let expected_packed = execute_portable_trace(&mut expected, &[pea, branch], 0x0100, 0x0106);
+
+        let mut actual_mem = vec![0u8; 0x1000];
+        let mut actual = prepare(&mut actual_mem, 0x486D, 0x0040);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(
+                &actual,
+                0x0100,
+                CpuType::M68040,
+                vec![pea, branch],
+                Some(0x0100),
+            )
+            .expect("PEA displacement loop should compile");
+        let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(actual.pc, expected.pc);
+        assert_eq!(actual.dar, expected.dar);
+        assert_eq!(actual.get_ccr(), expected.get_ccr());
+        assert_eq!(actual_mem, expected_mem);
+        assert_eq!(&actual_mem[0x07FC..0x0800], &0x0340u32.to_be_bytes());
+
+        // PEA (d16,A7) pushes an address computed from the pre-decrement
+        // stack pointer.
+        let pea_sp = TraceBuildOp {
+            opcode: 0x486F,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::PeaDisp {
+                reg: 7,
+                displacement: 0x10,
+            },
+        };
+        let mut sp_expected_mem = vec![0u8; 0x1000];
+        let mut sp_expected = prepare(&mut sp_expected_mem, 0x486F, 0x0010);
+        let sp_expected_packed =
+            execute_portable_trace(&mut sp_expected, &[pea_sp, branch], 0x0100, 0x0106);
+        let mut sp_actual_mem = vec![0u8; 0x1000];
+        let mut sp_actual = prepare(&mut sp_actual_mem, 0x486F, 0x0010);
+        let mut sp_jit = TraceJit::new();
+        let sp_compiled = sp_jit
+            .compile_decoded_ops(
+                &sp_actual,
+                0x0100,
+                CpuType::M68040,
+                vec![pea_sp, branch],
+                Some(0x0100),
+            )
+            .expect("PEA (d16,A7) loop should compile");
+        let sp_actual_packed = unsafe { sp_compiled.call_native(&mut sp_actual, 1) };
+        assert_eq!(sp_actual_packed, sp_expected_packed);
+        assert_eq!(sp_actual.dar, sp_expected.dar);
+        assert_eq!(sp_actual_mem, sp_expected_mem);
+        assert_eq!(&sp_actual_mem[0x07FC..0x0800], &0x0810u32.to_be_bytes());
+
+        let mut untouched_mem = vec![0u8; 0x1000];
+        prepare(&mut untouched_mem, 0x486D, 0x0040);
+
+        // A stack slot outside the window reaches the side exit with
+        // nothing committed.
+        let mut bail_mem = vec![0u8; 0x1000];
+        let mut bailed = prepare(&mut bail_mem, 0x486D, 0x0040);
+        bailed.set_a(7, 0x0002);
+        let mut bail_jit = TraceJit::new();
+        let bail_compiled = bail_jit
+            .compile_decoded_ops(
+                &bailed,
+                0x0100,
+                CpuType::M68040,
+                vec![pea, branch],
+                Some(0x0100),
+            )
+            .expect("PEA displacement loop should compile");
+        let before = bailed.dar;
+        let packed = unsafe { bail_compiled.call_native(&mut bailed, 1) };
+        assert_eq!(packed, 0, "bail retires no instructions or cycles");
+        assert_eq!(bailed.pc, 0x0100);
+        assert_eq!(bailed.dar, before);
+        assert_eq!(bailed.get_ccr(), 0x15);
+        assert_eq!(bail_mem, untouched_mem, "nothing was stored");
+
+        // A stack slot overlapping the trace's own code hits the
+        // store-overlap guard before anything commits.
+        let mut smc_mem = vec![0u8; 0x1000];
+        let mut smc = prepare(&mut smc_mem, 0x486D, 0x0040);
+        smc.set_a(7, 0x0106);
+        let mut smc_jit = TraceJit::new();
+        let smc_compiled = smc_jit
+            .compile_decoded_ops(
+                &smc,
+                0x0100,
+                CpuType::M68040,
+                vec![pea, branch],
+                Some(0x0100),
+            )
+            .expect("PEA displacement loop should compile");
+        let before = smc.dar;
+        let packed = unsafe { smc_compiled.call_native(&mut smc, 1) };
+        assert_eq!(packed, 0, "store-overlap guard retires nothing");
+        assert_eq!(smc.dar, before);
+        assert_eq!(smc_mem, untouched_mem);
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
