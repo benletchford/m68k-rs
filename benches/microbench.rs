@@ -1104,6 +1104,75 @@ fn bench_pea_displacement_loop() {
     );
 }
 
+/// Measure a JIT-compiled loop that pushes two constants with the admitted
+/// predecrement stores and pops them back, keeping the stack balanced while
+/// exercising both checked constant stores. This models the argument-push
+/// sequence compilers emit before a call, with the pops standing in for the
+/// callee consuming its arguments:
+///
+/// ```c
+/// for (;;) {
+///     PushZeroLong();      /* CLR.L -(SP)         */
+///     PushZeroWord();      /* CLR.W -(SP)         */
+///     PushWord(0x1234);    /* MOVE.W #$1234,-(SP) */
+///     sink16 = PopWord();  /* MOVE.W (A7)+,D3     */
+///     sink16b = PopWord(); /* MOVE.W (A7)+,D4     */
+///     sink32 = PopLong();  /* MOVE.L (A7)+,D5     */
+///     ++iterations;        /* ADDQ.L #1,D1        */
+/// }
+/// ```
+///
+/// The instruction budget is a whole number of eight-instruction
+/// iterations, so the run ends at the loop head and the final counter,
+/// sink, and stack values are exact.
+fn bench_predec_imm_store_loop() {
+    const CODE_BASE: u32 = 0x6E00;
+    const ITERATIONS: u32 = 12_500_000;
+    const INSTRS: u32 = ITERATIONS * 8;
+    let words = [
+        0x42A7, // loop: CLR.L -(SP)
+        0x4267, // CLR.W -(SP)
+        0x3F3C, 0x1234, // MOVE.W #$1234,-(SP)
+        0x361F, // MOVE.W (A7)+,D3
+        0x381F, // MOVE.W (A7)+,D4
+        0x2A1F, // MOVE.L (A7)+,D5
+        0x5281, // ADDQ.L #1,D1
+        0x60EE, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.d(1), ITERATIONS, "one increment per iteration");
+    assert_eq!(cpu.d(3), 0x1234, "the popped word is the pushed immediate");
+    assert_eq!(cpu.d(4), 0, "the popped word is the cleared word slot");
+    assert_eq!(cpu.d(5), 0, "the popped long is the cleared long slot");
+    assert_eq!(cpu.a(7), 0x8000, "the stack is balanced at the loop head");
+    println!(
+        "batch     predec imm stores       {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -1227,6 +1296,10 @@ fn main() {
     }
     if only.as_deref() == Some("indexed-immediate-compare") {
         bench_indexed_immediate_compare();
+        return;
+    }
+    if only.as_deref() == Some("predec-imm-stores") {
+        bench_predec_imm_store_loop();
         return;
     }
     if only.as_deref() == Some("pea-displacement") {

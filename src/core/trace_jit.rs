@@ -380,6 +380,17 @@ pub(crate) enum JitTraceOp {
         reg: u8,
         displacement: i16,
     },
+    /// `CLR.L -(An)` / `MOVE.W #imm,-(An)`: store a constant through the
+    /// checked window at the decremented address. The value and cycle count
+    /// are fixed while recording, N/Z/V/C are compile-time constants of the
+    /// stored value with X preserved, and every check precedes the store
+    /// and the register update so a bail commits nothing.
+    PreDecImmStore {
+        size: Size,
+        reg: u8,
+        value: u32,
+        cycles: i32,
+    },
     /// ADDQ/SUBQ through a checked address-register-relative memory EA.
     MemAddqSubq {
         data: u32,
@@ -1185,6 +1196,7 @@ impl TraceJit {
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::PeaDisp { .. }
+                    | JitTraceOp::PreDecImmStore { .. }
                     | JitTraceOp::MemAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
                     | JitTraceOp::IndirectJsr { .. }
@@ -1430,6 +1442,12 @@ impl TraceJit {
                     JitTraceOp::PeaDisp { .. } => {
                         let env = mem_env.as_ref().expect("PeaDisp implies a window env");
                         emit_pea_disp(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::PreDecImmStore { .. } => {
+                        let env = mem_env
+                            .as_ref()
+                            .expect("PreDecImmStore implies a window env");
+                        emit_pre_dec_imm_store(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     _ => emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only),
                 };
@@ -1855,6 +1873,10 @@ impl JitTraceOp {
             // MC68000 PEA (d16,An): twelve-cycle push plus the four-cycle
             // displacement extension fetch.
             Self::PeaDisp { .. } => 16,
+            // Captured while recording: the MC68000 forms differ (CLR.L
+            // -(An) is a 22-cycle read-modify-write, MOVE.W #imm,-(An) is
+            // twelve cycles).
+            Self::PreDecImmStore { cycles, .. } => cycles,
         }
     }
 
@@ -2254,6 +2276,54 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 JitTraceOp::PeaDisp {
                     reg,
                     displacement: displacement as i16,
+                },
+            )
+        }
+        DecodedMemOp::Clr {
+            size: Size::Long,
+            ea: FastEa::AnPreDec(reg),
+        } => (
+            None,
+            None,
+            JitTraceOp::PreDecImmStore {
+                size: Size::Long,
+                reg,
+                value: 0,
+                // MC68000 CLR.L -(An): the twelve-cycle read-modify-write
+                // memory clear plus the ten-cycle predecrement long EA.
+                cycles: 22,
+            },
+        ),
+        DecodedMemOp::Clr {
+            size: Size::Word,
+            ea: FastEa::AnPreDec(reg),
+        } => (
+            None,
+            None,
+            JitTraceOp::PreDecImmStore {
+                size: Size::Word,
+                reg,
+                value: 0,
+                // MC68000 CLR.W -(An): the eight-cycle read-modify-write
+                // memory clear plus the six-cycle predecrement word EA.
+                cycles: 14,
+            },
+        ),
+        DecodedMemOp::Move {
+            size: Size::Word,
+            src: FastEa::Imm,
+            dst: FastEa::AnPreDec(reg),
+        } => {
+            let immediate = read_ext(2, bus)?;
+            (
+                Some(immediate),
+                None,
+                JitTraceOp::PreDecImmStore {
+                    size: Size::Word,
+                    reg,
+                    value: u32::from(immediate),
+                    // MC68000 MOVE.W #imm,-(An) is twelve cycles.
+                    cycles: 12,
                 },
             )
         }
@@ -2666,6 +2736,9 @@ fn execute_portable_op(
     if matches!(op.op, JitTraceOp::PeaDisp { .. }) {
         return execute_portable_pea_disp(cpu, op, code_start, code_end);
     }
+    if matches!(op.op, JitTraceOp::PreDecImmStore { .. }) {
+        return execute_portable_pre_dec_imm_store(cpu, op, code_start, code_end);
+    }
     if matches!(
         op.op,
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. }
@@ -2807,6 +2880,45 @@ fn execute_portable_pea_disp(
             ea: FastEa::AnDisp(reg),
         },
     ) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_pre_dec_imm_store(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::PreDecImmStore { size, reg, .. } = trace.op else {
+        return None;
+    };
+    let target = cpu.dar[8 + reg as usize].wrapping_sub(jit_ea_step(size, reg));
+    let masked = target & cpu.address_mask;
+    if masked < code_end && masked.wrapping_add(size.bytes()) > code_start {
+        return None;
+    }
+    // The opcode family distinguishes the admitted forms: 0x3000 is the
+    // MOVE.W immediate push, 0x4200 is the CLR read-modify-write.
+    let op = if trace.opcode & 0xF000 == 0x3000 {
+        DecodedMemOp::Move {
+            size,
+            src: FastEa::Imm,
+            dst: FastEa::AnPreDec(reg),
+        }
+    } else {
+        DecodedMemOp::Clr {
+            size,
+            ea: FastEa::AnPreDec(reg),
+        }
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(cpu, op) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -3686,6 +3798,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::PeaDisp { .. } => {
             unreachable!("PeaDisp is handled by execute_portable_pea_disp")
         }
+        JitTraceOp::PreDecImmStore { .. } => {
+            unreachable!("PreDecImmStore is handled by execute_portable_pre_dec_imm_store")
+        }
     }
 }
 
@@ -4238,6 +4353,9 @@ fn emit_jit_op(
         }
         JitTraceOp::PeaDisp { .. } => {
             unreachable!("PeaDisp is emitted by emit_pea_disp")
+        }
+        JitTraceOp::PreDecImmStore { .. } => {
+            unreachable!("PreDecImmStore is emitted by emit_pre_dec_imm_store")
         }
         JitTraceOp::IndirectJsr { .. } => {
             unreachable!("IndirectJsr is emitted by emit_indirect_jsr")
@@ -4974,6 +5092,59 @@ fn emit_pea_disp(
     guard_store_not_code(builder, env, bail, masked, Size::Long);
     window_store(builder, env, off, Size::Long, address);
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit `CLR.L -(An)` / `MOVE.W #imm,-(An)`: a constant store through the
+/// checked window at the decremented address. The alignment, window, and
+/// store-overlap checks all precede the store and the register update, and
+/// because the stored value is a recording-time constant, N/Z/V/C are
+/// stored as constants with X untouched. The MC68000's CLR quirk of reading
+/// the destination first is not observable through the plain-memory window
+/// (and its cost is already in the recorded cycle count), so the emission
+/// stores directly.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_pre_dec_imm_store(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::PreDecImmStore {
+        size, reg, value, ..
+    } = trace.op
+    else {
+        unreachable!("expected predecrement immediate store trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+    let target = builder
+        .ins()
+        .iadd_imm(base, -i64::from(jit_ea_step(size, reg)));
+    let (off, masked) = checked_window_off(builder, env, bail, target, size);
+    guard_store_not_code(builder, env, bail, masked, size);
+    let stored = iconst_u32(builder, value);
+    window_store(builder, env, off, size, stored);
+    store_reg(builder, cpu, JitDirectReg::Addr(reg), target);
+
+    let masked_value = value & size_mask(size);
+    let n = if masked_value & size_msb(size) != 0 {
+        NFLAG_SET
+    } else {
+        0
+    };
+    store_u32(builder, cpu, offset_of!(CpuCore, n_flag), n);
+    store_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), masked_value);
+    store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
+    store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -7092,6 +7263,234 @@ mod portable_tests {
                 Some(0x0100),
             )
             .expect("PEA displacement loop should compile");
+        let before = smc.dar;
+        let packed = unsafe { smc_compiled.call_native(&mut smc, 1) };
+        assert_eq!(packed, 0, "store-overlap guard retires nothing");
+        assert_eq!(smc.dar, before);
+        assert_eq!(smc_mem, untouched_mem);
+    }
+
+    #[test]
+    fn pre_dec_imm_store_decode_and_portable_execution() {
+        // CLR.L -(A7): pushes a zero long, sets Z, clears N/V/C, keeps X.
+        let mut clr_cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0100..0x0102].copy_from_slice(&0x42A7u16.to_be_bytes());
+        mem[0x07FC..0x0800].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        attach_window(&mut clr_cpu, &mut mem);
+        clr_cpu.set_cpu_type(CpuType::M68040);
+        clr_cpu.set_a(7, 0x0800);
+        clr_cpu.set_ccr(0x1B);
+
+        let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        decode_bus.write_word(0x0100, 0x42A7);
+        let trace = decode_trace_op(&clr_cpu, &mut decode_bus, 0x0100, CpuType::M68040)
+            .expect("CLR.L -(A7) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::PreDecImmStore {
+                size: Size::Long,
+                reg: 7,
+                value: 0,
+                cycles: 22,
+            }
+        ));
+        assert_eq!(trace.extension, None);
+        assert_eq!(
+            execute_portable_op(&mut clr_cpu, trace, 0x0100, 0x0102),
+            Some(22)
+        );
+        assert_eq!(clr_cpu.dar[15], 0x07FC);
+        assert_eq!(&mem[0x07FC..0x0800], &[0, 0, 0, 0]);
+        assert_eq!(clr_cpu.get_ccr(), 0x14, "X and Z set, N/V/C clear");
+        assert_eq!(clr_cpu.pc, 0x0102);
+
+        // MOVE.W #$8000,-(A7): pushes the immediate, sets N, keeps X.
+        let mut imm_cpu = cpu();
+        let mut imm_mem = vec![0u8; 0x1000];
+        imm_mem[0x0100..0x0102].copy_from_slice(&0x3F3Cu16.to_be_bytes());
+        imm_mem[0x0102..0x0104].copy_from_slice(&0x8000u16.to_be_bytes());
+        attach_window(&mut imm_cpu, &mut imm_mem);
+        imm_cpu.set_cpu_type(CpuType::M68040);
+        imm_cpu.set_a(7, 0x0800);
+        imm_cpu.set_ccr(0x17);
+
+        let mut imm_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        imm_bus.write_word(0x0100, 0x3F3C);
+        imm_bus.write_word(0x0102, 0x8000);
+        let imm_trace = decode_trace_op(&imm_cpu, &mut imm_bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W #imm,-(A7) should decode");
+        assert!(matches!(
+            imm_trace.op,
+            JitTraceOp::PreDecImmStore {
+                size: Size::Word,
+                reg: 7,
+                value: 0x8000,
+                cycles: 12,
+            }
+        ));
+        assert_eq!(imm_trace.extension, Some(0x8000));
+        assert_eq!(
+            execute_portable_op(&mut imm_cpu, imm_trace, 0x0100, 0x0104),
+            Some(12)
+        );
+        assert_eq!(imm_cpu.dar[15], 0x07FE);
+        assert_eq!(&imm_mem[0x07FE..0x0800], &0x8000u16.to_be_bytes());
+        assert_eq!(imm_cpu.get_ccr(), 0x18, "X and N set, Z/V/C clear");
+        assert_eq!(imm_cpu.pc, 0x0104);
+
+        // CLR.W -(A7): the word form pushes a zero word for fourteen cycles.
+        let mut clrw_cpu = cpu();
+        let mut clrw_mem = vec![0u8; 0x1000];
+        clrw_mem[0x0100..0x0102].copy_from_slice(&0x4267u16.to_be_bytes());
+        clrw_mem[0x07FE..0x0800].copy_from_slice(&0xBEEFu16.to_be_bytes());
+        attach_window(&mut clrw_cpu, &mut clrw_mem);
+        clrw_cpu.set_cpu_type(CpuType::M68040);
+        clrw_cpu.set_a(7, 0x0800);
+        clrw_cpu.set_ccr(0x1B);
+
+        let mut clrw_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        clrw_bus.write_word(0x0100, 0x4267);
+        let clrw_trace = decode_trace_op(&clrw_cpu, &mut clrw_bus, 0x0100, CpuType::M68040)
+            .expect("CLR.W -(A7) should decode");
+        assert!(matches!(
+            clrw_trace.op,
+            JitTraceOp::PreDecImmStore {
+                size: Size::Word,
+                reg: 7,
+                value: 0,
+                cycles: 14,
+            }
+        ));
+        assert_eq!(
+            execute_portable_op(&mut clrw_cpu, clrw_trace, 0x0100, 0x0102),
+            Some(14)
+        );
+        assert_eq!(clrw_cpu.dar[15], 0x07FE);
+        assert_eq!(&clrw_mem[0x07FE..0x0800], &[0, 0]);
+        assert_eq!(clrw_cpu.get_ccr(), 0x14, "X and Z set, N/V/C clear");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_pre_dec_imm_store_matches_portable_and_bails_atomically() {
+        let clr = TraceBuildOp {
+            opcode: 0x42A7,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::PreDecImmStore {
+                size: Size::Long,
+                reg: 7,
+                value: 0,
+                cycles: 22,
+            },
+        };
+        let push_imm = TraceBuildOp {
+            opcode: 0x3F3C,
+            extension: Some(0x8000),
+            extension2: None,
+            pc: 0x0102,
+            op: JitTraceOp::PreDecImmStore {
+                size: Size::Word,
+                reg: 7,
+                value: 0x8000,
+                cycles: 12,
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60F8,
+            extension: None,
+            extension2: None,
+            pc: 0x0106,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -8,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+
+        let prepare = |mem: &mut [u8]| {
+            mem[0x0100..0x0102].copy_from_slice(&0x42A7u16.to_be_bytes());
+            mem[0x0102..0x0104].copy_from_slice(&0x3F3Cu16.to_be_bytes());
+            mem[0x0104..0x0106].copy_from_slice(&0x8000u16.to_be_bytes());
+            mem[0x0106..0x0108].copy_from_slice(&0x60F8u16.to_be_bytes());
+            let mut cpu = cpu();
+            attach_window(&mut cpu, mem);
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_a(7, 0x0800);
+            cpu.set_ccr(0x15);
+            cpu
+        };
+
+        let mut expected_mem = vec![0u8; 0x1000];
+        let mut expected = prepare(&mut expected_mem);
+        let expected_packed =
+            execute_portable_trace(&mut expected, &[clr, push_imm, branch], 0x0100, 0x0108);
+
+        let mut actual_mem = vec![0u8; 0x1000];
+        let mut actual = prepare(&mut actual_mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(
+                &actual,
+                0x0100,
+                CpuType::M68040,
+                vec![clr, push_imm, branch],
+                Some(0x0100),
+            )
+            .expect("predecrement store loop should compile");
+        let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(actual.pc, expected.pc);
+        assert_eq!(actual.dar, expected.dar);
+        assert_eq!(actual.get_ccr(), expected.get_ccr());
+        assert_eq!(actual_mem, expected_mem);
+        assert_eq!(&actual_mem[0x07FC..0x0800], &[0, 0, 0, 0]);
+        assert_eq!(&actual_mem[0x07FA..0x07FC], &0x8000u16.to_be_bytes());
+        assert_eq!(actual.dar[15], 0x07FA);
+
+        let mut untouched_mem = vec![0u8; 0x1000];
+        prepare(&mut untouched_mem);
+
+        // A stack slot outside the window bails with nothing committed.
+        let mut bail_mem = vec![0u8; 0x1000];
+        let mut bailed = prepare(&mut bail_mem);
+        bailed.set_a(7, 0x0002);
+        let mut bail_jit = TraceJit::new();
+        let bail_compiled = bail_jit
+            .compile_decoded_ops(
+                &bailed,
+                0x0100,
+                CpuType::M68040,
+                vec![clr, push_imm, branch],
+                Some(0x0100),
+            )
+            .expect("predecrement store loop should compile");
+        let before = bailed.dar;
+        let packed = unsafe { bail_compiled.call_native(&mut bailed, 1) };
+        assert_eq!(packed, 0, "bail retires no instructions or cycles");
+        assert_eq!(bailed.pc, 0x0100);
+        assert_eq!(bailed.dar, before);
+        assert_eq!(bailed.get_ccr(), 0x15);
+        assert_eq!(bail_mem, untouched_mem, "nothing was stored");
+
+        // A stack slot overlapping the trace's own code hits the
+        // store-overlap guard before anything commits.
+        let mut smc_mem = vec![0u8; 0x1000];
+        let mut smc = prepare(&mut smc_mem);
+        smc.set_a(7, 0x0108);
+        let mut smc_jit = TraceJit::new();
+        let smc_compiled = smc_jit
+            .compile_decoded_ops(
+                &smc,
+                0x0100,
+                CpuType::M68040,
+                vec![clr, push_imm, branch],
+                Some(0x0100),
+            )
+            .expect("predecrement store loop should compile");
         let before = smc.dar;
         let packed = unsafe { smc_compiled.call_native(&mut smc, 1) };
         assert_eq!(packed, 0, "store-overlap guard retires nothing");
