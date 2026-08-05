@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.7.0...m68k-v0.7.1) (2026-08-05)
+
+
+### Performance Improvements
+
+* JIT brief-indexed memory-source ALU operations ([0bc6b89](https://github.com/benletchford/m68k-rs/commit/0bc6b891db8b1f99b0edf806dfa12a8e64cd8e85))
+* JIT fixed-point state update loops ([303f5e3](https://github.com/benletchford/m68k-rs/commit/303f5e3309fbde2dd603c5d99b3c18d60de85046))
+
 ## [0.7.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.6.0...m68k-v0.7.0) (2026-08-04)
 
 
