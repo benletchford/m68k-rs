@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.7.2...m68k-v0.8.0) (2026-08-05)
+
+
+### Features
+
+* report exact trace recording paths ([0edf7df](https://github.com/benletchford/m68k-rs/commit/0edf7df5bb70803671fe468ddbc85fe2f3a5c921))
+
 ## [0.7.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.7.1...m68k-v0.7.2) (2026-08-05)
 
 
