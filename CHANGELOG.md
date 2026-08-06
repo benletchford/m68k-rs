@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.2...m68k-v0.8.3) (2026-08-06)
+
+
+### Performance Improvements
+
+* **execute:** add precise decoded dispatch for boundary-hook runs ([3a2c591](https://github.com/benletchford/m68k-rs/commit/3a2c5918ba4b9eecc112eb2a50ae56c1fedbb920))
+
 ## [0.8.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.1...m68k-v0.8.2) (2026-08-06)
 
 
