@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.8.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.1...m68k-v0.8.2) (2026-08-06)
+
+
+### Bug Fixes
+
+* **trace-profile:** attribute recordings that end with no unsupported opcode ([153436b](https://github.com/benletchford/m68k-rs/commit/153436b8bb62b5281345489a904eae135de6265b))
+
+
+### Performance Improvements
+
+* JIT brief-indexed LEA ([934f5ca](https://github.com/benletchford/m68k-rs/commit/934f5ca60438c09adfb5a90bd11b78be000dc8e5))
+
 ## [0.8.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.0...m68k-v0.8.1) (2026-08-06)
 
 

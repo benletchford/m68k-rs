@@ -349,7 +349,7 @@ checksum = "616ec5685824bcc94416c6d4a7a446eea774a31efd7062c8480ba6fd06d7a6e5"
 
 [[package]]
 name = "m68k"
-version = "0.8.1"
+version = "0.8.2"
 dependencies = [
  "astro-float",
  "cranelift-codegen",
