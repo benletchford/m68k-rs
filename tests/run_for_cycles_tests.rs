@@ -1043,3 +1043,47 @@ fn boundary_hook_decoded_subset_matches_step_when_hook_raises_irq() {
         );
     }
 }
+
+#[test]
+fn boundary_hook_decoded_subset_rejects_reserved_moveq_encoding() {
+    let mut initial_bus = EventBus::new();
+    initial_bus.load_word(0x1000, 0x7100); // Reserved group-7 encoding, not MOVEQ.
+    initial_bus.start_recording_word_reads();
+
+    let mut precise_bus = initial_bus.clone();
+    let mut decoded_bus = initial_bus;
+    let mut precise_cpu = cpu_at(CpuType::M68000, 0x1000);
+    let mut decoded_cpu = cpu_at(CpuType::M68000, 0x1000);
+    precise_cpu.set_d(0, 0xDEAD_BEEF);
+    decoded_cpu.set_d(0, 0xDEAD_BEEF);
+    let mut precise_hooks = 0;
+    let mut decoded_hooks = 0;
+
+    let precise = precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 100, |_, _, _| {
+        precise_hooks += 1;
+        CycleBatchControl::Continue
+    });
+    let decoded =
+        decoded_cpu.run_for_cycles_with_boundary_hook(&mut decoded_bus, 100, |_, _, event| {
+            if matches!(event, CycleBoundaryEvent::Instruction { .. }) {
+                decoded_hooks += 1;
+            }
+            CycleBatchControl::Continue
+        });
+
+    let expected_exit = CycleBatchExit::IllegalInstruction { opcode: 0x7100 };
+    assert_eq!(precise.exit, expected_exit);
+    assert_eq!(decoded, precise);
+    assert_eq!(decoded.cycles, 0);
+    assert_eq!(decoded.instructions, 0);
+    assert_eq!(precise_hooks, 0);
+    assert_eq!(decoded_hooks, 0);
+    assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+    assert_eq!(decoded_cpu.ir, precise_cpu.ir);
+    assert_eq!(decoded_cpu.dar_save, precise_cpu.dar_save);
+    assert_eq!(decoded_cpu.sr_save, precise_cpu.sr_save);
+    assert_eq!(decoded_cpu.prefetch_queue, precise_cpu.prefetch_queue);
+    assert_eq!(decoded_cpu.prefetch_count, precise_cpu.prefetch_count);
+    assert_eq!(decoded_bus.memory, precise_bus.memory);
+    assert_eq!(decoded_bus.word_reads, precise_bus.word_reads);
+}

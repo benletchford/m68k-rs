@@ -889,7 +889,7 @@ impl CpuCore {
                 | CpuType::M68030
                 | CpuType::M68040,
                 Some(op @ DecodedSimpleOp::Moveq { .. }),
-            ) => op,
+            ) if opcode & 0x0100 == 0 => op,
             _ => return dispatch_instruction(self, bus, opcode),
         };
 
