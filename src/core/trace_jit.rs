@@ -253,6 +253,14 @@ pub(crate) enum JitTraceOp {
         displacement: i16,
         cycles: i32,
     },
+    /// `LEA (d8,An,Xn),An` with the brief extension decoded once while
+    /// recording. LEA is register-only: it accesses no memory and changes
+    /// no condition codes.
+    LeaIndex {
+        src: JitEa,
+        dst: u8,
+        cycles: i32,
+    },
     AddSubxReg {
         src: u8,
         dst: u8,
@@ -1710,6 +1718,7 @@ impl JitTraceOp {
             Self::AddrDataReg { .. } => 8,
             Self::AddrCmpImmediate { cycles, .. } => cycles,
             Self::LeaAn { cycles, .. } => cycles,
+            Self::LeaIndex { cycles, .. } => cycles,
             Self::AddSubxReg { .. } => 8,
             Self::BitReg {
                 op: JitBitOp::Test, ..
@@ -2357,6 +2366,23 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                     dst,
                     displacement: displacement as i16,
                     cycles: if is_pre_68020(cpu_type) { 8 } else { 4 },
+                },
+            )
+        }
+        DecodedMemOp::Lea {
+            reg: dst,
+            ea: FastEa::AnIndex(base),
+        } => {
+            let extension = read_ext(2, bus)?;
+            let src = decode_jit_ea(6, u16::from(base), extension, cpu_type)?;
+            (
+                Some(extension),
+                None,
+                JitTraceOp::LeaIndex {
+                    src,
+                    dst,
+                    // MC68000 LEA (d8,An,Xn) is twelve cycles.
+                    cycles: if is_pre_68020(cpu_type) { 12 } else { 4 },
                 },
             )
         }
@@ -3494,6 +3520,31 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 cpu.dar[8 + base as usize].wrapping_add(displacement as i32 as u32);
             cycles
         }
+        JitTraceOp::LeaIndex { src, dst, cycles } => {
+            let JitEa::Index {
+                base,
+                index,
+                index_long,
+                scale,
+                displacement,
+            } = src
+            else {
+                unreachable!("indexed LEA decoder admitted an unsupported EA")
+            };
+            let raw_index = match index {
+                JitDirectReg::Data(reg) => cpu.dar[reg as usize],
+                JitDirectReg::Addr(reg) => cpu.dar[8 + reg as usize],
+            };
+            let index_value = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            cpu.dar[8 + dst as usize] = cpu.dar[8 + base as usize]
+                .wrapping_add(index_value.wrapping_shl(u32::from(scale)))
+                .wrapping_add(displacement as i32 as u32);
+            cycles
+        }
         JitTraceOp::AddSubxReg {
             src,
             dst,
@@ -4051,6 +4102,35 @@ fn emit_jit_op(
         } => {
             let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
             let address = builder.ins().iadd_imm(base, displacement as i64);
+            store_reg(builder, cpu, JitDirectReg::Addr(dst), address);
+            cycles_const(builder, op.op.max_cycles())
+        }
+        JitTraceOp::LeaIndex { src, dst, .. } => {
+            let JitEa::Index {
+                base,
+                index,
+                index_long,
+                scale,
+                displacement,
+            } = src
+            else {
+                unreachable!("indexed LEA decoder admitted an unsupported EA")
+            };
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let address = builder.ins().iadd(base, index);
+            let address = builder.ins().iadd_imm(address, displacement as i64);
             store_reg(builder, cpu, JitDirectReg::Addr(dst), address);
             cycles_const(builder, op.op.max_cycles())
         }
@@ -7097,6 +7177,123 @@ mod portable_tests {
         assert_eq!(packed, 0, "store-overlap guard retires nothing");
         assert_eq!(smc.dar, before);
         assert_eq!(smc_mem, untouched_mem);
+    }
+
+    #[test]
+    fn indexed_lea_decode_and_portable_execution() {
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(0, 0x1000);
+        cpu.set_d(2, 0x0010);
+        cpu.set_ccr(0x1F);
+
+        let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        decode_bus.write_word(0x0100, 0x43F0);
+        decode_bus.write_word(0x0102, 0x2004);
+        let trace = decode_trace_op(&cpu, &mut decode_bus, 0x0100, CpuType::M68040)
+            .expect("LEA (d8,An,Xn) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::LeaIndex {
+                src: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                },
+                dst: 1,
+                cycles: 4,
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x2004));
+        assert_eq!(
+            execute_portable_op(&mut cpu, trace, 0x0100, 0x0104),
+            Some(4)
+        );
+        assert_eq!(cpu.dar[9], 0x1014, "A1 = A0 + D2.W + 4");
+        assert_eq!(cpu.dar[8], 0x1000, "the base register is untouched");
+        assert_eq!(cpu.get_ccr(), 0x1F, "LEA changes no condition codes");
+
+        // Word indexes sign-extend.
+        cpu.set_d(2, 0x0001_8000);
+        assert_eq!(
+            execute_portable_op(&mut cpu, trace, 0x0100, 0x0104),
+            Some(4)
+        );
+        assert_eq!(
+            cpu.dar[9],
+            0x1000u32.wrapping_sub(0x8000).wrapping_add(4),
+            "a word index sign-extends before the add"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_indexed_lea_matches_portable() {
+        let lea = TraceBuildOp {
+            opcode: 0x43F0,
+            extension: Some(0x2004),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::LeaIndex {
+                src: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                },
+                dst: 1,
+                cycles: 4,
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+
+        let prepare = || {
+            let mut cpu = cpu();
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_a(0, 0x1000);
+            cpu.set_d(2, 0x8000);
+            cpu.set_ccr(0x15);
+            cpu
+        };
+
+        let mut expected = prepare();
+        let expected_packed = execute_portable_trace(&mut expected, &[lea, branch], 0x0100, 0x0106);
+
+        let mut actual = prepare();
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(
+                &actual,
+                0x0100,
+                CpuType::M68040,
+                vec![lea, branch],
+                Some(0x0100),
+            )
+            .expect("indexed LEA loop should compile");
+        let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(actual.pc, expected.pc);
+        assert_eq!(actual.dar, expected.dar);
+        assert_eq!(actual.get_ccr(), expected.get_ccr());
+        assert_eq!(
+            actual.dar[9],
+            0x1000u32.wrapping_sub(0x8000).wrapping_add(4),
+            "the negative word index case matches natively"
+        );
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]

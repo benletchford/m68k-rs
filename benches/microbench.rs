@@ -1104,6 +1104,69 @@ fn bench_pea_displacement_loop() {
     );
 }
 
+/// Measure a JIT-compiled loop whose address computation is an indexed
+/// LEA — the register-only form that blocks a deterministic boot-phase
+/// head in EV Override profiling. The loop sweeps the word index and
+/// wraps it, so the run ends at an exact wrap boundary with fully
+/// asserted final state:
+///
+/// ```c
+/// for (;;) {
+///     entry = &table[i];        /* LEA (4,A0,D2.W),A1 */
+///     if (++i < 0x7FFF) continue; /* ADDQ; CMPI; BLT   */
+///     i = 0;                    /* MOVEQ #0,D2         */
+/// }
+/// ```
+fn bench_indexed_lea_loop() {
+    const CODE_BASE: u32 = 0x6E00;
+    const WRAP_INSTRS: u32 = 4 * 0x7FFF + 2;
+    const WRAPS: u32 = 763;
+    const INSTRS: u32 = WRAP_INSTRS * WRAPS;
+    let words = [
+        0x43F0, 0x2004, // loop: LEA (4,A0,D2.W),A1
+        0x5282, // ADDQ.L #1,D2
+        0x0C42, 0x7FFF, // CMPI.W #$7FFF,D2
+        0x6DF4, // BLT.S loop
+        0x7400, // MOVEQ #0,D2
+        0x60F0, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x4200);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.d(2), 0, "the run ends exactly at a wrap boundary");
+    assert_eq!(cpu.a(0), 0x4200, "the base register is untouched");
+    assert_eq!(
+        cpu.a(1),
+        0x4200 + 0x8002,
+        "the last computed address is the final table entry"
+    );
+    println!(
+        "batch     indexed lea loop        {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -1231,6 +1294,10 @@ fn main() {
     }
     if only.as_deref() == Some("pea-displacement") {
         bench_pea_displacement_loop();
+        return;
+    }
+    if only.as_deref() == Some("indexed-lea") {
+        bench_indexed_lea_loop();
         return;
     }
     if only.as_deref() == Some("immediate-shifts") {
