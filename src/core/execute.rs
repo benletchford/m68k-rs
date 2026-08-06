@@ -597,7 +597,7 @@ impl CpuCore {
                 // A full-dispatch instruction may have just extended a path
                 // recording before exhausting this outer batch's budget.
                 // The caller may mutate guest state before the next batch.
-                trace_jit::stop_recording(self);
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchResult {
                     instructions: retired,
                     exit: BatchExit::BudgetExhausted,
@@ -684,7 +684,7 @@ impl CpuCore {
                 // The caller may emulate a surfaced trap and resume at an
                 // unrelated guest PC. Never let an in-progress path recording
                 // cross that host-controlled execution boundary.
-                trace_jit::stop_recording(self);
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::TrapOrException);
                 return BatchResult {
                     instructions: retired,
                     exit,
@@ -699,7 +699,7 @@ impl CpuCore {
                 // The fault handler is not the sequential continuation of the
                 // instruction being recorded. Discard the partial path before
                 // execution resumes at the exception vector.
-                trace_jit::stop_recording(self);
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::TrapOrException);
                 self.run_mode = RUN_MODE_NORMAL;
                 probe_on_entry = true;
             } else {
@@ -727,7 +727,7 @@ impl CpuCore {
             }
 
             if self.stopped != 0 {
-                trace_jit::stop_recording(self);
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchResult {
                     instructions: retired,
                     exit: BatchExit::Stopped,
@@ -737,7 +737,7 @@ impl CpuCore {
             if !watch_pcs.is_empty() && watch_pcs.contains(&self.pc) {
                 // Match the decoded fast path: a watched-PC return is a host
                 // boundary, so a partial recording cannot survive it.
-                trace_jit::stop_recording(self);
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchResult {
                     instructions: retired,
                     exit: BatchExit::WatchedPc { pc: self.pc },

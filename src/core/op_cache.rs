@@ -1113,7 +1113,7 @@ impl CpuCore {
                 }
                 CachedOp::Mem(op) => {
                     if !super::mem_ops::execute_mem_op(self, op) {
-                        trace_jit::stop_recording(self);
+                        trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                         return BatchInnerExit::Miss(opcode);
                     }
                     #[cfg(feature = "trace-profile")]
@@ -1130,12 +1130,12 @@ impl CpuCore {
             remaining -= 1;
             *retired += 1;
             if watch && watch_pcs.contains(&self.pc) {
-                trace_jit::stop_recording(self);
+                trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
                 return BatchInnerExit::Watched(self.pc);
             }
         }
 
-        trace_jit::stop_recording(self);
+        trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
         BatchInnerExit::Budget
     }
 

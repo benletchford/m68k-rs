@@ -31,6 +31,10 @@ pub struct TraceProfileRow {
     pub blocker_pc: Option<u32>,
     /// Opcode word that blocked trace construction.
     pub blocker_opcode: Option<u16>,
+    /// Most recent reason a recording at this head produced no trace
+    /// without an unsupported opcode, if any. A head with this set and no
+    /// `blocker_pc` carries no opcode-admission opportunity at all.
+    pub reject_reason: Option<TraceRejectReason>,
     /// Number of operations in the current compiled/portable trace.
     pub compiled_ops: u32,
     /// Number of calls into the trace executor.
@@ -58,6 +62,58 @@ pub enum TraceDecodeFailureReason {
     /// Memory still contains the executed opcode, but its form is not
     /// traceable or an operand-extension read failed.
     UnsupportedFormOrOperandRead,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+/// Why a recording produced no trace even though decoding never refused an
+/// instruction.
+///
+/// These outcomes carry no *opcode* opportunity: there is no blocker to
+/// support, so heads whose recordings end this way are reported separately
+/// and are absent from the opportunity ranking by construction.
+#[non_exhaustive]
+pub enum TraceRejectReason {
+    /// A trap or exception surfaced mid-recording. The embedder handles it
+    /// and may resume at an unrelated guest PC, so no instruction-set
+    /// coverage extends a recording past this point: it is a structural
+    /// bound on the head, not a missing feature.
+    TrapOrException,
+    /// The batch ended at a host boundary mid-recording — instruction
+    /// budget exhausted, a watched PC, a stopped CPU, or a decoded
+    /// fast-path miss. This says nothing about the head: it is an artifact
+    /// of how the embedder sliced execution, and the same head may record
+    /// further in a later batch.
+    HostBoundary,
+    /// The recorded prefix does not end in a trace-terminating operation.
+    NoTraceTerminal,
+    /// Fewer operations than the minimum for the region's kind.
+    TooShort,
+    /// An indirect-JSR region shorter than the minimum that amortizes the
+    /// call boundary.
+    IndirectJsrTooShort,
+    /// A linear (non-loop) region carrying checked memory ALU operations,
+    /// which does not amortize trace validation.
+    LinearMemoryAlu,
+    /// The region's code range wraps the address space.
+    AddressWrap,
+    /// The compiler backend declined the region or was unavailable.
+    Backend,
+}
+
+impl TraceRejectReason {
+    /// Short stable label used in the report.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::TrapOrException => "trap-or-exception",
+            Self::HostBoundary => "host-boundary",
+            Self::NoTraceTerminal => "no-trace-terminal",
+            Self::TooShort => "too-short",
+            Self::IndirectJsrTooShort => "indirect-jsr-too-short",
+            Self::LinearMemoryAlu => "linear-memory-alu",
+            Self::AddressWrap => "address-wrap",
+            Self::Backend => "backend",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -113,6 +169,34 @@ pub struct FailedTraceShapeProfileRow {
     /// Coarse classification of the reconstruction failure.
     pub reason: TraceDecodeFailureReason,
     /// Number of recording attempts with this exact shape.
+    pub recordings: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// One distinct recording that ended without an unsupported opcode.
+///
+/// Complements [`FailedTraceShapeProfileRow`]: that type describes
+/// recordings stopped by an instruction the decoder refused, this one
+/// describes recordings that ran out of decoded execution or were declined
+/// by a compile-stage policy. Both were previously indistinguishable from
+/// "this head was never hot".
+#[non_exhaustive]
+pub struct SilentRejectionProfileRow {
+    /// Guest program counter at which recording began.
+    pub start_pc: u32,
+    /// CPU model active while recording.
+    pub cpu_type: CpuType,
+    /// Why the recording produced no trace.
+    pub reason: TraceRejectReason,
+    /// Guest address of the instruction that stopped the recording: the
+    /// trapping instruction for [`TraceRejectReason::TrapOrException`], and
+    /// the PC the CPU had reached otherwise. For a trap this is the bound
+    /// on how far this head can ever record.
+    pub exit_pc: u32,
+    /// Operations successfully reconstructed before the recording ended, in
+    /// execution order.
+    pub prefix: Vec<TraceShapeOp>,
+    /// Number of recording attempts with this exact shape and outcome.
     pub recordings: u64,
 }
 
@@ -183,6 +267,11 @@ pub struct TraceProfileSnapshot {
     /// reached. Zero unless a pathological workload produced thousands of
     /// distinct failed paths.
     pub failed_shape_overflow: u64,
+    /// Recordings that ended without an unsupported opcode: control left
+    /// the decoded path, or a compile-stage policy declined the region.
+    pub silent_rejections: Vec<SilentRejectionProfileRow>,
+    /// Silent rejections dropped after the distinct-shape cap was reached.
+    pub silent_rejection_overflow: u64,
     /// Total observed backward branches.
     pub backward_hits: u64,
     /// Total rejected trace-entry opportunities.
@@ -347,6 +436,56 @@ impl TraceProfileSnapshot {
             let _ = writeln!(out);
         }
 
+        let mut silent_rejections = self.silent_rejections.clone();
+        silent_rejections.sort_unstable_by(|a, b| {
+            b.recordings
+                .cmp(&a.recordings)
+                .then_with(|| b.prefix.len().cmp(&a.prefix.len()))
+                .then_with(|| a.start_pc.cmp(&b.start_pc))
+        });
+        let _ = writeln!(
+            out,
+            "silent rejections (recordings that produced no trace with no unsupported opcode)"
+        );
+        let _ = writeln!(
+            out,
+            "note: these heads have no blocker to support, so they carry no opcode-admission opportunity and are absent from the ranking above. trap-or-exception is a structural bound — no instruction coverage extends a recording past it; host-boundary is only an artifact of batch slicing."
+        );
+        if self.silent_rejection_overflow > 0 {
+            let _ = writeln!(
+                out,
+                "note: {} silent rejections dropped past the {}-shape cap",
+                self.silent_rejection_overflow, SILENT_REJECTION_CAP
+            );
+        }
+        let _ = writeln!(out, "rank  start_pc  records stranded exit_pc  reason");
+        for (rank, shape) in silent_rejections.iter().take(40).enumerate() {
+            let _ = writeln!(
+                out,
+                "{:>4}  {:08X} {:>8} {:>8}   {:08X} {}",
+                rank + 1,
+                shape.start_pc,
+                shape.recordings,
+                shape.prefix.len(),
+                shape.exit_pc,
+                shape.reason.label()
+            );
+            let _ = write!(out, "      prefix:");
+            if shape.prefix.is_empty() {
+                let _ = write!(out, " (none)");
+            }
+            for op in &shape.prefix {
+                let _ = write!(out, " {:08X}:{:04X}", op.pc, op.opcode);
+                if let Some(extension) = op.extension {
+                    let _ = write!(out, "/{extension:04X}");
+                }
+                if let Some(extension) = op.extension2 {
+                    let _ = write!(out, "/{extension:04X}");
+                }
+            }
+            let _ = writeln!(out);
+        }
+
         let mut compiled_shapes = self.compiled_shapes.clone();
         compiled_shapes.sort_unstable_by(|a, b| {
             b.recordings
@@ -438,6 +577,7 @@ struct Row {
     prefix_ops: u32,
     blocker_pc: Option<u32>,
     blocker_opcode: Option<u16>,
+    reject_reason: Option<TraceRejectReason>,
     compiled_ops: u32,
     native_calls: u64,
     jit_retired: u64,
@@ -449,6 +589,19 @@ struct Row {
 /// a full prefix sequence, so the map must not grow for the whole session;
 /// drops past the cap are counted and reported.
 const FAILED_SHAPE_CAP: usize = 4096;
+
+/// Upper bound on distinct silent-rejection shapes kept per process, for
+/// the same reason as [`FAILED_SHAPE_CAP`].
+const SILENT_REJECTION_CAP: usize = 4096;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SilentRejectionKey {
+    start_pc: u32,
+    cpu_type: u32,
+    reason: TraceRejectReason,
+    exit_pc: u32,
+    prefix: Vec<TraceShapeOp>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct FailedShapeKey {
@@ -499,6 +652,10 @@ struct Profile {
     /// is bounded for the process lifetime and the report states what was
     /// dropped instead of growing without limit.
     failed_shape_overflow: u64,
+    /// Recordings that ended without an unsupported opcode, bounded by
+    /// `SILENT_REJECTION_CAP` on the same rationale.
+    silent_rejections: BTreeMap<SilentRejectionKey, u64>,
+    silent_rejection_overflow: u64,
     compiled_shapes: BTreeMap<CompiledShapeKey, u64>,
     decoded_mem_counts: Box<[u64]>,
     decoded_mem_site_counts: SiteCounts,
@@ -513,6 +670,8 @@ impl Default for Profile {
             decoded_mem_counts: vec![0; super::op_cache::DECODE_TABLE_SIZE].into_boxed_slice(),
             decoded_mem_site_counts: SiteCounts::default(),
             failed_shape_overflow: 0,
+            silent_rejections: BTreeMap::new(),
+            silent_rejection_overflow: 0,
         }
     }
 }
@@ -540,6 +699,7 @@ impl Profile {
                 prefix_ops: row.prefix_ops,
                 blocker_pc: row.blocker_pc,
                 blocker_opcode: row.blocker_opcode,
+                reject_reason: row.reject_reason,
                 compiled_ops: row.compiled_ops,
                 native_calls: row.native_calls,
                 jit_retired: row.jit_retired,
@@ -584,6 +744,18 @@ impl Profile {
                 recordings,
             })
             .collect();
+        let silent_rejections = self
+            .silent_rejections
+            .iter()
+            .map(|(key, &recordings)| SilentRejectionProfileRow {
+                start_pc: key.start_pc,
+                cpu_type: cpu_type_from_repr(key.cpu_type),
+                reason: key.reason,
+                exit_pc: key.exit_pc,
+                prefix: key.prefix.clone(),
+                recordings,
+            })
+            .collect();
         let compiled_shapes = self
             .compiled_shapes
             .iter()
@@ -607,6 +779,8 @@ impl Profile {
             failed_shapes,
             compiled_shapes,
             failed_shape_overflow: self.failed_shape_overflow,
+            silent_rejections,
+            silent_rejection_overflow: self.silent_rejection_overflow,
         }
     }
 }
@@ -707,6 +881,39 @@ pub(crate) fn note_blocker(
             return;
         }
         let recordings = profile.0.failed_shapes.entry(key).or_default();
+        *recordings = recordings.saturating_add(1);
+    });
+}
+
+/// Record a recording that produced no trace without any unsupported
+/// opcode. Without this the head keeps its backward-branch counters but
+/// gains no prefix, blocker, or shape entry, so it is indistinguishable in
+/// the report from a head that was never hot — and it silently leaves the
+/// opportunity ranking, which orders by `rejected_hits * prefix_ops`.
+pub(crate) fn note_silent_rejection(
+    start_pc: u32,
+    cpu_type: CpuType,
+    exit_pc: u32,
+    prefix: Vec<TraceShapeOp>,
+    reason: TraceRejectReason,
+) {
+    PROFILE.with_borrow_mut(|profile| {
+        profile.0.row(start_pc, cpu_type).reject_reason = Some(reason);
+        let key = SilentRejectionKey {
+            start_pc,
+            cpu_type: cpu_type as u32,
+            reason,
+            exit_pc,
+            prefix,
+        };
+        if profile.0.silent_rejections.len() >= SILENT_REJECTION_CAP
+            && !profile.0.silent_rejections.contains_key(&key)
+        {
+            profile.0.silent_rejection_overflow =
+                profile.0.silent_rejection_overflow.saturating_add(1);
+            return;
+        }
+        let recordings = profile.0.silent_rejections.entry(key).or_default();
         *recordings = recordings.saturating_add(1);
     });
 }
@@ -1248,5 +1455,152 @@ mod tests {
         assert!(report.contains("decoded memory operations: total=3 distinct_opcodes=2"));
         assert!(report.find("20D9").unwrap() < report.find("10DC").unwrap());
         assert!(report.contains("00001000  20D9           2"));
+    }
+
+    #[test]
+    fn silently_rejected_head_is_reported_instead_of_vanishing() {
+        reset();
+        for _ in 0..4 {
+            note_backward_edge(0x900, CpuType::M68040, true);
+        }
+        note_silent_rejection(
+            0x900,
+            CpuType::M68040,
+            0x914,
+            dummy_prefix(0x900, 9),
+            TraceRejectReason::TrapOrException,
+        );
+
+        let snapshot = snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0x900)
+            .expect("head keeps its row");
+        assert_eq!(row.reject_reason, Some(TraceRejectReason::TrapOrException));
+        // No blocker means no opcode to support: the head must not acquire
+        // projected dispatches it can never deliver.
+        assert_eq!(row.blocker_pc, None);
+        assert_eq!(row.prefix_ops, 0);
+        assert_eq!(row.projected_dispatches(), 0);
+
+        let report = snapshot.report();
+        assert!(report.contains("silent rejections"));
+        assert!(report.contains("00000900        1        9   00000914 trap-or-exception"));
+        // The stranded prefix is visible, which is what makes the exit pc
+        // actionable.
+        assert!(report.contains("00000900:7000"));
+    }
+
+    #[test]
+    fn trap_inside_a_loop_body_is_attributed_not_silently_dropped() {
+        // The shape that motivated this change: a hot loop whose body
+        // reaches a trap, so recording ends with a prefix too short to
+        // compile. Before this, the head kept its backward-branch counters
+        // but gained no prefix, blocker, or shape entry — indistinguishable
+        // in the report from a head that was never hot.
+        reset();
+        let mut bus = LinearMemoryBus::new(0x1000);
+        bus.write_word(0, 0x4A80); // TST.L D0          <- loop head
+        bus.write_word(2, 0x6704); // BEQ.S $0008
+        bus.write_word(4, 0x5380); // SUBQ.L #1,D0
+        bus.write_word(6, 0x60F8); // BRA.S $0000       (back edge)
+        bus.write_word(8, 0xA123); // A-line trap in the loop's exit path
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0;
+        // One iteration makes the head hot; the second is the recording
+        // pass, and it is the one that reaches the trap — so the recording
+        // never closes the loop.
+        cpu.set_d(0, 1);
+        let result = cpu.run_batch(&mut bus, 100, &[]);
+
+        assert_eq!(result.exit, BatchExit::AlineTrap { opcode: 0xA123 });
+        assert!(!cpu.trace_recording);
+
+        let snapshot = snapshot();
+        let rejection = snapshot
+            .silent_rejections
+            .iter()
+            .find(|row| row.start_pc == 0)
+            .expect("the trap-ended recording is attributed");
+        // The trap outranks the compile-stage reason: it is the bound on
+        // how far this head can ever record.
+        assert_eq!(rejection.reason, TraceRejectReason::TrapOrException);
+        assert_eq!(rejection.exit_pc, 8);
+        assert_eq!(rejection.prefix.len(), 2);
+        assert_eq!(rejection.prefix[0].opcode, 0x4A80);
+
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0)
+            .expect("head row");
+        assert_eq!(row.reject_reason, Some(TraceRejectReason::TrapOrException));
+        assert_eq!(row.compiled_ops, 0);
+        assert!(snapshot.report().contains("trap-or-exception"));
+    }
+
+    #[test]
+    fn silent_rejection_reasons_are_distinguished() {
+        reset();
+        note_silent_rejection(
+            0x100,
+            CpuType::M68040,
+            0x110,
+            dummy_prefix(0x100, 2),
+            TraceRejectReason::TooShort,
+        );
+        note_silent_rejection(
+            0x200,
+            CpuType::M68040,
+            0x230,
+            dummy_prefix(0x200, 3),
+            TraceRejectReason::LinearMemoryAlu,
+        );
+        // Same head, same prefix, different outcome: distinct entries.
+        note_silent_rejection(
+            0x200,
+            CpuType::M68040,
+            0x230,
+            dummy_prefix(0x200, 3),
+            TraceRejectReason::LinearMemoryAlu,
+        );
+
+        let snapshot = snapshot();
+        assert_eq!(snapshot.silent_rejections.len(), 2);
+        let linear = snapshot
+            .silent_rejections
+            .iter()
+            .find(|row| row.reason == TraceRejectReason::LinearMemoryAlu)
+            .expect("linear-memory-alu entry");
+        assert_eq!(linear.recordings, 2);
+        assert_eq!(linear.exit_pc, 0x230);
+        let report = snapshot.report();
+        assert!(report.contains("too-short"));
+        assert!(report.contains("linear-memory-alu"));
+    }
+
+    #[test]
+    fn silent_rejections_are_capped_and_overflow_is_reported() {
+        reset();
+        for index in 0..(SILENT_REJECTION_CAP as u32 + 3) {
+            note_silent_rejection(
+                0x100 + index * 2,
+                CpuType::M68040,
+                0x100 + index * 2 + 8,
+                dummy_prefix(0x100, 1),
+                TraceRejectReason::Backend,
+            );
+        }
+        let snapshot = snapshot();
+        assert_eq!(snapshot.silent_rejections.len(), SILENT_REJECTION_CAP);
+        assert_eq!(snapshot.silent_rejection_overflow, 3);
+        assert!(
+            snapshot
+                .report()
+                .contains("3 silent rejections dropped past the 4096-shape cap")
+        );
     }
 }
