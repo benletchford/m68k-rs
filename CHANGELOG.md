@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.0...m68k-v0.8.1) (2026-08-06)
+
+
+### Performance Improvements
+
+* JIT displacement PEA pushes ([6313f2f](https://github.com/benletchford/m68k-rs/commit/6313f2fc49187fff335ef8e47ac89da89f28a9ac))
+
 ## [0.8.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.7.2...m68k-v0.8.0) (2026-08-05)
 
 
