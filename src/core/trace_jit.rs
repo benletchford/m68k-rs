@@ -403,6 +403,54 @@ pub(crate) enum JitTraceOp {
     },
 }
 
+/// Why a compile-stage gate declined a recorded region.
+///
+/// Kept separate from the public profiling enum so the always-compiled
+/// gate logic does not depend on the optional profiler; the mapping in
+/// `profile_reject_reason` is exhaustive, so a new gate must declare how
+/// it is reported.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegionRejectReason {
+    NoTraceTerminal,
+    TooShort,
+    IndirectJsrTooShort,
+    LinearMemoryAlu,
+    AddressWrap,
+    Backend,
+}
+
+/// Why an in-progress recording was stopped from outside the recorder.
+///
+/// The distinction is load-bearing for reporting: a trap or exception is a
+/// structural bound on how far a head can ever record, while a host
+/// boundary is an artifact of how the embedder sliced execution and says
+/// nothing about the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordingStop {
+    /// A trap or exception surfaced. The embedder handles it and may resume
+    /// at an unrelated guest PC, so no amount of instruction coverage
+    /// extends a recording past this point.
+    TrapOrException,
+    /// The batch ended at a host boundary: instruction budget exhausted, a
+    /// watched PC, a stopped CPU, or a decoded fast-path miss. The head may
+    /// well record further in a later batch.
+    HostBoundary,
+}
+
+/// How a recording ended, which decides whether the profiler has already
+/// attributed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RecordingEnd {
+    /// Decoding refused an executed instruction. `note_blocker` has already
+    /// recorded the head, its prefix, and the offending opcode.
+    Blocker,
+    /// Something outside the recorder stopped it mid-region.
+    Stopped(RecordingStop),
+    /// The region closed on its own terms: a back edge, a recorded branch,
+    /// or an operation limit.
+    Region,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct TraceBuildOp {
     opcode: u16,
@@ -944,6 +992,32 @@ impl TraceJit {
         )
     }
 
+    #[cfg(feature = "trace-profile")]
+    fn profile_reject_reason(
+        reason: RegionRejectReason,
+    ) -> super::trace_profile::TraceRejectReason {
+        use super::trace_profile::TraceRejectReason as Public;
+        // Exhaustive so a new compile gate must declare how it is reported.
+        match reason {
+            RegionRejectReason::NoTraceTerminal => Public::NoTraceTerminal,
+            RegionRejectReason::TooShort => Public::TooShort,
+            RegionRejectReason::IndirectJsrTooShort => Public::IndirectJsrTooShort,
+            RegionRejectReason::LinearMemoryAlu => Public::LinearMemoryAlu,
+            RegionRejectReason::AddressWrap => Public::AddressWrap,
+            RegionRejectReason::Backend => Public::Backend,
+        }
+    }
+
+    /// Exhaustive so a new stop cause must declare how it is reported.
+    #[cfg(feature = "trace-profile")]
+    fn profile_stop_reason(cause: RecordingStop) -> super::trace_profile::TraceRejectReason {
+        use super::trace_profile::TraceRejectReason as Public;
+        match cause {
+            RecordingStop::TrapOrException => Public::TrapOrException,
+            RecordingStop::HostBoundary => Public::HostBoundary,
+        }
+    }
+
     fn reject_recording(&mut self, cpu: &mut CpuCore) {
         if let Some(recording) = self.recording.take() {
             let idx = trace_cache_index(recording.start_pc);
@@ -956,7 +1030,8 @@ impl TraceJit {
         cpu.trace_recording = false;
     }
 
-    fn finish_recording(&mut self, cpu: &mut CpuCore, exit_pc: u32) {
+    #[cfg_attr(not(feature = "trace-profile"), allow(unused_variables))]
+    fn finish_recording(&mut self, cpu: &mut CpuCore, exit_pc: u32, end: RecordingEnd) {
         let Some(mut recording) = self.recording.take() else {
             cpu.trace_recording = false;
             return;
@@ -986,26 +1061,57 @@ impl TraceJit {
                 extension2: op.extension2,
             })
             .collect();
-        self.slots[idx] =
-            match self.compile_decoded_ops(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc)) {
-                Some(mut trace) => {
-                    trace.adaptive_rerecords = adaptive_rerecords;
-                    if adaptive_rerecords >= TRACE_MAX_ADAPTIVE_RERECORDS {
-                        trace.adaptive_branch = false;
-                    }
-                    TraceSlot::Compiled(trace)
+        let outcome =
+            self.compile_decoded_ops_reason(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc));
+        #[cfg(feature = "trace-profile")]
+        let reject_reason = outcome.as_ref().err().copied();
+        self.slots[idx] = match outcome {
+            Ok(mut trace) => {
+                trace.adaptive_rerecords = adaptive_rerecords;
+                if adaptive_rerecords >= TRACE_MAX_ADAPTIVE_RERECORDS {
+                    trace.adaptive_branch = false;
                 }
-                None => {
-                    push_probe_skip(cpu, start_pc);
-                    TraceSlot::Rejected {
-                        pc: start_pc,
-                        cpu_type,
-                    }
+                TraceSlot::Compiled(trace)
+            }
+            Err(_) => {
+                push_probe_skip(cpu, start_pc);
+                TraceSlot::Rejected {
+                    pc: start_pc,
+                    cpu_type,
                 }
-            };
+            }
+        };
         #[cfg(feature = "trace-profile")]
         if matches!(self.slots[idx], TraceSlot::Compiled(_)) {
             super::trace_profile::note_compiled(start_pc, cpu_type, recorded_shape);
+        } else if let Some(reason) = reject_reason {
+            // A recording that ends at an unsupported opcode is already
+            // attributed by `note_blocker`; anything else would leave no
+            // report entry at all, so attribute it here. Leaving the
+            // decoded path outranks the compile-stage reason: it bounds how
+            // far this head can ever record, which no opcode coverage can
+            // change.
+            if end != RecordingEnd::Blocker {
+                let reason = match end {
+                    RecordingEnd::Stopped(cause) => Self::profile_stop_reason(cause),
+                    _ => Self::profile_reject_reason(reason),
+                };
+                // Report the instruction that stopped the recording. For a
+                // trap `pc` has already advanced past its opcode word, so
+                // `ppc` is the actionable address. This is reporting only:
+                // `exit_pc` still drives self-loop detection above.
+                let reported_pc = match end {
+                    RecordingEnd::Stopped(RecordingStop::TrapOrException) => cpu.ppc,
+                    _ => exit_pc,
+                };
+                super::trace_profile::note_silent_rejection(
+                    start_pc,
+                    cpu_type,
+                    reported_pc,
+                    recorded_shape,
+                    reason,
+                );
+            }
         }
     }
 
@@ -1060,7 +1166,7 @@ impl TraceJit {
                     },
                 );
             }
-            self.finish_recording(cpu, executed_pc);
+            self.finish_recording(cpu, executed_pc, RecordingEnd::Blocker);
             return;
         };
         let op_len = op.length();
@@ -1077,16 +1183,16 @@ impl TraceJit {
             // dependent counter update is already compiled efficiently.
             JitTraceOp::Dbcc { .. } => {
                 self.recording.as_mut().unwrap().ops.push(op);
-                self.finish_recording(cpu, next_pc);
+                self.finish_recording(cpu, next_pc, RecordingEnd::Region);
                 return;
             }
             JitTraceOp::IndirectJsr { .. } => {
                 self.recording.as_mut().unwrap().ops.push(op);
-                self.finish_recording(cpu, next_pc);
+                self.finish_recording(cpu, next_pc, RecordingEnd::Region);
                 return;
             }
             _ if next_pc != executed_pc.wrapping_add(op_len as u32) => {
-                self.finish_recording(cpu, executed_pc);
+                self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
                 return;
             }
             _ => {}
@@ -1095,16 +1201,19 @@ impl TraceJit {
         let recording = self.recording.as_mut().unwrap();
         recording.ops.push(op);
         if next_pc == start_pc {
-            self.finish_recording(cpu, next_pc);
+            self.finish_recording(cpu, next_pc, RecordingEnd::Region);
             return;
         }
 
         let repeated = recording.ops.iter().any(|op| op.pc == next_pc);
         if recording.ops.len() >= TRACE_MAX_OPS || repeated {
-            self.finish_recording(cpu, next_pc);
+            self.finish_recording(cpu, next_pc, RecordingEnd::Region);
         }
     }
 
+    /// Outcome-only wrapper over [`Self::compile_decoded_ops_reason`], kept
+    /// for the many tests that assert only whether a region compiled.
+    #[cfg(test)]
     fn compile_decoded_ops(
         &mut self,
         cpu: &CpuCore,
@@ -1113,8 +1222,25 @@ impl TraceJit {
         ops: Vec<TraceBuildOp>,
         recorded_exit_pc: Option<u32>,
     ) -> Option<CompiledTrace> {
+        self.compile_decoded_ops_reason(cpu, start_pc, cpu_type, ops, recorded_exit_pc)
+            .ok()
+    }
+
+    /// Compile a recorded region, reporting *why* a region was declined.
+    ///
+    /// The reason exists so the profiler can attribute recordings that end
+    /// without any unsupported opcode; a head declined here has no blocker
+    /// and would otherwise leave no trace in the report at all.
+    fn compile_decoded_ops_reason(
+        &mut self,
+        cpu: &CpuCore,
+        start_pc: u32,
+        cpu_type: CpuType,
+        ops: Vec<TraceBuildOp>,
+        recorded_exit_pc: Option<u32>,
+    ) -> Result<CompiledTrace, RegionRejectReason> {
         if !ops.last().is_some_and(|op| op.op.ends_trace()) {
-            return None;
+            return Err(RegionRejectReason::NoTraceTerminal);
         }
 
         let self_loop = recorded_exit_pc == Some(start_pc)
@@ -1127,7 +1253,7 @@ impl TraceJit {
             TRACE_MIN_OPS
         };
         if ops.len() < min_ops {
-            return None;
+            return Err(RegionRejectReason::TooShort);
         }
 
         let max_cycles = ops.iter().map(|op| op.op.max_cycles()).sum();
@@ -1160,7 +1286,7 @@ impl TraceJit {
             .last()
             .is_some_and(|op| matches!(op.op, JitTraceOp::IndirectJsr { .. }));
         if ends_in_indirect_jsr && ops.len() < TRACE_MIN_INDIRECT_JSR_OPS {
-            return None;
+            return Err(RegionRejectReason::IndirectJsrTooShort);
         }
 
         // Short checked memory ALU regions do not amortize trace validation
@@ -1178,7 +1304,7 @@ impl TraceJit {
                 )
             })
         {
-            return None;
+            return Err(RegionRejectReason::LinearMemoryAlu);
         }
 
         let needs_window = ops.iter().any(|op| {
@@ -1208,7 +1334,7 @@ impl TraceJit {
             let start = cpu.address(op.pc);
             let end = start as u64 + op.length() as u64;
             if end > cpu.address_mask as u64 + 1 || end > u32::MAX as u64 {
-                return None;
+                return Err(RegionRejectReason::AddressWrap);
             }
             code_start = code_start.min(start);
             code_end = code_end.max(end as u32);
@@ -1228,6 +1354,7 @@ impl TraceJit {
             aligned_only: cpu.is_pre_68020,
             address_mask: cpu.address_mask,
         })
+        .ok_or(RegionRejectReason::Backend)
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -1636,9 +1763,10 @@ pub(crate) fn record_executed<B: AddressBus>(
 /// End an in-progress recording before control leaves the fast decoded-op
 /// path. A usable prefix ending in a branch is compiled; otherwise the
 /// target is marked rejected.
-pub(crate) fn stop_recording(cpu: &mut CpuCore) {
+pub(crate) fn stop_recording(cpu: &mut CpuCore, cause: RecordingStop) {
     if cpu.trace_recording {
-        TRACE_JIT.with_borrow_mut(|jit| jit.finish_recording(cpu, cpu.pc));
+        TRACE_JIT
+            .with_borrow_mut(|jit| jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause)));
     }
 }
 
