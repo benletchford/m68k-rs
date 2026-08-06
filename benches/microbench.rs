@@ -1038,6 +1038,72 @@ fn bench_indexed_immediate_compare() {
     );
 }
 
+/// Measure a JIT-compiled loop that pushes an address with `PEA (d16,A5)`
+/// and pops it back with a postincrement load, keeping the stack balanced
+/// across iterations while exercising the checked predecrement store. This
+/// models a compiler materializing the address of an A5-relative global as
+/// a by-reference argument; the popping load stands in for the callee
+/// consuming the pushed pointer:
+///
+/// ```c
+/// int32_t count = 0;                  /* MOVEQ #0,D0, once  */
+/// for (;;) {
+///     ++count;                        /* ADDQ.L #1,D0    */
+///     int32_t *arg = &globals->field; /* PEA $40(A5)     */
+///     sink = arg;                     /* MOVE.L (A7)+,D3 */
+///     ++iterations;                   /* ADDQ.L #1,D1    */
+/// }
+/// ```
+///
+/// The instruction budget is one initializer plus a whole number of
+/// five-instruction iterations, so the run ends at the loop head and the
+/// final counter, pointer, and stack values are exact.
+fn bench_pea_displacement_loop() {
+    const CODE_BASE: u32 = 0x6E00;
+    const ITERATIONS: u32 = 20_000_000;
+    const INSTRS: u32 = 1 + ITERATIONS * 5;
+    let words = [
+        0x7000, // MOVEQ #0,D0
+        0x5280, // loop: ADDQ.L #1,D0
+        0x486D, 0x0040, // PEA $40(A5)
+        0x261F, // MOVE.L (A7)+,D3
+        0x5281, // ADDQ.L #1,D1
+        0x60F4, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(5, 0x4200);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.d(0), ITERATIONS, "count increments once per iteration");
+    assert_eq!(cpu.d(1), ITERATIONS, "iterations increment once per pass");
+    assert_eq!(cpu.d(3), 0x4240, "the popped value is the pushed address");
+    assert_eq!(cpu.a(7), 0x8000, "the stack is balanced at the loop head");
+    println!(
+        "batch     pea displacement loop   {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -1161,6 +1227,10 @@ fn main() {
     }
     if only.as_deref() == Some("indexed-immediate-compare") {
         bench_indexed_immediate_compare();
+        return;
+    }
+    if only.as_deref() == Some("pea-displacement") {
+        bench_pea_displacement_loop();
         return;
     }
     if only.as_deref() == Some("immediate-shifts") {
