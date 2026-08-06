@@ -5,7 +5,7 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::BatchInnerExit;
+use super::op_cache::{BatchInnerExit, DecodedSimpleOp};
 use super::trace_jit;
 use super::types::{
     BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult,
@@ -394,7 +394,11 @@ impl CpuCore {
             } else {
                 0
             };
-            let step_result = self.step(bus);
+            let step_result = if CALL_INSTRUCTION_HOOK && CALL_INTERRUPT_HOOK {
+                self.step_with_dispatch(bus, CpuCore::dispatch_boundary_hook_decoded)
+            } else {
+                self.step(bus)
+            };
             if CALL_INSTRUCTION_HOOK {
                 self.int_level = deferred_irq;
             }
@@ -756,7 +760,20 @@ impl CpuCore {
     /// automatically in this mode. For HLE interception with automatic fallback
     /// to exceptions, use `step_with_hle_handler()`.
     pub fn step<B: AddressBus>(&mut self, bus: &mut B) -> StepResult {
-        use crate::core::types::{InternalStepResult, StepResult};
+        self.step_with_dispatch(bus, dispatch_instruction)
+    }
+
+    /// Execute one precise instruction using the supplied post-fetch dispatcher.
+    ///
+    /// The helper owns the normal `step()` prologue and epilogue so internal
+    /// callers can select a dispatcher after the precise opcode fetch without
+    /// fetching the opcode twice.
+    fn step_with_dispatch<B, F>(&mut self, bus: &mut B, dispatch: F) -> StepResult
+    where
+        B: AddressBus,
+        F: FnOnce(&mut CpuCore, &mut B, u16) -> super::types::InternalStepResult,
+    {
+        use crate::core::types::InternalStepResult;
 
         self.set_precise_bus(true);
         if self.stopped != 0 {
@@ -779,7 +796,7 @@ impl CpuCore {
         }
 
         let opcode_fetch_cached = bus.last_fetch_was_cached();
-        let result = dispatch_instruction(self, bus, self.ir as u16);
+        let result = dispatch(self, bus, self.ir as u16);
         let fetch_cached = if matches!(
             self.cpu_type,
             super::types::CpuType::M68EC020 | super::types::CpuType::M68020
@@ -835,6 +852,50 @@ impl CpuCore {
         }
 
         res
+    }
+
+    /// Execute the narrow decoded subset allowed by the boundary-hook runner.
+    ///
+    /// Called only after the precise opcode fetch. Unsupported operations pass the
+    /// same fetched opcode to the existing dispatcher without repeating fetch or
+    /// prefetch work.
+    fn dispatch_boundary_hook_decoded<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+    ) -> super::types::InternalStepResult {
+        use super::types::{CpuType, InternalStepResult};
+
+        // Trace states remain on the normal dispatcher so it can preserve trace
+        // exceptions and model-specific behavior.
+        if self.run_mode != RUN_MODE_NORMAL || (self.t1_flag | self.t0_flag) != 0 {
+            return dispatch_instruction(self, bus, opcode);
+        }
+
+        let fast_op = match (
+            self.cpu_type,
+            DecodedSimpleOp::decode(self.cpu_type, opcode),
+        ) {
+            // M68040 NOP is excluded because the normal path performs T0 pipeline
+            // synchronization.
+            (
+                CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030,
+                Some(op @ DecodedSimpleOp::Nop),
+            ) => op,
+            (
+                CpuType::M68000
+                | CpuType::M68010
+                | CpuType::M68020
+                | CpuType::M68030
+                | CpuType::M68040,
+                Some(op @ DecodedSimpleOp::Moveq { .. }),
+            ) if opcode & 0x0100 == 0 => op,
+            _ => return dispatch_instruction(self, bus, opcode),
+        };
+
+        InternalStepResult::Ok {
+            cycles: fast_op.execute(self, bus),
+        }
     }
 
     /// Execute a single instruction with HLE trap handling (CPU + bus access).
