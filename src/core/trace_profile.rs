@@ -193,6 +193,14 @@ pub struct SilentRejectionProfileRow {
     /// the PC the CPU had reached otherwise. For a trap this is the bound
     /// on how far this head can ever record.
     pub exit_pc: u32,
+    /// Opcode word at `exit_pc`, read through the fastmem window only.
+    ///
+    /// For [`TraceRejectReason::TrapOrException`] this names *which* trap
+    /// bounded the recording, which the address alone does not: an A-line
+    /// word ($Axxx) identifies the Toolbox or OS call. Without it the report
+    /// can say a head is trap-bounded but not whether the trap is one a
+    /// trace could ever be compiled through.
+    pub exit_opcode: Option<u16>,
     /// Operations successfully reconstructed before the recording ended, in
     /// execution order.
     pub prefix: Vec<TraceShapeOp>,
@@ -458,16 +466,22 @@ impl TraceProfileSnapshot {
                 self.silent_rejection_overflow, SILENT_REJECTION_CAP
             );
         }
-        let _ = writeln!(out, "rank  start_pc  records stranded exit_pc  reason");
+        let _ = writeln!(
+            out,
+            "rank  start_pc  records stranded exit_pc  opcode reason"
+        );
         for (rank, shape) in silent_rejections.iter().take(40).enumerate() {
             let _ = writeln!(
                 out,
-                "{:>4}  {:08X} {:>8} {:>8}   {:08X} {}",
+                "{:>4}  {:08X} {:>8} {:>8}   {:08X}   {}  {}",
                 rank + 1,
                 shape.start_pc,
                 shape.recordings,
                 shape.prefix.len(),
                 shape.exit_pc,
+                shape
+                    .exit_opcode
+                    .map_or_else(|| "----".to_owned(), |word| format!("{word:04X}")),
                 shape.reason.label()
             );
             let _ = write!(out, "      prefix:");
@@ -600,6 +614,7 @@ struct SilentRejectionKey {
     cpu_type: u32,
     reason: TraceRejectReason,
     exit_pc: u32,
+    exit_opcode: Option<u16>,
     prefix: Vec<TraceShapeOp>,
 }
 
@@ -752,6 +767,7 @@ impl Profile {
                 cpu_type: cpu_type_from_repr(key.cpu_type),
                 reason: key.reason,
                 exit_pc: key.exit_pc,
+                exit_opcode: key.exit_opcode,
                 prefix: key.prefix.clone(),
                 recordings,
             })
@@ -894,6 +910,7 @@ pub(crate) fn note_silent_rejection(
     start_pc: u32,
     cpu_type: CpuType,
     exit_pc: u32,
+    exit_opcode: Option<u16>,
     prefix: Vec<TraceShapeOp>,
     reason: TraceRejectReason,
 ) {
@@ -904,6 +921,7 @@ pub(crate) fn note_silent_rejection(
             cpu_type: cpu_type as u32,
             reason,
             exit_pc,
+            exit_opcode,
             prefix,
         };
         if profile.0.silent_rejections.len() >= SILENT_REJECTION_CAP
@@ -1467,6 +1485,7 @@ mod tests {
             0x900,
             CpuType::M68040,
             0x914,
+            Some(0xA9F4),
             dummy_prefix(0x900, 9),
             TraceRejectReason::TrapOrException,
         );
@@ -1486,7 +1505,19 @@ mod tests {
 
         let report = snapshot.report();
         assert!(report.contains("silent rejections"));
-        assert!(report.contains("00000900        1        9   00000914 trap-or-exception"));
+        // The stopping opcode is now named: an A-line word identifies which
+        // Toolbox or OS call bounded the recording, which the address alone
+        // does not.
+        assert_eq!(
+            snapshot
+                .silent_rejections
+                .iter()
+                .find(|entry| entry.start_pc == 0x900)
+                .expect("silent rejection recorded")
+                .exit_opcode,
+            Some(0xA9F4)
+        );
+        assert!(report.contains("00000900        1        9   00000914   A9F4  trap-or-exception"));
         // The stranded prefix is visible, which is what makes the exit pc
         // actionable.
         assert!(report.contains("00000900:7000"));
@@ -1529,6 +1560,12 @@ mod tests {
         // how far this head can ever record.
         assert_eq!(rejection.reason, TraceRejectReason::TrapOrException);
         assert_eq!(rejection.exit_pc, 8);
+        // The captured word is the A-line opcode itself. This can only hold
+        // if the capture in `finish_recording` read the *trapping*
+        // instruction (via `ppc`) through the window path -- the post-trap
+        // address holds a different word, and a failed window read would
+        // yield None.
+        assert_eq!(rejection.exit_opcode, Some(0xA123));
         assert_eq!(rejection.prefix.len(), 2);
         assert_eq!(rejection.prefix[0].opcode, 0x4A80);
 
@@ -1549,6 +1586,7 @@ mod tests {
             0x100,
             CpuType::M68040,
             0x110,
+            Some(0xA9F4),
             dummy_prefix(0x100, 2),
             TraceRejectReason::TooShort,
         );
@@ -1556,6 +1594,7 @@ mod tests {
             0x200,
             CpuType::M68040,
             0x230,
+            Some(0xA9F4),
             dummy_prefix(0x200, 3),
             TraceRejectReason::LinearMemoryAlu,
         );
@@ -1564,6 +1603,7 @@ mod tests {
             0x200,
             CpuType::M68040,
             0x230,
+            Some(0xA9F4),
             dummy_prefix(0x200, 3),
             TraceRejectReason::LinearMemoryAlu,
         );
@@ -1590,6 +1630,7 @@ mod tests {
                 0x100 + index * 2,
                 CpuType::M68040,
                 0x100 + index * 2 + 8,
+                None,
                 dummy_prefix(0x100, 1),
                 TraceRejectReason::Backend,
             );

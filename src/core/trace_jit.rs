@@ -1104,10 +1104,16 @@ impl TraceJit {
                     RecordingEnd::Stopped(RecordingStop::TrapOrException) => cpu.ppc,
                     _ => exit_pc,
                 };
+                // Name the instruction that stopped the recording. For a trap
+                // this is the A-line word identifying the Toolbox or OS call,
+                // which decides whether a trace could ever be compiled through
+                // it. Window-only read: the profiler must not add bus traffic.
+                let reported_opcode = super::mem_ops::peek_window_word(cpu, reported_pc);
                 super::trace_profile::note_silent_rejection(
                     start_pc,
                     cpu_type,
                     reported_pc,
+                    reported_opcode,
                     recorded_shape,
                     reason,
                 );
