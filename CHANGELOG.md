@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.9.0...m68k-v0.9.1) (2026-08-08)
+
+
+### Performance Improvements
+
+* jit immediate word multiplies ([e1eb2ae](https://github.com/benletchford/m68k-rs/commit/e1eb2aeb3ed3c30312a36ddf7251f814de1259ea))
+
 ## [0.9.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.3...m68k-v0.9.0) (2026-08-08)
 
 
