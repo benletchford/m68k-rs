@@ -224,6 +224,14 @@ pub(crate) enum JitTraceOp {
         signed: bool,
         m68000_timing: bool,
     },
+    /// `MULU.W`/`MULS.W #imm,Dn`. The multiplicand is an extension word
+    /// rather than a register, so it is captured once while recording.
+    MulWordImmediate {
+        immediate: u16,
+        dst: u8,
+        signed: bool,
+        m68000_timing: bool,
+    },
     /// 68020+ MULU.L/MULS.L with a data-register source and the 32-bit
     /// result form. The 64-bit Dh:Dl form retains the interpreter path.
     MulLongDataReg {
@@ -1844,6 +1852,11 @@ impl JitTraceOp {
                 ..
             } => 70,
             Self::MulWordDataReg { .. } => 42,
+            Self::MulWordImmediate {
+                m68000_timing: true,
+                ..
+            } => 74,
+            Self::MulWordImmediate { .. } => 42,
             Self::MulLongDataReg { .. } => 40,
             Self::AddrDataReg {
                 op: JitAddrOp::Cmpa,
@@ -2041,6 +2054,9 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_binary_immediate_data_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
+    if let Some(op) = decode_mul_word_immediate_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
     if let Some(op) = decode_cmpi_word_mem_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
@@ -2159,6 +2175,43 @@ fn decode_binary_immediate_data_reg_trace_op<B: AddressBus>(
             dst,
             size,
             cycles,
+        },
+    })
+}
+
+/// `MULU.W`/`MULS.W #imm,Dn`. The register-source forms already decode
+/// through `DecodedSimpleOp`, which cannot see the extension word holding
+/// the multiplicand; capture it here instead.
+///
+/// This form heads nine separate hot loops in a capped gameplay profile
+/// (1.69M rejected recordings), each blocking after a single operation,
+/// which is what kept the loop bodies behind it out of every trace.
+fn decode_mul_word_immediate_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    // 1100 ddd 0mm 111 100: opmode 3 = MULU.W, 7 = MULS.W; ea = immediate.
+    if (opcode & 0xF000) != 0xC000 || (opcode & 0x003F) != 0x003C {
+        return None;
+    }
+    let op_mode = (opcode >> 6) & 7;
+    if !matches!(op_mode, 3 | 7) {
+        return None;
+    }
+    let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(extension),
+        extension2: None,
+        pc,
+        op: JitTraceOp::MulWordImmediate {
+            immediate: extension,
+            dst: ((opcode >> 9) & 7) as u8,
+            signed: op_mode == 7,
+            m68000_timing: cpu_type == CpuType::M68000,
         },
     })
 }
@@ -3589,6 +3642,37 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 42
             }
         }
+        JitTraceOp::MulWordImmediate {
+            immediate,
+            dst,
+            signed,
+            m68000_timing,
+        } => {
+            let dst_word = cpu.dar[dst as usize] as u16;
+            let result = if signed {
+                (i32::from(immediate as i16) * i32::from(dst_word as i16)) as u32
+            } else {
+                u32::from(immediate) * u32::from(dst_word)
+            };
+            cpu.dar[dst as usize] = result;
+            cpu.set_logic_flags(result, Size::Long);
+            if m68000_timing {
+                // 68000 multiply time varies with the multiplier's bit
+                // pattern, exactly as for the register form -- plus the
+                // 4-cycle word-immediate operand fetch the interpreter
+                // charges via ea_source_cycles(Immediate, Word), which the
+                // register form does not have.
+                let variable = if signed {
+                    let shifted = u32::from(immediate) << 1;
+                    ((shifted ^ (shifted >> 1)) & 0xFFFF).count_ones()
+                } else {
+                    immediate.count_ones()
+                };
+                42 + 2 * variable as i32
+            } else {
+                42
+            }
+        }
         JitTraceOp::MulLongDataReg { src, dst, signed } => {
             let src_value = cpu.dar[src as usize];
             let dst_value = cpu.dar[dst as usize];
@@ -4116,6 +4200,41 @@ fn emit_jit_op(
                 }
             }
             cycles_const(builder, op.op.max_cycles())
+        }
+        JitTraceOp::MulWordImmediate {
+            immediate,
+            dst,
+            signed,
+            m68000_timing,
+        } => {
+            // The multiplicand is fixed, so its sign extension and -- on the
+            // 68000 -- its cycle contribution both fold at compile time.
+            let dst_word = load_reg_sized(builder, cpu, JitDirectReg::Data(dst), Size::Word);
+            let (src_value, dst_value) = if signed {
+                (
+                    iconst_u32(builder, immediate as i16 as i32 as u32),
+                    sign_extend_word(builder, dst_word),
+                )
+            } else {
+                (iconst_u32(builder, u32::from(immediate)), dst_word)
+            };
+            let result = builder.ins().imul(src_value, dst_value);
+            store_reg(builder, cpu, JitDirectReg::Data(dst), result);
+            set_logic_flags(builder, cpu, result, Size::Long);
+
+            if m68000_timing {
+                let variable = if signed {
+                    let shifted = u32::from(immediate) << 1;
+                    ((shifted ^ (shifted >> 1)) & 0xFFFF).count_ones()
+                } else {
+                    immediate.count_ones()
+                };
+                // 38 + 2*bits + the 4-cycle word-immediate operand fetch,
+                // matching the interpreter's exec_mulu/exec_muls exactly.
+                cycles_const(builder, 42 + 2 * variable as i32)
+            } else {
+                cycles_const(builder, 42)
+            }
         }
         JitTraceOp::MulWordDataReg {
             src,
@@ -7080,8 +7199,11 @@ mod portable_tests {
                 memory: vec![0u8; 0x1000],
                 word_reads: std::collections::BTreeMap::new(),
             };
-            bus.memory[0x0102..0x0104].copy_from_slice(&0xC0FCu16.to_be_bytes());
-            bus.memory[0x0104..0x0106].copy_from_slice(&0x0005u16.to_be_bytes());
+            // An opcode the trace decoder refuses and which carries no
+            // extension words, so a failing decode costs exactly the one
+            // opcode read. (This was `C0FC` until `MUL.W #imm,Dn` became
+            // supported -- pick a still-unsupported form when updating.)
+            bus.memory[0x0102..0x0104].copy_from_slice(&0x4AFCu16.to_be_bytes());
             let mut jit = TraceJit::new();
             jit.recording = Some(TraceRecording {
                 start_pc: 0x0100,
@@ -7091,7 +7213,7 @@ mod portable_tests {
             });
             cpu.set_cpu_type(CpuType::M68040);
             cpu.trace_recording = true;
-            cpu.ir = 0xC0FC;
+            cpu.ir = 0x4AFC;
             jit.record_executed(cpu, &mut bus, 0x0102, 0x0106);
             bus.word_reads
         };
@@ -7108,7 +7230,7 @@ mod portable_tests {
         super::super::trace_profile::reset();
         let mut windowed = cpu();
         let mut mem = vec![0u8; 0x1000];
-        mem[0x0102..0x0104].copy_from_slice(&0xC0FCu16.to_be_bytes());
+        mem[0x0102..0x0104].copy_from_slice(&0x4AFCu16.to_be_bytes());
         mem[0x0104..0x0106].copy_from_slice(&0x0005u16.to_be_bytes());
         mem[0x0106..0x0108].copy_from_slice(&0x60F8u16.to_be_bytes());
         attach_window(&mut windowed, &mut mem);
@@ -7123,8 +7245,8 @@ mod portable_tests {
             .find(|row| row.start_pc == 0x0100)
             .expect("the failure was recorded");
         assert_eq!(shape.blocker_pc, 0x0102);
-        assert_eq!(shape.executed_opcode, 0xC0FC);
-        assert_eq!(shape.memory_opcode, Some(0xC0FC));
+        assert_eq!(shape.executed_opcode, 0x4AFC);
+        assert_eq!(shape.memory_opcode, Some(0x4AFC));
         assert_eq!(shape.next_word, Some(0x0005));
         assert_eq!(shape.next_word2, Some(0x60F8));
         assert_eq!(shape.prefix_ops, 1);
@@ -7428,6 +7550,246 @@ mod portable_tests {
             0x1000u32.wrapping_sub(0x8000).wrapping_add(4),
             "the negative word index case matches natively"
         );
+    }
+
+    #[test]
+    fn mul_word_immediate_cycle_headroom_covers_the_68000_worst_case() {
+        // `try_execute` uses `max_cycles()` both to decide whether a trace
+        // fits `cycles_remaining` and to derive the self-loop iteration
+        // count, so the metadata must dominate every actual cost. Parity
+        // tests cannot catch a shared underestimate -- native and portable
+        // agree with each other while both overrun the budget -- so this
+        // checks metadata against the portable-returned cycles directly,
+        // across immediates including the worst cases (MULU $FFFF and
+        // MULS $5555 both cost 38 + 2*16 = 70 on the 68000).
+        let mut worst_seen = 0;
+        for signed in [false, true] {
+            for &immediate in &[0x0000u16, 0x0001, 0x5555, 0x8000, 0xAAAA, 0xFFFF] {
+                let op = JitTraceOp::MulWordImmediate {
+                    immediate,
+                    dst: 0,
+                    signed,
+                    m68000_timing: true,
+                };
+                let trace = TraceBuildOp {
+                    opcode: if signed { 0xC1FC } else { 0xC0FC },
+                    extension: Some(immediate),
+                    extension2: None,
+                    pc: 0x0100,
+                    op,
+                };
+                let mut cpu = cpu();
+                cpu.set_cpu_type(CpuType::M68000);
+                cpu.set_d(0, 0x1234);
+                let cycles = execute_portable_op(&mut cpu, trace, 0x0100, 0x0104)
+                    .expect("portable immediate multiply executes");
+                assert!(
+                    op.max_cycles() >= cycles,
+                    "headroom: max_cycles {} < actual {} for imm {immediate:04X} signed {signed}",
+                    op.max_cycles(),
+                    cycles
+                );
+                worst_seen = worst_seen.max(cycles);
+            }
+        }
+        assert_eq!(
+            worst_seen, 74,
+            "the sweep reaches the true 68000 worst case"
+        );
+        assert_eq!(
+            JitTraceOp::MulWordImmediate {
+                immediate: 0xFFFF,
+                dst: 0,
+                signed: false,
+                m68000_timing: true,
+            }
+            .max_cycles(),
+            74,
+            "the 68000 bound is tight: 70 as for MulWordDataReg plus the
+             4-cycle word-immediate operand fetch"
+        );
+        assert_eq!(
+            JitTraceOp::MulWordImmediate {
+                immediate: 0xFFFF,
+                dst: 0,
+                signed: false,
+                m68000_timing: false,
+            }
+            .max_cycles(),
+            42,
+            "later CPUs keep the fixed pre-scaled value"
+        );
+    }
+
+    #[test]
+    fn mul_word_immediate_cycles_match_the_interpreter() {
+        // The differential Ben asked for: the trace operation's cycle
+        // result is compared against the interpreter's own
+        // exec_mulu/exec_muls for the same immediate, not against the
+        // trace's own arithmetic -- a shared underestimate between the
+        // portable and native paths cannot hide from this. The immediate
+        // form charges the 4-cycle word-operand fetch on the 68000
+        // (ea_source_cycles(Immediate, Word)), which the register form
+        // does not.
+        use super::super::ea::AddressingMode;
+        for signed in [false, true] {
+            for &immediate in &[0x0000u16, 0x0001, 0x5555, 0x8000, 0xAAAA, 0xFFFF] {
+                // Interpreter side: execute the real instruction with the
+                // immediate in the instruction stream at pc.
+                let mut icpu = cpu();
+                icpu.set_cpu_type(CpuType::M68000);
+                icpu.pc = 0x2000;
+                icpu.prefetch_queue = [immediate, 0];
+                icpu.prefetch_count = 1;
+                icpu.set_d(0, 0x9ABC);
+                let mut ibus = super::super::memory::LinearMemoryBus::new(0x4000);
+                ibus.write_word(0x2000, immediate);
+                let interpreter_cycles = if signed {
+                    icpu.exec_muls(&mut ibus, AddressingMode::Immediate, 0)
+                } else {
+                    icpu.exec_mulu(&mut ibus, AddressingMode::Immediate, 0)
+                };
+
+                // Trace side: the portable operation for the same form.
+                let op = JitTraceOp::MulWordImmediate {
+                    immediate,
+                    dst: 0,
+                    signed,
+                    m68000_timing: true,
+                };
+                let trace = TraceBuildOp {
+                    opcode: if signed { 0xC1FC } else { 0xC0FC },
+                    extension: Some(immediate),
+                    extension2: None,
+                    pc: 0x0100,
+                    op,
+                };
+                let mut tcpu = cpu();
+                tcpu.set_cpu_type(CpuType::M68000);
+                tcpu.set_d(0, 0x9ABC);
+                let trace_cycles = execute_portable_op(&mut tcpu, trace, 0x0100, 0x0104)
+                    .expect("portable immediate multiply executes");
+
+                assert_eq!(
+                    trace_cycles, interpreter_cycles,
+                    "imm {immediate:04X} signed {signed}: trace vs interpreter"
+                );
+                assert_eq!(
+                    icpu.d(0),
+                    tcpu.d(0),
+                    "imm {immediate:04X} signed {signed}: results agree"
+                );
+                assert!(
+                    op.max_cycles() >= interpreter_cycles,
+                    "imm {immediate:04X} signed {signed}: headroom {} < interpreter {}",
+                    op.max_cycles(),
+                    interpreter_cycles
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mul_word_immediate_decodes_and_executes_portably() {
+        // C0FC = MULU.W #imm,D0; C1FC = MULS.W #imm,D0.
+        for (opcode, signed) in [(0xC0FCu16, false), (0xC1FC, true)] {
+            for &(immediate, seed) in &[
+                (0x0003u16, 0x0000_0005u32),
+                (0xFFFF, 0x0000_0002),
+                (0x8000, 0x0000_8000),
+                (0x0000, 0x1234_5678),
+            ] {
+                let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+                decode_bus.write_word(0x0100, opcode);
+                decode_bus.write_word(0x0102, immediate);
+                let mut cpu = cpu();
+                cpu.set_cpu_type(CpuType::M68040);
+                cpu.set_d(0, seed);
+                let trace = decode_trace_op(&cpu, &mut decode_bus, 0x0100, CpuType::M68040)
+                    .expect("MUL.W #imm,Dn should decode");
+                assert!(matches!(
+                    trace.op,
+                    JitTraceOp::MulWordImmediate { immediate: imm, dst: 0, signed: s, .. }
+                        if imm == immediate && s == signed
+                ));
+
+                execute_portable_op(&mut cpu, trace, 0x0100, 0x0104);
+                let expected = if signed {
+                    (i32::from(immediate as i16) * i32::from(seed as u16 as i16)) as u32
+                } else {
+                    u32::from(immediate) * u32::from(seed as u16)
+                };
+                assert_eq!(
+                    cpu.d(0),
+                    expected,
+                    "opcode {opcode:04X} imm {immediate:04X}"
+                );
+            }
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_mul_word_immediate_matches_portable() {
+        // The 68000 timing path folds the multiplicand's bit pattern at
+        // compile time, so check a value with a distinctive popcount as well
+        // as the sign-extension boundary.
+        for (opcode, signed) in [(0xC0FCu16, false), (0xC1FC, true)] {
+            for &immediate in &[0x0003u16, 0xFFFF, 0x8001] {
+                let mul = TraceBuildOp {
+                    opcode,
+                    extension: Some(immediate),
+                    extension2: None,
+                    pc: 0x0100,
+                    op: JitTraceOp::MulWordImmediate {
+                        immediate,
+                        dst: 0,
+                        signed,
+                        m68000_timing: true,
+                    },
+                };
+                let branch = TraceBuildOp {
+                    opcode: 0x60FA,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0104,
+                    op: JitTraceOp::Branch {
+                        condition: 0,
+                        displacement: -6,
+                        length: 2,
+                        expected_taken: None,
+                    },
+                };
+                let prepare = || {
+                    let mut cpu = cpu();
+                    cpu.set_cpu_type(CpuType::M68000);
+                    cpu.set_d(0, 0x0000_9ABC);
+                    cpu.set_ccr(0x1F);
+                    cpu
+                };
+
+                let mut expected = prepare();
+                let expected_packed =
+                    execute_portable_trace(&mut expected, &[mul, branch], 0x0100, 0x0106);
+
+                let mut actual = prepare();
+                let mut jit = TraceJit::new();
+                let compiled = jit
+                    .compile_decoded_ops(
+                        &actual,
+                        0x0100,
+                        CpuType::M68000,
+                        vec![mul, branch],
+                        Some(0x0100),
+                    )
+                    .expect("immediate multiply loop should compile");
+                let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+
+                assert_eq!(actual_packed, expected_packed, "cycles/retired");
+                assert_eq!(actual.dar, expected.dar, "registers");
+                assert_eq!(actual.get_ccr(), expected.get_ccr(), "ccr");
+            }
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
