@@ -286,6 +286,15 @@ struct EventBus {
     boundary_requested: bool,
     record_word_reads: bool,
     word_reads: Vec<u32>,
+    bus_events: Vec<BusEvent>,
+    fetch_cached: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BusEvent {
+    ReadWord(u32),
+    IplHold,
+    Sync(u32),
 }
 
 impl EventBus {
@@ -300,6 +309,8 @@ impl EventBus {
             boundary_requested: false,
             record_word_reads: false,
             word_reads: Vec::new(),
+            bus_events: Vec::new(),
+            fetch_cached: true,
         }
     }
 
@@ -319,6 +330,7 @@ impl EventBus {
 
     fn start_recording_word_reads(&mut self) {
         self.word_reads.clear();
+        self.bus_events.clear();
         self.record_word_reads = true;
     }
 }
@@ -336,6 +348,7 @@ impl AddressBus for EventBus {
     fn read_word(&mut self, address: u32) -> u16 {
         if self.record_word_reads {
             self.word_reads.push(address);
+            self.bus_events.push(BusEvent::ReadWord(address));
         }
         u16::from_be_bytes([
             self.read_byte(address),
@@ -368,6 +381,22 @@ impl AddressBus for EventBus {
     fn write_long(&mut self, address: u32, value: u32) {
         for (offset, byte) in value.to_be_bytes().into_iter().enumerate() {
             self.write_byte(address.wrapping_add(offset as u32), byte);
+        }
+    }
+
+    fn sync(&mut self, cpu_clocks: u32) {
+        if self.record_word_reads {
+            self.bus_events.push(BusEvent::Sync(cpu_clocks));
+        }
+    }
+
+    fn last_fetch_was_cached(&self) -> bool {
+        self.fetch_cached
+    }
+
+    fn ipl_hold_sample(&mut self) {
+        if self.record_word_reads {
+            self.bus_events.push(BusEvent::IplHold);
         }
     }
 
@@ -891,6 +920,103 @@ fn boundary_hook_decoded_subset_matches_step_for_each_supported_cpu_model() {
 }
 
 #[test]
+fn boundary_hook_decoded_clr_matches_precise_state_timing_and_bus_order() {
+    for cpu_type in [
+        CpuType::M68000,
+        CpuType::M68010,
+        CpuType::M68020,
+        CpuType::M68030,
+        CpuType::M68040,
+    ] {
+        for (opcode, expected_d0, expected_m68000_events) in [
+            (
+                0x4240,
+                0xDEAD_0000,
+                vec![
+                    BusEvent::ReadWord(0x1000),
+                    BusEvent::ReadWord(0x1002),
+                    BusEvent::ReadWord(0x1004),
+                    BusEvent::IplHold,
+                ],
+            ),
+            (
+                0x4280,
+                0,
+                vec![
+                    BusEvent::ReadWord(0x1000),
+                    BusEvent::ReadWord(0x1002),
+                    BusEvent::ReadWord(0x1004),
+                    BusEvent::IplHold,
+                    BusEvent::Sync(2),
+                ],
+            ),
+        ] {
+            for fetch_cached in [false, true] {
+                let mut initial_bus = EventBus::new();
+                initial_bus.load_word(0x1000, opcode);
+                initial_bus.load_word(0x1002, 0x4E71);
+                initial_bus.load_word(0x1004, 0x4E71);
+                initial_bus.fetch_cached = fetch_cached;
+                initial_bus.start_recording_word_reads();
+
+                let mut precise_bus = initial_bus.clone();
+                let mut decoded_bus = initial_bus;
+                let mut precise_cpu = cpu_at(cpu_type, 0x1000);
+                let mut decoded_cpu = cpu_at(cpu_type, 0x1000);
+                precise_cpu.set_d(0, 0xDEAD_BEEF);
+                decoded_cpu.set_d(0, 0xDEAD_BEEF);
+                precise_cpu.set_sr(0x271F);
+                decoded_cpu.set_sr(0x271F);
+
+                let mut precise_hooks = Vec::new();
+                let precise =
+                    precise_cpu.run_for_cycles_with_hook(&mut precise_bus, 1, |_, _, cycles| {
+                        precise_hooks.push(cycles);
+                        CycleBatchControl::Return
+                    });
+                let mut decoded_hooks = Vec::new();
+                let decoded = decoded_cpu.run_for_cycles_with_boundary_hook(
+                    &mut decoded_bus,
+                    1,
+                    |_, _, event| {
+                        decoded_hooks.push(event);
+                        CycleBatchControl::Return
+                    },
+                );
+
+                assert_eq!(decoded, precise, "{cpu_type:?} opcode {opcode:04X}");
+                assert_eq!(
+                    decoded_hooks,
+                    precise_hooks
+                        .into_iter()
+                        .map(|cycles| CycleBoundaryEvent::Instruction { cycles })
+                        .collect::<Vec<_>>(),
+                    "{cpu_type:?} opcode {opcode:04X}"
+                );
+                assert_eq!(decoded.instructions, 1);
+                assert_eq!(decoded.exit, CycleBatchExit::BoundaryRequested);
+                assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+                assert_eq!(decoded_cpu.d(0), expected_d0);
+                assert_eq!(
+                    decoded_cpu.get_sr() & 0x1F,
+                    0x14,
+                    "X is preserved and Z is set"
+                );
+                assert_eq!(decoded_cpu.ir, precise_cpu.ir);
+                assert_eq!(decoded_cpu.prefetch_queue, precise_cpu.prefetch_queue);
+                assert_eq!(decoded_cpu.prefetch_count, precise_cpu.prefetch_count);
+                assert_eq!(decoded_bus.memory, precise_bus.memory);
+                assert_eq!(decoded_bus.bus_events, precise_bus.bus_events);
+
+                if cpu_type == CpuType::M68000 {
+                    assert_eq!(decoded_bus.bus_events, expected_m68000_events);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn boundary_hook_decoded_subset_falls_back_without_changing_fetch_order() {
     let mut initial_bus = EventBus::new();
     initial_bus.load_word(0x1000, 0x7001); // MOVEQ #1,D0
@@ -927,7 +1053,7 @@ fn boundary_hook_decoded_subset_falls_back_without_changing_fetch_order() {
 #[test]
 fn boundary_hook_decoded_subset_observes_hook_cpu_state_changes() {
     let words = [
-        (0x1000, 0x4E71), // NOP
+        (0x1000, 0x4240), // CLR.W D0
         (0x1002, 0x7001), // skipped by the hook's PC update
         (0x1004, 0x7202), // MOVEQ #2,D1
         (0x1006, 0x4E71), // M68040 fallback
@@ -936,6 +1062,8 @@ fn boundary_hook_decoded_subset_observes_hook_cpu_state_changes() {
     let mut decoded_bus = bus_with(&words);
     let mut precise_cpu = cpu_at(CpuType::M68020, 0x1000);
     let mut decoded_cpu = cpu_at(CpuType::M68020, 0x1000);
+    precise_cpu.set_d(0, 0xDEAD_BEEF);
+    decoded_cpu.set_d(0, 0xDEAD_BEEF);
 
     let update_after_first_instruction = |cpu: &mut CpuCore| {
         if cpu.ppc == 0x1000 {
@@ -960,6 +1088,7 @@ fn boundary_hook_decoded_subset_observes_hook_cpu_state_changes() {
 
     assert_eq!(decoded, precise);
     assert_cpu_state_eq(&decoded_cpu, &precise_cpu);
+    assert_eq!(decoded_cpu.d(0), 0xDEAD_0000);
     assert_eq!(decoded_cpu.d(1), 2);
 }
 
@@ -967,7 +1096,7 @@ fn boundary_hook_decoded_subset_observes_hook_cpu_state_changes() {
 fn boundary_hook_decoded_subset_matches_step_when_hook_raises_irq() {
     for cpu_type in [CpuType::M68000, CpuType::M68020, CpuType::M68040] {
         let mut initial_bus = EventBus::new();
-        initial_bus.load_word(0x1000, 0x7001); // MOVEQ #1,D0: fast-path target
+        initial_bus.load_word(0x1000, 0x4240); // CLR.W D0: fast-path target
         initial_bus.load_word(0x1002, 0x7201); // MOVEQ #1,D1: must not execute
         initial_bus.load_long(0x6C, 0x2000); // level-3 autovector
         initial_bus.load_word(0x2000, 0x4E71); // handler entry: must not execute
@@ -979,6 +1108,8 @@ fn boundary_hook_decoded_subset_matches_step_when_hook_raises_irq() {
         let mut decoded_cpu = cpu_at(cpu_type, 0x1000);
         precise_cpu.set_sr(0x2000); // supervisor, interrupt mask 0
         decoded_cpu.set_sr(0x2000);
+        precise_cpu.set_d(0, 0xDEAD_BEEF);
+        decoded_cpu.set_d(0, 0xDEAD_BEEF);
 
         let mut precise_instruction_events = Vec::new();
         let precise =

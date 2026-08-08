@@ -5,11 +5,11 @@
 use super::cpu::{CpuCore, SFLAG_SET};
 use super::decode::{dispatch_instruction, needs_rollback_snapshot};
 use super::memory::AddressBus;
-use super::op_cache::{BatchInnerExit, DecodedSimpleOp};
+use super::op_cache::{BatchInnerExit, DecodedSimpleOp, UnaryOp};
 use super::trace_jit;
 use super::types::{
-    BatchExit, BatchResult, CycleBatchControl, CycleBatchExit, CycleBatchResult,
-    CycleBoundaryEvent, StepResult,
+    BatchExit, BatchResult, CpuType, CycleBatchControl, CycleBatchExit, CycleBatchResult,
+    CycleBoundaryEvent, Size, StepResult,
 };
 
 /// Stop level constants.
@@ -21,6 +21,36 @@ pub const STOP_LEVEL_HALT: u32 = 2;
 pub const RUN_MODE_NORMAL: u32 = 0;
 /// Bus/address-error recovery or reset processing is active.
 pub const RUN_MODE_BERR_AERR_RESET: u32 = 1;
+
+/// Decode the deliberately narrow register-only subset whose precise
+/// instruction completion is preserved by the boundary-hook dispatcher.
+#[inline]
+fn decode_boundary_hook_op(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleOp> {
+    let decoded = DecodedSimpleOp::decode(cpu_type, opcode);
+    match (cpu_type, decoded) {
+        // M68040 NOP is excluded because the normal path performs T0 pipeline
+        // synchronization.
+        (
+            CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030,
+            Some(op @ DecodedSimpleOp::Nop),
+        ) => Some(op),
+        (
+            CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030 | CpuType::M68040,
+            Some(op @ DecodedSimpleOp::Moveq { .. }),
+        ) if opcode & 0x0100 == 0 => Some(op),
+        (
+            CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030 | CpuType::M68040,
+            Some(
+                op @ DecodedSimpleOp::UnaryDataReg {
+                    op: UnaryOp::Clr,
+                    size: Size::Word | Size::Long,
+                    ..
+                },
+            ),
+        ) => Some(op),
+        _ => None,
+    }
+}
 
 impl CpuCore {
     #[inline]
@@ -864,7 +894,7 @@ impl CpuCore {
         bus: &mut B,
         opcode: u16,
     ) -> super::types::InternalStepResult {
-        use super::types::{CpuType, InternalStepResult};
+        use super::types::InternalStepResult;
 
         // Trace states remain on the normal dispatcher so it can preserve trace
         // exceptions and model-specific behavior.
@@ -872,30 +902,27 @@ impl CpuCore {
             return dispatch_instruction(self, bus, opcode);
         }
 
-        let fast_op = match (
-            self.cpu_type,
-            DecodedSimpleOp::decode(self.cpu_type, opcode),
-        ) {
-            // M68040 NOP is excluded because the normal path performs T0 pipeline
-            // synchronization.
-            (
-                CpuType::M68000 | CpuType::M68010 | CpuType::M68020 | CpuType::M68030,
-                Some(op @ DecodedSimpleOp::Nop),
-            ) => op,
-            (
-                CpuType::M68000
-                | CpuType::M68010
-                | CpuType::M68020
-                | CpuType::M68030
-                | CpuType::M68040,
-                Some(op @ DecodedSimpleOp::Moveq { .. }),
-            ) if opcode & 0x0100 == 0 => op,
-            _ => return dispatch_instruction(self, bus, opcode),
+        let Some(fast_op) = decode_boundary_hook_op(self.cpu_type, opcode) else {
+            return dispatch_instruction(self, bus, opcode);
         };
 
-        InternalStepResult::Ok {
-            cycles: fast_op.execute(self, bus),
-        }
+        let cycles = match (self.cpu_type, fast_op) {
+            // The generic decoded executor mutates Dn immediately. M68000
+            // CLR.W/L Dn instead performs its final prefetch and IPL poll
+            // first, plus the long form's two-clock sync, so reuse the precise
+            // implementation for that model after the opcode-only decode.
+            (
+                CpuType::M68000,
+                DecodedSimpleOp::UnaryDataReg {
+                    op: UnaryOp::Clr,
+                    reg,
+                    size,
+                },
+            ) => self.exec_clr(bus, size, super::ea::AddressingMode::DataDirect(reg)),
+            _ => fast_op.execute(self, bus),
+        };
+
+        InternalStepResult::Ok { cycles }
     }
 
     /// Execute a single instruction with HLE trap handling (CPU + bus access).
@@ -1273,5 +1300,45 @@ impl CpuCore {
         self.clear_execution_pipeline_state();
         self.set_sr(new_sr);
         self.stopped |= STOP_LEVEL_STOP;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boundary_hook_clr_admission_is_exact() {
+        for cpu_type in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68020,
+            CpuType::M68030,
+            CpuType::M68040,
+        ] {
+            for opcode in 0x4240..=0x4247 {
+                assert!(matches!(
+                    decode_boundary_hook_op(cpu_type, opcode),
+                    Some(DecodedSimpleOp::UnaryDataReg {
+                        op: UnaryOp::Clr,
+                        size: Size::Word,
+                        ..
+                    })
+                ));
+            }
+            for opcode in 0x4280..=0x4287 {
+                assert!(matches!(
+                    decode_boundary_hook_op(cpu_type, opcode),
+                    Some(DecodedSimpleOp::UnaryDataReg {
+                        op: UnaryOp::Clr,
+                        size: Size::Long,
+                        ..
+                    })
+                ));
+            }
+            for opcode in [0x4200, 0x4248, 0x4250, 0x42C0] {
+                assert!(decode_boundary_hook_op(cpu_type, opcode).is_none());
+            }
+        }
     }
 }
