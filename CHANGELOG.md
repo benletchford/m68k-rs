@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.9.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.3...m68k-v0.9.0) (2026-08-08)
+
+
+### Features
+
+* **trace-profile:** report silent-rejection opcodes ([ff6455f](https://github.com/benletchford/m68k-rs/commit/ff6455f95f1c14c7a8341034c169d778921545cd))
+
+
+### Performance Improvements
+
+* **execute:** decode register CLR for boundary hooks ([b1d4891](https://github.com/benletchford/m68k-rs/commit/b1d4891f586a64d56b6ca31fbabe7fc0e84d83a1))
+
 ## [0.8.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.8.2...m68k-v0.8.3) (2026-08-06)
 
 
