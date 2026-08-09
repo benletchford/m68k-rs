@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.2...m68k-v0.10.3) (2026-08-09)
+
+
+### Performance Improvements
+
+* jit stores to brief-indexed destinations (MOVE, CLR) ([6c7e8c5](https://github.com/benletchford/m68k-rs/commit/6c7e8c5743a59a7511477c46f1fbecaa0c0e5634))
+
 ## [0.10.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.1...m68k-v0.10.2) (2026-08-09)
 
 
