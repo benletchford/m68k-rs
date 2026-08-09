@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.3...m68k-v0.10.4) (2026-08-09)
+
+
+### Performance Improvements
+
+* JIT CLR to predecrement destinations ([e0368a0](https://github.com/benletchford/m68k-rs/commit/e0368a0e81a668ba367479d66f459b150cdfc9eb))
+
 ## [0.10.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.2...m68k-v0.10.3) (2026-08-09)
 
 
