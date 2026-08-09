@@ -2775,11 +2775,11 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     };
     let src = decode_ea(src_mode, opcode & 7)?;
     let dst = decode_ea(dst_mode, (opcode >> 9) & 7)?;
-    // The measured loop only needs indexed reads. Indexed stores can be
-    // added when a profile demonstrates that their extra emitter paths pay.
-    if matches!(dst, JitEa::Index { .. }) {
-        return None;
-    }
+    // Indexed destinations were gated until "a profile demonstrates that
+    // their extra emitter paths pay". Three profiled heads across two
+    // workloads now terminate on indexed-destination stores (MOVE.W 3180
+    // and the CLR forms 4230/4270), so the store side gets the same brief-
+    // indexed support the read side has had.
     if !src.is_mem() && !dst.is_mem() {
         return None;
     }
@@ -3572,7 +3572,43 @@ fn execute_portable_move_mem(
             write(cpu, off, value);
             cpu.set_logic_flags(value, size);
         }
-        JitEa::Index { .. } => return None,
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base_value = dst_base(cpu, base);
+            // The index register must also observe a staged source
+            // adjustment: in `MOVE.W (A2)+,(d8,A1,A2.W)` the source
+            // post-increment commits before the destination EA evaluates.
+            let raw_index = match index {
+                JitDirectReg::Addr(r) => match staged {
+                    Some((idx, v)) if idx == 8 + r as usize => v,
+                    _ => cpu.dar[8 + r as usize],
+                },
+                JitDirectReg::Data(r) => cpu.dar[r as usize],
+            };
+            let index_value = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            let addr = base_value
+                .wrapping_add(index_value << scale)
+                .wrapping_add(displacement as i32 as u32);
+            let off = locate(cpu, addr)?;
+            let masked = addr & cpu.address_mask;
+            if masked < code_end && masked.wrapping_add(bytes) > code_start {
+                return None;
+            }
+            if let Some((idx, v)) = staged {
+                cpu.dar[idx] = v;
+            }
+            write(cpu, off, value);
+            cpu.set_logic_flags(value, size);
+        }
     }
 
     Some(JitTraceOp::MoveMem { size, src, dst }.max_cycles())
@@ -5659,6 +5695,50 @@ fn emit_move_mem(
             window_store(builder, env, off, size, value);
             set_logic_flags(builder, cpu, value, size);
         }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base_value = dst_base(builder, base);
+            // The index register must also observe a staged source
+            // adjustment (`MOVE.W (A2)+,(d8,A1,A2.W)`): the source
+            // post-increment commits before the destination EA evaluates.
+            let raw_index = match (index, staged) {
+                (JitDirectReg::Addr(ir), Some((sr, v))) if sr == ir => v,
+                _ => load_reg(builder, cpu, index),
+            };
+            let index_value = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index_value = if scale == 0 {
+                index_value
+            } else {
+                builder.ins().ishl_imm(index_value, i64::from(scale))
+            };
+            let a = builder.ins().iadd(base_value, index_value);
+            let addr = builder.ins().iadd_imm(a, displacement as i64);
+            let (off, masked) = checked_window_off(builder, env, bail, addr, size);
+            let lt_end =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedLessThan, masked, env.code_end as i64);
+            let past = builder.ins().iadd_imm(masked, size.bytes() as i64);
+            let gt_start =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThan, past, env.code_start as i64);
+            let bad = builder.ins().band(lt_end, gt_start);
+            branch_guard(builder, bail, bad);
+            commit_staged(builder);
+            window_store(builder, env, off, size, value);
+            set_logic_flags(builder, cpu, value, size);
+        }
         JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
             let address = iconst_u32(builder, address);
             let (off, masked) = checked_window_off(builder, env, bail, address, size);
@@ -5667,7 +5747,6 @@ fn emit_move_mem(
             window_store(builder, env, off, size, value);
             set_logic_flags(builder, cpu, value, size);
         }
-        JitEa::Index { .. } => unreachable!("indexed MOVE destination is not traceable"),
     }
 
     cycles_const(
@@ -8365,6 +8444,218 @@ mod portable_tests {
         assert_eq!(actual.c_flag, 0, "C is cleared by a zero count");
         assert_eq!(actual.v_flag, 0, "V is cleared");
         assert_ne!(actual.n_flag, 0, "N comes from the unshifted value");
+    }
+
+    #[test]
+    fn move_to_indexed_destination_decodes_and_matches_the_interpreter() {
+        // 3180 = MOVE.W D0,(d8,A0,Xn): the indexed-destination store that
+        // three profiled heads terminate on. The staged case is the subtle
+        // one -- MOVE.W (A2)+,(d8,A1,A2.W) commits the source post-
+        // increment before the destination EA evaluates -- and portable
+        // and native could share a wrong staging model, so both are
+        // checked against the interpreter's own decoded execution rather
+        // than only against each other.
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0x3180);
+        bus.write_word(0x0102, 0x2004); // (4,A0,D2.W)
+        let trace = decode_trace_op(&cpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W Dn,(d8,An,Xn) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::MoveMem {
+                size: Size::Word,
+                src: JitEa::Data(0),
+                dst: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                },
+            }
+        ));
+
+        // Staged-interaction differential: MOVE.W (A2)+,(d8,A1,A2.W).
+        // dst reg 1, dst mode 6 (index), src mode 3 (postinc), src reg 2
+        // => 0011 001 110 011 010 = 0x339A.
+        let mut dbus = super::super::memory::LinearMemoryBus::new(0x1000);
+        dbus.write_word(0x0100, 0x339A);
+        dbus.write_word(0x0102, 0xA008); // (8,A1,A2.W) index=A2 word
+        let staged_trace = decode_trace_op(&cpu, &mut dbus, 0x0100, CpuType::M68040)
+            .expect("staged indexed store should decode");
+        assert!(matches!(
+            staged_trace.op,
+            JitTraceOp::MoveMem {
+                size: Size::Word,
+                src: JitEa::PostInc(2),
+                dst: JitEa::Index {
+                    base: 1,
+                    index: JitDirectReg::Addr(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 8,
+                },
+            }
+        ));
+
+        let prepare = |mem: &mut Vec<u8>| {
+            let mut c = cpu_fn();
+            c.set_cpu_type(CpuType::M68040);
+            c.set_a(2, 0x0200); // source pointer; also the dst index register
+            c.set_a(1, 0x0400); // dst base
+            c.set_a(7, 0x0900);
+            mem[0x0200..0x0202].copy_from_slice(&0xBEEFu16.to_be_bytes());
+            // The interpreter reads the extension word from guest memory.
+            mem[0x0100..0x0102].copy_from_slice(&0x339Au16.to_be_bytes());
+            mem[0x0102..0x0104].copy_from_slice(&0xA008u16.to_be_bytes());
+            attach_window(&mut c, mem);
+            c.pc = 0x0100;
+            c
+        };
+        fn cpu_fn() -> CpuCore {
+            let mut c = CpuCore::new();
+            c.set_sr(0x2700);
+            c
+        }
+
+        // Interpreter (decoded fast path) reference.
+        let mut imem = vec![0u8; 0x1000];
+        let mut icpu = prepare(&mut imem);
+        icpu.pc = 0x0102; // execute_mem_op reads extensions from pc
+        assert!(super::super::mem_ops::execute_mem_op(
+            &mut icpu,
+            DecodedMemOp::Move {
+                size: Size::Word,
+                src: FastEa::AnPostInc(2),
+                dst: FastEa::AnIndex(1),
+            },
+        ));
+
+        // Portable trace op.
+        let mut pmem = vec![0u8; 0x1000];
+        let mut pcpu = prepare(&mut pmem);
+        let cycles = execute_portable_op(&mut pcpu, staged_trace, 0x0100, 0x0104)
+            .expect("portable staged indexed store executes");
+        assert!(cycles > 0);
+
+        assert_eq!(icpu.a(2), 0x0202, "interpreter commits the post-increment");
+        assert_eq!(pcpu.a(2), icpu.a(2), "portable matches interpreter A2");
+        // The stored address uses the UPDATED A2 as index: 0x400+0x202+8.
+        let addr = 0x0400 + 0x0202 + 8;
+        assert_eq!(
+            &imem[addr..addr + 2],
+            &0xBEEFu16.to_be_bytes(),
+            "interpreter stores through the post-incremented index"
+        );
+        assert_eq!(pmem, imem, "portable memory matches interpreter exactly");
+        assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "flags agree");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_move_to_indexed_destination_matches_portable() {
+        // Plain, negative-word-index, and staged-postinc cases.
+        let cases: [(JitEa, u16, u32, u32); 3] = [
+            (
+                JitEa::Data(0),
+                0x3180, // MOVE.W D0,(4,A0,D2.W)
+                0x0000_0010,
+                0x0000_0004,
+            ),
+            (
+                JitEa::Data(0),
+                0x3180,
+                0xFFFF_8000, // negative word index, sign-extension boundary
+                0x0000_0004,
+            ),
+            (
+                JitEa::PostInc(2),
+                0x339A, // MOVE.W (A2)+,(8,A1,A2.W) -- staged interaction
+                0,
+                0,
+            ),
+        ];
+        for (case, (src, opcode, d2, _)) in cases.iter().enumerate() {
+            let dst = if *opcode == 0x3180 {
+                JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                }
+            } else {
+                JitEa::Index {
+                    base: 1,
+                    index: JitDirectReg::Addr(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 8,
+                }
+            };
+            let mv = TraceBuildOp {
+                opcode: *opcode,
+                extension: Some(if *opcode == 0x3180 { 0x2004 } else { 0xA008 }),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::MoveMem {
+                    size: Size::Word,
+                    src: *src,
+                    dst,
+                },
+            };
+            let branch = TraceBuildOp {
+                opcode: 0x60FA,
+                extension: None,
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -6,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let mut emem = vec![0u8; 0x1000];
+            let mut amem = vec![0u8; 0x1000];
+            let prepare = |mem: &mut Vec<u8>| {
+                let mut c = cpu();
+                c.set_cpu_type(CpuType::M68040);
+                c.set_d(0, 0x0000_CAFE);
+                c.set_d(2, *d2);
+                c.set_a(0, 0x0300);
+                c.set_a(1, 0x0400);
+                c.set_a(2, 0x0200);
+                c.set_a(7, 0x0900);
+                mem[0x0200..0x0202].copy_from_slice(&0x1234u16.to_be_bytes());
+                attach_window(&mut c, mem);
+                c
+            };
+            let mut expected = prepare(&mut emem);
+            let expected_packed =
+                execute_portable_trace(&mut expected, &[mv, branch], 0x0100, 0x0106);
+            let mut actual = prepare(&mut amem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(
+                    &actual,
+                    0x0100,
+                    CpuType::M68040,
+                    vec![mv, branch],
+                    Some(0x0100),
+                )
+                .expect("indexed-destination store loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(
+                actual_packed, expected_packed,
+                "case {case}: cycles/retired"
+            );
+            assert_eq!(actual.dar, expected.dar, "case {case}: registers");
+            assert_eq!(actual.get_ccr(), expected.get_ccr(), "case {case}: ccr");
+            assert_eq!(amem, emem, "case {case}: memory");
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
