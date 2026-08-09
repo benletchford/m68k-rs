@@ -376,6 +376,7 @@ pub(crate) enum JitTraceOp {
     /// ADD.W/L Dn,`<ea>` store/accumulate operations through measured writable
     /// address-register-relative forms.
     AddRegToMem {
+        is_sub: bool,
         size: Size,
         src: u8,
         dst: JitEa,
@@ -2802,19 +2803,20 @@ fn decode_add_reg_to_mem_trace_op<B: AddressBus>(
     opcode: u16,
     cpu_type: CpuType,
 ) -> Option<TraceBuildOp> {
-    let DecodedMemOp::AluToMem {
-        op: BinaryOp::Add,
-        size,
-        src,
-        dst,
-    } = DecodedMemOp::decode(cpu_type, opcode)?
+    let DecodedMemOp::AluToMem { op, size, src, dst } = DecodedMemOp::decode(cpu_type, opcode)?
     else {
         return None;
+    };
+    let is_sub = match op {
+        BinaryOp::Add => false,
+        BinaryOp::Sub => true,
+        _ => return None,
     };
     if !matches!(size, Size::Word | Size::Long) {
         return None;
     }
     let (dst, extension) = match dst {
+        FastEa::AnInd(reg) => (JitEa::Ind(reg), None),
         FastEa::AnPostInc(reg) => (JitEa::PostInc(reg), None),
         FastEa::AnDisp(reg) => {
             let displacement = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
@@ -2827,7 +2829,12 @@ fn decode_add_reg_to_mem_trace_op<B: AddressBus>(
         extension,
         extension2: None,
         pc,
-        op: JitTraceOp::AddRegToMem { size, src, dst },
+        op: JitTraceOp::AddRegToMem {
+            is_sub,
+            size,
+            src,
+            dst,
+        },
     })
 }
 
@@ -3353,10 +3360,17 @@ fn execute_portable_add_reg_to_mem(
     code_start: u32,
     code_end: u32,
 ) -> Option<i32> {
-    let JitTraceOp::AddRegToMem { size, src, dst } = trace.op else {
+    let JitTraceOp::AddRegToMem {
+        is_sub,
+        size,
+        src,
+        dst,
+    } = trace.op
+    else {
         return None;
     };
     let (reg, raw) = match dst {
+        JitEa::Ind(reg) => (reg, cpu.dar[8 + reg as usize]),
         JitEa::PostInc(reg) => (reg, cpu.dar[8 + reg as usize]),
         JitEa::Disp(reg, displacement) => (
             reg,
@@ -3373,10 +3387,11 @@ fn execute_portable_add_reg_to_mem(
     if super::mem_ops::execute_mem_op(
         cpu,
         DecodedMemOp::AluToMem {
-            op: BinaryOp::Add,
+            op: if is_sub { BinaryOp::Sub } else { BinaryOp::Add },
             size,
             src,
             dst: match dst {
+                JitEa::Ind(_) => FastEa::AnInd(reg),
                 JitEa::PostInc(_) => FastEa::AnPostInc(reg),
                 JitEa::Disp(_, _) => FastEa::AnDisp(reg),
                 _ => unreachable!(),
@@ -5211,8 +5226,14 @@ fn emit_add_reg_to_mem(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::AddRegToMem { size, src, dst } = trace.op else {
-        unreachable!("expected register-to-memory ADD trace")
+    let JitTraceOp::AddRegToMem {
+        is_sub,
+        size,
+        src,
+        dst,
+    } = trace.op
+    else {
+        unreachable!("expected register-to-memory ADD/SUB trace")
     };
     let bail = builder.create_block();
     bails.push(BailReq {
@@ -5222,6 +5243,10 @@ fn emit_add_reg_to_mem(
     });
 
     let (reg, addr, next) = match dst {
+        JitEa::Ind(reg) => {
+            let addr = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            (reg, addr, None)
+        }
         JitEa::PostInc(reg) => {
             let addr = load_reg(builder, cpu, JitDirectReg::Addr(reg));
             let next = builder
@@ -5233,20 +5258,28 @@ fn emit_add_reg_to_mem(
             let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
             (reg, builder.ins().iadd_imm(base, displacement as i64), None)
         }
-        _ => unreachable!("unsupported register-to-memory ADD destination"),
+        _ => unreachable!("unsupported register-to-memory ADD/SUB destination"),
     };
     let (off, masked) = checked_window_off(builder, env, bail, addr, size);
     guard_store_not_code(builder, env, bail, masked, size);
     let dst_value = window_load(builder, env, off, size);
     let src_value = load_reg(builder, cpu, JitDirectReg::Data(src));
     let src_value = mask_value(builder, src_value, size);
-    let result = builder.ins().iadd(dst_value, src_value);
+    let result = if is_sub {
+        builder.ins().isub(dst_value, src_value)
+    } else {
+        builder.ins().iadd(dst_value, src_value)
+    };
 
     window_store(builder, env, off, size, result);
     if let Some(next) = next {
         store_reg(builder, cpu, JitDirectReg::Addr(reg), next);
     }
-    set_add_flags(builder, cpu, src_value, dst_value, result, size);
+    if is_sub {
+        set_sub_flags(builder, cpu, src_value, dst_value, result, size);
+    } else {
+        set_add_flags(builder, cpu, src_value, dst_value, result, size);
+    }
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -7147,6 +7180,7 @@ mod portable_tests {
         assert!(matches!(
             add.op,
             JitTraceOp::AddRegToMem {
+                is_sub: false,
                 size: Size::Long,
                 src: 0,
                 dst: JitEa::Disp(1, 0x0018),
@@ -8074,6 +8108,120 @@ mod portable_tests {
                 assert_eq!(actual.dar, expected.dar, "registers");
                 assert_eq!(actual.get_ccr(), expected.get_ccr(), "ccr");
             }
+        }
+    }
+
+    #[test]
+    fn sub_reg_to_mem_decodes_for_all_three_destinations() {
+        // 9190 = SUB.L D0,(A0) -- the form blocking a 153k-hit gameplay
+        // head -- plus the postinc and displacement forms, and the ADD
+        // indirect form newly admitted alongside.
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (pc, words, expected_dst, expected_sub) in [
+            (0x0100u32, vec![0x9190u16], JitEa::Ind(0), true),
+            (0x0110, vec![0x9198], JitEa::PostInc(0), true),
+            (0x0120, vec![0x91A8, 0x0018], JitEa::Disp(0, 0x18), true),
+            (0x0130, vec![0xD190], JitEa::Ind(0), false),
+        ] {
+            for (i, w) in words.iter().enumerate() {
+                bus.write_word(pc + i as u32 * 2, *w);
+            }
+            let trace = decode_trace_op(&cpu, &mut bus, pc, CpuType::M68040)
+                .expect("ADD/SUB reg-to-mem should decode");
+            assert!(
+                matches!(
+                    trace.op,
+                    JitTraceOp::AddRegToMem { is_sub, size: Size::Long, src: 0, dst }
+                        if is_sub == expected_sub && dst == expected_dst
+                ),
+                "words {words:04X?} decoded {:?}",
+                trace.op
+            );
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_sub_reg_to_mem_matches_portable() {
+        // Values chosen to exercise borrow, signed overflow, and zero: the
+        // flag cases where an ADD-path mistake would show.
+        for &(initial, sub_by) in &[
+            (0x0000_0005u32, 0x0000_0003u32), // plain
+            (0x0000_0003, 0x0000_0005),       // borrow (C/X set)
+            (0x8000_0000, 0x0000_0001),       // signed overflow (V set)
+            (0x0000_0007, 0x0000_0007),       // zero (Z set)
+        ] {
+            let sub = TraceBuildOp {
+                opcode: 0x9190,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::AddRegToMem {
+                    is_sub: true,
+                    size: Size::Long,
+                    src: 0,
+                    dst: JitEa::Ind(0),
+                },
+            };
+            let branch = TraceBuildOp {
+                opcode: 0x60FC,
+                extension: None,
+                extension2: None,
+                pc: 0x0102,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -4,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let mut expected_mem = vec![0u8; 0x1000];
+            expected_mem[0x0200..0x0204].copy_from_slice(&initial.to_be_bytes());
+            let mut actual_mem = expected_mem.clone();
+
+            let prepare = |mem: &mut Vec<u8>| {
+                let mut cpu = cpu();
+                cpu.set_cpu_type(CpuType::M68040);
+                cpu.set_a(0, 0x0200);
+                cpu.set_d(0, sub_by);
+                cpu.set_ccr(0x00);
+                attach_window(&mut cpu, mem);
+                cpu
+            };
+
+            let mut expected = prepare(&mut expected_mem);
+            let expected_packed =
+                execute_portable_trace(&mut expected, &[sub, branch], 0x0100, 0x0104);
+
+            let mut actual = prepare(&mut actual_mem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(
+                    &actual,
+                    0x0100,
+                    CpuType::M68040,
+                    vec![sub, branch],
+                    Some(0x0100),
+                )
+                .expect("SUB.L Dn,(An) loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+
+            let context = format!("initial {initial:#010X} sub_by {sub_by:#010X}");
+            assert_eq!(actual_packed, expected_packed, "cycles/retired: {context}");
+            assert_eq!(actual.dar, expected.dar, "registers: {context}");
+            assert_eq!(
+                actual.get_ccr(),
+                expected.get_ccr(),
+                "ccr incl X: {context}"
+            );
+            assert_eq!(actual_mem, expected_mem, "memory: {context}");
+            assert_eq!(
+                u32::from_be_bytes(actual_mem[0x0200..0x0204].try_into().unwrap()),
+                initial.wrapping_sub(sub_by),
+                "stored difference: {context}"
+            );
         }
     }
 
@@ -9646,6 +9794,7 @@ mod portable_tests {
                 extension2: None,
                 pc: 0x0106,
                 op: JitTraceOp::AddRegToMem {
+                    is_sub: false,
                     size: Size::Long,
                     src: 0,
                     dst: JitEa::Disp(1, 0x0018),
