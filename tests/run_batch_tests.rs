@@ -1249,6 +1249,41 @@ fn mixed_path_loop_with_exit_seeded_continuation_matches_step() {
     });
 }
 
+/// Self-modifying code aimed at a chained continuation: the outer section
+/// rewrites the continuation's first opcode every round (EORI toggles
+/// ADDQ.L #1,D2 and ADDQ.L #2,D2), so the parent trace side-exits into a
+/// compiled continuation whose first opcode changed. The chain must
+/// surface that miss so the rewritten opcode is dispatched -- silently
+/// dropping it would skip the instruction and diverge D2 from step().
+#[test]
+fn rewritten_continuation_head_after_side_exit_matches_step() {
+    let words = &[
+        0x0A01, 0x0001, // $1000: EORI.B #1,D1  (Z flips every iteration)
+        0x6602, // $1004: BNE.S $1008
+        0x5282, // $1006: ADDQ.L #1,D2   <- rewritten between rounds
+        0x1ADC, // $1008: MOVE.B (A4)+,(A5)+
+        0x5283, // $100A: ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0x0A78, 0x0600, 0x1006, // $1010: EORI.W #$0600,($1006).W
+        0x707F, // $1016: MOVEQ #127,D0
+        0x5347, // $1018: SUBQ.W #1,D7
+        0x66E4, // $101A: BNE.S $1000
+        0xA000, // $101C: sentinel
+    ];
+    assert_fastmem_matches_step(
+        "rewritten continuation head",
+        words,
+        CpuType::M68040,
+        |cpu| {
+            cpu.set_a(4, 0x3000);
+            cpu.set_a(5, 0x4000);
+            cpu.set_d(0, 127);
+            cpu.set_d(1, 0);
+            cpu.set_d(7, 6);
+        },
+    );
+}
+
 /// A memory operation followed immediately by DBRA is a common 68k copy-loop
 /// shape. It must remain exact when admitted as the minimum two-op self-loop.
 #[test]

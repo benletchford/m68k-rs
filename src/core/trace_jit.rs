@@ -973,12 +973,17 @@ impl TraceJit {
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_adaptive_rerecord(pc, cpu_type);
             }
-            // A guard exit landed the interpreter mid-continuation. Treat
-            // the exit target as a trace-head candidate: hot fall-through
-            // continuations then form their own traces, and once compiled
-            // they run directly from here (bounded chaining) instead of
-            // waiting for a backward-branch probe that never comes.
-            if partial_call_this_entry && !single_iter && chain_budget > 0 && cpu.pc != pc {
+            // A guarded BRANCH exit landed the interpreter mid-
+            // continuation. Treat the exit target as a trace-head
+            // candidate: hot fall-through continuations then form their
+            // own traces, and once compiled they run directly from here
+            // (bounded chaining) instead of waiting for a backward-branch
+            // probe that never comes. Memory bails (window, alignment,
+            // self-modifying-code) are deliberately excluded: their exit
+            // pc is an access the trace could not execute, so seeding it
+            // would probe and compile a continuation that starts on the
+            // very op that just bailed.
+            if guarded_branch_exit && !single_iter && chain_budget > 0 && cpu.pc != pc {
                 match self.note_trace_exit(cpu.pc, cpu_type) {
                     ExitSeed::Chain => {
                         // The callee excludes its entry pc from its own
@@ -991,8 +996,8 @@ impl TraceJit {
                         let entry_watched = watch_pcs
                             .iter()
                             .any(|&watched| cpu.address(watched) == cpu.address(cpu.pc));
-                        if !entry_watched
-                            && let Some((CachedRunResult::Ran, chained)) = self.try_execute(
+                        if !entry_watched {
+                            match self.try_execute(
                                 cpu,
                                 bus,
                                 cpu_type,
@@ -1000,9 +1005,18 @@ impl TraceJit {
                                 false,
                                 watch_pcs,
                                 chain_budget - 1,
-                            )
-                        {
-                            retired += chained;
+                            ) {
+                                Some((CachedRunResult::Ran, chained)) => retired += chained,
+                                // The continuation's first opcode changed:
+                                // the child has already consumed it (ppc/ir
+                                // set, pc advanced) and the caller must
+                                // dispatch it. Surface the miss while
+                                // keeping every instruction retired so far.
+                                Some((miss @ CachedRunResult::Miss(_), chained)) => {
+                                    return Some((miss, retired + chained));
+                                }
+                                None => {}
+                            }
                         }
                     }
                     ExitSeed::StartRecording => cpu.trace_recording = true,
@@ -10108,6 +10122,100 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
+    fn chained_continuation_miss_surfaces_the_rewritten_opcode() {
+        // Three deterministic phases against a step() twin, with identical
+        // external mutations at identical instruction counts:
+        //   1. The branch predicate holds, so the head trace compiles on
+        //      the taken spine -- which EXCLUDES the continuation.
+        //   2. The predicate is flipped externally; every head call now
+        //      guard-exits, seeding and compiling the continuation, and
+        //      the parent chains into it. Kept short so adaptive
+        //      re-recording (64-call window) cannot replace the head spine.
+        //   3. The continuation's first opcode is rewritten externally
+        //      (ADDQ.L #1,D2 -> ADDQ.L #2,D2) in both twins. The next
+        //      chained entry must surface the validation miss so the
+        //      rewritten opcode is dispatched; silently dropping the miss
+        //      skips the instruction and diverges D2.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0xB206, // head: CMP.B D6,D1
+            0x6706, // BEQ.S skip (taken while D1 == D6)
+            0x5282, // cont: ADDQ.L #1,D2   <- rewritten in phase 3
+            0x1ADC, // MOVE.B (A4)+,(A5)+
+            0x5283, // ADDQ.L #1,D3
+            0x51C8, 0xFFF4, // skip: DBRA D0,head
+            0x60F0, // BRA.S head
+        ];
+        let mk = |bus: &mut super::super::memory::LinearMemoryBus| {
+            for (index, word) in words.iter().enumerate() {
+                bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+            }
+            let mut cpu = CpuCore::new();
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_sr(0x2700);
+            cpu.pc = CODE_BASE;
+            cpu.set_a(4, 0x3000);
+            cpu.set_a(5, 0x4000);
+            cpu.set_a(7, 0x9000);
+            cpu.set_d(0, 0x7FFF);
+            cpu.set_d(1, 5);
+            cpu.set_d(6, 5); // equal: BEQ taken
+            cpu
+        };
+        let mut bus_a = super::super::memory::LinearMemoryBus::new(0x10000);
+        let mut cpu_a = mk(&mut bus_a); // step twin
+        let mut bus_b = super::super::memory::LinearMemoryBus::new(0x10000);
+        let mut cpu_b = mk(&mut bus_b); // run_batch twin
+
+        let step_n =
+            |cpu: &mut CpuCore, bus: &mut super::super::memory::LinearMemoryBus, n: u32| {
+                for _ in 0..n {
+                    assert!(matches!(cpu.step(bus), crate::StepResult::Ok { .. }));
+                }
+            };
+        let batch_n =
+            |cpu: &mut CpuCore, bus: &mut super::super::memory::LinearMemoryBus, n: u32| {
+                let mut left = n;
+                while left > 0 {
+                    let r = cpu.run_batch(bus, left, &[0]);
+                    assert!(r.instructions > 0, "batch made no progress");
+                    left -= r.instructions;
+                }
+            };
+
+        // Phase 1: 30 instructions of taken-spine iterations.
+        step_n(&mut cpu_a, &mut bus_a, 30);
+        batch_n(&mut cpu_b, &mut bus_b, 30);
+        // Phase 2: flip the predicate in both twins; 30 instructions of
+        // guard exits, seeding, and chaining.
+        cpu_a.set_d(1, 9);
+        cpu_b.set_d(1, 9);
+        step_n(&mut cpu_a, &mut bus_a, 30);
+        batch_n(&mut cpu_b, &mut bus_b, 30);
+        // The continuation must exist as its own compiled trace for phase 3
+        // to test anything.
+        let cont_pc = CODE_BASE + 4;
+        let cont_compiled = TRACE_JIT.with_borrow(|jit| {
+            matches!(
+                &jit.slots[trace_cache_index(cont_pc)],
+                TraceSlot::Compiled(CompiledTrace { pc, .. }) if *pc == cont_pc
+            )
+        });
+        assert!(cont_compiled, "phase 2 must compile the continuation");
+        // Phase 3: rewrite the continuation head in both twins, then run
+        // one full not-taken iteration through each.
+        bus_a.write_word_at(cont_pc, 0x5482);
+        bus_b.write_word_at(cont_pc, 0x5482);
+        step_n(&mut cpu_a, &mut bus_a, 6);
+        batch_n(&mut cpu_b, &mut bus_b, 6);
+
+        assert_eq!(cpu_b.dar, cpu_a.dar, "registers diverged (D2 skip?)");
+        assert_eq!(cpu_b.pc, cpu_a.pc, "pc diverged");
+        assert_eq!(cpu_b.get_ccr(), cpu_a.get_ccr(), "ccr diverged");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
     fn native_cmp_indexed_matches_portable_and_bails_atomically() {
         let cmp = TraceBuildOp {
             opcode: 0xB270,
@@ -12569,30 +12677,72 @@ mod portable_tests {
                 })
                 .count()
         });
+        assert!(
+            compiled >= 2,
+            "exit seeding should compile a continuation inside the loop \
+             body in addition to the head trace (found {compiled})"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn memory_bails_do_not_create_exit_candidacy() {
+        // The loop stores its own head opcode back onto itself: harmless
+        // when interpreted (the write is idempotent), but the compiled
+        // trace's store-not-code guard bails on every call at op 1 -- a
+        // MEMORY bail, not a guarded branch exit. The bail target must
+        // never become a trace-head candidate in any form (counting,
+        // compiled, or rejected): seeding it would record and compile a
+        // continuation that starts on the very op that cannot execute.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x3088, // MOVE.W D0,(A0)   (A0 -> head; writes 0x5282 back)
+            0x51C9, 0xFFFA, // DBRA D1,head
+            0x60F6, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, CODE_BASE);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x5282);
+        cpu.set_d(1, 0x7F);
+        let result = cpu.run_batch(&mut bus, 20_000, &[0]);
+        assert_eq!(result.instructions, 20_000, "loop runs to budget");
+        let bail_pc = CODE_BASE + 2; // the MOVE that memory-bails
+        let touched = TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(bail_pc)] {
+            TraceSlot::Counting { pc, .. } if *pc == bail_pc => true,
+            TraceSlot::Compiled(CompiledTrace { pc, .. }) if *pc == bail_pc => true,
+            TraceSlot::Rejected { pc, .. } if *pc == bail_pc => true,
+            _ => false,
+        });
         let dump = TRACE_JIT.with_borrow(|jit| {
-            loop_pcs
-                .iter()
-                .map(|&pc| {
-                    let slot = &jit.slots[trace_cache_index(pc)];
-                    let desc = match slot {
+            (0..5u32)
+                .map(|w| {
+                    let pc = CODE_BASE + w * 2;
+                    match &jit.slots[trace_cache_index(pc)] {
                         TraceSlot::Compiled(CompiledTrace { pc: c, ops, .. }) if *c == pc => {
-                            format!("Compiled({} ops)", ops.len())
+                            format!("{pc:05X}:Compiled({})", ops.len())
                         }
                         TraceSlot::Counting { pc: c, hits, .. } if *c == pc => {
-                            format!("Counting(hits={hits})")
+                            format!("{pc:05X}:Cnt({hits})")
                         }
-                        TraceSlot::Rejected { pc: c, .. } if *c == pc => "Rejected".into(),
-                        _ => "-".into(),
-                    };
-                    format!("{pc:05X}:{desc}")
+                        TraceSlot::Rejected { pc: c, .. } if *c == pc => format!("{pc:05X}:Rej"),
+                        _ => format!("{pc:05X}:-"),
+                    }
                 })
                 .collect::<Vec<_>>()
                 .join(" ")
         });
         assert!(
-            compiled >= 2,
-            "exit seeding should compile a continuation inside the loop \
-             body in addition to the head trace (found {compiled}): {dump}"
+            !touched,
+            "a memory bail must not seed candidacy at its target in any form: {dump}"
         );
     }
 }
