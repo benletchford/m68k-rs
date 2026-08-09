@@ -34,6 +34,8 @@ pub struct TraceProfileRow {
     /// Most recent reason a recording at this head produced no trace
     /// without an unsupported opcode, if any. A head with this set and no
     /// `blocker_pc` carries no opcode-admission opportunity at all.
+    ///
+    /// Classified waits never appear here — see [`Self::wait_hits`].
     pub reject_reason: Option<TraceRejectReason>,
     /// Number of operations in the current compiled/portable trace.
     pub compiled_ops: u32,
@@ -48,6 +50,25 @@ pub struct TraceProfileRow {
     pub guarded_branch_exits: u64,
     /// Trace re-recordings triggered by adaptive branch behavior.
     pub adaptive_rerecords: u64,
+    /// The head's recorded loop was classified as a pure poll (a wait):
+    /// it was deliberately not compiled, and it is excluded from the
+    /// projected-dispatch opportunity ranking.
+    ///
+    /// Backward-branch hits attributed to a classified wait shape: hits
+    /// observed while the head's most recent completed recording was a
+    /// classified pure poll.
+    ///
+    /// Wait accounting is **shape-specific and independent** of blocker
+    /// accounting: classifying a wait never touches `blocker_pc`,
+    /// `prefix_ops`, or `reject_reason`, and recording a blocker never
+    /// erases wait shapes (see [`TraceProfileSnapshot::wait_shapes`]).
+    /// A head that has recorded both kinds of shape appears in the
+    /// opportunity ranking for its non-wait volume *and* in the wait
+    /// section for its wait shapes, in whichever order the recordings
+    /// happened. [`Self::projected_dispatches`] subtracts these hits so
+    /// wait-driven volume cannot inflate the ranking. A wait is not a
+    /// silent rejection and never sets [`Self::reject_reason`].
+    pub wait_hits: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -173,6 +194,24 @@ pub struct FailedTraceShapeProfileRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// One distinct recorded loop shape classified as a pure poll (a wait).
+///
+/// Wait shapes are keyed by their exact operation sequence, like failed
+/// shapes, so wait accounting survives cache eviction and interleaving
+/// with non-wait recordings at the same head in either order.
+#[non_exhaustive]
+pub struct WaitShapeProfileRow {
+    /// Guest program counter at which the classified loop starts.
+    pub start_pc: u32,
+    /// CPU model active while recording.
+    pub cpu_type: CpuType,
+    /// The classified loop's exact operations, in execution order.
+    pub ops: Vec<TraceShapeOp>,
+    /// Number of recordings that produced this exact wait shape.
+    pub recordings: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// One distinct recording that ended without an unsupported opcode.
 ///
 /// Complements [`FailedTraceShapeProfileRow`]: that type describes
@@ -249,7 +288,12 @@ impl TraceProfileRow {
     /// blocker. This deliberately excludes the blocker itself: some control-
     /// flow instructions should terminate a trace rather than execute in it.
     pub fn projected_dispatches(&self) -> u64 {
+        // Wait-attributed hits are volume the head accumulated while its
+        // live shape was a classified poll; counting them would let waits
+        // recruit the head into the ranking, which is the distortion this
+        // profiler exists to remove.
         self.rejected_hits
+            .saturating_sub(self.wait_hits)
             .saturating_mul(u64::from(self.prefix_ops))
     }
 }
@@ -278,8 +322,13 @@ pub struct TraceProfileSnapshot {
     /// Recordings that ended without an unsupported opcode: control left
     /// the decoded path, or a compile-stage policy declined the region.
     pub silent_rejections: Vec<SilentRejectionProfileRow>,
+    /// Recorded loop shapes classified as pure polls, keyed by exact
+    /// operation sequence.
+    pub wait_shapes: Vec<WaitShapeProfileRow>,
     /// Silent rejections dropped after the distinct-shape cap was reached.
     pub silent_rejection_overflow: u64,
+    /// Wait recordings dropped after the distinct wait-shape cap.
+    pub wait_shape_overflow: u64,
     /// Total observed backward branches.
     pub backward_hits: u64,
     /// Total rejected trace-entry opportunities.
@@ -293,7 +342,21 @@ pub struct TraceProfileSnapshot {
 impl TraceProfileSnapshot {
     /// Format the snapshot as a ranked, human-readable profiling report.
     pub fn report(&self) -> String {
-        let mut rows = self.rows.clone();
+        // Ranking and wait accounting are independent. A row ranks when it
+        // carries opcode-admission opportunity: a recorded blocker, or
+        // positive projected dispatches (wait-attributed hits are
+        // subtracted from that metric, so wait volume cannot recruit a
+        // head). A blocker-carrying head stays visible even at zero
+        // projected -- its volume may be flowing through a compiled prefix
+        // as guard exits rather than rejected hits -- while a pure wait
+        // (no blocker, nothing projected) reports only in the wait section
+        // below, in whichever order its recordings happened.
+        let mut rows: Vec<_> = self
+            .rows
+            .clone()
+            .into_iter()
+            .filter(|row| row.blocker_pc.is_some() || row.projected_dispatches() > 0)
+            .collect();
         rows.sort_unstable_by(|a, b| {
             b.projected_dispatches()
                 .cmp(&a.projected_dispatches())
@@ -344,6 +407,71 @@ impl TraceProfileSnapshot {
                 row.native_calls,
                 row.jit_retired
             );
+        }
+
+        if !self.wait_shapes.is_empty() {
+            let _ = writeln!(
+                out,
+                "wait loops (classified pure polls; not compiled; excluded from ranking)"
+            );
+            if self.wait_shape_overflow > 0 {
+                let _ = writeln!(
+                    out,
+                    "note: {} wait recordings dropped past the {}-shape cap",
+                    self.wait_shape_overflow, SILENT_REJECTION_CAP
+                );
+            }
+            // One line per (start_pc, cpu_type) head carrying the head-level
+            // wait-hit volume exactly once, with the shape-level recording
+            // counts nested under it. Keying the lookup by pc alone would
+            // print one CPU model's aggregate against another model's
+            // shapes; repeating the aggregate per shape would misattribute
+            // head volume as shape volume.
+            let mut heads: BTreeMap<(u32, u32), Vec<&WaitShapeProfileRow>> = BTreeMap::new();
+            for shape in &self.wait_shapes {
+                heads
+                    .entry((shape.start_pc, shape.cpu_type as u32))
+                    .or_default()
+                    .push(shape);
+            }
+            let mut head_rows: Vec<_> = heads
+                .into_iter()
+                .map(|((pc, _), shapes)| {
+                    let cpu_type = shapes[0].cpu_type;
+                    let wait_hits = self
+                        .rows
+                        .iter()
+                        .find(|row| row.start_pc == pc && row.cpu_type == cpu_type)
+                        .map_or(0, |row| row.wait_hits);
+                    (pc, cpu_type, wait_hits, shapes)
+                })
+                .collect();
+            head_rows.sort_unstable_by(|a, b| b.2.cmp(&a.2).then_with(|| a.0.cmp(&b.0)));
+            let _ = writeln!(
+                out,
+                "rank  start_pc  cpu      wait_hits  shapes  recordings"
+            );
+            for (rank, (pc, cpu_type, wait_hits, shapes)) in head_rows.iter().take(40).enumerate() {
+                let recordings: u64 = shapes.iter().map(|shape| shape.recordings).sum();
+                let _ = writeln!(
+                    out,
+                    "{:>4}  {:08X}  {:<8} {:>9} {:>7} {:>11}",
+                    rank + 1,
+                    pc,
+                    format!("{cpu_type:?}"),
+                    wait_hits,
+                    shapes.len(),
+                    recordings
+                );
+                for shape in shapes {
+                    let _ = writeln!(
+                        out,
+                        "      shape ops={} records={}",
+                        shape.ops.len(),
+                        shape.recordings
+                    );
+                }
+            }
         }
 
         let mut compiled_rows: Vec<_> = self
@@ -597,6 +725,11 @@ struct Row {
     jit_retired: u64,
     guarded_branch_exits: u64,
     adaptive_rerecords: u64,
+    wait_hits: u64,
+    /// Whether the most recent completed recording at this head was a
+    /// classified wait. Drives per-hit attribution only; presentation is
+    /// shape-keyed and never derived from this flag.
+    last_recording_was_wait: bool,
 }
 
 /// Upper bound on distinct failed shapes kept per process. Each entry holds
@@ -670,6 +803,11 @@ struct Profile {
     /// Recordings that ended without an unsupported opcode, bounded by
     /// `SILENT_REJECTION_CAP` on the same rationale.
     silent_rejections: BTreeMap<SilentRejectionKey, u64>,
+    /// Classified wait shapes: (start_pc, cpu_type, ops) -> recordings.
+    /// Shape-keyed so the accounting is order-independent; bounded by
+    /// `SILENT_REJECTION_CAP` on the same rationale as failed shapes.
+    wait_shapes: BTreeMap<(u32, u32, Vec<TraceShapeOp>), u64>,
+    wait_shape_overflow: u64,
     silent_rejection_overflow: u64,
     compiled_shapes: BTreeMap<CompiledShapeKey, u64>,
     decoded_mem_counts: Box<[u64]>,
@@ -687,6 +825,8 @@ impl Default for Profile {
             failed_shape_overflow: 0,
             silent_rejections: BTreeMap::new(),
             silent_rejection_overflow: 0,
+            wait_shapes: BTreeMap::new(),
+            wait_shape_overflow: 0,
         }
     }
 }
@@ -720,6 +860,7 @@ impl Profile {
                 jit_retired: row.jit_retired,
                 guarded_branch_exits: row.guarded_branch_exits,
                 adaptive_rerecords: row.adaptive_rerecords,
+                wait_hits: row.wait_hits,
             })
             .collect();
         let decoded_mem_ops = self
@@ -784,6 +925,18 @@ impl Profile {
                 },
             )
             .collect();
+        let wait_shapes = self
+            .wait_shapes
+            .iter()
+            .map(
+                |((start_pc, cpu_type, ops), &recordings)| WaitShapeProfileRow {
+                    start_pc: *start_pc,
+                    cpu_type: cpu_type_from_repr(*cpu_type),
+                    ops: ops.clone(),
+                    recordings,
+                },
+            )
+            .collect();
         TraceProfileSnapshot {
             backward_hits: rows.iter().map(|row| row.backward_hits).sum(),
             rejected_hits: rows.iter().map(|row| row.rejected_hits).sum(),
@@ -797,6 +950,8 @@ impl Profile {
             failed_shape_overflow: self.failed_shape_overflow,
             silent_rejections,
             silent_rejection_overflow: self.silent_rejection_overflow,
+            wait_shapes,
+            wait_shape_overflow: self.wait_shape_overflow,
         }
     }
 }
@@ -845,7 +1000,32 @@ pub(crate) fn note_backward_edge(pc: u32, cpu_type: CpuType, rejected: bool) {
         row.backward_hits = row.backward_hits.saturating_add(1);
         if rejected {
             row.rejected_hits = row.rejected_hits.saturating_add(1);
+            if row.last_recording_was_wait {
+                row.wait_hits = row.wait_hits.saturating_add(1);
+            }
         }
+    });
+}
+
+/// Record that a completed recording at `pc` was classified as a pure
+/// poll loop and deliberately left uncompiled.
+///
+/// Shape-keyed: the classification is stored against the loop's exact
+/// operation sequence, and only the per-hit attribution flag lives on the
+/// head row — so blocker accounting at the same head is never disturbed,
+/// in either recording order.
+pub(crate) fn note_wait_loop(pc: u32, cpu_type: CpuType, ops: Vec<TraceShapeOp>) {
+    PROFILE.with_borrow_mut(|profile| {
+        profile.0.row(pc, cpu_type).last_recording_was_wait = true;
+        let key = (pc, cpu_type as u32, ops);
+        if profile.0.wait_shapes.len() >= SILENT_REJECTION_CAP
+            && !profile.0.wait_shapes.contains_key(&key)
+        {
+            profile.0.wait_shape_overflow = profile.0.wait_shape_overflow.saturating_add(1);
+            return;
+        }
+        let recordings = profile.0.wait_shapes.entry(key).or_default();
+        *recordings = recordings.saturating_add(1);
     });
 }
 
@@ -864,6 +1044,10 @@ pub(crate) fn note_blocker(
 ) {
     PROFILE.with_borrow_mut(|profile| {
         let row = profile.0.row(start_pc, cpu_type);
+        // Flip per-hit attribution: subsequent hits at this head belong to
+        // the just-recorded non-wait shape. Wait shapes already recorded
+        // stay in the shape table untouched.
+        row.last_recording_was_wait = false;
         // Keep the longest observed prefix for this trace head. It is the
         // conservative amount of already-supported work stranded behind the
         // blocker; path variation is visible through the shape table.
@@ -915,7 +1099,10 @@ pub(crate) fn note_silent_rejection(
     reason: TraceRejectReason,
 ) {
     PROFILE.with_borrow_mut(|profile| {
-        profile.0.row(start_pc, cpu_type).reject_reason = Some(reason);
+        let row = profile.0.row(start_pc, cpu_type);
+        // Same attribution flip as note_blocker.
+        row.last_recording_was_wait = false;
+        row.reject_reason = Some(reason);
         let key = SilentRejectionKey {
             start_pc,
             cpu_type: cpu_type as u32,
@@ -938,7 +1125,10 @@ pub(crate) fn note_silent_rejection(
 
 pub(crate) fn note_compiled(pc: u32, cpu_type: CpuType, ops: Vec<TraceShapeOp>) {
     PROFILE.with_borrow_mut(|profile| {
-        profile.0.row(pc, cpu_type).compiled_ops = ops.len() as u32;
+        let row = profile.0.row(pc, cpu_type);
+        // Same attribution flip as note_blocker.
+        row.last_recording_was_wait = false;
+        row.compiled_ops = ops.len() as u32;
         let recordings = profile
             .0
             .compiled_shapes
@@ -1577,6 +1767,151 @@ mod tests {
         assert_eq!(row.reject_reason, Some(TraceRejectReason::TrapOrException));
         assert_eq!(row.compiled_ops, 0);
         assert!(snapshot.report().contains("trap-or-exception"));
+    }
+
+    #[test]
+    fn wait_section_is_shape_and_cpu_sound() {
+        // Ben's reproduction: the same PC recorded under two CPU models
+        // with distinct wait volumes, and multiple wait shapes under one
+        // model. The report must print each model's own wait_hits (a
+        // pc-only lookup prints the first model's aggregate on both
+        // lines), and per-shape recording counts must be per shape, not
+        // the head aggregate repeated.
+        reset();
+        // M68000: one shape, 3 wait-attributed hits.
+        note_wait_loop(0x100, CpuType::M68000, dummy_prefix(0x100, 2));
+        for _ in 0..3 {
+            note_backward_edge(0x100, CpuType::M68000, true);
+        }
+        // M68040: two distinct shapes (one recorded twice), 7 hits.
+        note_wait_loop(0x100, CpuType::M68040, dummy_prefix(0x100, 2));
+        note_wait_loop(0x100, CpuType::M68040, dummy_prefix(0x100, 3));
+        note_wait_loop(0x100, CpuType::M68040, dummy_prefix(0x100, 3));
+        for _ in 0..7 {
+            note_backward_edge(0x100, CpuType::M68040, true);
+        }
+
+        let snapshot = snapshot();
+        let hits = |cpu: CpuType| {
+            snapshot
+                .rows
+                .iter()
+                .find(|row| row.start_pc == 0x100 && row.cpu_type == cpu)
+                .map_or(0, |row| row.wait_hits)
+        };
+        assert_eq!(hits(CpuType::M68000), 3);
+        assert_eq!(hits(CpuType::M68040), 7);
+        assert_eq!(
+            snapshot
+                .wait_shapes
+                .iter()
+                .filter(|shape| shape.cpu_type == CpuType::M68040)
+                .count(),
+            2,
+            "two distinct shapes under M68040"
+        );
+
+        let report = snapshot.report();
+        let wait_section = report
+            .split("wait loops")
+            .nth(1)
+            .expect("wait section present");
+        assert!(
+            wait_section.contains("M68000") && wait_section.contains("M68040"),
+            "both models present: {wait_section}"
+        );
+        // Each model's own volume on its own line.
+        let m68000_line = wait_section
+            .lines()
+            .find(|line| line.contains("M68000"))
+            .unwrap();
+        let m68040_line = wait_section
+            .lines()
+            .find(|line| line.contains("M68040"))
+            .unwrap();
+        assert!(
+            m68000_line.split_whitespace().any(|w| w == "3"),
+            "M68000 line carries its own 3 hits: {m68000_line}"
+        );
+        assert!(
+            m68040_line.split_whitespace().any(|w| w == "7"),
+            "M68040 line carries its own 7 hits: {m68040_line}"
+        );
+        // Per-shape recording counts are per shape (1 and 2), never the
+        // head aggregate (3) repeated.
+        assert!(
+            wait_section.contains("shape ops=2 records=1")
+                && wait_section.contains("shape ops=3 records=2"),
+            "shape lines carry per-shape recordings: {wait_section}"
+        );
+    }
+
+    #[test]
+    fn wait_attribution_is_order_independent_and_cannot_inflate_ranking() {
+        // Deterministic note-level check of the attribution arithmetic, in
+        // both recording orders. 5 non-wait rejected edges against a 2-op
+        // blocker prefix project 10 dispatches; 7 wait-attributed edges
+        // must not change that.
+        for wait_first in [false, true] {
+            reset();
+            let blocker = TraceBlocker {
+                pc: 0x104,
+                executed_opcode: 0x4AFC,
+                memory_opcode: Some(0x4AFC),
+                next_word: None,
+                next_word2: None,
+            };
+            let record_wait = || {
+                note_wait_loop(0x100, CpuType::M68040, dummy_prefix(0x100, 2));
+                for _ in 0..7 {
+                    note_backward_edge(0x100, CpuType::M68040, true);
+                }
+            };
+            let record_blocker = || {
+                note_blocker(0x100, CpuType::M68040, dummy_prefix(0x100, 2), blocker);
+                for _ in 0..5 {
+                    note_backward_edge(0x100, CpuType::M68040, true);
+                }
+            };
+            if wait_first {
+                record_wait();
+                record_blocker();
+            } else {
+                record_blocker();
+                record_wait();
+            }
+
+            let snapshot = snapshot();
+            let row = snapshot
+                .rows
+                .iter()
+                .find(|row| row.start_pc == 0x100)
+                .expect("head profiled");
+            assert_eq!(row.rejected_hits, 12, "order {wait_first}");
+            assert_eq!(row.wait_hits, 7, "order {wait_first}");
+            assert_eq!(
+                row.projected_dispatches(),
+                10,
+                "wait volume must not inflate the ranking (order {wait_first})"
+            );
+            assert_eq!(row.blocker_pc, Some(0x104), "order {wait_first}");
+            assert_eq!(
+                snapshot
+                    .wait_shapes
+                    .iter()
+                    .filter(|shape| shape.start_pc == 0x100)
+                    .map(|shape| shape.recordings)
+                    .sum::<u64>(),
+                1,
+                "the wait shape is recorded once (order {wait_first})"
+            );
+            let report = snapshot.report();
+            let ranking = report.split("wait loops").next().unwrap();
+            assert!(
+                ranking.contains("00000100"),
+                "blocker head ranks in both orders (order {wait_first})"
+            );
+        }
     }
 
     #[test]

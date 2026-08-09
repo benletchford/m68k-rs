@@ -419,6 +419,9 @@ pub(crate) enum JitTraceOp {
 /// it is reported.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RegionRejectReason {
+    /// The recorded self-loop is a pure poll: a wait, deliberately left
+    /// uncompiled. Reported as a wait rather than as a silent rejection.
+    WaitLoop,
     NoTraceTerminal,
     TooShort,
     IndirectJsrTooShort,
@@ -1007,6 +1010,14 @@ impl TraceJit {
         use super::trace_profile::TraceRejectReason as Public;
         // Exhaustive so a new compile gate must declare how it is reported.
         match reason {
+            // A classified wait is routed to `note_wait_loop` by
+            // `finish_recording` before this mapping is consulted; the
+            // profiler represents it through the shape-keyed wait table
+            // flag and the wait-loops report section, never as a silent
+            // rejection.
+            RegionRejectReason::WaitLoop => {
+                unreachable!("classified waits are reported via note_wait_loop")
+            }
             RegionRejectReason::NoTraceTerminal => Public::NoTraceTerminal,
             RegionRejectReason::TooShort => Public::TooShort,
             RegionRejectReason::IndirectJsrTooShort => Public::IndirectJsrTooShort,
@@ -1099,7 +1110,15 @@ impl TraceJit {
             // decoded path outranks the compile-stage reason: it bounds how
             // far this head can ever record, which no opcode coverage can
             // change.
-            if end != RecordingEnd::Blocker {
+            if reason == RegionRejectReason::WaitLoop {
+                // A classified wait is accounted as a wait, keyed by the
+                // recorded shape so the accounting is independent of any
+                // blocker shapes at the same head, in either recording
+                // order. It keeps its own report section and its exclusion
+                // from the opportunity ranking, rather than being filed as
+                // a generic rejection.
+                super::trace_profile::note_wait_loop(start_pc, cpu_type, recorded_shape);
+            } else if end != RecordingEnd::Blocker {
                 let reason = match end {
                     RecordingEnd::Stopped(cause) => Self::profile_stop_reason(cause),
                     _ => Self::profile_reject_reason(reason),
@@ -1319,6 +1338,23 @@ impl TraceJit {
             })
         {
             return Err(RegionRejectReason::LinearMemoryAlu);
+        }
+
+        // A pure poll loop burns wall time by design: its exit depends only
+        // on memory it never writes, so executing it faster cannot make it
+        // exit sooner. It is also exactly the class no trap-anchored wait
+        // detector can see. Compiling it as a native spin multiplies the
+        // instructions burned per wall second while the guest waits, so
+        // refuse the compilation and leave the loop on the decoded path.
+        //
+        // This requires the recording to have actually gone round, not
+        // merely to end in a branch whose static target is the head.
+        // `self_loop` is true for a fall-through path as well, and a
+        // recording that fell through to an unsupported operation is a
+        // different shape entirely: reporting it as a wait would remove a
+        // real blocker from the opportunity ranking.
+        if recorded_exit_pc == Some(start_pc) && is_pure_poll_loop(&ops) {
+            return Err(RegionRejectReason::WaitLoop);
         }
 
         let needs_window = ops.iter().any(|op| {
@@ -1734,6 +1770,116 @@ struct CompileParams<'a> {
     aligned_only: bool,
     #[cfg_attr(any(not(feature = "jit"), target_family = "wasm"), allow(dead_code))]
     address_mask: u32,
+}
+
+const CC_N: u8 = 0b1000;
+const CC_Z: u8 = 0b0100;
+const CC_V: u8 = 0b0010;
+const CC_C: u8 = 0b0001;
+
+/// Condition codes a 68k conditional branch reads. `T`/`F` read nothing.
+fn branch_flags_read(condition: u8) -> u8 {
+    match condition & 0xF {
+        0 | 1 => 0,              // T / F
+        2 | 3 => CC_C | CC_Z,    // HI / LS
+        4 | 5 => CC_C,           // CC / CS
+        6 | 7 => CC_Z,           // NE / EQ
+        8 | 9 => CC_V,           // VC / VS
+        10 | 11 => CC_N,         // PL / MI
+        12 | 13 => CC_N | CC_V,  // GE / LT
+        _ => CC_N | CC_V | CC_Z, // GT / LE
+    }
+}
+
+/// A recorded self-loop is a pure poll when it consists of memory reads
+/// that mutate nothing except the condition codes, followed by a single
+/// terminal conditional branch whose consumed flags were all written by
+/// those reads (conservative flag provenance: a BTST-only loop branching
+/// on carry does not classify, because BTST writes only Z). Interior
+/// branches disqualify: a guarded interior branch means the head can
+/// record multiple dynamic shapes, and the profiler's per-head wait flag
+/// is only sound when the recorded path is structurally unique. Such a
+/// loop's exit can only be driven by memory it never writes, so
+/// executing it faster cannot make it exit sooner — it is a wait. The
+/// match is exhaustive so every future trace operation must declare its
+/// classification here.
+fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
+    let Some((terminal, body)) = ops.split_last() else {
+        return false;
+    };
+    let JitTraceOp::Branch { condition, .. } = terminal.op else {
+        return false;
+    };
+    let consumed = branch_flags_read(condition);
+    if consumed == 0 {
+        // An unconditional terminal branch has no memory-driven exit.
+        return false;
+    }
+    let mut mem_written_flags: u8 = 0;
+    for op in body {
+        match op.op {
+            // No-ops mutate nothing.
+            JitTraceOp::Nop => {}
+            // Interior branches make the recorded path non-unique for
+            // this head; per-head wait accounting would then erase
+            // opportunity data belonging to other shapes.
+            JitTraceOp::Branch { .. } => return false,
+            // Memory-reading compares and tests write NZVC only; the
+            // polled value is the only input that can change.
+            JitTraceOp::TstMem { .. }
+            | JitTraceOp::CmpiWordMem { .. }
+            | JitTraceOp::AddrCmpMemToReg { .. }
+            | JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Cmp,
+                ..
+            }
+            | JitTraceOp::AnDispUnary {
+                op: JitUnaryOp::Tst,
+                ..
+            } => mem_written_flags |= CC_N | CC_Z | CC_V | CC_C,
+            // A bit test writes only Z.
+            JitTraceOp::AnDispBit {
+                op: JitBitOp::Test, ..
+            } => mem_written_flags |= CC_Z,
+            // Everything else mutates registers or memory, or transfers
+            // control in a way that can end the wait from inside: any of
+            // those makes the loop's progress self-driven, so it is not a
+            // pure poll.
+            JitTraceOp::MoveReg { .. }
+            | JitTraceOp::Moveq { .. }
+            | JitTraceOp::UnaryDataReg { .. }
+            | JitTraceOp::AddqSubqReg { .. }
+            | JitTraceOp::AddqSubqAddr { .. }
+            | JitTraceOp::BinaryDataReg { .. }
+            | JitTraceOp::BinaryImmediateDataReg { .. }
+            | JitTraceOp::MulWordDataReg { .. }
+            | JitTraceOp::MulWordImmediate { .. }
+            | JitTraceOp::MulLongDataReg { .. }
+            | JitTraceOp::AddrDataReg { .. }
+            | JitTraceOp::AddrCmpImmediate { .. }
+            | JitTraceOp::LeaAn { .. }
+            | JitTraceOp::LeaIndex { .. }
+            | JitTraceOp::AddSubxReg { .. }
+            | JitTraceOp::BitReg { .. }
+            | JitTraceOp::Exg { .. }
+            | JitTraceOp::Ext { .. }
+            | JitTraceOp::Extb { .. }
+            | JitTraceOp::SccDataReg { .. }
+            | JitTraceOp::ShiftReg { .. }
+            | JitTraceOp::Swap { .. }
+            | JitTraceOp::Dbcc { .. }
+            | JitTraceOp::IndirectJsr { .. }
+            | JitTraceOp::MoveMem { .. }
+            | JitTraceOp::MovemWordPostInc { .. }
+            | JitTraceOp::AluMemToReg { .. }
+            | JitTraceOp::AnDispUnary { .. }
+            | JitTraceOp::AddRegToMem { .. }
+            | JitTraceOp::MemAddqSubq { .. }
+            | JitTraceOp::AnDispBit { .. }
+            | JitTraceOp::PeaDisp { .. } => return false,
+        }
+    }
+    mem_written_flags != 0 && consumed & !mem_written_flags == 0
 }
 
 /// Attempt to execute a compiled trace at the current PC. See
@@ -9420,5 +9566,516 @@ mod portable_tests {
                 assert_eq!(actual.ir, 0x60FC);
             }
         }
+    }
+
+    #[test]
+    fn pure_poll_classification_requires_idempotence_and_a_memory_read() {
+        let branch = TraceBuildOp {
+            opcode: 0x67FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 7,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let poll = TraceBuildOp {
+            opcode: 0xB26D,
+            extension: Some(0xFFF0),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Cmp,
+                size: Size::Word,
+                src: JitEa::Disp(5, -16),
+                dst: 1,
+            },
+        };
+        // A memory compare plus the loop branch: a pure poll.
+        assert!(is_pure_poll_loop(&[poll, branch]));
+
+        // A memory-tested loop is also a poll.
+        let tst = TraceBuildOp {
+            opcode: 0x4A6D,
+            extension: Some(0xFFF0),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AnDispUnary {
+                op: JitUnaryOp::Tst,
+                size: Size::Word,
+                reg: 5,
+                displacement: -16,
+            },
+        };
+        assert!(is_pure_poll_loop(&[tst, branch]));
+
+        // No memory read: burning by intent (a calibration loop), not a poll.
+        assert!(!is_pure_poll_loop(&[branch]));
+
+        // Any register mutation makes progress self-driven.
+        let counter = TraceBuildOp {
+            opcode: 0x5280,
+            extension: None,
+            extension2: None,
+            pc: 0x0102,
+            op: JitTraceOp::AddqSubqReg {
+                reg: 0,
+                data: 1,
+                size: Size::Long,
+                is_sub: false,
+            },
+        };
+        assert!(!is_pure_poll_loop(&[poll, counter, branch]));
+
+        // A memory ALU that writes its destination register is not a poll.
+        let add = TraceBuildOp {
+            op: JitTraceOp::AluMemToReg {
+                op: JitBinaryOp::Add,
+                size: Size::Word,
+                src: JitEa::Disp(5, -16),
+                dst: 1,
+            },
+            ..poll
+        };
+        assert!(!is_pure_poll_loop(&[add, branch]));
+
+        // Loading through a scratch register is register mutation, even
+        // though the loop "only" polls: not classified (v1 is strict).
+        let scratch_load = TraceBuildOp {
+            op: JitTraceOp::MoveMem {
+                size: Size::Word,
+                src: JitEa::Disp(5, -16),
+                dst: JitEa::Data(0),
+            },
+            ..poll
+        };
+        assert!(!is_pure_poll_loop(&[scratch_load, branch]));
+
+        // Flag provenance: a bit test writes only Z, so a loop branching
+        // on Z classifies…
+        let btst = TraceBuildOp {
+            opcode: 0x082D,
+            extension: Some(0x0003),
+            extension2: Some(0xFFF0),
+            pc: 0x0100,
+            op: JitTraceOp::AnDispBit {
+                op: JitBitOp::Test,
+                bit: JitBitSource::Imm(3),
+                reg: 5,
+                displacement: -16,
+            },
+        };
+        let bne = TraceBuildOp {
+            op: JitTraceOp::Branch {
+                condition: 6,
+                displacement: -8,
+                length: 2,
+                expected_taken: None,
+            },
+            ..branch
+        };
+        assert!(is_pure_poll_loop(&[btst, bne]));
+
+        // …but the same loop branching on carry does not: BTST never
+        // writes C, so the exit would depend on preserved pre-loop state.
+        let bcs = TraceBuildOp {
+            op: JitTraceOp::Branch {
+                condition: 5,
+                displacement: -8,
+                length: 2,
+                expected_taken: None,
+            },
+            ..branch
+        };
+        assert!(!is_pure_poll_loop(&[btst, bcs]));
+
+        // A loop with only an unconditional branch has no memory-driven
+        // exit and is not classified.
+        let bra = TraceBuildOp {
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+            ..branch
+        };
+        assert!(!is_pure_poll_loop(&[poll, bra]));
+
+        // Regression for the multi-shape hazard: an interior guarded
+        // branch means this head can record several dynamic paths (a poll
+        // path and a mutating path), and the per-head wait flag would
+        // erase the non-wait shapes' opportunity data. Such loops must
+        // not classify; only a single terminal conditional branch keeps
+        // the recorded path structurally unique.
+        let guarded = TraceBuildOp {
+            op: JitTraceOp::Branch {
+                condition: 6,
+                displacement: 4,
+                length: 2,
+                expected_taken: Some(false),
+            },
+            ..branch
+        };
+        assert!(!is_pure_poll_loop(&[poll, guarded, bra]));
+        assert!(!is_pure_poll_loop(&[poll, guarded, branch]));
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "trace-profile",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn blocker_then_eviction_then_wait_keeps_the_blocker_ranked() {
+        // Ben's reverse-order reproduction: record the fall-through blocker
+        // first, evict the slot, then classify the taken loop as a wait.
+        // Both orderings must converge to the same reported state: the
+        // blocker stays visible in the opportunity ranking, the wait shape
+        // reports in the wait section, and wait-attributed volume cannot
+        // inflate projected dispatches.
+        super::super::trace_profile::reset();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x4000);
+        bus.write_word(0x0100, 0xB26D); // CMP.W (-0x10,A5),D1
+        bus.write_word(0x0102, 0xFFF0);
+        bus.write_word(0x0104, 0x67FA); // BEQ.S head
+        bus.write_word(0x0106, 0xC3F0); // MULS.W (0,A0,D0.W),D1 -- untraceable
+        bus.write_word(0x0108, 0x0800);
+        bus.write_word(0x010A, 0x60F4); // BRA.S head
+        bus.write_word(0x0300, 0x1234); // the polled word
+        bus.write_word(0x2100, 0x5282); // ADDQ.L #1,D2
+        bus.write_word(0x2102, 0x60FC); // BRA.S 0x2100
+
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(5, 0x0310);
+        cpu.set_a(0, 0x0400);
+        cpu.set_a(7, 0x0900);
+        cpu.set_d(0, 0);
+
+        // Phase 1: unequal compare -- fall-through records the blocker.
+        cpu.pc = 0x0100;
+        cpu.set_d(1, 0x5555);
+        cpu.run_batch(&mut bus, 5_000, &[]);
+        let mid = super::super::trace_profile::snapshot();
+        assert_eq!(
+            mid.rows
+                .iter()
+                .find(|row| row.start_pc == 0x0100)
+                .expect("phase 1 head profiled")
+                .blocker_pc,
+            Some(0x0106),
+            "phase 1 records the real blocker"
+        );
+
+        // Phase 2: evict the direct-mapped slot with the colliding head.
+        cpu.pc = 0x2100;
+        cpu.run_batch(&mut bus, 200, &[]);
+
+        // Phase 3: equal compare -- the taken loop classifies as a wait.
+        cpu.pc = 0x0100;
+        cpu.set_d(1, 0x1234);
+        cpu.run_batch(&mut bus, 5_000, &[]);
+
+        let snapshot = super::super::trace_profile::snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0x0100)
+            .expect("phase 3 head profiled");
+        assert_eq!(
+            row.blocker_pc,
+            Some(0x0106),
+            "the wait classification never disturbs blocker accounting"
+        );
+        assert!(row.wait_hits > 0, "phase-3 spins attribute as wait hits");
+        assert!(
+            snapshot
+                .wait_shapes
+                .iter()
+                .any(|shape| shape.start_pc == 0x0100),
+            "the wait shape reports independently"
+        );
+        assert_eq!(
+            row.projected_dispatches(),
+            row.rejected_hits
+                .saturating_sub(row.wait_hits)
+                .saturating_mul(u64::from(row.prefix_ops)),
+            "wait volume is subtracted from the ranking metric"
+        );
+
+        let report = snapshot.report();
+        let ranking = report
+            .split("wait loops")
+            .next()
+            .expect("report has a ranking section");
+        assert!(
+            ranking.contains("00000100"),
+            "the blocker keeps the head visible in the ranking: {ranking}"
+        );
+        assert!(report.contains("wait loops"));
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "trace-profile",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn wait_then_eviction_then_fall_through_restores_the_blocker() {
+        // The wait bit must reflect the most recent completed recording,
+        // not the first. Sequence: classify a genuine wait; evict its
+        // direct-mapped slot with a colliding head (0x0100 and 0x2100 both
+        // map to slot 0x80); revisit with the compare unequal so the back
+        // edge falls through into an unsupported operation. The second
+        // recording finds a real blocker, and the head must return to the
+        // opportunity ranking rather than staying hidden in the wait
+        // section by the stale classification.
+        super::super::trace_profile::reset();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x4000);
+        // Wait/fall-through head at 0x0100.
+        bus.write_word(0x0100, 0xB26D); // CMP.W (-0x10,A5),D1
+        bus.write_word(0x0102, 0xFFF0);
+        bus.write_word(0x0104, 0x67FA); // BEQ.S head
+        bus.write_word(0x0106, 0xC3F0); // MULS.W (0,A0,D0.W),D1 -- untraceable
+        bus.write_word(0x0108, 0x0800);
+        bus.write_word(0x010A, 0x60F4); // BRA.S head
+        bus.write_word(0x0300, 0x1234); // the polled word
+        // Colliding loop head at 0x2100.
+        bus.write_word(0x2100, 0x5282); // ADDQ.L #1,D2
+        bus.write_word(0x2102, 0x60FC); // BRA.S 0x2100
+
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_a(5, 0x0310);
+        cpu.set_a(0, 0x0400);
+        cpu.set_a(7, 0x0900);
+        cpu.set_d(0, 0);
+
+        // Phase 1: equal compare -- the loop spins and classifies as a wait.
+        cpu.pc = 0x0100;
+        cpu.set_d(1, 0x1234);
+        cpu.run_batch(&mut bus, 5_000, &[]);
+        let mid = super::super::trace_profile::snapshot();
+        let row = mid
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0x0100)
+            .expect("phase 1 head profiled");
+        assert!(
+            mid.wait_shapes.iter().any(|shape| shape.start_pc == 0x0100),
+            "phase 1 classifies the taken loop as a wait shape"
+        );
+        assert!(row.wait_hits > 0, "phase 1 spins attribute as wait hits");
+
+        // Phase 2: a backward branch to the colliding head evicts the
+        // rejected slot for 0x0100.
+        cpu.pc = 0x2100;
+        cpu.run_batch(&mut bus, 200, &[]);
+
+        // Phase 3: unequal compare -- the back edge falls through into the
+        // unsupported multiply and a fresh recording finds the blocker.
+        cpu.pc = 0x0100;
+        cpu.set_d(1, 0x5555);
+        cpu.run_batch(&mut bus, 5_000, &[]);
+
+        let snapshot = super::super::trace_profile::snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0x0100)
+            .expect("phase 3 head profiled");
+        assert_eq!(
+            row.blocker_pc,
+            Some(0x0106),
+            "the real blocker is attributed"
+        );
+        // The fall-through's [CMP, BEQ] prefix compiles as a 2-op loop, so
+        // fall-through volume flows through guard exits rather than
+        // rejected hits: projected stays 0, and it is the recorded blocker
+        // that keeps the head visible in the ranking.
+        assert!(
+            row.wait_hits > 0,
+            "phase-1 spin volume stays wait-attributed"
+        );
+        assert_eq!(
+            row.rejected_hits, row.wait_hits,
+            "no non-wait rejected volume exists in this flow"
+        );
+        assert!(
+            snapshot
+                .wait_shapes
+                .iter()
+                .any(|shape| shape.start_pc == 0x0100),
+            "the phase-1 wait shape survives independently"
+        );
+
+        let report = snapshot.report();
+        let ranking = report
+            .split("wait loops")
+            .next()
+            .expect("report has a ranking section");
+        assert!(
+            ranking.contains("00000100"),
+            "the head returns to the opportunity ranking: {ranking}"
+        );
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "trace-profile",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn fall_through_past_a_back_edge_is_not_a_wait() {
+        // The recorded operations here are byte-identical to a pure poll --
+        // a memory compare and a conditional branch back to the head -- but
+        // the branch was *not* taken and execution fell through into an
+        // unsupported state-mutating operation. Classifying on the branch's
+        // static target alone would call this a wait and drop its real
+        // blocker out of the opportunity ranking.
+        super::super::trace_profile::reset();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0xB26D); // head: CMP.W (-0x10,A5),D1
+        bus.write_word(0x0102, 0xFFF0);
+        bus.write_word(0x0104, 0x67FA); // BEQ.S head  (never taken)
+        bus.write_word(0x0106, 0xC3F0); // MULS.W (0,A0,D0.W),D1 -- untraceable
+        bus.write_word(0x0108, 0x0800);
+        bus.write_word(0x010A, 0x60F4); // BRA.S head
+        bus.write_word(0x0300, 0x0001); // the polled word
+
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0x0100;
+        cpu.set_a(5, 0x0310);
+        cpu.set_a(0, 0x0400);
+        cpu.set_a(7, 0x0900);
+        // Unequal, so the back edge falls through every iteration.
+        cpu.set_d(1, 0x5555);
+        cpu.set_d(0, 0);
+        cpu.run_batch(&mut bus, 5_000, &[]);
+
+        let snapshot = super::super::trace_profile::snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0x0100)
+            .expect("the head was profiled");
+        assert_eq!(
+            row.wait_hits, 0,
+            "a fall-through path is not a wait even though its recorded ops look like one"
+        );
+        assert!(
+            snapshot
+                .wait_shapes
+                .iter()
+                .all(|shape| shape.start_pc != 0x0100),
+            "no wait shape is recorded for a fall-through"
+        );
+        assert_eq!(
+            row.blocker_pc,
+            Some(0x0106),
+            "the real blocker is still attributed"
+        );
+
+        let report = snapshot.report();
+        let ranking = report
+            .split("wait loops")
+            .next()
+            .expect("report has a ranking section");
+        assert!(
+            ranking.contains("00000100"),
+            "the head stays in the opportunity ranking: {ranking}"
+        );
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "trace-profile",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn pure_poll_loop_is_reported_as_wait_and_left_uncompiled() {
+        super::super::trace_profile::reset();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0xB26D); // CMP.W (-0x10,A5),D1
+        bus.write_word(0x0102, 0xFFF0);
+        bus.write_word(0x0104, 0x67FA); // BEQ.S back to 0x0100
+        bus.write_word(0x0FF0, 0x1234); // the polled value
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = 0x0100;
+        cpu.set_a(5, 0x1000);
+        cpu.set_d(1, 0x1234); // equal → the poll loops until the budget ends
+
+        let result = cpu.run_batch(&mut bus, 20_000, &[]);
+        assert_eq!(result.instructions, 20_000, "the wait executes decoded");
+
+        let snapshot = super::super::trace_profile::snapshot();
+        let row = snapshot
+            .rows
+            .iter()
+            .find(|row| row.start_pc == 0x0100)
+            .expect("the poll head was profiled");
+        assert!(
+            row.wait_hits > 0,
+            "spins after classification attribute as wait hits"
+        );
+        assert_eq!(
+            row.projected_dispatches(),
+            0,
+            "a pure wait carries no ranked opportunity"
+        );
+        assert!(
+            snapshot
+                .wait_shapes
+                .iter()
+                .any(|shape| shape.start_pc == 0x0100 && shape.recordings > 0),
+            "the classified shape is recorded in the wait table"
+        );
+        // The chosen contract: the shape table (and the wait-loops report
+        // section) is the sole representation of a classified wait. It is
+        // not a silent rejection, so the reason field stays empty.
+        assert_eq!(
+            row.reject_reason, None,
+            "a classified wait never masquerades as a silent-rejection reason"
+        );
+        assert!(
+            !snapshot
+                .compiled_shapes
+                .iter()
+                .any(|shape| shape.start_pc == 0x0100),
+            "the wait was not compiled"
+        );
+        let report = snapshot.report();
+        assert!(report.contains("wait loops"));
+        assert!(
+            !report
+                .lines()
+                .take_while(|line| !line.contains("wait loops"))
+                .any(|line| line.contains("00000100")),
+            "the wait head is excluded from the opportunity ranking"
+        );
+
+        // The veto routes through the reasoned rejection path added for
+        // silent-rejection accounting, so assert it is attributed *as a
+        // wait* there rather than as a generic compile-stage refusal or by
+        // dropping out of the accounting entirely.
+        assert!(
+            !snapshot
+                .silent_rejections
+                .iter()
+                .any(|entry| entry.start_pc == 0x0100),
+            "a classified wait is not filed as a silent rejection"
+        );
+        assert!(
+            !report.contains("backend"),
+            "a classified wait is not attributed to the compiler backend"
+        );
     }
 }
