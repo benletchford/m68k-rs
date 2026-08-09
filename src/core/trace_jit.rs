@@ -365,6 +365,13 @@ pub(crate) enum JitTraceOp {
         size: Size,
         src: JitEa,
     },
+    /// CLR through a checked brief-indexed effective address. The store
+    /// address passes the window and code-overlap checks before anything
+    /// commits, so a bail leaves memory and flags untouched.
+    ClrMem {
+        size: Size,
+        dst: JitEa,
+    },
     /// CMPA.W/L through `(An)` or `d16(An)`. Unlike ordinary CMP, the
     /// destination is always the full address register and a word source is
     /// sign-extended before the 32-bit comparison.
@@ -1366,6 +1373,7 @@ impl TraceJit {
                     | JitTraceOp::AluMemToReg { .. }
                     | JitTraceOp::CmpiWordMem { .. }
                     | JitTraceOp::TstMem { .. }
+                    | JitTraceOp::ClrMem { .. }
                     | JitTraceOp::AddrCmpMemToReg { .. }
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
@@ -1583,6 +1591,10 @@ impl TraceJit {
                     JitTraceOp::TstMem { .. } => {
                         let env = mem_env.as_ref().expect("TstMem implies a window env");
                         emit_tst_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::ClrMem { .. } => {
+                        let env = mem_env.as_ref().expect("ClrMem implies a window env");
+                        emit_clr_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::AddrCmpMemToReg { .. } => {
                         let env = mem_env
@@ -1877,7 +1889,8 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::AddRegToMem { .. }
             | JitTraceOp::MemAddqSubq { .. }
             | JitTraceOp::AnDispBit { .. }
-            | JitTraceOp::PeaDisp { .. } => return false,
+            | JitTraceOp::PeaDisp { .. }
+            | JitTraceOp::ClrMem { .. } => return false,
         }
     }
     mem_written_flags != 0 && consumed & !mem_written_flags == 0
@@ -2142,6 +2155,15 @@ impl JitTraceOp {
                     18
                 } else {
                     14
+                }
+            }
+            // CLR is the M68000UM store cost (8, or 12 for long) plus the
+            // same indexed EA calculation as the read above.
+            Self::ClrMem { size, .. } => {
+                if size == Size::Long {
+                    26
+                } else {
+                    18
                 }
             }
             Self::AddrCmpMemToReg { .. } => 24,
@@ -2587,6 +2609,14 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 },
             )
         }
+        DecodedMemOp::Clr {
+            size,
+            ea: FastEa::AnIndex(reg),
+        } => {
+            let extension = read_ext(2, bus)?;
+            let dst = decode_jit_ea(6, u16::from(reg), extension, cpu_type)?;
+            (Some(extension), None, JitTraceOp::ClrMem { size, dst })
+        }
         DecodedMemOp::Pea {
             ea: FastEa::AnDisp(reg),
         } => {
@@ -3020,6 +3050,9 @@ fn execute_portable_op(
     if matches!(op.op, JitTraceOp::TstMem { .. }) {
         return execute_portable_tst_mem(cpu, op);
     }
+    if matches!(op.op, JitTraceOp::ClrMem { .. }) {
+        return execute_portable_clr_mem(cpu, op, code_start, code_end);
+    }
     if matches!(op.op, JitTraceOp::AddrCmpMemToReg { .. }) {
         return execute_portable_addr_cmp_mem_to_reg(cpu, op);
     }
@@ -3318,6 +3351,62 @@ fn execute_portable_tst_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i3
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
     if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::Tst { size, ea }) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_clr_mem(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::ClrMem { size, dst } = trace.op else {
+        return None;
+    };
+    let JitEa::Index {
+        base,
+        index,
+        index_long,
+        scale,
+        displacement,
+    } = dst
+    else {
+        return None;
+    };
+    // Pre-check the store target against the trace's own code, as the
+    // compiled version does, so a self-modifying store bails instead of
+    // executing.
+    let base_value = cpu.dar[8 + base as usize];
+    let raw_index = match index {
+        JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+        JitDirectReg::Data(r) => cpu.dar[r as usize],
+    };
+    let index_value = if index_long {
+        raw_index
+    } else {
+        raw_index as u16 as i16 as i32 as u32
+    };
+    let raw = base_value
+        .wrapping_add(index_value << scale)
+        .wrapping_add(displacement as i32 as u32);
+    let masked = raw & cpu.address_mask;
+    if masked < code_end && masked.wrapping_add(size.bytes()) > code_start {
+        return None;
+    }
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::Clr {
+            size,
+            ea: FastEa::AnIndex(base),
+        },
+    ) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -4137,6 +4226,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::TstMem { .. } => {
             unreachable!("TstMem is handled by execute_portable_tst_mem")
         }
+        JitTraceOp::ClrMem { .. } => {
+            unreachable!("ClrMem is handled by execute_portable_clr_mem")
+        }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is handled by execute_portable_addr_cmp_mem_to_reg")
         }
@@ -4762,6 +4854,9 @@ fn emit_jit_op(
         JitTraceOp::TstMem { .. } => {
             unreachable!("TstMem is emitted by emit_tst_mem")
         }
+        JitTraceOp::ClrMem { .. } => {
+            unreachable!("ClrMem is emitted by emit_clr_mem")
+        }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is emitted by emit_addr_cmp_mem_to_reg")
         }
@@ -5072,6 +5167,65 @@ fn emit_tst_mem(
     let (off, _) = checked_window_off(builder, env, bail, address, size);
     let value = window_load(builder, env, off, size);
     set_logic_flags(builder, cpu, value, size);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit CLR to a brief-indexed destination. The address passes the window
+/// and code-overlap checks before the store and the flag writes, so a bail
+/// commits nothing. CLR sets Z and clears N, V, and C; X is untouched.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_clr_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::ClrMem {
+        size,
+        dst:
+            JitEa::Index {
+                base,
+                index,
+                index_long,
+                scale,
+                displacement,
+            },
+    } = trace.op
+    else {
+        unreachable!("memory CLR decoder admitted an unsupported EA")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    let raw_index = load_reg(builder, cpu, index);
+    let index = if index_long {
+        raw_index
+    } else {
+        let word = builder.ins().ireduce(types::I16, raw_index);
+        builder.ins().sextend(types::I32, word)
+    };
+    let index = if scale == 0 {
+        index
+    } else {
+        builder.ins().ishl_imm(index, i64::from(scale))
+    };
+    let address = builder.ins().iadd(base, index);
+    let address = builder.ins().iadd_imm(address, displacement as i64);
+    let (off, masked) = checked_window_off(builder, env, bail, address, size);
+    guard_store_not_code(builder, env, bail, masked, size);
+    let zero = iconst_u32(builder, 0);
+    window_store(builder, env, off, size, zero);
+    store_u32(builder, cpu, offset_of!(CpuCore, n_flag), 0);
+    store_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), 0);
+    store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
+    store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -8655,6 +8809,183 @@ mod portable_tests {
             assert_eq!(actual.dar, expected.dar, "case {case}: registers");
             assert_eq!(actual.get_ccr(), expected.get_ccr(), "case {case}: ccr");
             assert_eq!(amem, emem, "case {case}: memory");
+        }
+    }
+
+    #[test]
+    fn clr_to_indexed_destination_decodes_and_clears_with_correct_flags() {
+        // 4230/4270 = CLR.B/W (d8,An,Xn): the indexed-destination stores
+        // two profiled heads terminate on.
+        let mut dcpu = cpu();
+        dcpu.set_cpu_type(CpuType::M68040);
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0x4230);
+        bus.write_word(0x0102, 0x2004); // (4,A0,D2.W)
+        let byte_trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("CLR.B (d8,An,Xn) should decode");
+        assert!(matches!(
+            byte_trace.op,
+            JitTraceOp::ClrMem {
+                size: Size::Byte,
+                dst: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                },
+            }
+        ));
+        bus.write_word(0x0100, 0x4270);
+        let word_trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("CLR.W (d8,An,Xn) should decode");
+        assert!(matches!(
+            word_trace.op,
+            JitTraceOp::ClrMem {
+                size: Size::Word,
+                ..
+            }
+        ));
+
+        // CLR sets Z, clears N/V/C, and leaves X alone.
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0100..0x0102].copy_from_slice(&0x4270u16.to_be_bytes());
+        mem[0x0102..0x0104].copy_from_slice(&0x2004u16.to_be_bytes());
+        mem[0x0306..0x0308].copy_from_slice(&0xCAFEu16.to_be_bytes());
+        let mut c = cpu();
+        c.set_cpu_type(CpuType::M68040);
+        c.set_a(0, 0x0300);
+        c.set_d(2, 2);
+        c.set_ccr(0x1F); // all set: X must survive, NZVC must be rewritten
+        attach_window(&mut c, &mut mem);
+        let cycles = execute_portable_op(&mut c, word_trace, 0x0100, 0x0104)
+            .expect("portable indexed CLR executes");
+        assert!(cycles > 0);
+        assert_eq!(&mem[0x0306..0x0308], &[0, 0], "destination cleared");
+        assert_eq!(c.get_ccr(), 0x14, "Z set, N/V/C cleared, X preserved");
+        assert_eq!(c.pc, 0x0104, "pc advanced past opcode and extension");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_clr_to_indexed_destination_matches_portable_and_bails_atomically() {
+        // Case 0: CLR.B with a negative word index. Case 1: CLR.W with a
+        // scaled long index (68040 brief format).
+        let cases: [(u16, u16, JitTraceOp); 2] = [
+            (
+                0x4230,
+                0x20FC, // (-4,A0,D2.W)
+                JitTraceOp::ClrMem {
+                    size: Size::Byte,
+                    dst: JitEa::Index {
+                        base: 0,
+                        index: JitDirectReg::Data(2),
+                        index_long: false,
+                        scale: 0,
+                        displacement: -4,
+                    },
+                },
+            ),
+            (
+                0x4270,
+                0x3A08, // (8,A0,D3.L*2)
+                JitTraceOp::ClrMem {
+                    size: Size::Word,
+                    dst: JitEa::Index {
+                        base: 0,
+                        index: JitDirectReg::Data(3),
+                        index_long: true,
+                        scale: 1,
+                        displacement: 8,
+                    },
+                },
+            ),
+        ];
+        for (case, (opcode, extension, op)) in cases.iter().enumerate() {
+            let clr = TraceBuildOp {
+                opcode: *opcode,
+                extension: Some(*extension),
+                extension2: None,
+                pc: 0x0100,
+                op: *op,
+            };
+            let branch = TraceBuildOp {
+                opcode: 0x60FA,
+                extension: None,
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -6,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let ops = vec![clr, branch];
+            let prepare = |mem: &mut Vec<u8>| {
+                mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                mem[0x0102..0x0104].copy_from_slice(&extension.to_be_bytes());
+                mem[0x0300..0x0400].fill(0xAA);
+                let mut c = cpu();
+                c.set_cpu_type(CpuType::M68040);
+                c.set_a(0, 0x0320);
+                c.set_d(2, 0xFFFF_FF00); // word part -256
+                c.set_d(3, 0x0000_0040); // scaled by 2 = 0x80
+                c.set_ccr(0x10);
+                attach_window(&mut c, mem);
+                c
+            };
+            let mut emem = vec![0u8; 0x1000];
+            let mut expected = prepare(&mut emem);
+            let expected_packed = execute_portable_trace(&mut expected, &ops, 0x0100, 0x0106);
+            let mut amem = vec![0u8; 0x1000];
+            let mut actual = prepare(&mut amem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+                .expect("indexed CLR loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(
+                actual_packed, expected_packed,
+                "case {case}: cycles/retired"
+            );
+            assert_eq!(actual.dar, expected.dar, "case {case}: registers");
+            assert_eq!(actual.get_ccr(), expected.get_ccr(), "case {case}: ccr");
+            assert_eq!(amem, emem, "case {case}: memory");
+            let cleared = if case == 0 {
+                0x0320 - 256 - 4
+            } else {
+                0x0320 + 0x80 + 8
+            };
+            assert_eq!(amem[cleared], 0, "case {case}: destination byte cleared");
+
+            if case == 0 {
+                // A store aimed at the trace's own code must bail on both
+                // paths with nothing committed.
+                let overlap = |mem: &mut Vec<u8>| {
+                    let mut c = prepare(mem);
+                    // 0x0102 = base - 256 - 4  =>  base = 0x0206
+                    c.set_a(0, 0x0206);
+                    c
+                };
+                let mut pmem = vec![0u8; 0x1000];
+                let mut pcpu = overlap(&mut pmem);
+                let packed = execute_portable_trace(&mut pcpu, &ops, 0x0100, 0x0106);
+                assert_eq!(packed, 0, "portable bails on a store into code");
+                assert_eq!(pcpu.pc, 0x0100);
+                assert_eq!(pcpu.get_ccr(), 0x10);
+                assert_eq!(pmem[0x0102], 0x20, "extension word untouched");
+
+                let mut nmem = vec![0u8; 0x1000];
+                let mut ncpu = overlap(&mut nmem);
+                let before = ncpu.dar;
+                let packed = unsafe { compiled.call_native(&mut ncpu, 1) };
+                assert_eq!(packed, 0, "native bails on a store into code");
+                assert_eq!(ncpu.pc, 0x0100);
+                assert_eq!(ncpu.dar, before);
+                assert_eq!(ncpu.get_ccr(), 0x10);
+                assert_eq!(nmem, pmem, "native bail commits nothing");
+            }
         }
     }
 
