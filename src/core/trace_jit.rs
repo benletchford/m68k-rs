@@ -667,8 +667,13 @@ impl TraceJit {
     /// Attempt to execute a compiled trace at the current PC.
     ///
     /// On `CachedRunResult::Ran`, the returned count is the number of
-    /// guest instructions the trace retired. The count is 0 for
-    /// `Fault`/`Miss`.
+    /// guest instructions the trace retired. On `Miss` the count is the
+    /// number of instructions retired BEFORE the miss: zero when the
+    /// entered trace's own first opcode changed, but non-zero when a
+    /// chained continuation missed validation after its parent (and any
+    /// earlier links) retired instructions -- callers must account the
+    /// count before dispatching the missed opcode, as
+    /// `run_decoded_simple_batch` does. The count is 0 for `Fault`.
     ///
     /// A self-looping trace (one whose closing branch targets its own
     /// head) may run many iterations per call: up to `instr_budget`
