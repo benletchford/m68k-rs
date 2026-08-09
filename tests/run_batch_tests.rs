@@ -1223,6 +1223,32 @@ fn mem_trace_memcpy_loop_matches_step() {
     });
 }
 
+/// A mixed-path loop: the comparison alternates every iteration, so the
+/// conditional branch never settles and whichever path the head trace
+/// records, it guard-exits on ~half of all calls forever -- the shape
+/// adaptive re-recording cannot fix. Exit-seeded candidacy forms a second
+/// trace at the exit target and chains into it; everything must still
+/// match step() exactly through recording, promotion, and chaining.
+#[test]
+fn mixed_path_loop_with_exit_seeded_continuation_matches_step() {
+    let words = &[
+        0x0A01, 0x0001, // $1000: EORI.B #1,D1   (Z flips every iteration)
+        0x6602, // $1004: BNE.S $1008
+        0x5282, // $1006: ADDQ.L #1,D2
+        0x1ADC, // $1008: MOVE.B (A4)+,(A5)+
+        0x5283, // $100A: ADDQ.L #1,D3 (keeps both continuations >= 3 ops)
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0xA000, // $1010: sentinel
+    ];
+    assert_fastmem_matches_step("mixed-path exit seed", words, CpuType::M68040, |cpu| {
+        cpu.set_a(4, 0x3000);
+        cpu.set_a(5, 0x4000);
+        cpu.set_d(0, 255);
+        cpu.set_d(1, 0);
+        cpu.set_d(2, 0);
+    });
+}
+
 /// A memory operation followed immediately by DBRA is a common 68k copy-loop
 /// shape. It must remain exact when admitted as the minimum two-op self-loop.
 #[test]
