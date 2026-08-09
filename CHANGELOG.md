@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.0...m68k-v0.10.1) (2026-08-09)
+
+
+### Performance Improvements
+
+* JIT register-count shifts ([662c6a1](https://github.com/benletchford/m68k-rs/commit/662c6a1df0197aa658d1afb1dbfb3f9df7d67957))
+
 ## [0.10.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.9.1...m68k-v0.10.0) (2026-08-09)
 
 
