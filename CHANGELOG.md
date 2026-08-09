@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.4...m68k-v0.10.5) (2026-08-09)
+
+
+### Performance Improvements
+
+* JIT immediate MOVE stores to memory destinations ([40a8cac](https://github.com/benletchford/m68k-rs/commit/40a8cace840b35f4c32f72aa044849104062db35))
+
 ## [0.10.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.3...m68k-v0.10.4) (2026-08-09)
 
 
