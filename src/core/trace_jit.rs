@@ -9668,6 +9668,102 @@ mod portable_tests {
         }
     }
 
+    #[test]
+    fn move_immediate_matches_the_interpreter_with_exact_68000_cycles() {
+        // Native parity alone shares this feature's addressing, flag, and
+        // max_cycles logic on both sides; a shared regression would pass
+        // it. This differential pits the portable executor against the
+        // interpreter's own step() on a 68000 for every admitted form,
+        // asserting the exact register/memory/NZVCX state AND that the
+        // trace's cycle charge equals the interpreter's true cycle count.
+        let cases: [(&[u16], &str); 4] = [
+            (&[0x3F3C, 0x8111], "MOVE.W #imm,-(SP)"),
+            (&[0x2F3C, 0xDEAD, 0xBEEF], "MOVE.L #imm,-(SP)"),
+            (&[0x3B7C, 0x0000, 0x0010], "MOVE.W #zero,(d16,A5)"),
+            (&[0x31BC, 0x0042, 0x2004], "MOVE.W #imm,(4,A0,D2.W)"),
+        ];
+        for (words, label) in cases {
+            let setup = |c: &mut CpuCore| {
+                c.set_cpu_type(CpuType::M68000);
+                c.set_a(0, 0x0300);
+                c.set_a(5, 0x0400);
+                c.set_a(7, 0x0800);
+                c.set_d(2, 0x0006);
+                c.set_ccr(0x1F); // X must survive; N/Z/V/C must be rewritten
+                c.pc = 0x0100;
+            };
+            // Interpreter twin: true 68000 execution with true cycles,
+            // reading and writing through its own bus.
+            let mut ibus = super::super::memory::LinearMemoryBus::new(0x1000);
+            for (index, word) in words.iter().enumerate() {
+                ibus.write_word(0x0100 + index as u32 * 2, *word);
+            }
+            let mut icpu = cpu();
+            setup(&mut icpu);
+            let icycles = match icpu.step(&mut ibus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+            // Portable twin: the trace op decoded from the same bytes,
+            // executing through the attached window.
+            let mut pmem = vec![0u8; 0x1000];
+            for (index, word) in words.iter().enumerate() {
+                pmem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            let mut pcpu = cpu();
+            setup(&mut pcpu);
+            attach_window(&mut pcpu, &mut pmem);
+            let t = decode_trace_op(&pcpu, &mut ibus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: should decode"));
+            assert!(matches!(t.op, JitTraceOp::MoveImmMem { .. }), "{label}");
+            let pcycles =
+                execute_portable_op(&mut pcpu, t, 0x0100, 0x0100 + words.len() as u32 * 2)
+                    .unwrap_or_else(|| panic!("{label}: portable executes"));
+            assert_eq!(pcpu.dar, icpu.dar, "{label}: registers");
+            assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "{label}: NZVCX");
+            // The stored value, read from each twin's own memory at the
+            // interpreter-computed destination.
+            let (dst_addr, bytes) = match t.op {
+                JitTraceOp::MoveImmMem {
+                    size,
+                    dst: JitEa::PreDec(r),
+                    ..
+                } => (icpu.a(r.into()), size.bytes()),
+                JitTraceOp::MoveImmMem {
+                    size,
+                    dst: JitEa::Disp(r, d),
+                    ..
+                } => (icpu.a(r.into()).wrapping_add(d as i32 as u32), size.bytes()),
+                JitTraceOp::MoveImmMem {
+                    size,
+                    dst:
+                        JitEa::Index {
+                            base, displacement, ..
+                        },
+                    ..
+                } => (
+                    icpu.a(base.into())
+                        .wrapping_add(icpu.d(2) as u16 as i16 as i32 as u32)
+                        .wrapping_add(displacement as i32 as u32),
+                    size.bytes(),
+                ),
+                _ => unreachable!(),
+            };
+            for offset in 0..bytes {
+                let a = dst_addr + offset;
+                assert_eq!(
+                    pmem[a as usize],
+                    ibus.read_byte(a),
+                    "{label}: stored byte at {a:#06x}"
+                );
+            }
+            assert_eq!(
+                pcycles, icycles,
+                "{label}: the trace cycle charge must equal the 68000's"
+            );
+        }
+    }
+
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn native_cmp_indexed_matches_portable_and_bails_atomically() {
