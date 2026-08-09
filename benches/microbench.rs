@@ -755,6 +755,61 @@ fn bench_movem_indexed_loop() {
     );
 }
 
+/// Exercise the register-to-memory subtract loop the profile flagged: four
+/// `SUB.L D0,(A0)` against one cell between a MOVEA reload and a DBRA, so
+/// the admitted form dominates the trace rather than the loop plumbing.
+fn bench_sub_reg_to_mem_loop() {
+    // 326,594 outer cycles of 643 instructions end exactly at the outer
+    // label, with 512 subtracts per cycle applied to the same cell.
+    const CYCLES: u32 = 326_594;
+    const INSTRS: u32 = CYCLES * 643;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x204B, // outer: MOVEA.L A3,A0
+        0x727F, // MOVEQ #127,D1
+        0x9190, // inner: SUB.L D0,(A0)
+        0x9190, // SUB.L D0,(A0)
+        0x9190, // SUB.L D0,(A0)
+        0x9190, // SUB.L D0,(A0)
+        0x51C9, 0xFFF6, // DBRA D1,inner
+        0x60EE, // BRA.S outer
+    ];
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_d(0, 1);
+        cpu.set_a(3, 0x4000);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    bus.write_long(0x4000, 0);
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.pc, CODE_BASE, "the run ends exactly at the outer label");
+    assert_eq!(
+        bus.read_long(0x4000),
+        0u32.wrapping_sub(512 * CYCLES),
+        "every subtract landed on the cell"
+    );
+    println!(
+        "batch     SUB reg-to-mem loop     {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce a path-biased trace that is first recorded through an uncommon
 /// conditional edge before settling into a copy loop on the opposite edge.
 /// A first-path-only
@@ -1366,6 +1421,10 @@ fn main() {
     }
     if only.as_deref() == Some("register-count-shift") {
         bench_register_count_shift_loop();
+        return;
+    }
+    if only.as_deref() == Some("sub-reg-to-mem") {
+        bench_sub_reg_to_mem_loop();
         return;
     }
     if only.as_deref() == Some("indexed-lea") {
