@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.1...m68k-v0.10.2) (2026-08-09)
+
+
+### Performance Improvements
+
+* jit register-to-memory subtracts ([8796494](https://github.com/benletchford/m68k-rs/commit/879649408f1417a5050ff8f122e59939e1f1b1be))
+
 ## [0.10.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.0...m68k-v0.10.1) (2026-08-09)
 
 
