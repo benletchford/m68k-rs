@@ -2193,6 +2193,7 @@ impl JitTraceOp {
             Self::MoveImmMem { size, dst, .. } => match (size, dst) {
                 (Size::Long, JitEa::Disp(_, _)) => 24,
                 (Size::Long, _) => 20,
+                (_, JitEa::Index { .. }) => 18,
                 (_, JitEa::Disp(_, _)) => 16,
                 _ => 12,
             },
@@ -2867,6 +2868,18 @@ fn decode_move_imm_mem_trace_op<B: AddressBus>(
             (
                 JitEa::Disp(dst_reg, displacement as i16),
                 Some(displacement),
+            )
+        }
+        6 => {
+            if size == Size::Long {
+                // Immediate high/low plus the brief extension word exceed
+                // TraceBuildOp's two extension slots.
+                return None;
+            }
+            let brief = read_ext(2 + 2 * imm_words, bus)?;
+            (
+                decode_jit_ea(6, u16::from(dst_reg), brief, cpu.cpu_type)?,
+                Some(brief),
             )
         }
         _ => return None,
@@ -3594,6 +3607,31 @@ fn execute_portable_move_imm_mem(
             cpu.dar[8 + r as usize].wrapping_add(displacement as i32 as u32),
             None,
         ),
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base_value = cpu.dar[8 + base as usize];
+            let raw_index = match index {
+                JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+                JitDirectReg::Data(r) => cpu.dar[r as usize],
+            };
+            let index_value = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            (
+                base,
+                base_value
+                    .wrapping_add(index_value << scale)
+                    .wrapping_add(displacement as i32 as u32),
+                None,
+            )
+        }
         _ => return None,
     };
     let off = locate(cpu, addr)?;
@@ -5484,6 +5522,29 @@ fn emit_move_imm_mem(
         JitEa::Disp(reg, displacement) => {
             let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
             (builder.ins().iadd_imm(base, displacement as i64), None)
+        }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let address = builder.ins().iadd(base, index);
+            (builder.ins().iadd_imm(address, displacement as i64), None)
         }
         _ => unreachable!("immediate MOVE decoder admitted an unsupported EA"),
     };
@@ -9455,6 +9516,34 @@ mod portable_tests {
             !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
             "three-extension form must not decode as MoveImmMem"
         );
+        // 31BC = MOVE.W #imm,(d8,A0,Xn): the immediate word plus the brief
+        // extension fit the two-slot budget.
+        bus.write_word(0x0100, 0x31BC);
+        bus.write_word(0x0102, 0x0042);
+        bus.write_word(0x0104, 0x2004); // (4,A0,D2.W)
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W #imm,(d8,An,Xn) should decode");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Word,
+                value: 0x0042,
+                dst: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                },
+            }
+        ));
+        // ...but the long form would need three words and stays decoded.
+        bus.write_word(0x0100, 0x21BC);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040);
+        assert!(
+            !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
+            "long immediate to an indexed destination must stay decoded"
+        );
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -9462,7 +9551,7 @@ mod portable_tests {
     fn native_move_immediate_to_memory_matches_portable_and_bails_without_moving_sp() {
         // Case 0: MOVE.W #imm,-(SP). Case 1: MOVE.L #imm,-(SP).
         // Case 2: MOVE.W #imm,(d16,A5).
-        let cases: [(u16, JitTraceOp, Option<u16>, Option<u16>); 3] = [
+        let cases: [(u16, JitTraceOp, Option<u16>, Option<u16>); 4] = [
             (
                 0x3F3C,
                 JitTraceOp::MoveImmMem {
@@ -9492,6 +9581,22 @@ mod portable_tests {
                 },
                 Some(0x8000),
                 Some(0x0010),
+            ),
+            (
+                0x31BC, // MOVE.W #imm,(4,A0,D2.W)
+                JitTraceOp::MoveImmMem {
+                    size: Size::Word,
+                    value: 0x0042,
+                    dst: JitEa::Index {
+                        base: 0,
+                        index: JitDirectReg::Data(2),
+                        index_long: false,
+                        scale: 0,
+                        displacement: 4,
+                    },
+                },
+                Some(0x0042),
+                Some(0x2004),
             ),
         ];
         for (case, (opcode, op, ext, ext2)) in cases.iter().enumerate() {
