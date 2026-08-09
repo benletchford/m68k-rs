@@ -4624,9 +4624,17 @@ fn emit_jit_op(
             direction,
             op,
         } => {
-            debug_assert!(
-                !count_is_register && matches!((op, direction), (0, 0) | (1, 0) | (1, 1))
-            );
+            debug_assert!(matches!((op, direction), (0, 0) | (1, 0) | (1, 1)));
+            if count_is_register {
+                let shift = RegisterCountShift {
+                    reg,
+                    size,
+                    count_reg: count_or_reg,
+                    direction,
+                    op,
+                };
+                return emit_register_count_shift(builder, cpu, shift, pre020);
+            }
             let shift = if count_or_reg == 0 {
                 8
             } else {
@@ -6201,6 +6209,137 @@ fn bool_const(builder: &mut FunctionBuilder<'_>, value: bool) -> Value {
         builder.ins().icmp_imm(IntCC::Equal, zero, 0)
     } else {
         builder.ins().icmp_imm(IntCC::NotEqual, zero, 0)
+    }
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+#[derive(Debug, Clone, Copy)]
+struct RegisterCountShift {
+    reg: u8,
+    size: Size,
+    count_reg: u8,
+    direction: u8,
+    op: u8,
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+/// `ASR`/`LSR`/`LSL Dx,Dy`: the shift distance is only known at run time,
+/// so the count clamping, the shifted-out bit, and the cycle cost are all
+/// computed in the trace rather than folded at compile time.
+///
+/// Two architectural details drive the shape of this code. The 68k takes
+/// the count modulo 64, and a **zero count is not a no-op for the flags**:
+/// it clears C and V and sets N/Z from the unshifted value, but leaves X
+/// untouched. X is therefore read back and re-selected rather than simply
+/// written.
+fn emit_register_count_shift(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    shift: RegisterCountShift,
+    pre020: bool,
+) -> Value {
+    let RegisterCountShift {
+        reg,
+        size,
+        count_reg,
+        direction,
+        op,
+    } = shift;
+    let bits = size.bits() as u32;
+    let value = load_reg_sized(builder, cpu, JitDirectReg::Data(reg), size);
+    let raw_count = load_reg(builder, cpu, JitDirectReg::Data(count_reg));
+    let count = builder.ins().band_imm(raw_count, 63);
+    let count_is_zero = builder.ins().icmp_imm(IntCC::Equal, count, 0);
+
+    let last_bit = iconst_u32(builder, bits - 1);
+    let bits_value = iconst_u32(builder, bits);
+    let zero = iconst_u32(builder, 0);
+    // Clamped so no shift amount can exceed the value width, and so the
+    // count-1 index stays defined when the count is zero (its flag results
+    // are discarded below).
+    let count_minus_one = builder.ins().iadd_imm(count, -1);
+    let over_last = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, count_minus_one, last_bit);
+    let shifted_out_index = builder.ins().select(over_last, last_bit, count_minus_one);
+    let count_past_width = builder
+        .ins()
+        .icmp(IntCC::UnsignedGreaterThan, count, bits_value);
+    let count_reaches_width =
+        builder
+            .ins()
+            .icmp(IntCC::UnsignedGreaterThanOrEqual, count, bits_value);
+
+    let (result, carry) = match (op, direction) {
+        (0, 0) => {
+            // ASR: shifting an all-sign-bits value further changes nothing,
+            // so clamping the distance to the width reproduces the
+            // architectural result for every larger count.
+            let signed = match size {
+                Size::Byte => sign_extend_byte(builder, value),
+                Size::Word => sign_extend_word(builder, value),
+                Size::Long => value,
+            };
+            // The shift amount clamps at the last bit position: a count of
+            // exactly the operand width must still saturate to all sign
+            // bits, and shifting an I32 by 32 or more is not defined here.
+            let count_over_last = builder
+                .ins()
+                .icmp(IntCC::UnsignedGreaterThan, count, last_bit);
+            let clamped = builder.ins().select(count_over_last, last_bit, count);
+            let result = builder.ins().sshr(signed, clamped);
+            let bit = builder.ins().ushr(value, shifted_out_index);
+            let carry = builder.ins().band_imm(bit, 1);
+            (result, carry)
+        }
+        (1, 0) => {
+            // LSR: zero once the count reaches the width; the last bit
+            // shifted out is still the carry when the count equals it.
+            let plain = builder.ins().ushr(value, count);
+            let result = builder.ins().select(count_reaches_width, zero, plain);
+            let bit = builder.ins().ushr(value, shifted_out_index);
+            let bit = builder.ins().band_imm(bit, 1);
+            let carry = builder.ins().select(count_past_width, zero, bit);
+            (result, carry)
+        }
+        (1, 1) => {
+            // LSL: mirror of LSR, with the carry taken from the bit that
+            // reaches the top on the final iteration.
+            let plain = builder.ins().ishl(value, count);
+            let result = builder.ins().select(count_reaches_width, zero, plain);
+            let index = builder.ins().isub(bits_value, count);
+            let index = builder.ins().band_imm(index, 31);
+            let bit = builder.ins().ushr(value, index);
+            let bit = builder.ins().band_imm(bit, 1);
+            let carry = builder.ins().select(count_past_width, zero, bit);
+            (result, carry)
+        }
+        _ => unreachable!("unsupported native register shift"),
+    };
+
+    let result = mask_value(builder, result, size);
+    // A zero count leaves the register unchanged, which `value` already is.
+    let result = builder.ins().select(count_is_zero, value, result);
+    let result = mask_value(builder, result, size);
+    write_data_reg_sized(builder, cpu, reg, size, result);
+
+    let carry = builder.ins().select(count_is_zero, zero, carry);
+    let carry_flag = flag_from_nonzero(builder, carry, CFLAG_SET);
+    store_value_u32(builder, cpu, offset_of!(CpuCore, c_flag), carry_flag);
+    // X is preserved across a zero-count shift.
+    let previous_x = load_u32(builder, cpu, offset_of!(CpuCore, x_flag));
+    let x_flag = builder.ins().select(count_is_zero, previous_x, carry_flag);
+    store_value_u32(builder, cpu, offset_of!(CpuCore, x_flag), x_flag);
+    store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
+    set_logic_flags_nv(builder, cpu, result, size);
+
+    if pre020 {
+        let base = if size == Size::Long { 8 } else { 6 };
+        let scaled = builder.ins().imul_imm(count, 2);
+        builder.ins().iadd_imm(scaled, base)
+    } else {
+        // 68020+ barrel shifter: fixed cost, as in the immediate form.
+        cycles_const(builder, 6)
     }
 }
 
@@ -7940,6 +8079,148 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
+    fn native_register_count_shift_matches_portable_across_counts() {
+        // The architecturally interesting counts: zero (flags change but X
+        // is preserved and the register does not), one, counts at and past
+        // the operand width (result saturates, carry stops), and the
+        // modulo-64 wrap (64 behaves as zero, 65 as one).
+        for &(op, direction) in &[(0u8, 0u8), (1, 0), (1, 1)] {
+            for size in [Size::Byte, Size::Word, Size::Long] {
+                for &count in &[0u32, 1, 7, 8, 15, 16, 31, 32, 33, 63, 64, 65] {
+                    for &value in &[0x0000_0000u32, 0x8000_0001, 0x1234_5678, 0xFFFF_FFFF] {
+                        for &initial_x in &[0u32, 1] {
+                            let shift = TraceBuildOp {
+                                opcode: 0xE2A0,
+                                extension: None,
+                                extension2: None,
+                                pc: 0x0100,
+                                op: JitTraceOp::ShiftReg {
+                                    reg: 0,
+                                    size,
+                                    count_or_reg: 1,
+                                    count_is_register: true,
+                                    direction,
+                                    op,
+                                },
+                            };
+                            let branch = TraceBuildOp {
+                                opcode: 0x60FC,
+                                extension: None,
+                                extension2: None,
+                                pc: 0x0102,
+                                op: JitTraceOp::Branch {
+                                    condition: 0,
+                                    displacement: -4,
+                                    length: 2,
+                                    expected_taken: None,
+                                },
+                            };
+                            let prepare = || {
+                                let mut cpu = cpu();
+                                cpu.set_cpu_type(CpuType::M68000);
+                                cpu.set_d(0, value);
+                                cpu.set_d(1, count);
+                                cpu.x_flag = initial_x;
+                                cpu
+                            };
+
+                            let mut expected = prepare();
+                            let expected_packed = execute_portable_trace(
+                                &mut expected,
+                                &[shift, branch],
+                                0x0100,
+                                0x0104,
+                            );
+
+                            let mut actual = prepare();
+                            let mut jit = TraceJit::new();
+                            let compiled = jit
+                                .compile_decoded_ops(
+                                    &actual,
+                                    0x0100,
+                                    CpuType::M68000,
+                                    vec![shift, branch],
+                                    Some(0x0100),
+                                )
+                                .expect("register-count shift loop should compile");
+                            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+
+                            let context = format!(
+                                "op={op} dir={direction} size={size:?} count={count} \
+                                 value={value:#010X} x={initial_x}"
+                            );
+                            assert_eq!(actual_packed, expected_packed, "cycles/retired: {context}");
+                            assert_eq!(actual.dar, expected.dar, "registers: {context}");
+                            assert_eq!(actual.get_ccr(), expected.get_ccr(), "ccr: {context}");
+                            assert_eq!(actual.x_flag != 0, expected.x_flag != 0, "X: {context}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn zero_register_count_shift_preserves_x_and_the_operand() {
+        // Called out separately because it is the case an immediate-count
+        // encoding can never produce: a zero count clears C and V and sets
+        // N/Z from the unshifted value, while leaving X and the register
+        // alone.
+        let shift = TraceBuildOp {
+            opcode: 0xE2A0,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::ShiftReg {
+                reg: 0,
+                size: Size::Long,
+                count_or_reg: 1,
+                count_is_register: true,
+                direction: 0,
+                op: 0,
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60FC,
+            extension: None,
+            extension2: None,
+            pc: 0x0102,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -4,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let mut actual = cpu();
+        actual.set_cpu_type(CpuType::M68000);
+        actual.set_d(0, 0x8000_0000);
+        actual.set_d(1, 0);
+        actual.x_flag = 1;
+        actual.c_flag = 1;
+
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(
+                &actual,
+                0x0100,
+                CpuType::M68000,
+                vec![shift, branch],
+                Some(0x0100),
+            )
+            .expect("zero-count shift should compile");
+        unsafe { compiled.call_native(&mut actual, 1) };
+
+        assert_eq!(actual.d(0), 0x8000_0000, "the operand is untouched");
+        assert_ne!(actual.x_flag, 0, "X survives a zero count");
+        assert_eq!(actual.c_flag, 0, "C is cleared by a zero count");
+        assert_eq!(actual.v_flag, 0, "V is cleared");
+        assert_ne!(actual.n_flag, 0, "N comes from the unshifted value");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
     fn native_cmp_indexed_matches_portable_and_bails_atomically() {
         let cmp = TraceBuildOp {
             opcode: 0xB270,
@@ -9067,7 +9348,7 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
-    fn native_trace_accepts_only_supported_immediate_shift_forms() {
+    fn native_trace_accepts_supported_shift_forms_with_either_count() {
         let asr = DecodedSimpleOp::decode(CpuType::M68040, 0xE247)
             .unwrap()
             .to_jit_trace_op();
@@ -9103,10 +9384,38 @@ mod portable_tests {
             })
         ));
 
+        // Register counts are admitted for the same three forms; the
+        // distance, the shifted-out bit, and the cycle cost are computed in
+        // the trace instead of folded at compile time.
         let register_asr = DecodedSimpleOp::decode(CpuType::M68040, 0xE267)
             .unwrap()
             .to_jit_trace_op();
-        assert!(register_asr.is_none());
+        assert!(matches!(
+            register_asr,
+            Some(JitTraceOp::ShiftReg {
+                reg: 7,
+                size: Size::Word,
+                count_or_reg: 1,
+                count_is_register: true,
+                direction: 0,
+                op: 0,
+            })
+        ));
+
+        // ASL still refuses with either count kind: its overflow flag is
+        // set from whether the sign bit changed during the shift, which is
+        // not yet lowered.
+        let register_asl = DecodedSimpleOp::decode(CpuType::M68040, 0xE367)
+            .unwrap()
+            .to_jit_trace_op();
+        assert!(register_asl.is_none());
+
+        // Rotates likewise: ROXL/ROXR carry the extend bit through the
+        // rotation, and ROL/ROR have their own carry rule.
+        let register_rol = DecodedSimpleOp::decode(CpuType::M68040, 0xE37F)
+            .unwrap()
+            .to_jit_trace_op();
+        assert!(register_rol.is_none());
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]

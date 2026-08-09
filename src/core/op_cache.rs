@@ -425,11 +425,12 @@ impl DecodedSimpleOp {
                 }
                 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
                 {
-                    // Native traces lower the measured immediate-count right
-                    // arithmetic/logical and left logical forms. Keep other
-                    // variants on the decoded interpreter until their flag
-                    // handling is lowered and measured independently.
-                    if !count_is_register && matches!((op, direction), (0, 0) | (1, 0) | (1, 1)) {
+                    // Native traces lower the right arithmetic/logical and
+                    // left logical forms, with either an immediate or a
+                    // register count. ASL and the rotates stay on the decoded
+                    // interpreter until their overflow and extend handling is
+                    // lowered and measured independently.
+                    if matches!((op, direction), (0, 0) | (1, 0) | (1, 1)) {
                         Some(JitTraceOp::ShiftReg {
                             reg,
                             size,

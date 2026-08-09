@@ -1167,6 +1167,74 @@ fn bench_indexed_lea_loop() {
     );
 }
 
+/// Register-count shifts, the form the profile showed blocking a
+/// fixed-point table-lookup loop. The count lives in a register even
+/// though it is loop-invariant, so the trace must compute the distance,
+/// the shifted-out bit, and the cycle cost at run time.
+///
+/// C model of the loop body:
+/// ```c
+/// int32_t d0;          /* value being shifted */
+/// int32_t d1 = 16;     /* shift distance, held in a register */
+/// int16_t d2;          /* loop counter */
+/// do {
+///     d0 = table_word >> d1;   /* ASR.L D1,D0 -- arithmetic */
+///     d2 += 1;
+/// } while (d2 < 0x7FFF);
+/// ```
+fn bench_register_count_shift_loop() {
+    const CODE_BASE: u32 = 0x7200;
+    const WRAP_INSTRS: u32 = 4 * 0x7FFF + 2;
+    const WRAPS: u32 = 763;
+    const INSTRS: u32 = WRAP_INSTRS * WRAPS;
+    let words = [
+        0xE2A0, // loop: ASR.L D1,D0
+        0x5282, // ADDQ.L #1,D2
+        0x0C42, 0x7FFF, // CMPI.W #$7FFF,D2
+        0x6DF6, // BLT.S loop
+        0x7400, // MOVEQ #0,D2
+        0x60F2, // BRA.S loop
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        // A count of one keeps the shifted value from saturating to zero
+        // immediately, so every iteration does real work.
+        cpu.set_d(0, 0x4000_0000);
+        cpu.set_d(1, 1);
+        cpu.set_a(7, 0x8000);
+        cpu
+    };
+
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.d(2), 0, "the run ends exactly at a wrap boundary");
+    assert_eq!(cpu.d(1), 1, "the count register is untouched");
+    assert_eq!(
+        cpu.d(0),
+        0,
+        "repeated arithmetic right shifts of a positive value saturate to zero"
+    );
+    println!(
+        "batch     register count shift    {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Measure decoded generic memory operations without allowing a backward
 /// branch to turn the workload into a native JIT loop. Each pass walks the
 /// same straight-line code, retaining the decoded-op cache while resetting
@@ -1294,6 +1362,10 @@ fn main() {
     }
     if only.as_deref() == Some("pea-displacement") {
         bench_pea_displacement_loop();
+        return;
+    }
+    if only.as_deref() == Some("register-count-shift") {
+        bench_register_count_shift_loop();
         return;
     }
     if only.as_deref() == Some("indexed-lea") {
