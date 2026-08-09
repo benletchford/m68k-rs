@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.9.1...m68k-v0.10.0) (2026-08-09)
+
+
+### Features
+
+* classify pure poll loops at trace compile time ([5ecdc72](https://github.com/benletchford/m68k-rs/commit/5ecdc72a54431f7d1cf6c98d928c098b51a721fc))
+
 ## [0.9.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.9.0...m68k-v0.9.1) (2026-08-08)
 
 
