@@ -2179,14 +2179,7 @@ impl JitTraceOp {
                 (_, JitEa::Index { .. }) => 18,
                 (Size::Long, _) => 22,
                 _ => 14,
-            // same indexed EA calculation as the read above.
-            Self::ClrMem { size, .. } => {
-                if size == Size::Long {
-                    26
-                } else {
-                    18
-                }
-            }
+            },
             // MOVE #imm to memory per the M68000UM move table: 12 for
             // byte/word to the extension-less destinations, 16 with a
             // displacement; long pays the extra immediate fetch.

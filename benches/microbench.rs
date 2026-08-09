@@ -920,6 +920,59 @@ fn bench_clr_predec_loop() {
     );
 }
 
+/// Exercise the immediate-store family the gameplay profile flagged: a
+/// word push (MOVE.W #imm,-(SP)) with an ADDQ restoring SP, and an
+/// indexed immediate store swept by the DBRA counter.
+fn bench_move_imm_store_loop() {
+    // Outer cycles of 514 instructions (128 four-op iterations plus the
+    // reload and restart) end exactly at the head with SP restored.
+    const CYCLES: u32 = 350_000;
+    const INSTRS: u32 = CYCLES * 514;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x3F3C, 0x1111, // head: MOVE.W #$1111,-(SP)
+        0x31BC, 0x0042, 0x1200, // MOVE.W #$42,(0,A0,D1.W*2)
+        0x548F, // ADDQ.L #2,SP
+        0x51C9, 0xFFF2, // DBRA D1,head
+        0x727F, // MOVEQ #127,D1 (reload: D1 is both counter and index)
+        0x60EC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x4000);
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(1, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.a(7), 0x8000, "SP restored every iteration");
+    assert_eq!(bus.read_word(0x4000), 0x0042, "indexed immediate landed");
+    assert_eq!(
+        bus.read_word(0x7FFE),
+        0x1111,
+        "push landed below initial SP"
+    );
+    println!(
+        "batch     imm store loop          {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce a path-biased trace that is first recorded through an uncommon
 /// conditional edge before settling into a copy loop on the opposite edge.
 /// A first-path-only
@@ -1535,6 +1588,10 @@ fn main() {
     }
     if only.as_deref() == Some("clr-predec") {
         bench_clr_predec_loop();
+        return;
+    }
+    if only.as_deref() == Some("move-imm-store") {
+        bench_move_imm_store_loop();
         return;
     }
     if only.as_deref() == Some("indexed-dest-store") {
