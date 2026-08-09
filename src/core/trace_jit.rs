@@ -12702,7 +12702,7 @@ mod portable_tests {
         const CODE_BASE: u32 = 0x7000;
         let words = [
             0x5282, // head: ADDQ.L #1,D2
-            0x3088, // MOVE.W D0,(A0)   (A0 -> head; writes 0x5282 back)
+            0x3080, // MOVE.W D0,(A0)   (A0 -> head; writes 0x5282 back)
             0x51C9, 0xFFFA, // DBRA D1,head
             0x60F6, // BRA.S head
         ];
