@@ -868,6 +868,58 @@ fn bench_indexed_dest_store_loop() {
     );
 }
 
+/// Exercise the predecrement CLR forms the gameplay profile flagged:
+/// CLR.L -(SP) and CLR.W -(SP) with an ADDQ restoring the stack pointer
+/// each iteration, so the loop runs indefinitely at a fixed SP.
+fn bench_clr_predec_loop() {
+    // 408,560 outer cycles of 514 instructions end exactly at the outer
+    // label with SP restored; the six bytes below SP end cleared.
+    const CYCLES: u32 = 408_560;
+    const INSTRS: u32 = CYCLES * 514;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x727F, // outer: MOVEQ #127,D1
+        0x42A7, // inner: CLR.L -(SP)
+        0x4267, // CLR.W -(SP)
+        0x5C8F, // ADDQ.L #6,SP
+        0x51C9, 0xFFF8, // DBRA D1,inner
+        0x60F2, // BRA.S outer
+    ];
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    for address in 0x3FFA..0x4000 {
+        bus.write_byte(address, 0xAA);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x4000);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.pc, CODE_BASE, "the run ends exactly at the outer label");
+    assert_eq!(cpu.a(7), 0x4000, "SP restored every iteration");
+    for address in 0x3FFA..0x4000 {
+        assert_eq!(bus.read_byte(address), 0, "stack slot cleared");
+    }
+    println!(
+        "batch     predec CLR loop         {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce a path-biased trace that is first recorded through an uncommon
 /// conditional edge before settling into a copy loop on the opposite edge.
 /// A first-path-only
@@ -1479,6 +1531,10 @@ fn main() {
     }
     if only.as_deref() == Some("register-count-shift") {
         bench_register_count_shift_loop();
+        return;
+    }
+    if only.as_deref() == Some("clr-predec") {
+        bench_clr_predec_loop();
         return;
     }
     if only.as_deref() == Some("indexed-dest-store") {
