@@ -372,6 +372,14 @@ pub(crate) enum JitTraceOp {
         size: Size,
         dst: JitEa,
     },
+    /// MOVE of an immediate value to a memory destination through the
+    /// checked window. No source registers, so no staging; a destination
+    /// register update (postinc/predec) commits only after every guard.
+    MoveImmMem {
+        size: Size,
+        value: u32,
+        dst: JitEa,
+    },
     /// CMPA.W/L through `(An)` or `d16(An)`. Unlike ordinary CMP, the
     /// destination is always the full address register and a word source is
     /// sign-extended before the 32-bit comparison.
@@ -1374,6 +1382,7 @@ impl TraceJit {
                     | JitTraceOp::CmpiWordMem { .. }
                     | JitTraceOp::TstMem { .. }
                     | JitTraceOp::ClrMem { .. }
+                    | JitTraceOp::MoveImmMem { .. }
                     | JitTraceOp::AddrCmpMemToReg { .. }
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
@@ -1595,6 +1604,10 @@ impl TraceJit {
                     JitTraceOp::ClrMem { .. } => {
                         let env = mem_env.as_ref().expect("ClrMem implies a window env");
                         emit_clr_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::MoveImmMem { .. } => {
+                        let env = mem_env.as_ref().expect("MoveImmMem implies a window env");
+                        emit_move_imm_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::AddrCmpMemToReg { .. } => {
                         let env = mem_env
@@ -1890,7 +1903,8 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::MemAddqSubq { .. }
             | JitTraceOp::AnDispBit { .. }
             | JitTraceOp::PeaDisp { .. }
-            | JitTraceOp::ClrMem { .. } => return false,
+            | JitTraceOp::ClrMem { .. }
+            | JitTraceOp::MoveImmMem { .. } => return false,
         }
     }
     mem_written_flags != 0 && consumed & !mem_written_flags == 0
@@ -2166,6 +2180,16 @@ impl JitTraceOp {
                 (Size::Long, _) => 22,
                 _ => 14,
             },
+            // MOVE #imm to memory per the M68000UM move table: 12 for
+            // byte/word to the extension-less destinations, 16 with a
+            // displacement; long pays the extra immediate fetch.
+            Self::MoveImmMem { size, dst, .. } => match (size, dst) {
+                (Size::Long, JitEa::Disp(_, _)) => 24,
+                (Size::Long, _) => 20,
+                (_, JitEa::Index { .. }) => 18,
+                (_, JitEa::Disp(_, _)) => 16,
+                _ => 12,
+            },
             Self::AddrCmpMemToReg { .. } => 24,
             Self::AddRegToMem { size, dst, .. } => match (size, dst) {
                 (Size::Long, JitEa::Disp(_, _)) => 24,
@@ -2248,6 +2272,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_movem_word_postinc_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_move_imm_mem_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
     if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
@@ -2776,6 +2803,89 @@ fn decode_an_disp_trace_op<B: AddressBus>(
 /// indexed, or absolute EAs. At least one side must be memory; extension
 /// words are captured in execution order for validation and
 /// self-modification checks.
+/// Decode `MOVE #imm,<memory>` for the destination forms that fit the
+/// two extension-word budget: byte/word immediates to `(An)`, `(An)+`,
+/// `-(An)`, and `(d16,An)`, and long immediates to the extension-less
+/// destinations. `MOVE.L #imm,(d16,An)` needs three extension words and
+/// stays on the decoded path.
+fn decode_move_imm_mem_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    let size = match opcode >> 12 {
+        1 => Size::Byte,
+        3 => Size::Word,
+        2 => Size::Long,
+        _ => return None,
+    };
+    // Source must be immediate: mode 7, register 4.
+    if opcode & 0x003F != 0x003C {
+        return None;
+    }
+    let dst_reg = ((opcode >> 9) & 7) as u8;
+    let dst_mode = (opcode >> 6) & 7;
+    let read_ext =
+        |offset: u32, bus: &mut B| bus.try_read_word(cpu.address(pc.wrapping_add(offset))).ok();
+    let (value, extension, extension2, imm_words) = match size {
+        Size::Long => {
+            let hi = read_ext(2, bus)?;
+            let lo = read_ext(4, bus)?;
+            (
+                (u32::from(hi) << 16) | u32::from(lo),
+                Some(hi),
+                Some(lo),
+                2u32,
+            )
+        }
+        Size::Word => {
+            let imm = read_ext(2, bus)?;
+            (u32::from(imm), Some(imm), None, 1)
+        }
+        Size::Byte => {
+            let imm = read_ext(2, bus)?;
+            (u32::from(imm & 0x00FF), Some(imm), None, 1)
+        }
+    };
+    let (dst, extension2) = match dst_mode {
+        2 => (JitEa::Ind(dst_reg), extension2),
+        3 => (JitEa::PostInc(dst_reg), extension2),
+        4 => (JitEa::PreDec(dst_reg), extension2),
+        5 => {
+            if size == Size::Long {
+                // Three extension words in total; TraceBuildOp carries two.
+                return None;
+            }
+            let displacement = read_ext(2 + 2 * imm_words, bus)?;
+            (
+                JitEa::Disp(dst_reg, displacement as i16),
+                Some(displacement),
+            )
+        }
+        6 => {
+            if size == Size::Long {
+                // Immediate high/low plus the brief extension word exceed
+                // TraceBuildOp's two extension slots.
+                return None;
+            }
+            let brief = read_ext(2 + 2 * imm_words, bus)?;
+            (
+                decode_jit_ea(6, u16::from(dst_reg), brief, cpu.cpu_type)?,
+                Some(brief),
+            )
+        }
+        _ => return None,
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension,
+        extension2,
+        pc,
+        op: JitTraceOp::MoveImmMem { size, value, dst },
+    })
+}
+
 fn decode_move_mem_trace_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -3063,6 +3173,9 @@ fn execute_portable_op(
     }
     if matches!(op.op, JitTraceOp::ClrMem { .. }) {
         return execute_portable_clr_mem(cpu, op, code_start, code_end);
+    }
+    if matches!(op.op, JitTraceOp::MoveImmMem { .. }) {
+        return execute_portable_move_imm_mem(cpu, op, code_start, code_end);
     }
     if matches!(op.op, JitTraceOp::AddrCmpMemToReg { .. }) {
         return execute_portable_addr_cmp_mem_to_reg(cpu, op);
@@ -3426,6 +3539,107 @@ fn execute_portable_clr_mem(
         cpu.pc = old_pc;
         None
     }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_move_imm_mem(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::MoveImmMem { size, value, dst } = trace.op else {
+        return None;
+    };
+    let bytes = size.bytes();
+    let aligned_only = cpu.is_pre_68020;
+    let locate = |cpu: &CpuCore, raw: u32| -> Option<u32> {
+        if aligned_only && size != Size::Byte && (raw & 1) != 0 {
+            return None;
+        }
+        if cpu.fm_len == 0 {
+            return None;
+        }
+        let off = (raw & cpu.address_mask).wrapping_sub(cpu.fm_base);
+        if off <= cpu.fm_len - bytes {
+            Some(off)
+        } else {
+            None
+        }
+    };
+    let write = |cpu: &mut CpuCore, off: u32, value: u32| unsafe {
+        let p = (cpu.fm_ptr as *mut u8).add(off as usize);
+        match size {
+            Size::Byte => *p = value as u8,
+            Size::Word => {
+                let b = (value as u16).to_be_bytes();
+                *p = b[0];
+                *p.add(1) = b[1];
+            }
+            Size::Long => {
+                let b = value.to_be_bytes();
+                *p = b[0];
+                *p.add(1) = b[1];
+                *p.add(2) = b[2];
+                *p.add(3) = b[3];
+            }
+        }
+    };
+    let (r, addr, new_reg) = match dst {
+        JitEa::Ind(r) => (r, cpu.dar[8 + r as usize], None),
+        JitEa::PostInc(r) => {
+            let base = cpu.dar[8 + r as usize];
+            (r, base, Some(base.wrapping_add(jit_ea_step(size, r))))
+        }
+        JitEa::PreDec(r) => {
+            let a = cpu.dar[8 + r as usize].wrapping_sub(jit_ea_step(size, r));
+            (r, a, Some(a))
+        }
+        JitEa::Disp(r, displacement) => (
+            r,
+            cpu.dar[8 + r as usize].wrapping_add(displacement as i32 as u32),
+            None,
+        ),
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base_value = cpu.dar[8 + base as usize];
+            let raw_index = match index {
+                JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+                JitDirectReg::Data(r) => cpu.dar[r as usize],
+            };
+            let index_value = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            (
+                base,
+                base_value
+                    .wrapping_add(index_value << scale)
+                    .wrapping_add(displacement as i32 as u32),
+                None,
+            )
+        }
+        _ => return None,
+    };
+    let off = locate(cpu, addr)?;
+    let masked = addr & cpu.address_mask;
+    // Self-modification guard, as in the compiled version: nothing —
+    // including the register update — commits on a bail.
+    if masked < code_end && masked.wrapping_add(bytes) > code_start {
+        return None;
+    }
+    if let Some(v) = new_reg {
+        cpu.dar[8 + r as usize] = v;
+    }
+    write(cpu, off, value);
+    cpu.set_logic_flags(value, size);
+    Some(trace.op.max_cycles())
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
@@ -4243,6 +4457,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::ClrMem { .. } => {
             unreachable!("ClrMem is handled by execute_portable_clr_mem")
         }
+        JitTraceOp::MoveImmMem { .. } => {
+            unreachable!("MoveImmMem is handled by execute_portable_move_imm_mem")
+        }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is handled by execute_portable_addr_cmp_mem_to_reg")
         }
@@ -4871,6 +5088,9 @@ fn emit_jit_op(
         JitTraceOp::ClrMem { .. } => {
             unreachable!("ClrMem is emitted by emit_clr_mem")
         }
+        JitTraceOp::MoveImmMem { .. } => {
+            unreachable!("MoveImmMem is emitted by emit_move_imm_mem")
+        }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is emitted by emit_addr_cmp_mem_to_reg")
         }
@@ -5251,6 +5471,84 @@ fn emit_clr_mem(
     store_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), 0);
     store_u32(builder, cpu, offset_of!(CpuCore, v_flag), 0);
     store_u32(builder, cpu, offset_of!(CpuCore, c_flag), 0);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit MOVE #imm to a memory destination. The address passes the window
+/// and code-overlap checks before the register update, the store, and the
+/// flag writes, so a bail commits nothing.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_move_imm_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::MoveImmMem { size, value, dst } = trace.op else {
+        unreachable!("expected an immediate memory MOVE trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let (address, updated_reg) = match dst {
+        JitEa::Ind(reg) => (load_reg(builder, cpu, JitDirectReg::Addr(reg)), None),
+        JitEa::PostInc(reg) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            let next = builder
+                .ins()
+                .iadd_imm(base, i64::from(jit_ea_step(size, reg)));
+            (base, Some((reg, next)))
+        }
+        JitEa::PreDec(reg) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            let address = builder
+                .ins()
+                .iadd_imm(base, -i64::from(jit_ea_step(size, reg)));
+            (address, Some((reg, address)))
+        }
+        JitEa::Disp(reg, displacement) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            (builder.ins().iadd_imm(base, displacement as i64), None)
+        }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let address = builder.ins().iadd(base, index);
+            (builder.ins().iadd_imm(address, displacement as i64), None)
+        }
+        _ => unreachable!("immediate MOVE decoder admitted an unsupported EA"),
+    };
+    let (off, masked) = checked_window_off(builder, env, bail, address, size);
+    guard_store_not_code(builder, env, bail, masked, size);
+    if let Some((reg, next)) = updated_reg {
+        store_reg(builder, cpu, JitDirectReg::Addr(reg), next);
+    }
+    let value = iconst_u32(builder, value);
+    window_store(builder, env, off, size, value);
+    set_logic_flags(builder, cpu, value, size);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -9143,6 +9441,327 @@ mod portable_tests {
         assert_eq!(ncpu.a(7), 0x0106, "native bail leaves SP untouched");
         assert_eq!(ncpu.get_ccr(), 0x10);
         assert_eq!(nmem, pmem, "neither path commits anything");
+    }
+
+    #[test]
+    fn move_immediate_to_memory_decodes_within_the_extension_budget() {
+        // 3F3C = MOVE.W #imm,-(SP): the 20.9M-dispatch gameplay blocker.
+        let dcpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0x3F3C);
+        bus.write_word(0x0102, 0x1234);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W #imm,-(SP) should decode");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Word,
+                value: 0x1234,
+                dst: JitEa::PreDec(7),
+            }
+        ));
+        // 2F3C = MOVE.L #imm,-(SP): both extension words carry the value.
+        bus.write_word(0x0100, 0x2F3C);
+        bus.write_word(0x0102, 0xDEAD);
+        bus.write_word(0x0104, 0xBEEF);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.L #imm,-(SP) should decode");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Long,
+                value: 0xDEAD_BEEF,
+                dst: JitEa::PreDec(7),
+            }
+        ));
+        assert_eq!((t.extension, t.extension2), (Some(0xDEAD), Some(0xBEEF)));
+        // Byte immediates use the extension word's low byte only.
+        bus.write_word(0x0100, 0x1F3C);
+        bus.write_word(0x0102, 0xAABB);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.B #imm,-(SP) should decode");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Byte,
+                value: 0xBB,
+                dst: JitEa::PreDec(7),
+            }
+        ));
+        // MOVE.W #imm,(d16,An): the displacement rides in extension2.
+        bus.write_word(0x0100, 0x3B7C); // MOVE.W #imm,(d16,A5)
+        bus.write_word(0x0102, 0x0042);
+        bus.write_word(0x0104, 0x0010);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W #imm,(d16,An) should decode");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Word,
+                value: 0x0042,
+                dst: JitEa::Disp(5, 0x0010),
+            }
+        ));
+        // MOVE.L #imm,(d16,An) needs three extension words: stays decoded.
+        bus.write_word(0x0100, 0x2B7C);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040);
+        assert!(
+            !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
+            "three-extension form must not decode as MoveImmMem"
+        );
+        // 31BC = MOVE.W #imm,(d8,A0,Xn): the immediate word plus the brief
+        // extension fit the two-slot budget.
+        bus.write_word(0x0100, 0x31BC);
+        bus.write_word(0x0102, 0x0042);
+        bus.write_word(0x0104, 0x2004); // (4,A0,D2.W)
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W #imm,(d8,An,Xn) should decode");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Word,
+                value: 0x0042,
+                dst: JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(2),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 4,
+                },
+            }
+        ));
+        // ...but the long form would need three words and stays decoded.
+        bus.write_word(0x0100, 0x21BC);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040);
+        assert!(
+            !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
+            "long immediate to an indexed destination must stay decoded"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_move_immediate_to_memory_matches_portable_and_bails_without_moving_sp() {
+        // Case 0: MOVE.W #imm,-(SP). Case 1: MOVE.L #imm,-(SP).
+        // Case 2: MOVE.W #imm,(d16,A5).
+        let cases: [(u16, JitTraceOp, Option<u16>, Option<u16>); 4] = [
+            (
+                0x3F3C,
+                JitTraceOp::MoveImmMem {
+                    size: Size::Word,
+                    value: 0x1234,
+                    dst: JitEa::PreDec(7),
+                },
+                Some(0x1234),
+                None,
+            ),
+            (
+                0x2F3C,
+                JitTraceOp::MoveImmMem {
+                    size: Size::Long,
+                    value: 0xDEAD_BEEF,
+                    dst: JitEa::PreDec(7),
+                },
+                Some(0xDEAD),
+                Some(0xBEEF),
+            ),
+            (
+                0x3B7C,
+                JitTraceOp::MoveImmMem {
+                    size: Size::Word,
+                    value: 0x8000, // negative word: N must set
+                    dst: JitEa::Disp(5, 0x0010),
+                },
+                Some(0x8000),
+                Some(0x0010),
+            ),
+            (
+                0x31BC, // MOVE.W #imm,(4,A0,D2.W)
+                JitTraceOp::MoveImmMem {
+                    size: Size::Word,
+                    value: 0x0042,
+                    dst: JitEa::Index {
+                        base: 0,
+                        index: JitDirectReg::Data(2),
+                        index_long: false,
+                        scale: 0,
+                        displacement: 4,
+                    },
+                },
+                Some(0x0042),
+                Some(0x2004),
+            ),
+        ];
+        for (case, (opcode, op, ext, ext2)) in cases.iter().enumerate() {
+            let mv = TraceBuildOp {
+                opcode: *opcode,
+                extension: *ext,
+                extension2: *ext2,
+                pc: 0x0100,
+                op: *op,
+            };
+            let oplen = 2 + 2 * (ext.is_some() as u32 + ext2.is_some() as u32);
+            let branch = TraceBuildOp {
+                opcode: 0x60FE,
+                extension: None,
+                extension2: None,
+                pc: 0x0100 + oplen,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -(oplen as i32) - 2,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let ops = vec![mv, branch];
+            let end = 0x0100 + oplen + 2;
+            let prepare = |mem: &mut Vec<u8>| {
+                let mut c = cpu();
+                c.set_cpu_type(CpuType::M68040);
+                c.set_a(5, 0x0300);
+                c.set_a(7, 0x0800);
+                c.set_ccr(0x10); // X set: MOVE must preserve it
+                mem[0x0700..0x0708].fill(0xAA);
+                mem[0x0310..0x0312].fill(0xAA);
+                attach_window(&mut c, mem);
+                c
+            };
+            let mut emem = vec![0u8; 0x1000];
+            let mut expected = prepare(&mut emem);
+            let expected_packed = execute_portable_trace(&mut expected, &ops, 0x0100, end);
+            let mut amem = vec![0u8; 0x1000];
+            let mut actual = prepare(&mut amem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+                .expect("immediate store loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(
+                actual_packed, expected_packed,
+                "case {case}: cycles/retired"
+            );
+            assert_eq!(actual.dar, expected.dar, "case {case}: registers");
+            assert_eq!(actual.get_ccr(), expected.get_ccr(), "case {case}: ccr");
+            assert_eq!(amem, emem, "case {case}: memory");
+            assert_ne!(actual.get_ccr() & 0x10, 0, "case {case}: X preserved");
+
+            if case == 0 {
+                // A predec store aimed at the trace's own code bails on
+                // both paths with SP untouched.
+                let overlap = |mem: &mut Vec<u8>| {
+                    let mut c = prepare(mem);
+                    c.set_a(7, 0x0104); // 0x0104 - 2 = 0x0102, inside the trace
+                    c
+                };
+                let mut pmem = vec![0u8; 0x1000];
+                let mut pcpu = overlap(&mut pmem);
+                let packed = execute_portable_trace(&mut pcpu, &ops, 0x0100, end);
+                assert_eq!(packed, 0, "portable bails on store into code");
+                assert_eq!(pcpu.a(7), 0x0104, "portable bail leaves SP untouched");
+                let mut nmem = vec![0u8; 0x1000];
+                let mut ncpu = overlap(&mut nmem);
+                let packed = unsafe { compiled.call_native(&mut ncpu, 1) };
+                assert_eq!(packed, 0, "native bails on store into code");
+                assert_eq!(ncpu.a(7), 0x0104, "native bail leaves SP untouched");
+                assert_eq!(nmem, pmem, "neither path commits anything");
+            }
+        }
+    }
+
+    #[test]
+    fn move_immediate_matches_the_interpreter_with_exact_68000_cycles() {
+        // Native parity alone shares this feature's addressing, flag, and
+        // max_cycles logic on both sides; a shared regression would pass
+        // it. This differential pits the portable executor against the
+        // interpreter's own step() on a 68000 for every admitted form,
+        // asserting the exact register/memory/NZVCX state AND that the
+        // trace's cycle charge equals the interpreter's true cycle count.
+        let cases: [(&[u16], &str); 4] = [
+            (&[0x3F3C, 0x8111], "MOVE.W #imm,-(SP)"),
+            (&[0x2F3C, 0xDEAD, 0xBEEF], "MOVE.L #imm,-(SP)"),
+            (&[0x3B7C, 0x0000, 0x0010], "MOVE.W #zero,(d16,A5)"),
+            (&[0x31BC, 0x0042, 0x2004], "MOVE.W #imm,(4,A0,D2.W)"),
+        ];
+        for (words, label) in cases {
+            let setup = |c: &mut CpuCore| {
+                c.set_cpu_type(CpuType::M68000);
+                c.set_a(0, 0x0300);
+                c.set_a(5, 0x0400);
+                c.set_a(7, 0x0800);
+                c.set_d(2, 0x0006);
+                c.set_ccr(0x1F); // X must survive; N/Z/V/C must be rewritten
+                c.pc = 0x0100;
+            };
+            // Interpreter twin: true 68000 execution with true cycles,
+            // reading and writing through its own bus.
+            let mut ibus = super::super::memory::LinearMemoryBus::new(0x1000);
+            for (index, word) in words.iter().enumerate() {
+                ibus.write_word(0x0100 + index as u32 * 2, *word);
+            }
+            let mut icpu = cpu();
+            setup(&mut icpu);
+            let icycles = match icpu.step(&mut ibus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+            // Portable twin: the trace op decoded from the same bytes,
+            // executing through the attached window.
+            let mut pmem = vec![0u8; 0x1000];
+            for (index, word) in words.iter().enumerate() {
+                pmem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            let mut pcpu = cpu();
+            setup(&mut pcpu);
+            attach_window(&mut pcpu, &mut pmem);
+            let t = decode_trace_op(&pcpu, &mut ibus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: should decode"));
+            assert!(matches!(t.op, JitTraceOp::MoveImmMem { .. }), "{label}");
+            let pcycles =
+                execute_portable_op(&mut pcpu, t, 0x0100, 0x0100 + words.len() as u32 * 2)
+                    .unwrap_or_else(|| panic!("{label}: portable executes"));
+            assert_eq!(pcpu.dar, icpu.dar, "{label}: registers");
+            assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "{label}: NZVCX");
+            // The stored value, read from each twin's own memory at the
+            // interpreter-computed destination.
+            let (dst_addr, bytes) = match t.op {
+                JitTraceOp::MoveImmMem {
+                    size,
+                    dst: JitEa::PreDec(r),
+                    ..
+                } => (icpu.a(r.into()), size.bytes()),
+                JitTraceOp::MoveImmMem {
+                    size,
+                    dst: JitEa::Disp(r, d),
+                    ..
+                } => (icpu.a(r.into()).wrapping_add(d as i32 as u32), size.bytes()),
+                JitTraceOp::MoveImmMem {
+                    size,
+                    dst:
+                        JitEa::Index {
+                            base, displacement, ..
+                        },
+                    ..
+                } => (
+                    icpu.a(base.into())
+                        .wrapping_add(icpu.d(2) as u16 as i16 as i32 as u32)
+                        .wrapping_add(displacement as i32 as u32),
+                    size.bytes(),
+                ),
+                _ => unreachable!(),
+            };
+            for offset in 0..bytes {
+                let a = dst_addr + offset;
+                assert_eq!(
+                    pmem[a as usize],
+                    ibus.read_byte(a),
+                    "{label}: stored byte at {a:#06x}"
+                );
+            }
+            assert_eq!(
+                pcycles, icycles,
+                "{label}: the trace cycle charge must equal the 68000's"
+            );
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
