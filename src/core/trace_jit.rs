@@ -3278,6 +3278,8 @@ fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
         BinaryOp::Cmp => JitBinaryOp::Cmp,
         BinaryOp::Add => JitBinaryOp::Add,
         BinaryOp::Sub => JitBinaryOp::Sub,
+        BinaryOp::And => JitBinaryOp::And,
+        BinaryOp::Or => JitBinaryOp::Or,
         _ => return None,
     };
     let (src, extension) = match src {
@@ -3760,6 +3762,8 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
         JitBinaryOp::Cmp => BinaryOp::Cmp,
         JitBinaryOp::Add => BinaryOp::Add,
         JitBinaryOp::Sub => BinaryOp::Sub,
+        JitBinaryOp::And => BinaryOp::And,
+        JitBinaryOp::Or => BinaryOp::Or,
         _ => return None,
     };
     let src = match src {
@@ -5973,6 +5977,16 @@ fn emit_alu_mem_to_reg(
             let result = builder.ins().isub(dst_value, src_value);
             write_data_reg_sized(builder, cpu, dst, size, result);
             set_sub_flags(builder, cpu, src_value, dst_value, result, size);
+        }
+        JitBinaryOp::And => {
+            let result = builder.ins().band(dst_value, src_value);
+            write_data_reg_sized(builder, cpu, dst, size, result);
+            set_logic_flags(builder, cpu, result, size);
+        }
+        JitBinaryOp::Or => {
+            let result = builder.ins().bor(dst_value, src_value);
+            write_data_reg_sized(builder, cpu, dst, size, result);
+            set_logic_flags(builder, cpu, result, size);
         }
         _ => unreachable!("unsupported memory-to-register ALU operation"),
     }
@@ -10340,6 +10354,161 @@ mod portable_tests {
                 "a four-op prefix is below the salvage bar"
             );
         });
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_memory_and_or_match_portable() {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0xC268,
+                extension: Some(0x0010),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::AluMemToReg {
+                    op: JitBinaryOp::And,
+                    size: Size::Word,
+                    src: JitEa::Disp(0, 0x0010),
+                    dst: 1,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x8468,
+                extension: Some(0x0012),
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::AluMemToReg {
+                    op: JitBinaryOp::Or,
+                    size: Size::Word,
+                    src: JitEa::Disp(0, 0x0012),
+                    dst: 2,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60F6,
+                extension: None,
+                extension2: None,
+                pc: 0x0108,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -10,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        // The portable executor re-reads extension words from the window;
+        // seed the instruction bytes in both arms' memory.
+        let seed = |mem: &mut [u8]| {
+            for (index, word) in [0xC268u16, 0x0010, 0x8468, 0x0012, 0x60F6]
+                .iter()
+                .enumerate()
+            {
+                mem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            mem[0x0310..0x0312].copy_from_slice(&0x0FF0u16.to_be_bytes());
+            mem[0x0312..0x0314].copy_from_slice(&0x00AAu16.to_be_bytes());
+        };
+        let mut mem = vec![0u8; 0x1000];
+        seed(&mut mem);
+        let mut native = cpu();
+        native.set_cpu_type(CpuType::M68040);
+        native.set_a(0, 0x0300);
+        native.set_d(1, 0xFFFF_F0F0);
+        native.set_d(2, 0x1111_0000);
+        native.set_ccr(0x10);
+        attach_window(&mut native, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("AND/OR loop should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!((packed >> 32) as u32, 3, "all ops retired");
+        assert_eq!(native.d(1) & 0xFFFF, 0x00F0, "AND result merged low word");
+        assert_eq!(native.d(2) & 0xFFFF, 0x00AA, "OR result merged low word");
+        assert_ne!(native.get_ccr() & 0x10, 0, "X preserved");
+
+        let mut pmem = vec![0u8; 0x1000];
+        seed(&mut pmem);
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_a(0, 0x0300);
+        portable.set_d(1, 0xFFFF_F0F0);
+        portable.set_d(2, 0x1111_0000);
+        portable.set_ccr(0x10);
+        attach_window(&mut portable, &mut pmem);
+        let ppacked = execute_portable_trace(&mut portable, &ops, 0x0100, 0x010A);
+        assert_eq!(ppacked, packed, "retired count and cycles agree");
+        assert_eq!(portable.d(1), native.d(1));
+        assert_eq!(portable.d(2), native.d(2));
+        assert_eq!(portable.get_ccr(), native.get_ccr(), "flags agree");
+    }
+
+    #[test]
+    fn memory_and_or_match_the_interpreter_with_exact_cycles() {
+        // The census exemplar C270 (AND.W (d16,A0),D1) and the OR twin,
+        // differentially against step() on a 68000: exact registers,
+        // logic flags with X preserved, and cycle charges.
+        let cases: [(&[u16], &str); 3] = [
+            (&[0xC270, 0x2004], "AND.W (4,A0,D2.W),D1"),
+            (&[0xC268, 0x0010], "AND.W (d16,A0),D1"),
+            (&[0x8268, 0x0010], "OR.W (d16,A0),D1"),
+        ];
+        for (words, label) in cases {
+            let setup = |c: &mut CpuCore| {
+                c.set_cpu_type(CpuType::M68000);
+                c.set_a(0, 0x0300);
+                c.set_d(1, 0xFFFF_F0F0);
+                c.set_d(2, 0x0006);
+                c.set_ccr(0x1F); // X must survive; NZVC rewritten
+                c.pc = 0x0100;
+            };
+            let mut ibus = super::super::memory::LinearMemoryBus::new(0x1000);
+            for (index, word) in words.iter().enumerate() {
+                ibus.write_word(0x0100 + index as u32 * 2, *word);
+            }
+            ibus.write_word(0x0310, 0x0FF0);
+            ibus.write_word(0x030A, 0x0FF0);
+            let mut icpu = cpu();
+            setup(&mut icpu);
+            let icycles = match icpu.step(&mut ibus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+            let mut pmem = vec![0u8; 0x1000];
+            for (index, word) in words.iter().enumerate() {
+                pmem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            pmem[0x0310..0x0312].copy_from_slice(&0x0FF0u16.to_be_bytes());
+            pmem[0x030A..0x030C].copy_from_slice(&0x0FF0u16.to_be_bytes());
+            let mut pcpu = cpu();
+            setup(&mut pcpu);
+            attach_window(&mut pcpu, &mut pmem);
+            let t = decode_trace_op(&pcpu, &mut ibus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: should decode"));
+            assert!(
+                matches!(
+                    t.op,
+                    JitTraceOp::AluMemToReg {
+                        op: JitBinaryOp::And | JitBinaryOp::Or,
+                        ..
+                    }
+                ),
+                "{label}"
+            );
+            let pcycles =
+                execute_portable_op(&mut pcpu, t, 0x0100, 0x0100 + words.len() as u32 * 2)
+                    .unwrap_or_else(|| panic!("{label}: portable executes"));
+            assert_eq!(pcpu.dar, icpu.dar, "{label}: registers");
+            assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "{label}: NZVCX");
+            // The memory-ALU family charges conservative cycle maxima
+            // (the budget-headroom convention its existing ops use), so
+            // the trace may overcharge but must never undercharge.
+            assert!(
+                pcycles >= icycles,
+                "{label}: trace charge {pcycles} under the 68000's {icycles}"
+            );
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
