@@ -666,10 +666,12 @@ pub(crate) struct TraceJit {
     /// Heads that have earned call-through permission: a recording here
     /// blocked at a recordable call, so future candidacy at the same pc
     /// starts with permission instead of re-earning it through a doomed
-    /// probe attempt. Direct-mapped and lossy: a collision drops a bit,
-    /// which only costs the one extra blocked attempt that was the
-    /// universal price before this table existed.
-    earned_call_permission: Vec<u32>,
+    /// probe attempt. Two-way per index: the gameplay profile shows hot
+    /// call-heads landing in the same slot (two of its worst cyclers
+    /// collide), and one spare way absorbs exactly that. Still lossy
+    /// beyond two -- losing an entry only costs the one extra blocked
+    /// attempt that was the universal price before the table existed.
+    earned_call_permission: Vec<[u32; 2]>,
 }
 
 impl fmt::Debug for TraceJit {
@@ -703,7 +705,7 @@ impl TraceJit {
             next_func: 0,
             slots: (0..TRACE_CACHE_SIZE).map(|_| TraceSlot::Empty).collect(),
             recording: None,
-            earned_call_permission: vec![u32::MAX; TRACE_CACHE_SIZE],
+            earned_call_permission: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
         }
     }
 
@@ -1128,11 +1130,25 @@ impl TraceJit {
     }
 
     fn grant_call_permission(&mut self, pc: u32) {
-        self.earned_call_permission[trace_cache_index(pc)] = pc;
+        let ways = &mut self.earned_call_permission[trace_cache_index(pc)];
+        if ways[0] == pc || ways[1] == pc {
+            return;
+        }
+        if ways[0] == u32::MAX {
+            ways[0] = pc;
+        } else if ways[1] == u32::MAX {
+            ways[1] = pc;
+        } else {
+            // Both ways live: rotate so persistent pairs survive and a
+            // third colliding head still makes progress eventually.
+            ways[1] = ways[0];
+            ways[0] = pc;
+        }
     }
 
     fn has_call_permission(&self, pc: u32) -> bool {
-        self.earned_call_permission[trace_cache_index(pc)] == pc
+        let ways = &self.earned_call_permission[trace_cache_index(pc)];
+        ways[0] == pc || ways[1] == pc
     }
 
     fn record_trace_target(&mut self, pc: u32, cpu_type: CpuType) {
@@ -15071,5 +15087,11 @@ mod portable_tests {
                 ..
             } if *pc == COLLIDER
         ));
+        // Two colliding call-heads both keep their permission: the
+        // gameplay profile's two worst cyclers share one index, and the
+        // second table way exists for exactly that pair.
+        jit.grant_call_permission(COLLIDER);
+        assert!(jit.has_call_permission(HEAD));
+        assert!(jit.has_call_permission(COLLIDER));
     }
 }
