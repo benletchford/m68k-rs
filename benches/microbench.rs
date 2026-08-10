@@ -973,6 +973,56 @@ fn bench_move_imm_store_loop() {
     );
 }
 
+/// The ROM-prologue frame shape: LINK, a store through the frame pointer,
+/// UNLK, loop. Base cannot admit LINK (the head blocks at op 0) and
+/// interprets the whole loop; with admission the frame ops compile.
+fn bench_link_unlk_frame_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x4E56, 0xFFF8, // head: LINK A6,#-8
+        0x5283, // ADDQ.L #1,D3
+        0x3D43, 0xFFFC, // MOVE.W D3,-4(A6)
+        0x4E5E, // UNLK A6
+        0x51C8, 0xFFF2, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60EC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    // The budget may stop mid-iteration; the frame slot trails D3 by at
+    // most one.
+    assert!(
+        (cpu.d(3) & 0xFFFF).abs_diff(u32::from(bus.read_word(0x7FF8))) <= 1,
+        "the frame store lands every iteration"
+    );
+    println!(
+        "batch     link/unlk frame loop    {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce a path-biased trace that is first recorded through an uncommon
 /// conditional edge before settling into a copy loop on the opposite edge.
 /// A first-path-only
@@ -1584,6 +1634,10 @@ fn main() {
     }
     if only.as_deref() == Some("register-count-shift") {
         bench_register_count_shift_loop();
+        return;
+    }
+    if only.as_deref() == Some("link-unlk") {
+        bench_link_unlk_frame_loop();
         return;
     }
     if only.as_deref() == Some("clr-predec") {
