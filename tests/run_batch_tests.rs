@@ -1397,3 +1397,26 @@ fn mem_trace_indexed_move_and_postinc_add_matches_step() {
         },
     );
 }
+
+/// A LINK/UNLK frame loop with a store through the frame pointer -- the
+/// ROM-prologue shape behind the biggest blocked heads in the gameplay
+/// profile. Must match step() through the whole lifecycle.
+#[test]
+fn link_unlk_frame_loop_matches_step() {
+    let words = &[
+        0x4E56, 0xFFF8, // $1000: LINK A6,#-8
+        0x5283, // $1004: ADDQ.L #1,D3
+        0x3D43, 0xFFFC, // $1006: MOVE.W D3,-4(A6)
+        0x4E5E, // $100A: UNLK A6
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0x5347, // $1010: SUBQ.W #1,D7
+        0x6602, // $1012: BNE.S $1016
+        0xA000, // $1014: sentinel
+        0x707F, // $1016: MOVEQ #127,D0
+        0x60E6, // $1018: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("link/unlk frame loop", words, CpuType::M68040, |cpu| {
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}

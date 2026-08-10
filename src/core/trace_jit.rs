@@ -412,6 +412,21 @@ pub(crate) enum JitTraceOp {
         reg: u8,
         displacement: i16,
     },
+    /// `LINK An,#d16`: push An through the checked window, point An at the
+    /// pushed frame, then move SP by the displacement. No condition code
+    /// changes; every check precedes the store and both register updates so
+    /// a bail commits nothing. A7 forms are never admitted (the pushed
+    /// value is generation-dependent for LINK A7).
+    Link {
+        reg: u8,
+        displacement: i16,
+    },
+    /// `UNLK An`: reload SP from An and pop the saved frame pointer back
+    /// into An through the checked window. The load is bounds/alignment
+    /// checked before either register updates.
+    Unlk {
+        reg: u8,
+    },
     /// ADDQ/SUBQ through a checked address-register-relative memory EA.
     MemAddqSubq {
         data: u32,
@@ -1387,6 +1402,8 @@ impl TraceJit {
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::PeaDisp { .. }
+                    | JitTraceOp::Link { .. }
+                    | JitTraceOp::Unlk { .. }
                     | JitTraceOp::MemAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
                     | JitTraceOp::IndirectJsr { .. }
@@ -1637,6 +1654,14 @@ impl TraceJit {
                     JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
                         let env = mem_env.as_ref().expect("AnDisp implies a window env");
                         emit_an_disp_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::Link { .. } => {
+                        let env = mem_env.as_ref().expect("Link implies a window env");
+                        emit_link(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::Unlk { .. } => {
+                        let env = mem_env.as_ref().expect("Unlk implies a window env");
+                        emit_unlk(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::PeaDisp { .. } => {
                         let env = mem_env.as_ref().expect("PeaDisp implies a window env");
@@ -1903,6 +1928,8 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::MemAddqSubq { .. }
             | JitTraceOp::AnDispBit { .. }
             | JitTraceOp::PeaDisp { .. }
+            | JitTraceOp::Link { .. }
+            | JitTraceOp::Unlk { .. }
             | JitTraceOp::ClrMem { .. }
             | JitTraceOp::MoveImmMem { .. } => return false,
         }
@@ -2204,6 +2231,9 @@ impl JitTraceOp {
             // MC68000 PEA (d16,An): twelve-cycle push plus the four-cycle
             // displacement extension fetch.
             Self::PeaDisp { .. } => 16,
+            // Interpreter parity: exec_link charges 16, exec_unlk 12.
+            Self::Link { .. } => 16,
+            Self::Unlk { .. } => 12,
         }
     }
 
@@ -2242,6 +2272,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_indirect_jsr_trace_op(pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_link_unlk_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
     if let Some(op) = decode_binary_immediate_data_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
@@ -2290,6 +2323,41 @@ fn decode_trace_op<B: AddressBus>(
         pc,
         op,
     })
+}
+
+/// Decode `LINK An,#d16` / `UNLK An`. A7 forms are excluded: LINK A7's
+/// pushed value is generation-dependent (the 68040 decrements first) and
+/// UNLK A7 is degenerate; ROM prologues use A6.
+fn decode_link_unlk_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    let reg = (opcode & 7) as u8;
+    if opcode & 0xFFF8 == 0x4E50 && reg != 7 {
+        let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+        return Some(TraceBuildOp {
+            opcode,
+            extension: Some(extension),
+            extension2: None,
+            pc,
+            op: JitTraceOp::Link {
+                reg,
+                displacement: extension as i16,
+            },
+        });
+    }
+    if opcode & 0xFFF8 == 0x4E58 && reg != 7 {
+        return Some(TraceBuildOp {
+            opcode,
+            extension: None,
+            extension2: None,
+            pc,
+            op: JitTraceOp::Unlk { reg },
+        });
+    }
+    None
 }
 
 /// Decode the register-source, 32-bit-result form of the 68020 long
@@ -3186,6 +3254,12 @@ fn execute_portable_op(
     if matches!(op.op, JitTraceOp::MemAddqSubq { .. }) {
         return execute_portable_mem_addq_subq(cpu, op, code_start, code_end);
     }
+    if matches!(op.op, JitTraceOp::Link { .. }) {
+        return execute_portable_link(cpu, op, code_start, code_end);
+    }
+    if matches!(op.op, JitTraceOp::Unlk { .. }) {
+        return execute_portable_unlk(cpu, op);
+    }
     if matches!(op.op, JitTraceOp::PeaDisp { .. }) {
         return execute_portable_pea_disp(cpu, op, code_start, code_end);
     }
@@ -3335,6 +3409,70 @@ fn execute_portable_pea_disp(
         cpu.pc = old_pc;
         None
     }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_link(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::Link { reg, displacement } = trace.op else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let new_sp = cpu.dar[15].wrapping_sub(4);
+    if cpu.is_pre_68020 && (new_sp & 1) != 0 {
+        return None;
+    }
+    let masked = new_sp & cpu.address_mask;
+    let off = masked.wrapping_sub(cpu.fm_base);
+    if off > cpu.fm_len - 4 {
+        return None;
+    }
+    if masked < code_end && masked.wrapping_add(4) > code_start {
+        return None;
+    }
+    let an = cpu.dar[8 + reg as usize];
+    unsafe {
+        let p = (cpu.fm_ptr as *mut u8).add(off as usize);
+        let b = an.to_be_bytes();
+        *p = b[0];
+        *p.add(1) = b[1];
+        *p.add(2) = b[2];
+        *p.add(3) = b[3];
+    }
+    cpu.dar[8 + reg as usize] = new_sp;
+    cpu.dar[15] = new_sp.wrapping_add(displacement as i32 as u32);
+    Some(trace.op.max_cycles())
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_unlk(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::Unlk { reg } = trace.op else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let addr = cpu.dar[8 + reg as usize];
+    if cpu.is_pre_68020 && (addr & 1) != 0 {
+        return None;
+    }
+    let off = (addr & cpu.address_mask).wrapping_sub(cpu.fm_base);
+    if off > cpu.fm_len - 4 {
+        return None;
+    }
+    let value = unsafe {
+        let p = (cpu.fm_ptr as *const u8).add(off as usize);
+        u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+    };
+    cpu.dar[15] = addr.wrapping_add(4);
+    cpu.dar[8 + reg as usize] = value;
+    Some(trace.op.max_cycles())
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
@@ -4475,6 +4613,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::PeaDisp { .. } => {
             unreachable!("PeaDisp is handled by execute_portable_pea_disp")
         }
+        JitTraceOp::Link { .. } | JitTraceOp::Unlk { .. } => {
+            unreachable!("LINK/UNLK are handled by execute_portable_link/unlk")
+        }
     }
 }
 
@@ -5099,6 +5240,9 @@ fn emit_jit_op(
         }
         JitTraceOp::MemAddqSubq { .. } => {
             unreachable!("MemAddqSubq is emitted by emit_mem_addq_subq")
+        }
+        JitTraceOp::Link { .. } | JitTraceOp::Unlk { .. } => {
+            unreachable!("LINK/UNLK are emitted by emit_link/emit_unlk")
         }
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
             unreachable!("AnDisp ops are emitted by emit_an_disp_mem")
@@ -6007,6 +6151,70 @@ fn emit_pea_disp(
     guard_store_not_code(builder, env, bail, masked, Size::Long);
     window_store(builder, env, off, Size::Long, address);
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit `LINK An,#d16`. Interpreter order: push An's original value, then
+/// An = the decremented SP, then SP moves by the displacement. All checks
+/// precede the store and both register writes.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_link(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::Link { reg, displacement } = trace.op else {
+        unreachable!("expected LINK trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let an = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+    let sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
+    let new_sp = builder.ins().iadd_imm(sp, -4);
+    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    guard_store_not_code(builder, env, bail, masked, Size::Long);
+    window_store(builder, env, off, Size::Long, an);
+    store_reg(builder, cpu, JitDirectReg::Addr(reg), new_sp);
+    let final_sp = builder.ins().iadd_imm(new_sp, displacement as i64);
+    store_reg(builder, cpu, JitDirectReg::Addr(7), final_sp);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit `UNLK An`. Interpreter order: SP reloads from An, the saved frame
+/// pointer pops into An. The load is checked before either register writes.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_unlk(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::Unlk { reg } = trace.op else {
+        unreachable!("expected UNLK trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let addr = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+    let (off, _) = checked_window_off(builder, env, bail, addr, Size::Long);
+    let value = window_load(builder, env, off, Size::Long);
+    let new_sp = builder.ins().iadd_imm(addr, 4);
+    store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    store_reg(builder, cpu, JitDirectReg::Addr(reg), value);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -11932,5 +12140,211 @@ mod portable_tests {
             !report.contains("backend"),
             "a classified wait is not attributed to the compiler backend"
         );
+    }
+
+    #[test]
+    fn link_and_unlk_a7_forms_are_never_admitted() {
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word_at(0x0100, 0x4E57); // LINK A7,#d16
+        bus.write_word_at(0x0102, 0xFFF8);
+        bus.write_word_at(0x0200, 0x4E5F); // UNLK A7
+        let cpu = CpuCore::new();
+        assert!(decode_link_unlk_trace_op(&cpu, &mut bus, 0x0100, 0x4E57).is_none());
+        assert!(decode_link_unlk_trace_op(&cpu, &mut bus, 0x0200, 0x4E5F).is_none());
+        // The A6 forms decode.
+        bus.write_word_at(0x0300, 0x4E56);
+        bus.write_word_at(0x0302, 0xFFF8);
+        let link = decode_link_unlk_trace_op(&cpu, &mut bus, 0x0300, 0x4E56).unwrap();
+        assert!(matches!(
+            link.op,
+            JitTraceOp::Link {
+                reg: 6,
+                displacement: -8
+            }
+        ));
+        assert_eq!(link.length(), 4);
+        let unlk = decode_link_unlk_trace_op(&cpu, &mut bus, 0x0400, 0x4E5E).unwrap();
+        assert!(matches!(unlk.op, JitTraceOp::Unlk { reg: 6 }));
+        assert_eq!(unlk.length(), 2);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    fn link_unlk_loop_ops() -> Vec<TraceBuildOp> {
+        vec![
+            TraceBuildOp {
+                opcode: 0x4E56,
+                extension: Some(0xFFF8),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::Link {
+                    reg: 6,
+                    displacement: -8,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4E5E,
+                extension: None,
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::Unlk { reg: 6 },
+            },
+            TraceBuildOp {
+                opcode: 0x60F8,
+                extension: None,
+                extension2: None,
+                pc: 0x0106,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -8,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ]
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_link_unlk_matches_portable() {
+        let ops = link_unlk_loop_ops();
+        let mut mem = vec![0u8; 0x1000];
+        let mut native = cpu();
+        native.set_cpu_type(CpuType::M68040);
+        native.set_a(6, 0x1111_2222);
+        native.set_a(7, 0x0800);
+        attach_window(&mut native, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("frame loop should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!((packed >> 32) as u32, 3, "all ops retired");
+        assert_eq!(native.a(6), 0x1111_2222, "frame pointer restored");
+        assert_eq!(native.a(7), 0x0800, "stack balanced");
+        assert_eq!(
+            &mem[0x07FC..0x0800],
+            &0x1111_2222u32.to_be_bytes(),
+            "the old frame pointer was pushed"
+        );
+
+        let mut pmem = vec![0u8; 0x1000];
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_a(6, 0x1111_2222);
+        portable.set_a(7, 0x0800);
+        attach_window(&mut portable, &mut pmem);
+        let ppacked = execute_portable_trace(&mut portable, &ops, 0x0100, 0x0108);
+        assert_eq!(ppacked, packed, "retired count and cycles agree");
+        assert_eq!(portable.a(6), native.a(6));
+        assert_eq!(portable.a(7), native.a(7));
+        assert_eq!(pmem, mem, "memory effects agree");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn link_bails_atomically_on_window_and_own_span() {
+        // Out of window: SP underflows the slab. Nothing commits.
+        let ops = link_unlk_loop_ops();
+        let mut mem = vec![0u8; 0x1000];
+        let mut c = cpu();
+        c.set_cpu_type(CpuType::M68040);
+        c.set_a(6, 0x1111_2222);
+        c.set_a(7, 0x0002);
+        attach_window(&mut c, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&c, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("frame loop should compile");
+        let packed = unsafe { compiled.call_native(&mut c, 1) };
+        assert_eq!((packed >> 32) as u32, 0, "bails before the push");
+        assert_eq!(c.a(6), 0x1111_2222);
+        assert_eq!(c.a(7), 0x0002);
+        assert_eq!(c.pc, 0x0100, "resume at the LINK for full dispatch");
+
+        // Store into the trace's own code: in-window, aligned, guarded.
+        let mut mem2 = vec![0u8; 0x1000];
+        let mut c2 = cpu();
+        c2.set_cpu_type(CpuType::M68040);
+        c2.set_a(6, 0x1111_2222);
+        c2.set_a(7, 0x0106);
+        attach_window(&mut c2, &mut mem2);
+        let packed2 = unsafe { compiled.call_native(&mut c2, 1) };
+        assert_eq!((packed2 >> 32) as u32, 0, "own-span push bails");
+        assert_eq!(c2.a(6), 0x1111_2222);
+        assert_eq!(c2.a(7), 0x0106);
+
+        // Portable parity for both bails.
+        let mut c3 = cpu();
+        c3.set_cpu_type(CpuType::M68040);
+        c3.set_a(6, 0x1111_2222);
+        c3.set_a(7, 0x0002);
+        let mut mem3 = vec![0u8; 0x1000];
+        attach_window(&mut c3, &mut mem3);
+        assert_eq!(
+            (execute_portable_trace(&mut c3, &ops, 0x0100, 0x0108) >> 32) as u32,
+            0
+        );
+        assert_eq!(c3.a(7), 0x0002);
+        c3.set_a(7, 0x0106);
+        assert_eq!(
+            (execute_portable_trace(&mut c3, &ops, 0x0100, 0x0108) >> 32) as u32,
+            0
+        );
+        assert_eq!(c3.a(7), 0x0106);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn unlk_bails_atomically_on_misalignment() {
+        // Pre-68020: an odd frame pointer must bail before either register
+        // moves. Build UNLK-first ops so the bail is at op 0.
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x4E5E,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::Unlk { reg: 6 },
+            },
+            TraceBuildOp {
+                opcode: 0x60FC,
+                extension: None,
+                extension2: None,
+                pc: 0x0102,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -4,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let mut mem = vec![0u8; 0x1000];
+        let mut c = cpu();
+        c.set_cpu_type(CpuType::M68000);
+        c.set_a(6, 0x0301);
+        c.set_a(7, 0x0800);
+        attach_window(&mut c, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&c, 0x0100, CpuType::M68000, ops.clone(), Some(0x0100))
+            .expect("UNLK loop should compile");
+        let packed = unsafe { compiled.call_native(&mut c, 1) };
+        assert_eq!((packed >> 32) as u32, 0, "odd frame pointer bails");
+        assert_eq!(c.a(6), 0x0301, "frame register untouched");
+        assert_eq!(c.a(7), 0x0800, "stack pointer untouched");
+
+        let mut pmem = vec![0u8; 0x1000];
+        let mut p = cpu();
+        p.set_cpu_type(CpuType::M68000);
+        p.set_a(6, 0x0301);
+        p.set_a(7, 0x0800);
+        attach_window(&mut p, &mut pmem);
+        assert_eq!(
+            (execute_portable_trace(&mut p, &ops, 0x0100, 0x0104) >> 32) as u32,
+            0
+        );
+        assert_eq!(p.a(6), 0x0301);
+        assert_eq!(p.a(7), 0x0800);
     }
 }
