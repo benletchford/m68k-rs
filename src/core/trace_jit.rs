@@ -346,6 +346,18 @@ pub(crate) enum JitTraceOp {
     IndirectJsr {
         reg: u8,
     },
+    /// A BSR recorded THROUGH: pushes the constant return address and
+    /// falls through to the callee's ops, which follow inline in the
+    /// trace. Admitted only on a call-through retry recording.
+    CallThrough {
+        return_pc: u32,
+    },
+    /// The callee's RTS: pops the return address and bails unless it
+    /// equals the recorded call's return -- a different return value is
+    /// a different flow. Checked before the stack pointer moves.
+    RtsReturn {
+        expected_return: u32,
+    },
     /// MOVE/MOVEA with at least one register-indirect operand, executed
     /// against the fastmem window (`dst == Addr` is MOVEA). Traces
     /// containing this op only run while a window is active; every access
@@ -602,6 +614,13 @@ struct TraceRecording {
     cpu_type: CpuType,
     ops: Vec<TraceBuildOp>,
     adaptive_rerecords: u8,
+    /// Set when the previous recording of this head ended at a call
+    /// boundary that qualifies for call-through: this recording may
+    /// admit one BSR and record through the callee.
+    allow_call_through: bool,
+    /// The pending return address while recording inside a callee
+    /// (depth is capped at one).
+    pending_return: Option<u32>,
 }
 
 enum TraceSlot {
@@ -611,6 +630,10 @@ enum TraceSlot {
         cpu_type: CpuType,
         hits: u8,
         adaptive_rerecords: u8,
+        /// See `TraceRecording::allow_call_through`; set by a recording
+        /// that ended at a qualifying call boundary so the head's next
+        /// recording attempts to record through it.
+        allow_call_through: bool,
     },
     Rejected {
         pc: u32,
@@ -980,6 +1003,7 @@ impl TraceJit {
                     cpu_type,
                     hits: 0,
                     adaptive_rerecords,
+                    allow_call_through: false,
                 };
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
@@ -1043,6 +1067,7 @@ impl TraceJit {
                 cpu_type: counted_type,
                 hits,
                 adaptive_rerecords,
+                allow_call_through,
             } if *counted_pc == pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
                 if *hits < TRACE_HOT_THRESHOLD {
@@ -1053,6 +1078,8 @@ impl TraceJit {
                     cpu_type,
                     ops: Vec::with_capacity(TRACE_MAX_OPS),
                     adaptive_rerecords: *adaptive_rerecords,
+                    allow_call_through: *allow_call_through,
+                    pending_return: None,
                 });
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_recording(pc, cpu_type);
@@ -1100,6 +1127,7 @@ impl TraceJit {
                     cpu_type,
                     hits: 1,
                     adaptive_rerecords: 0,
+                    allow_call_through: false,
                 };
                 TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
             }
@@ -1359,7 +1387,81 @@ impl TraceJit {
             return;
         }
 
+        // Call-through interception, active only on a retry recording:
+        // BSR records as a mid-trace push and the recording continues at
+        // the callee; the callee's RTS records as a checked return. The
+        // ungated recorder never reaches this and remains byte-identical
+        // to the behavior the opportunity ranking is built on.
+        if recording.allow_call_through
+            && let Some(call_op) = decode_call_op(cpu, bus, executed_pc, cpu.ir as u16)
+        {
+            match call_op.op {
+                JitTraceOp::CallThrough { return_pc } => {
+                    let recording = self.recording.as_mut().unwrap();
+                    if recording.pending_return.is_some() {
+                        // Depth cap: a nested call ends the region at the
+                        // outer callee's boundary.
+                        self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                        return;
+                    }
+                    // The callee must land near the recorded region or
+                    // the unified SMC interval would false-bail stores.
+                    let lo = recording
+                        .ops
+                        .iter()
+                        .map(|op| op.pc)
+                        .chain([executed_pc, next_pc])
+                        .min()
+                        .unwrap_or(executed_pc);
+                    let hi = recording
+                        .ops
+                        .iter()
+                        .map(|op| op.pc)
+                        .chain([executed_pc, next_pc])
+                        .max()
+                        .unwrap_or(executed_pc);
+                    if hi.wrapping_sub(lo) > CALL_THROUGH_MAX_SPAN {
+                        self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                        return;
+                    }
+                    recording.pending_return = Some(return_pc);
+                    recording.ops.push(call_op);
+                    return;
+                }
+                JitTraceOp::RtsReturn { .. } => {
+                    let recording = self.recording.as_mut().unwrap();
+                    if let Some(expected) = recording.pending_return.take() {
+                        if next_pc != expected {
+                            // The guest returned somewhere else: the
+                            // recorded flow does not hold.
+                            self.reject_recording(cpu);
+                            return;
+                        }
+                        recording.ops.push(TraceBuildOp {
+                            op: JitTraceOp::RtsReturn {
+                                expected_return: expected,
+                            },
+                            ..call_op
+                        });
+                        return;
+                    }
+                    // An RTS with no pending call is the head function's
+                    // own return: not ours to record through.
+                    self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                    return;
+                }
+                _ => unreachable!(),
+            }
+        }
+
         let Some(mut op) = decode_trace_op(cpu, bus, executed_pc, cpu_type) else {
+            // Retry gate: a first recording that ends at a BSR marks the
+            // head so its NEXT recording may record through the call.
+            // Everything else about this path (blocker attribution, the
+            // rejected slot the ranking counts) is unchanged; the flag is
+            // applied after the normal bookkeeping below.
+            let call_retry =
+                !recording.allow_call_through && matches!(cpu.ir as u16, w if w & 0xFF00 == 0x6100);
             #[cfg(feature = "trace-profile")]
             {
                 // Diagnostics read through the fastmem window only. The
@@ -1393,6 +1495,22 @@ impl TraceJit {
                 );
             }
             self.finish_recording(cpu, executed_pc, RecordingEnd::Blocker);
+            if call_retry {
+                let idx = trace_cache_index(start_pc);
+                if matches!(&self.slots[idx], TraceSlot::Rejected { pc, .. } if *pc == start_pc) {
+                    self.slots[idx] = TraceSlot::Counting {
+                        pc: start_pc,
+                        cpu_type,
+                        hits: 0,
+                        adaptive_rerecords: 0,
+                        allow_call_through: true,
+                    };
+                    // The reject pushed the head into the probe-skip
+                    // filter; clear it so the retry can be probed.
+                    cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
+                    cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+                }
+            }
             return;
         };
         let op_len = op.length();
@@ -1569,6 +1687,8 @@ impl TraceJit {
                     | JitTraceOp::MemAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
                     | JitTraceOp::IndirectJsr { .. }
+                    | JitTraceOp::CallThrough { .. }
+                    | JitTraceOp::RtsReturn { .. }
             )
         });
 
@@ -1824,6 +1944,14 @@ impl TraceJit {
                     JitTraceOp::Unlk { .. } => {
                         let env = mem_env.as_ref().expect("Unlk implies a window env");
                         emit_unlk(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::CallThrough { .. } => {
+                        let env = mem_env.as_ref().expect("CallThrough implies a window env");
+                        emit_call_through(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::RtsReturn { .. } => {
+                        let env = mem_env.as_ref().expect("RtsReturn implies a window env");
+                        emit_rts_return(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     JitTraceOp::PeaDisp { .. } => {
                         let env = mem_env.as_ref().expect("PeaDisp implies a window env");
@@ -2093,10 +2221,63 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::Link { .. }
             | JitTraceOp::Unlk { .. }
             | JitTraceOp::ClrMem { .. }
-            | JitTraceOp::MoveImmMem { .. } => return false,
+            | JitTraceOp::MoveImmMem { .. }
+            | JitTraceOp::CallThrough { .. }
+            | JitTraceOp::RtsReturn { .. } => return false,
         }
     }
     mem_written_flags != 0 && consumed & !mem_written_flags == 0
+}
+
+/// The distance cap for a recorded call: the SMC store guard uses one
+/// [code_start, code_end) interval, so a far callee would inflate the
+/// span and false-bail every unrelated store between the regions.
+const CALL_THROUGH_MAX_SPAN: u32 = 0x1000;
+
+/// Decode the call-boundary ops record-through understands. Consulted
+/// only when the active recording carries call-through permission, so
+/// the ungated recorder remains byte-identical to the ranked-blocker
+/// behavior the opportunity profile is built on.
+fn decode_call_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    if opcode == 0x4E75 {
+        return Some(TraceBuildOp {
+            opcode,
+            extension: None,
+            extension2: None,
+            pc,
+            // The expected return is filled in by the recorder from the
+            // pending call; zero here is never emitted.
+            op: JitTraceOp::RtsReturn { expected_return: 0 },
+        });
+    }
+    if opcode & 0xFF00 != 0x6100 {
+        return None;
+    }
+    let displacement_byte = (opcode & 0x00FF) as u8;
+    let (return_pc, extension, extension2) = match displacement_byte {
+        0x00 => {
+            let ext = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (pc.wrapping_add(4), Some(ext), None)
+        }
+        0xFF => {
+            let hi = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            let lo = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+            (pc.wrapping_add(6), Some(hi), Some(lo))
+        }
+        _ => (pc.wrapping_add(2), None, None),
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension,
+        extension2,
+        pc,
+        op: JitTraceOp::CallThrough { return_pc },
+    })
 }
 
 /// Attempt to execute a compiled trace at the current PC. See
@@ -2408,6 +2589,10 @@ impl JitTraceOp {
             // Interpreter parity: exec_link charges 16, exec_unlk 12.
             Self::Link { .. } => 16,
             Self::Unlk { .. } => 12,
+            // MC68000 BSR is 18(2/2) for every displacement width; RTS is
+            // 16(4/0).
+            Self::CallThrough { .. } => 18,
+            Self::RtsReturn { .. } => 16,
         }
     }
 
@@ -3464,6 +3649,12 @@ fn execute_portable_op(
     }
     if matches!(op.op, JitTraceOp::Unlk { .. }) {
         return execute_portable_unlk(cpu, op);
+    }
+    if matches!(op.op, JitTraceOp::CallThrough { .. }) {
+        return execute_portable_call_through(cpu, op, code_start, code_end);
+    }
+    if matches!(op.op, JitTraceOp::RtsReturn { .. }) {
+        return execute_portable_rts_return(cpu, op);
     }
     if matches!(op.op, JitTraceOp::PeaDisp { .. }) {
         return execute_portable_pea_disp(cpu, op, code_start, code_end);
@@ -4825,6 +5016,12 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::Link { .. } | JitTraceOp::Unlk { .. } => {
             unreachable!("LINK/UNLK are handled by execute_portable_link/unlk")
         }
+        JitTraceOp::CallThrough { .. } => {
+            unreachable!("CallThrough is handled by execute_portable_call_through")
+        }
+        JitTraceOp::RtsReturn { .. } => {
+            unreachable!("RtsReturn is handled by execute_portable_rts_return")
+        }
     }
 }
 
@@ -5458,6 +5655,12 @@ fn emit_jit_op(
         }
         JitTraceOp::PeaDisp { .. } => {
             unreachable!("PeaDisp is emitted by emit_pea_disp")
+        }
+        JitTraceOp::CallThrough { .. } => {
+            unreachable!("CallThrough is emitted by emit_call_through")
+        }
+        JitTraceOp::RtsReturn { .. } => {
+            unreachable!("RtsReturn is emitted by emit_rts_return")
         }
         JitTraceOp::IndirectJsr { .. } => {
             unreachable!("IndirectJsr is emitted by emit_indirect_jsr")
@@ -6192,6 +6395,135 @@ fn emit_indirect_jsr(
     store_bool(builder, cpu, offset_of!(CpuCore, change_of_flow), true);
     store_value_u32(builder, cpu, offset_of!(CpuCore, pc), target);
     cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit a recorded call: push the constant return address through the
+/// checked window and fall through to the callee's ops, which follow
+/// inline. The stack write and pointer update follow every guard, so a
+/// bail commits nothing.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_call_through(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::CallThrough { return_pc } = trace.op else {
+        unreachable!("expected a call-through trace op")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+    let old_sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
+    let new_sp = builder.ins().iadd_imm(old_sp, -4);
+    let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
+    guard_store_not_code(builder, env, bail, masked, Size::Long);
+    let value = iconst_u32(builder, return_pc);
+    window_store(builder, env, off, Size::Long, value);
+    store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit the callee's RTS: the popped value must equal the recorded
+/// call's return address -- a different value is a different flow --
+/// checked before the stack pointer moves.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_rts_return(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::RtsReturn { expected_return } = trace.op else {
+        unreachable!("expected an rts-return trace op")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+    let sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
+    let (off, _) = checked_window_off(builder, env, bail, sp, Size::Long);
+    let popped = window_load(builder, env, off, Size::Long);
+    let mismatch = builder
+        .ins()
+        .icmp_imm(IntCC::NotEqual, popped, i64::from(expected_return));
+    branch_guard(builder, bail, mismatch);
+    let new_sp = builder.ins().iadd_imm(sp, 4);
+    store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_call_through(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    code_start: u32,
+    code_end: u32,
+) -> Option<i32> {
+    let JitTraceOp::CallThrough { return_pc } = trace.op else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let new_sp = cpu.dar[15].wrapping_sub(4);
+    if cpu.is_pre_68020 && (new_sp & 1) != 0 {
+        return None;
+    }
+    let masked = new_sp & cpu.address_mask;
+    let off = masked.wrapping_sub(cpu.fm_base);
+    if off > cpu.fm_len - 4 {
+        return None;
+    }
+    if masked < code_end && masked.wrapping_add(4) > code_start {
+        return None;
+    }
+    unsafe {
+        let p = (cpu.fm_ptr as *mut u8).add(off as usize);
+        let b = return_pc.to_be_bytes();
+        *p = b[0];
+        *p.add(1) = b[1];
+        *p.add(2) = b[2];
+        *p.add(3) = b[3];
+    }
+    cpu.dar[15] = new_sp;
+    Some(trace.op.max_cycles())
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_rts_return(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::RtsReturn { expected_return } = trace.op else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let sp = cpu.dar[15];
+    if cpu.is_pre_68020 && (sp & 1) != 0 {
+        return None;
+    }
+    let off = (sp & cpu.address_mask).wrapping_sub(cpu.fm_base);
+    if off > cpu.fm_len - 4 {
+        return None;
+    }
+    let popped = unsafe {
+        let p = (cpu.fm_ptr as *const u8).add(off as usize);
+        u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+    };
+    if popped != expected_return {
+        return None;
+    }
+    cpu.dar[15] = sp.wrapping_add(4);
+    Some(trace.op.max_cycles())
 }
 
 /// Emit a checked ADDQ/SUBQ read-modify-write through an address-register-
@@ -8513,6 +8845,8 @@ mod portable_tests {
                 cpu_type: CpuType::M68040,
                 ops: vec![swap],
                 adaptive_rerecords: 0,
+                allow_call_through: false,
+                pending_return: None,
             });
             cpu.set_cpu_type(CpuType::M68040);
             cpu.trace_recording = true;
@@ -10909,96 +11243,67 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
-    fn chained_continuation_miss_surfaces_the_rewritten_opcode() {
-        // Three deterministic phases against a step() twin, with identical
-        // external mutations at identical instruction counts:
-        //   1. The branch predicate holds, so the head trace compiles on
-        //      the taken spine -- which EXCLUDES the continuation.
-        //   2. The predicate is flipped externally; every head call now
-        //      guard-exits, seeding and compiling the continuation, and
-        //      the parent chains into it. Kept short so adaptive
-        //      re-recording (64-call window) cannot replace the head spine.
-        //   3. The continuation's first opcode is rewritten externally
-        //      (ADDQ.L #1,D2 -> ADDQ.L #2,D2) in both twins. The next
-        //      chained entry must surface the validation miss so the
-        //      rewritten opcode is dispatched; silently dropping the miss
-        //      skips the instruction and diverges D2.
-        const CODE_BASE: u32 = 0x7000;
+    fn retry_gated_call_through_records_and_compiles_the_leaf_inline() {
+        // A loop whose body calls a two-op leaf through BSR.W. The first
+        // recording blocks at the call exactly as today and would leave
+        // the head rejected; the retry gate re-arms it with call-through
+        // permission, and the second recording captures the push, the
+        // callee body, the checked return, and the loop tail as ONE
+        // trace, which then executes natively.
+        const A: u32 = 0x7000;
         let words = [
-            0xB206, // head: CMP.B D6,D1
-            0x6706, // BEQ.S skip (taken while D1 == D6)
-            0x5282, // cont: ADDQ.L #1,D2   <- rewritten in phase 3
-            0x1ADC, // MOVE.B (A4)+,(A5)+
+            0x6100, 0x000C, // head: BSR.W leaf
             0x5283, // ADDQ.L #1,D3
-            0x51C8, 0xFFF4, // skip: DBRA D0,head
-            0x60F0, // BRA.S head
+            0x51C8, 0xFFF8, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0 (reload)
+            0x60F2, // BRA.S head
+            0x5282, // leaf: ADDQ.L #1,D2
+            0x4E75, // RTS
         ];
-        let mk = |bus: &mut super::super::memory::LinearMemoryBus| {
-            for (index, word) in words.iter().enumerate() {
-                bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
-            }
-            let mut cpu = CpuCore::new();
-            cpu.set_cpu_type(CpuType::M68040);
-            cpu.set_sr(0x2700);
-            cpu.pc = CODE_BASE;
-            cpu.set_a(4, 0x3000);
-            cpu.set_a(5, 0x4000);
-            cpu.set_a(7, 0x9000);
-            cpu.set_d(0, 0x7FFF);
-            cpu.set_d(1, 5);
-            cpu.set_d(6, 5); // equal: BEQ taken
-            cpu
-        };
-        let mut bus_a = super::super::memory::LinearMemoryBus::new(0x10000);
-        let mut cpu_a = mk(&mut bus_a); // step twin
-        let mut bus_b = super::super::memory::LinearMemoryBus::new(0x10000);
-        let mut cpu_b = mk(&mut bus_b); // run_batch twin
-
-        let step_n =
-            |cpu: &mut CpuCore, bus: &mut super::super::memory::LinearMemoryBus, n: u32| {
-                for _ in 0..n {
-                    assert!(matches!(cpu.step(bus), crate::StepResult::Ok { .. }));
-                }
-            };
-        let batch_n =
-            |cpu: &mut CpuCore, bus: &mut super::super::memory::LinearMemoryBus, n: u32| {
-                let mut left = n;
-                while left > 0 {
-                    let r = cpu.run_batch(bus, left, &[0]);
-                    assert!(r.instructions > 0, "batch made no progress");
-                    left -= r.instructions;
-                }
-            };
-
-        // Phase 1: 30 instructions of taken-spine iterations.
-        step_n(&mut cpu_a, &mut bus_a, 30);
-        batch_n(&mut cpu_b, &mut bus_b, 30);
-        // Phase 2: flip the predicate in both twins; 30 instructions of
-        // guard exits, seeding, and chaining.
-        cpu_a.set_d(1, 9);
-        cpu_b.set_d(1, 9);
-        step_n(&mut cpu_a, &mut bus_a, 30);
-        batch_n(&mut cpu_b, &mut bus_b, 30);
-        // The continuation must exist as its own compiled trace for phase 3
-        // to test anything.
-        let cont_pc = CODE_BASE + 4;
-        let cont_compiled = TRACE_JIT.with_borrow(|jit| {
-            matches!(
-                &jit.slots[trace_cache_index(cont_pc)],
-                TraceSlot::Compiled(CompiledTrace { pc, .. }) if *pc == cont_pc
-            )
-        });
-        assert!(cont_compiled, "phase 2 must compile the continuation");
-        // Phase 3: rewrite the continuation head in both twins, then run
-        // one full not-taken iteration through each.
-        bus_a.write_word_at(cont_pc, 0x5482);
-        bus_b.write_word_at(cont_pc, 0x5482);
-        step_n(&mut cpu_a, &mut bus_a, 6);
-        batch_n(&mut cpu_b, &mut bus_b, 6);
-
-        assert_eq!(cpu_b.dar, cpu_a.dar, "registers diverged (D2 skip?)");
-        assert_eq!(cpu_b.pc, cpu_a.pc, "pc diverged");
-        assert_eq!(cpu_b.get_ccr(), cpu_a.get_ccr(), "ccr diverged");
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        let result = cpu.run_batch(&mut bus, 40_000, &[0]);
+        assert_eq!(result.instructions, 40_000, "loop runs to budget");
+        // Every iteration increments D2 (in the leaf) and D3 (after the
+        // return) exactly once; the fixed budget may stop mid-iteration,
+        // so they advance in lockstep within one.
+        assert!(
+            cpu.d(2).abs_diff(cpu.d(3)) <= 1,
+            "leaf and tail in lockstep: d2={} d3={}",
+            cpu.d(2),
+            cpu.d(3)
+        );
+        assert!(cpu.d(2) > 5_000, "the loop actually iterated");
+        assert!(
+            cpu.a(7) == 0x9000 || cpu.a(7) == 0x8FFC,
+            "the stack is balanced or exactly mid-call: {:#06x}",
+            cpu.a(7)
+        );
+        let (compiled_ops, has_call, has_ret) =
+            TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(A)] {
+                TraceSlot::Compiled(CompiledTrace { pc, ops, .. }) if *pc == A => (
+                    ops.len(),
+                    ops.iter()
+                        .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                    ops.iter()
+                        .any(|op| matches!(op.op, JitTraceOp::RtsReturn { .. })),
+                ),
+                _ => (0, false, false),
+            });
+        assert!(
+            has_call && has_ret,
+            "the compiled head holds the call and the checked return \
+             ({compiled_ops} ops)"
+        );
+        assert_eq!(compiled_ops, 5, "call + leaf + return + tail + latch");
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
