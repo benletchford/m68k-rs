@@ -11308,6 +11308,67 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
+    fn rts_return_mismatch_bails_after_the_push_commits() {
+        // A recording can never produce an RtsReturn whose expectation
+        // differs from its call's push, so the guard is exercised with a
+        // hand-built op list. The contract at the bail: the CallThrough
+        // before it has retired (its push and SP update stand -- they are
+        // architecturally real), and the RTS itself commits nothing, so
+        // the interpreter re-executes it against the true stacked value.
+        let call = TraceBuildOp {
+            opcode: 0x6100,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::CallThrough { return_pc: 0x0104 },
+        };
+        let ret = TraceBuildOp {
+            opcode: 0x4E75,
+            extension: None,
+            extension2: None,
+            pc: 0x0112,
+            op: JitTraceOp::RtsReturn {
+                expected_return: 0x0999, // never what the call pushes
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60EC,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let ops = vec![call, ret, branch];
+        let mut mem = vec![0u8; 0x1000];
+        let mut actual = cpu();
+        actual.set_cpu_type(CpuType::M68040);
+        actual.set_a(7, 0x0800);
+        actual.set_ccr(0x15);
+        attach_window(&mut actual, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops, Some(0x0100))
+            .expect("call/return trace should compile");
+        let packed = unsafe { compiled.call_native(&mut actual, 1) };
+        let retired = (packed >> 32) as u32;
+        assert_eq!(retired, 1, "the call retired; the mismatched RTS did not");
+        assert_eq!(actual.a(7), 0x07FC, "the committed push stands");
+        assert_eq!(
+            &mem[0x07FC..0x0800],
+            &0x0000_0104u32.to_be_bytes(),
+            "the true return address is on the stack"
+        );
+        assert_eq!(actual.pc, 0x0112, "resume at the RTS for full dispatch");
+        assert_eq!(actual.get_ccr(), 0x15, "flags untouched");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
     fn native_cmp_indexed_matches_portable_and_bails_atomically() {
         let cmp = TraceBuildOp {
             opcode: 0xB270,
