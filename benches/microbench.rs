@@ -1028,9 +1028,10 @@ fn bench_link_unlk_frame_loop() {
 /// ROM regions the gameplay profile shows dying 14-26 ops deep. Base
 /// rejects the whole head and interprets; with salvage the twelve-op
 /// prefix through the branch compiles and only the tail stays
-/// interpreted. (A register-only nine-op variant measures ~1.0x -- the
-/// per-iteration trace entry/exit cost cancels the win on cheap ops; the
-/// salvage bar exists for exactly that reason.)
+/// interpreted. Two register tests sit between the branch and the
+/// blocker so the recording's last op is not a terminal: without salvage
+/// the whole head rejects. (A register-only nine-op variant measures
+/// ~1.0x -- trace entry/exit cost cancels the win on cheap ops.)
 fn bench_salvaged_prefix_loop() {
     const INSTRS: u32 = 100_000_000;
     const CODE_BASE: u32 = 0x6000;
@@ -1048,10 +1049,12 @@ fn bench_salvaged_prefix_loop() {
         0x4A41, // TST.W D1
         0x6602, // BNE.S +2 (taken until D1 wraps 16 bits)
         0x4E71, // NOP (skipped)
+        0x4A42, // TST.W D2 -- past the branch: master has no terminal here
+        0x4A42, // TST.W D2
         0x41F9, 0x0000, 0x3000, // LEA $3000.L,A0 -- the blocker
-        0x51C8, 0xFFD6, // DBRA D0,head
+        0x51C8, 0xFFD2, // DBRA D0,head
         0x707F, // MOVEQ #127,D0
-        0x60D0, // BRA.S head
+        0x60CC, // BRA.S head
     ];
     let mut bus = LinearMemoryBus::new(0x1_0000);
     for (index, word) in words.iter().enumerate() {

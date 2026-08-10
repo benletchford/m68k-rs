@@ -1420,3 +1420,39 @@ fn link_unlk_frame_loop_matches_step() {
         cpu.set_d(7, 5);
     });
 }
+
+/// The salvage shape end to end: a store-heavy prefix through an interior
+/// branch, an inadmissible LEA (abs).L, and a loop tail. The salvaged
+/// trace plus the interpreted tail must match step() exactly.
+#[test]
+fn salvaged_prefix_loop_matches_step() {
+    let words = &[
+        0x3083, // $1000: MOVE.W D3,(A0)
+        0x5283, // $1002: ADDQ.L #1,D3
+        0x3143, 0x0002, // $1004: MOVE.W D3,2(A0)
+        0x5284, // $1008: ADDQ.L #1,D4
+        0x3144, 0x0004, // $100A: MOVE.W D4,4(A0)
+        0x5285, // $100E: ADDQ.L #1,D5
+        0x3145, 0x0006, // $1010: MOVE.W D5,6(A0)
+        0x5286, // $1014: ADDQ.L #1,D6
+        0x3146, 0x0008, // $1016: MOVE.W D6,8(A0)
+        0x5281, // $101A: ADDQ.L #1,D1
+        0x4A41, // $101C: TST.W D1
+        0x6602, // $101E: BNE.S $1022
+        0x4E71, // $1020: NOP (skipped)
+        0x4A42, // $1022: TST.W D2 (past the branch: no terminal here)
+        0x4A42, // $1024: TST.W D2
+        0x41F9, 0x0000, 0x3000, // $1026: LEA $3000.L,A0 -- inadmissible
+        0x51C8, 0xFFD2, // $102C: DBRA D0,$1000
+        0x5347, // $1030: SUBQ.W #1,D7
+        0x6602, // $1032: BNE.S $1036
+        0xA000, // $1034: sentinel
+        0x707F, // $1036: MOVEQ #127,D0
+        0x60C6, // $1038: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("salvaged prefix loop", words, CpuType::M68040, |cpu| {
+        cpu.set_a(0, 0x4000);
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}

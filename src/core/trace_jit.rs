@@ -12391,11 +12391,13 @@ mod portable_tests {
             0x4A41, // TST.W D1
             0x6602, // BNE.S +2 (always taken: D1 counts up)
             0x4E71, // NOP (skipped)
+            0x4A42, // TST.W D2 -- past the branch: no terminal to stop at
+            0x4A42, // TST.W D2
             0x4E56, 0x0000, // LINK A6,#0  -- the blocker
             0x4E5E, // UNLK A6
-            0x51C8, 0xFFE4, // DBRA D0,head
+            0x51C8, 0xFFE0, // DBRA D0,head
             0x707F, // MOVEQ #127,D0
-            0x60DE, // BRA.S head
+            0x60DA, // BRA.S head
         ];
         let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
         for (index, word) in words.iter().enumerate() {
