@@ -117,6 +117,11 @@ pub enum TraceRejectReason {
     LinearMemoryAlu,
     /// The region's code range wraps the address space.
     AddressWrap,
+    /// A recorded call's caller or callee segment exceeds the
+    /// per-segment span cap once the complete shape is known, so its
+    /// self-modification interval would be oversized and false-bail
+    /// stores in the hole.
+    CallSpan,
     /// The compiler backend declined the region or was unavailable.
     Backend,
 }
@@ -132,6 +137,7 @@ impl TraceRejectReason {
             Self::IndirectJsrTooShort => "indirect-jsr-too-short",
             Self::LinearMemoryAlu => "linear-memory-alu",
             Self::AddressWrap => "address-wrap",
+            Self::CallSpan => "call-span",
             Self::Backend => "backend",
         }
     }

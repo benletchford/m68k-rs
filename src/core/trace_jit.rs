@@ -490,6 +490,11 @@ enum RegionRejectReason {
     IndirectJsrTooShort,
     LinearMemoryAlu,
     AddressWrap,
+    /// A recorded call's caller or callee segment exceeds
+    /// `CALL_THROUGH_MAX_SPAN` in the complete shape. The admission-time
+    /// check runs before the callee body and post-return tail exist, so
+    /// this is the authoritative bound.
+    CallSpan,
     Backend,
 }
 
@@ -1240,6 +1245,7 @@ impl TraceJit {
             RegionRejectReason::IndirectJsrTooShort => Public::IndirectJsrTooShort,
             RegionRejectReason::LinearMemoryAlu => Public::LinearMemoryAlu,
             RegionRejectReason::AddressWrap => Public::AddressWrap,
+            RegionRejectReason::CallSpan => Public::CallSpan,
             RegionRejectReason::Backend => Public::Backend,
         }
     }
@@ -1754,6 +1760,18 @@ impl TraceJit {
             // nothing and costs nothing.
             callee_start = 0;
             callee_end = 0;
+        }
+        // The admission-time span check runs at BSR interception, before
+        // the BSR is appended, before any callee instruction exists, and
+        // before the post-return tail is recorded. A callee that branches
+        // widely before returning would otherwise compile an oversized
+        // interval and false-bail stores anywhere in the hole, so the cap
+        // is enforced here on the complete shape.
+        if callee_end > callee_start
+            && (code_end.wrapping_sub(code_start) > CALL_THROUGH_MAX_SPAN
+                || callee_end.wrapping_sub(callee_start) > CALL_THROUGH_MAX_SPAN)
+        {
+            return Err(RegionRejectReason::CallSpan);
         }
 
         self.compile_ops(CompileParams {
@@ -13846,5 +13864,107 @@ mod portable_tests {
                 );
             });
         }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn wide_callee_rejects_when_the_complete_shape_exceeds_the_span_cap() {
+        // The admission-time check runs before the callee body exists; a
+        // callee that branches far before returning is only caught once
+        // the complete shape is known. Its oversized interval would
+        // false-bail every store in the hole, so compilation must refuse
+        // it -- and an otherwise identical near-branching callee must
+        // still compile.
+        let ops_with_callee_branch = |branch_displacement: i16| {
+            let branch_target = 0x0114u32.wrapping_add(branch_displacement as i32 as u32);
+            vec![
+                TraceBuildOp {
+                    opcode: 0x6100,
+                    extension: Some(0x000E),
+                    extension2: None,
+                    pc: 0x0100,
+                    op: JitTraceOp::CallThrough { return_pc: 0x0104 },
+                },
+                TraceBuildOp {
+                    opcode: 0x7001,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0110,
+                    op: JitTraceOp::Moveq { reg: 0, data: 1 },
+                },
+                TraceBuildOp {
+                    opcode: 0x6000,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0112,
+                    op: JitTraceOp::Branch {
+                        condition: 0,
+                        displacement: branch_displacement as i32,
+                        length: 2,
+                        expected_taken: Some(true),
+                    },
+                },
+                TraceBuildOp {
+                    opcode: 0x7201,
+                    extension: None,
+                    extension2: None,
+                    pc: branch_target,
+                    op: JitTraceOp::Moveq { reg: 1, data: 1 },
+                },
+                TraceBuildOp {
+                    opcode: 0x4E75,
+                    extension: None,
+                    extension2: None,
+                    pc: branch_target.wrapping_add(2),
+                    op: JitTraceOp::RtsReturn {
+                        expected_return: 0x0104,
+                    },
+                },
+                TraceBuildOp {
+                    opcode: 0x60FA,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0104,
+                    op: JitTraceOp::Branch {
+                        condition: 0,
+                        displacement: -6,
+                        length: 2,
+                        expected_taken: None,
+                    },
+                },
+            ]
+        };
+        let mut mem = vec![0u8; 0x10000];
+        let mut c = cpu();
+        c.set_cpu_type(CpuType::M68040);
+        c.set_a(7, 0x0800);
+        attach_window(&mut c, &mut mem);
+        let mut jit = TraceJit::new();
+        // Callee spans [0x0110, branch_target + 4): +0x1F00 puts it far
+        // over CALL_THROUGH_MAX_SPAN.
+        let wide = jit.compile_decoded_ops_reason(
+            &c,
+            0x0100,
+            CpuType::M68040,
+            ops_with_callee_branch(0x1F00),
+            Some(0x0100),
+        );
+        assert!(
+            matches!(wide, Err(RegionRejectReason::CallSpan)),
+            "an oversized callee interval must reject: {:?}",
+            wide.as_ref().err()
+        );
+        // The near-branching control still compiles with tight intervals.
+        let near = jit
+            .compile_decoded_ops_reason(
+                &c,
+                0x0100,
+                CpuType::M68040,
+                ops_with_callee_branch(0x0020),
+                Some(0x0100),
+            )
+            .expect("a near-branching callee compiles");
+        assert_eq!(near.callee_start, 0x0110);
+        assert_eq!(near.callee_end, 0x0134 + 4);
     }
 }
