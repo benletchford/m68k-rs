@@ -989,39 +989,37 @@ impl TraceJit {
             // would probe and compile a continuation that starts on the
             // very op that just bailed.
             if guarded_branch_exit && !single_iter && chain_budget > 0 && cpu.pc != pc {
-                match self.note_trace_exit(cpu.pc, cpu_type) {
+                // A watched exit target still counts candidacy hits, but
+                // neither chains nor starts a recording: a chained entry
+                // is not observed by the runner (watches fire before an
+                // interpreted instruction), and run_batch may return at
+                // the watch with host-visible state -- no recording may
+                // survive that boundary. The candidate is preserved for a
+                // later unwatched entry.
+                let entry_watched = watch_pcs
+                    .iter()
+                    .any(|&watched| cpu.address(watched) == cpu.address(cpu.pc));
+                match self.note_trace_exit(cpu.pc, cpu_type, entry_watched) {
                     ExitSeed::Chain => {
-                        // The callee excludes its entry pc from its own
-                        // watch check (run_batch semantics: watches fire
-                        // before an interpreted instruction, and the head
-                        // was reached by ordinary execution). A chained
-                        // entry is not observed by the runner, so a watch
-                        // on the chain target must fall back to the
-                        // interpreter instead.
-                        let entry_watched = watch_pcs
-                            .iter()
-                            .any(|&watched| cpu.address(watched) == cpu.address(cpu.pc));
-                        if !entry_watched {
-                            match self.try_execute(
-                                cpu,
-                                bus,
-                                cpu_type,
-                                instr_budget.saturating_sub(retired),
-                                false,
-                                watch_pcs,
-                                chain_budget - 1,
-                            ) {
-                                Some((CachedRunResult::Ran, chained)) => retired += chained,
-                                // The continuation's first opcode changed:
-                                // the child has already consumed it (ppc/ir
-                                // set, pc advanced) and the caller must
-                                // dispatch it. Surface the miss while
-                                // keeping every instruction retired so far.
-                                Some((miss @ CachedRunResult::Miss(_), chained)) => {
-                                    return Some((miss, retired + chained));
-                                }
-                                None => {}
+                        match self.try_execute(
+                            cpu,
+                            bus,
+                            cpu_type,
+                            instr_budget.saturating_sub(retired),
+                            false,
+                            watch_pcs,
+                            chain_budget - 1,
+                        ) {
+                            Some((CachedRunResult::Ran, chained)) => retired += chained,
+                            // The continuation's first opcode changed:
+                            // the child has already consumed it (ppc/ir
+                            // set, pc advanced) and the caller must
+                            // dispatch it. Surface the miss while
+                            // keeping every instruction retired so far.
+                            Some((miss @ CachedRunResult::Miss(_), chained)) => {
+                                return Some((miss, retired + chained));
                             }
+                            None => {}
                         }
                     }
                     ExitSeed::StartRecording => cpu.trace_recording = true,
@@ -1104,14 +1102,25 @@ impl TraceJit {
     /// `record_trace_target`, an exit seed never evicts a compiled trace on
     /// a cache-index collision: backward-branch targets are proven loop
     /// heads, exit targets are speculative.
-    fn note_trace_exit(&mut self, exit_pc: u32, cpu_type: CpuType) -> ExitSeed {
+    fn note_trace_exit(
+        &mut self,
+        exit_pc: u32,
+        cpu_type: CpuType,
+        entry_watched: bool,
+    ) -> ExitSeed {
         let idx = trace_cache_index(exit_pc);
         match &mut self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
                 cpu_type: compiled_type,
                 ..
-            }) if *compiled_pc == exit_pc && *compiled_type == cpu_type => ExitSeed::Chain,
+            }) if *compiled_pc == exit_pc && *compiled_type == cpu_type => {
+                if entry_watched {
+                    ExitSeed::None
+                } else {
+                    ExitSeed::Chain
+                }
+            }
             TraceSlot::Compiled(_) => ExitSeed::None,
             TraceSlot::Counting {
                 pc: counted_pc,
@@ -1120,7 +1129,7 @@ impl TraceJit {
                 adaptive_rerecords,
             } if *counted_pc == exit_pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
-                if *hits < TRACE_HOT_THRESHOLD || self.recording.is_some() {
+                if entry_watched || *hits < TRACE_HOT_THRESHOLD || self.recording.is_some() {
                     return ExitSeed::None;
                 }
                 let adaptive_rerecords = *adaptive_rerecords;
@@ -12600,11 +12609,11 @@ mod portable_tests {
         let mut jit = TraceJit::new();
         // First exit seeds a vacant slot; second promotes to recording.
         assert!(matches!(
-            jit.note_trace_exit(0x0100, CpuType::M68040),
+            jit.note_trace_exit(0x0100, CpuType::M68040, false),
             ExitSeed::None
         ));
         assert!(matches!(
-            jit.note_trace_exit(0x0100, CpuType::M68040),
+            jit.note_trace_exit(0x0100, CpuType::M68040, false),
             ExitSeed::StartRecording
         ));
         assert_eq!(
@@ -12615,11 +12624,11 @@ mod portable_tests {
         // While a recording is active, another hot exit defers rather than
         // stealing the recorder.
         assert!(matches!(
-            jit.note_trace_exit(0x0200, CpuType::M68040),
+            jit.note_trace_exit(0x0200, CpuType::M68040, false),
             ExitSeed::None
         ));
         assert!(matches!(
-            jit.note_trace_exit(0x0200, CpuType::M68040),
+            jit.note_trace_exit(0x0200, CpuType::M68040, false),
             ExitSeed::None
         ));
         // A rejected slot blocks re-seeding.
@@ -12629,7 +12638,7 @@ mod portable_tests {
             cpu_type: CpuType::M68040,
         };
         assert!(matches!(
-            jit.note_trace_exit(0x0300, CpuType::M68040),
+            jit.note_trace_exit(0x0300, CpuType::M68040, false),
             ExitSeed::None
         ));
         assert!(matches!(
@@ -12749,5 +12758,76 @@ mod portable_tests {
             !touched,
             "a memory bail must not seed candidacy at its target in any form: {dump}"
         );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn watched_exit_targets_never_seed_a_recording_across_the_boundary() {
+        // Unit contract: a watched exit target still counts candidacy but
+        // never installs a recording or chains; the candidate promotes on
+        // a later unwatched exit.
+        let mut jit = TraceJit::new();
+        assert!(matches!(
+            jit.note_trace_exit(0x0100, CpuType::M68040, false),
+            ExitSeed::None
+        ));
+        // Hot now -- but watched: no promotion, no recording installed.
+        assert!(matches!(
+            jit.note_trace_exit(0x0100, CpuType::M68040, true),
+            ExitSeed::None
+        ));
+        assert!(
+            jit.recording.is_none(),
+            "a watched exit must not install a recording"
+        );
+        // The same slot promotes on the next unwatched exit: candidacy
+        // (including the watched hit) was preserved.
+        assert!(matches!(
+            jit.note_trace_exit(0x0100, CpuType::M68040, false),
+            ExitSeed::StartRecording
+        ));
+
+        // System invariant (the reviewed leak): a watched run_batch return
+        // never leaves a recording active, no matter where exit seeding
+        // stood when the watch fired. Sweep the mixed-path rig -- whose
+        // head trace guard-exits to the loop body every other iteration --
+        // through compile/seed/promote transitions with the continuation
+        // pcs watched, checking the boundary after every return.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x0A01, 0x0001, // EORI.B #1,D1
+            0x6602, // BNE.S +2
+            0x5282, // ADDQ.L #1,D2
+            0x1ADC, // MOVE.B (A4)+,(A5)+
+            0x5283, // ADDQ.L #1,D3
+            0x51C8, 0xFFF2, // DBRA D0,head
+            0x60EE, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(4, 0x3000);
+        cpu.set_a(5, 0x4000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        let watches = [CODE_BASE + 6, CODE_BASE + 8];
+        for _ in 0..200 {
+            cpu.run_batch(&mut bus, 500, &watches);
+            assert!(
+                !cpu.trace_recording,
+                "no recording survives a watched run_batch return"
+            );
+            TRACE_JIT.with_borrow(|jit| {
+                assert!(
+                    jit.recording.is_none(),
+                    "no recorder state survives a watched run_batch return"
+                );
+            });
+        }
     }
 }
