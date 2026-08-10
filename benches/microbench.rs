@@ -1051,7 +1051,8 @@ fn bench_salvaged_prefix_loop() {
         0x4E71, // NOP (skipped)
         0x4A42, // TST.W D2 -- past the branch: master has no terminal here
         0x4A42, // TST.W D2
-        0x41F9, 0x0000, 0x3000, // LEA $3000.L,A0 -- the blocker
+        0x4E57, 0x0000, // LINK A7,#0 -- refused by design (A7 exclusion)
+        0x4E5F, // UNLK A7
         0x51C8, 0xFFD2, // DBRA D0,head
         0x707F, // MOVEQ #127,D0
         0x60CC, // BRA.S head

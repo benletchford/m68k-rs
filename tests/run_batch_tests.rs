@@ -1442,7 +1442,8 @@ fn salvaged_prefix_loop_matches_step() {
         0x4E71, // $1020: NOP (skipped)
         0x4A42, // $1022: TST.W D2 (past the branch: no terminal here)
         0x4A42, // $1024: TST.W D2
-        0x41F9, 0x0000, 0x3000, // $1026: LEA $3000.L,A0 -- inadmissible
+        0x4E57, 0x0000, // $1026: LINK A7,#0 -- refused by design
+        0x4E5F, // $102A: UNLK A7
         0x51C8, 0xFFD2, // $102C: DBRA D0,$1000
         0x5347, // $1030: SUBQ.W #1,D7
         0x6602, // $1032: BNE.S $1036
