@@ -1072,6 +1072,76 @@ fn bench_call_through_leaf() {
     );
 }
 
+
+/// The call-through shape that needs two SMC intervals: the leaf sits at
+/// BSR.W's maximum forward reach and the loop body stores into the gap
+/// between the code regions. A unified caller..callee interval would
+/// false-bail that store every iteration (and the old per-call span cap
+/// rejected the far call outright), so base interprets the whole loop.
+fn bench_far_call_through_leaf() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    const LEAF: u32 = CODE_BASE + 0x8000;
+    const GAP_SLOT: u32 = 0xA000;
+    let bsr_disp = (LEAF - (CODE_BASE + 2)) as u16;
+    let dbra_disp = CODE_BASE.wrapping_sub(CODE_BASE + 0x0A) as u16;
+    let bra_disp = CODE_BASE.wrapping_sub(CODE_BASE + 0x10) as u8;
+    let caller = [
+        0x6100,
+        bsr_disp, // head: BSR.W leaf
+        0x5283,   // ADDQ.L #1,D3
+        0x3083,   // MOVE.W D3,(A0)  (store into the gap)
+        0x51C8,
+        dbra_disp,                    // DBRA D0,head
+        0x707F,                       // MOVEQ #127,D0
+        0x6000 | u16::from(bra_disp), // BRA.S head
+    ];
+    let leaf_words = [
+        0x5282, // leaf: ADDQ.L #1,D2
+        0x4E75, // RTS
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in caller.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    for (index, word) in leaf_words.iter().enumerate() {
+        bus.write_word_at(LEAF + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_a(0, GAP_SLOT);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(
+        cpu.d(2).abs_diff(cpu.d(3)) <= 1,
+        "leaf and tail in lockstep"
+    );
+    // The budget may stop between the ADDQ and the store, so the stored
+    // word trails D3 by at most one.
+    assert!(
+        (cpu.d(3) & 0xFFFF).abs_diff(u32::from(bus.read_word(GAP_SLOT))) <= 1,
+        "the gap store lands every iteration"
+    );
+    println!(
+        "batch     far call-through+store  {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// The field shape salvage targets: a store-heavy body with one interior
 /// branch, then an instruction the decoder refuses (LEA (abs).L) -- the
 /// ROM regions the gameplay profile shows dying 14-26 ops deep. Base
@@ -1823,6 +1893,10 @@ fn main() {
     }
     if only.as_deref() == Some("call-through") {
         bench_call_through_leaf();
+        return;
+    }
+    if only.as_deref() == Some("far-call-through") {
+        bench_far_call_through_leaf();
         return;
     }
     if only.as_deref() == Some("salvage-prefix") {
