@@ -1265,6 +1265,37 @@ fn call_through_leaf_loop_matches_step() {
     });
 }
 
+/// The same loop-calls-leaf shape with the leaf at BSR.W's maximum
+/// forward reach (32KB away). The caller's and callee's code get
+/// separate SMC store intervals, so the far call is admitted; the whole
+/// lifecycle must still match step() exactly.
+#[test]
+fn far_leaf_call_through_matches_step() {
+    let leaf = 0x9000u32;
+    let bsr_disp = (leaf - (0x1000 + 2)) as u16;
+    let mut words = vec![
+        0x6100, bsr_disp, // $1000: BSR.W $9000
+        0x5283,   // $1004: ADDQ.L #1,D3
+        0x51C8, 0xFFF8, // $1006: DBRA D0,$1000
+        0x5347, // $100A: SUBQ.W #1,D7
+        0x6602, // $100C: BNE.S $1010
+        0xA000, // $100E: sentinel
+        0x707F, // $1010: MOVEQ #127,D0
+        0x60EC, // $1012: BRA.S $1000
+    ];
+    // Never-executed filler up to the leaf.
+    words.resize(((leaf - 0x1000) / 2) as usize, 0x4E71);
+    words.extend([
+        0x5282, // $9000: leaf: ADDQ.L #1,D2
+        0x4E75, // $9002: RTS
+    ]);
+    assert_fastmem_matches_step("far-leaf call-through", &words, CpuType::M68040, |cpu| {
+        cpu.set_a(7, 0x8000); // stack well clear of both code regions
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}
+
 /// A memory operation followed immediately by DBRA is a common 68k copy-loop
 /// shape. It must remain exact when admitted as the minimum two-op self-loop.
 #[test]
