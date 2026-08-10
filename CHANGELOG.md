@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.5...m68k-v0.10.6) (2026-08-10)
+
+
+### Performance Improvements
+
+* admit LINK/UNLK frame ops into traces ([865ebd9](https://github.com/benletchford/m68k-rs/commit/865ebd9e5b78e1c06638a6010a9304b17fbf4973))
+
 ## [0.10.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.4...m68k-v0.10.5) (2026-08-09)
 
 
