@@ -34,6 +34,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 const TRACE_CACHE_SIZE: usize = 4096;
 pub(crate) const TRACE_MAX_OPS: usize = 128;
 pub(crate) const TRACE_MIN_OPS: usize = 3;
+
+/// Minimum recorded ops for a blocked recording to be worth salvaging as
+/// a trimmed region. Higher than `TRACE_MIN_OPS`: a salvaged trace exits
+/// to the interpreter at its trimmed terminal every pass, so short
+/// fragments would pay entry/exit costs without covering enough work.
+const SALVAGE_MIN_OPS: usize = 8;
 const TRACE_MIN_SELF_LOOP_OPS: usize = 2;
 /// Indirect calls pay trace validation plus a native/Rust boundary on every
 /// visit. In same-binary paired 100-million-instruction runs, six-op register
@@ -1081,12 +1087,30 @@ impl TraceJit {
     }
 
     #[cfg_attr(not(feature = "trace-profile"), allow(unused_variables))]
-    fn finish_recording(&mut self, cpu: &mut CpuCore, exit_pc: u32, end: RecordingEnd) {
+    fn finish_recording(&mut self, cpu: &mut CpuCore, mut exit_pc: u32, end: RecordingEnd) {
         let Some(mut recording) = self.recording.take() else {
             cpu.trace_recording = false;
             return;
         };
         cpu.trace_recording = false;
+
+        // A recording stopped by an instruction the decoder refuses ends
+        // without a trace terminal, so compilation would reject the whole
+        // region. If the prefix already crossed a recorded branch, trim
+        // back to the last one and compile that instead: partial coverage
+        // of a long region beats none, and the guest re-enters full
+        // dispatch exactly where the trimmed tail began (the recorded op
+        // after the terminal names the true continuation, whichever way
+        // the branch went). Ops are execution-ordered, so the trimmed
+        // trace revalidates and runs exactly what the guest executed.
+        if end == RecordingEnd::Blocker
+            && !recording.ops.last().is_some_and(|op| op.op.ends_trace())
+            && let Some(last_terminal) = recording.ops.iter().rposition(|op| op.op.ends_trace())
+            && last_terminal + 1 >= SALVAGE_MIN_OPS
+        {
+            exit_pc = recording.ops[last_terminal + 1].pc;
+            recording.ops.truncate(last_terminal + 1);
+        }
 
         // An interior recorded branch becomes the region's ordinary final
         // branch when recording stops at its destination.
@@ -12346,5 +12370,155 @@ mod portable_tests {
         );
         assert_eq!(p.a(6), 0x0301);
         assert_eq!(p.a(7), 0x0800);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn blocked_recording_salvages_the_prefix_through_the_last_branch() {
+        // Nine admissible ops (the last a recorded interior branch), then
+        // LINK -- which this decoder refuses -- then a loop tail. Without
+        // salvage the whole head rejects; with it the prefix through the
+        // branch compiles and the tail stays interpreted.
+        const A: u32 = 0x0100;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0x5285, // ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0x5281, // ADDQ.L #1,D1
+            0x4A41, // TST.W D1
+            0x6602, // BNE.S +2 (always taken: D1 counts up)
+            0x4E71, // NOP (skipped)
+            0x4E56, 0x0000, // LINK A6,#0  -- the blocker
+            0x4E5E, // UNLK A6
+            0x51C8, 0xFFE4, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60DE, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(6, 0x3000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        let result = cpu.run_batch(&mut bus, 40_000, &[0]);
+        assert_eq!(result.instructions, 40_000, "loop runs to budget");
+        // Every iteration bumps D2..D7 and D1 exactly once each.
+        assert!(cpu.d(2) > 2_000, "the loop actually iterated");
+        assert!(
+            cpu.d(2).abs_diff(cpu.d(3)) <= 1 && cpu.d(2).abs_diff(cpu.d(7)) <= 1,
+            "counters advance in lockstep"
+        );
+        let salvaged = TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(A)] {
+            TraceSlot::Compiled(trace) if trace.pc == A => Some((
+                trace.ops.len(),
+                matches!(
+                    trace.ops.last().map(|op| op.op),
+                    Some(JitTraceOp::Branch { .. })
+                ),
+                trace
+                    .ops
+                    .iter()
+                    .all(|op| op.opcode != 0x4E56 && op.opcode != 0x4E5E),
+            )),
+            _ => None,
+        });
+        let (ops, ends_in_branch, excludes_blocked_tail) =
+            salvaged.expect("the blocked head compiles its salvageable prefix");
+        assert_eq!(ops, 9, "trimmed at the recorded branch");
+        assert!(ends_in_branch, "the trimmed terminal is the branch");
+        assert!(
+            excludes_blocked_tail,
+            "the unsupported tail is not recorded"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn short_blocked_recordings_still_reject() {
+        // A five-op prefix whose last terminal sits at op four: below
+        // SALVAGE_MIN_OPS the head must reject exactly as before. (The
+        // blocker must not directly follow the branch: a recording whose
+        // last op is already a terminal compiles today without salvage.)
+        const A: u32 = 0x0100;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x4A42, // TST.W D2
+            0x6602, // BNE.S +2 (always taken)
+            0x4E71, // NOP (skipped)
+            0x5284, // ADDQ.L #1,D4
+            0x4E56, 0x0000, // LINK A6,#0  -- the blocker
+            0x4E5E, // UNLK A6
+            0x51C8, 0xFFEC, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60E6, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(6, 0x3000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        cpu.run_batch(&mut bus, 40_000, &[0]);
+        TRACE_JIT.with_borrow(|jit| {
+            assert!(
+                matches!(
+                    &jit.slots[trace_cache_index(A)],
+                    TraceSlot::Rejected { pc, .. } if *pc == A
+                ),
+                "a four-op prefix is below the salvage bar"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn blocked_recording_without_a_branch_still_rejects() {
+        // A straight-line prefix has no terminal to trim to; the head
+        // must reject exactly as before regardless of length.
+        const A: u32 = 0x0100;
+        let words = [
+            0x5282, 0x5283, 0x5284, 0x5285, 0x5286, 0x5287, 0x5281, 0x5280,
+            0x4A41, // nine straight-line ops, no branch
+            0x4E56, 0x0000, // LINK A6,#0  -- the blocker
+            0x4E5E, // UNLK A6
+            0x51C8, 0xFFE6, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60E0, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(6, 0x3000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        cpu.run_batch(&mut bus, 40_000, &[0]);
+        TRACE_JIT.with_borrow(|jit| {
+            assert!(
+                matches!(
+                    &jit.slots[trace_cache_index(A)],
+                    TraceSlot::Rejected { pc, .. } if *pc == A
+                ),
+                "no recorded branch means nothing to salvage"
+            );
+        });
     }
 }
