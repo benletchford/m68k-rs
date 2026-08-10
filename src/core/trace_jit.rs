@@ -12376,7 +12376,7 @@ mod portable_tests {
     #[test]
     fn blocked_recording_salvages_the_prefix_through_the_last_branch() {
         // Nine admissible ops (the last a recorded interior branch), then
-        // LINK -- which this decoder refuses -- then a loop tail. Without
+        // LEA (abs).L -- which this decoder refuses -- then a loop tail. Without
         // salvage the whole head rejects; with it the prefix through the
         // branch compiles and the tail stays interpreted.
         const A: u32 = 0x0100;
@@ -12393,8 +12393,7 @@ mod portable_tests {
             0x4E71, // NOP (skipped)
             0x4A42, // TST.W D2 -- past the branch: no terminal to stop at
             0x4A42, // TST.W D2
-            0x4E56, 0x0000, // LINK A6,#0  -- the blocker
-            0x4E5E, // UNLK A6
+            0x41F9, 0x0000, 0x3000, // LEA $3000.L,A0  -- the blocker
             0x51C8, 0xFFE0, // DBRA D0,head
             0x707F, // MOVEQ #127,D0
             0x60DA, // BRA.S head
@@ -12425,10 +12424,7 @@ mod portable_tests {
                     trace.ops.last().map(|op| op.op),
                     Some(JitTraceOp::Branch { .. })
                 ),
-                trace
-                    .ops
-                    .iter()
-                    .all(|op| op.opcode != 0x4E56 && op.opcode != 0x4E5E),
+                trace.ops.iter().all(|op| op.opcode != 0x41F9),
             )),
             _ => None,
         });
@@ -12457,8 +12453,7 @@ mod portable_tests {
             0x6602, // BNE.S +2 (always taken)
             0x4E71, // NOP (skipped)
             0x5284, // ADDQ.L #1,D4
-            0x4E56, 0x0000, // LINK A6,#0  -- the blocker
-            0x4E5E, // UNLK A6
+            0x41F9, 0x0000, 0x3000, // LEA $3000.L,A0  -- the blocker
             0x51C8, 0xFFEC, // DBRA D0,head
             0x707F, // MOVEQ #127,D0
             0x60E6, // BRA.S head
@@ -12495,8 +12490,7 @@ mod portable_tests {
         let words = [
             0x5282, 0x5283, 0x5284, 0x5285, 0x5286, 0x5287, 0x5281, 0x5280,
             0x4A41, // nine straight-line ops, no branch
-            0x4E56, 0x0000, // LINK A6,#0  -- the blocker
-            0x4E5E, // UNLK A6
+            0x41F9, 0x0000, 0x3000, // LEA $3000.L,A0  -- the blocker
             0x51C8, 0xFFE6, // DBRA D0,head
             0x707F, // MOVEQ #127,D0
             0x60E0, // BRA.S head
