@@ -1094,6 +1094,66 @@ fn bench_salvaged_prefix_loop() {
     );
 }
 
+/// A mixed-path loop whose conditional branch alternates every iteration
+/// (EORI #1 flips Z), so whichever spine the head trace records, it
+/// guard-exits on half of all calls forever -- below the adaptive
+/// re-record ratio, above any useful coverage. The continuation between
+/// the branch join and the DBRA is what exit-seeded candidacy compiles.
+fn bench_mixed_path_loop() {
+    const CODE_BASE: u32 = 0x6000;
+    const INSTRS: u32 = 100_000_000;
+    let words = [
+        0x0A01, 0x0001, // head: EORI.B #1,D1
+        0x6602, // BNE.S join
+        0x5282, // ADDQ.L #1,D2
+        // join: a field-shaped continuation -- long enough that a chained
+        // native call amortizes its entry boundary, as the stranded
+        // continuations in the gameplay profile are.
+        0x1ADC, // join: MOVE.B (A4)+,(A5)+
+        0x5283, // ADDQ.L #1,D3
+        0x1ADC, 0x5283, // x2
+        0x1ADC, 0x5283, // x3
+        0x1ADC, 0x5283, // x4
+        0x1ADC, 0x5283, // x5
+        0x1ADC, 0x5283, // x6
+        0x51C8, 0xFFDE, // DBRA D0,head
+        0x2845, // outer: MOVEA.L D5,A4
+        0x2A46, // MOVEA.L D6,A5
+        0x707F, // MOVEQ #127,D0
+        0x60D4, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(4, 0x4000);
+        cpu.set_a(5, 0x5000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 127);
+        cpu.set_d(5, 0x4000);
+        cpu.set_d(6, 0x5000);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "batch     mixed-path loop         {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce a path-biased trace that is first recorded through an uncommon
 /// conditional edge before settling into a copy loop on the opposite edge.
 /// A first-path-only
@@ -1729,6 +1789,10 @@ fn main() {
     }
     if only.as_deref() == Some("sub-reg-to-mem") {
         bench_sub_reg_to_mem_loop();
+        return;
+    }
+    if only.as_deref() == Some("mixed-path") {
+        bench_mixed_path_loop();
         return;
     }
     if only.as_deref() == Some("indexed-lea") {

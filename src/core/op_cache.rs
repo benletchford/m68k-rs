@@ -1062,7 +1062,16 @@ impl CpuCore {
                             probe = true;
                             continue;
                         }
-                        CachedRunResult::Miss(opcode) => return BatchInnerExit::Miss(opcode),
+                        CachedRunResult::Miss(opcode) => {
+                            // A chained continuation can retire instructions
+                            // before its successor misses validation; those
+                            // are real completed instructions and must be
+                            // accounted before the missed opcode dispatches.
+                            // (`remaining` needs no update: this return path
+                            // leaves the budget loop entirely.)
+                            *retired += instructions;
+                            return BatchInnerExit::Miss(opcode);
+                        }
                     }
                 }
             }
