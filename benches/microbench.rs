@@ -1826,6 +1826,10 @@ fn main() {
         bench_memory_and_loop();
         return;
     }
+    if only.as_deref() == Some("clr-abs") {
+        bench_clr_abs_loop();
+        return;
+    }
     if only.as_deref() == Some("salvage-prefix") {
         bench_salvaged_prefix_loop();
         return;
