@@ -1028,12 +1028,18 @@ impl TraceJit {
             }
             if rerecord_dominant_path {
                 let adaptive_rerecords = trace.adaptive_rerecords.saturating_add(1);
+                // A slot recreated from scratch must consult the durable
+                // grant, or a head that already earned permission pays a
+                // fresh permissionless blocker every time its slot is
+                // replaced -- which is exactly what the side table exists
+                // to prevent.
+                let allow_call_through = self.has_call_permission(pc);
                 self.slots[idx] = TraceSlot::Counting {
                     pc,
                     cpu_type,
                     hits: 0,
                     adaptive_rerecords,
-                    allow_call_through: false,
+                    allow_call_through,
                 };
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
@@ -1197,6 +1203,10 @@ impl TraceJit {
         entry_watched: bool,
     ) -> ExitSeed {
         let idx = trace_cache_index(exit_pc);
+        // Read the durable grant before borrowing the slot mutably: a
+        // candidate created here must carry the permission its head
+        // already earned.
+        let permission = self.has_call_permission(exit_pc);
         match &mut self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
@@ -1250,7 +1260,7 @@ impl TraceJit {
                     cpu_type,
                     hits: 1,
                     adaptive_rerecords: 0,
-                    allow_call_through: false,
+                    allow_call_through: permission,
                 };
                 ExitSeed::None
             }
@@ -10386,6 +10396,59 @@ mod portable_tests {
         assert_eq!(pcpu.a(7), icpu.a(7), "portable matches interpreter A7");
         assert_eq!(pmem, imem, "memory matches interpreter exactly");
         assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "flags agree");
+    }
+
+    #[test]
+    fn a_revived_head_carries_its_durable_call_permission() {
+        // The grant is durable precisely so a head does not have to earn
+        // permission again every time its cache slot is replaced. Two ways
+        // a slot is created from scratch have to honour it: a candidate
+        // seeded from a guarded exit, and a slot recreated by adaptive
+        // re-recording. Without this the head pays a fresh permissionless
+        // call blocker despite holding the grant.
+        const HEAD: u32 = 0x0100;
+        let mut jit = TraceJit::new();
+        jit.grant_call_permission(HEAD);
+        assert!(jit.has_call_permission(HEAD));
+
+        // Stomp the slot, as an unrelated head sharing this index would.
+        let idx = trace_cache_index(HEAD);
+        jit.slots[idx] = TraceSlot::Empty;
+
+        // Revive it through the exit-seeding path.
+        assert!(matches!(
+            jit.note_trace_exit(HEAD, CpuType::M68040, false),
+            ExitSeed::None
+        ));
+        match &jit.slots[idx] {
+            TraceSlot::Counting {
+                pc,
+                allow_call_through,
+                ..
+            } => {
+                assert_eq!(*pc, HEAD);
+                assert!(
+                    *allow_call_through,
+                    "a revived candidate must carry the durable grant"
+                );
+            }
+            _ => panic!("the exit seed should have created a counting slot"),
+        }
+
+        // A head with no grant is still created without permission.
+        const OTHER: u32 = 0x0200;
+        let other_idx = trace_cache_index(OTHER);
+        jit.slots[other_idx] = TraceSlot::Empty;
+        let _ = jit.note_trace_exit(OTHER, CpuType::M68040, false);
+        match &jit.slots[other_idx] {
+            TraceSlot::Counting {
+                allow_call_through, ..
+            } => assert!(
+                !*allow_call_through,
+                "permission must come from the grant, not from being revived"
+            ),
+            _ => panic!("expected a counting slot"),
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
