@@ -13828,8 +13828,10 @@ mod portable_tests {
             0x5286, // ADDQ.L #1,D6
             0x5287, // ADDQ.L #1,D7
             0x4A41, // TST.W D1
-            0x6702, // BEQ.S call   (taken; its target IS the call)
-            0x4E71, // NOP
+            0x6602, // BNE.S call   (D1 is nonzero in steady state, so this
+            //         branch is TAKEN and its target IS the call, leaving
+            //         the branch as the region's last recorded op)
+            0x4E71, // NOP (skipped)
             0x6100, 0x000C, // call: BSR.W leaf
             0x5241, // ADDQ.W #1,D1
             0x51C8, 0xFFE6, // DBRA D0,head
