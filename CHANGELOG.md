@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.8](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.7...m68k-v0.10.8) (2026-08-11)
+
+
+### Performance Improvements
+
+* seed trace candidacy from guard exits and chain compiled continuations ([04f41a0](https://github.com/benletchford/m68k-rs/commit/04f41a0d4957e0420383175c967b9025bcd07320))
+
 ## [0.10.7](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.6...m68k-v0.10.7) (2026-08-11)
 
 
