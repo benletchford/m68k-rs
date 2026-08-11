@@ -1,6 +1,6 @@
 [package]
 name = "m68k"
-version = "0.10.9"
+version = "0.10.10"
 edition = "2024"
 rust-version = "1.93"
 license = "MIT"

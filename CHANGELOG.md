@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.10](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.9...m68k-v0.10.10) (2026-08-11)
+
+
+### Performance Improvements
+
+* admit AND and OR from memory into the register-ALU family ([14145e6](https://github.com/benletchford/m68k-rs/commit/14145e6184d3a1b2d287e810199337e88a804db1))
+
 ## [0.10.9](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.8...m68k-v0.10.9) (2026-08-11)
 
 
