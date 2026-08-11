@@ -1023,6 +1023,77 @@ fn bench_link_unlk_frame_loop() {
     );
 }
 
+/// The field shape salvage targets: a store-heavy body with one interior
+/// branch, then an instruction the decoder refuses (LEA (abs).L) -- the
+/// ROM regions the gameplay profile shows dying 14-26 ops deep. Base
+/// rejects the whole head and interprets; with salvage the twelve-op
+/// prefix through the branch compiles and only the tail stays
+/// interpreted. Two register tests sit between the branch and the
+/// blocker so the recording's last op is not a terminal: without salvage
+/// the whole head rejects. (A register-only nine-op variant measures
+/// ~1.0x -- trace entry/exit cost cancels the win on cheap ops.)
+fn bench_salvaged_prefix_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x3083, // head: MOVE.W D3,(A0)
+        0x5283, // ADDQ.L #1,D3
+        0x3143, 0x0002, // MOVE.W D3,2(A0)
+        0x5284, // ADDQ.L #1,D4
+        0x3144, 0x0004, // MOVE.W D4,4(A0)
+        0x5285, // ADDQ.L #1,D5
+        0x3145, 0x0006, // MOVE.W D5,6(A0)
+        0x5286, // ADDQ.L #1,D6
+        0x3146, 0x0008, // MOVE.W D6,8(A0)
+        0x5281, // ADDQ.L #1,D1
+        0x4A41, // TST.W D1
+        0x6602, // BNE.S +2 (taken until D1 wraps 16 bits)
+        0x4E71, // NOP (skipped)
+        0x4A42, // TST.W D2 -- past the branch: master has no terminal here
+        0x4A42, // TST.W D2
+        0x4E57, 0x0000, // LINK A7,#0 -- refused by design (A7 exclusion)
+        0x4E5F, // UNLK A7
+        0x51C8, 0xFFD2, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60CC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x4000);
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    // After iteration one the interpreted LEA holds A0 at $3000, so the
+    // steady-state head store lands there.
+    assert!(
+        (cpu.d(3) & 0xFFFF).abs_diff(u32::from(bus.read_word(0x3000))) <= 1
+            || (cpu.d(3) & 0xFFFF).abs_diff(u32::from(bus.read_word(0x3000))) >= 0xFFFF,
+        "the head store lands every iteration"
+    );
+    println!(
+        "batch     salvaged prefix loop    {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 /// Reproduce a path-biased trace that is first recorded through an uncommon
 /// conditional edge before settling into a copy loop on the opposite edge.
 /// A first-path-only
@@ -1638,6 +1709,10 @@ fn main() {
     }
     if only.as_deref() == Some("link-unlk") {
         bench_link_unlk_frame_loop();
+        return;
+    }
+    if only.as_deref() == Some("salvage-prefix") {
+        bench_salvaged_prefix_loop();
         return;
     }
     if only.as_deref() == Some("clr-predec") {
