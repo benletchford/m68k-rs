@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.9](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.8...m68k-v0.10.9) (2026-08-11)
+
+
+### Performance Improvements
+
+* admit absolute-addressed CLR into the memory-CLR family ([75baded](https://github.com/benletchford/m68k-rs/commit/75baded6c8c661a965d32fd0ed7a7d750bc1da76))
+
 ## [0.10.8](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.7...m68k-v0.10.8) (2026-08-11)
 
 
