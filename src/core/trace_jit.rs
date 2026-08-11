@@ -1273,7 +1273,24 @@ impl TraceJit {
     }
 
     #[cfg_attr(not(feature = "trace-profile"), allow(unused_variables))]
-    fn finish_recording(&mut self, cpu: &mut CpuCore, mut exit_pc: u32, end: RecordingEnd) {
+    fn finish_recording(&mut self, cpu: &mut CpuCore, exit_pc: u32, end: RecordingEnd) {
+        self.finish_recording_with_retry(cpu, exit_pc, end, false);
+    }
+
+    /// `call_retry_pending` marks the one case where a rescued prefix is
+    /// worse than no trace at all: a recording stopped by its first
+    /// unpermitted call. Salvaging there installs a compiled prefix that
+    /// stops short of the call, and because the permitted retry is only
+    /// armed when the head rejects, the head would never record through
+    /// the call at all. Retry outranks salvage; once the head holds
+    /// permission the flag is clear and a later blocker salvages normally.
+    fn finish_recording_with_retry(
+        &mut self,
+        cpu: &mut CpuCore,
+        mut exit_pc: u32,
+        end: RecordingEnd,
+        call_retry_pending: bool,
+    ) {
         let Some(mut recording) = self.recording.take() else {
             cpu.trace_recording = false;
             return;
@@ -1290,6 +1307,7 @@ impl TraceJit {
         // the branch went). Ops are execution-ordered, so the trimmed
         // trace revalidates and runs exactly what the guest executed.
         if end == RecordingEnd::Blocker
+            && !call_retry_pending
             && !recording.ops.last().is_some_and(|op| op.op.ends_trace())
             && let Some(last_terminal) = recording.ops.iter().rposition(|op| op.op.ends_trace())
             && last_terminal + 1 >= SALVAGE_MIN_OPS
@@ -1526,7 +1544,7 @@ impl TraceJit {
                     },
                 );
             }
-            self.finish_recording(cpu, executed_pc, RecordingEnd::Blocker);
+            self.finish_recording_with_retry(cpu, executed_pc, RecordingEnd::Blocker, call_retry);
             if call_retry {
                 let idx = trace_cache_index(start_pc);
                 if matches!(&self.slots[idx], TraceSlot::Rejected { pc, .. } if *pc == start_pc) {
@@ -13780,12 +13798,77 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
-    fn guard_exits_seed_and_chain_a_continuation_trace() {
-        // Mixed-path loop: EORI.B #1,D1 flips Z every iteration, so the
-        // head trace guard-exits on ~half of all calls forever -- the shape
-        // adaptive re-recording cannot settle. Exit seeding must form a
-        // second compiled trace inside the loop body.
+    fn a_salvageable_prefix_before_a_call_still_yields_the_permitted_retry() {
+        // Composition of the prefix salvage with retry-gated call-through.
+        // The head has eleven admissible ops and a recorded interior
+        // branch before its BSR, so the blocked recording IS salvageable.
+        // Salvaging it would install a compiled prefix that stops short of
+        // the call, and since the permitted retry is only armed when the
+        // head rejects, the head would never record through the call.
+        // Retry outranks salvage: the first unpermitted call blocker must
+        // leave the head armed for a permitted recording, and the trace
+        // that finally compiles must contain the call.
         const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0x5285, // ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0x4A41, // TST.W D1
+            0x6602, // BNE.S skip      (interior recorded branch)
+            0x4E71, // NOP
+            0x4A42, // skip: TST.W D2  (non-terminal tail before the call)
+            0x4A43, // TST.W D3
+            0x6100, 0x000C, // BSR.W leaf
+            0x5241, // ADDQ.W #1,D1
+            0x51C8, 0xFFE2, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60DC, // BRA.S head
+            0x5282, // leaf: ADDQ.L #1,D2
+            0x4E75, // RTS
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        let result = cpu.run_batch(&mut bus, 60_000, &[0]);
+        assert_eq!(result.instructions, 60_000, "loop runs to budget");
+
+        let (records_call, op_count) =
+            TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+                TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => (
+                    trace
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                    trace.ops.len(),
+                ),
+                _ => (false, 0),
+            });
+        assert!(
+            records_call,
+            "the head must record through its call, not stop at a salvaged \
+             prefix ({op_count} ops compiled)"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn blocked_recording_salvages_the_prefix_through_the_last_branch() {
+        // Nine admissible ops (the last a recorded interior branch), then
+        // the A7 LINK/UNLK pair -- refused by documented design, so no
+        // future coverage can admit this blocker -- then a loop tail. Without
+        // salvage the whole head rejects; with it the prefix through the
+        // branch compiles and the tail stays interpreted.
+        const A: u32 = 0x0100;
         let words = [
             0x0A01, 0x0001, // EORI.B #1,D1
             0x6602, // BNE.S +2
