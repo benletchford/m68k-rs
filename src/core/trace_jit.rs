@@ -14540,6 +14540,70 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
+    fn a_branch_landing_on_a_jsr_still_yields_the_permitted_retry() {
+        // The JSR counterpart of the branch-ended prefix case: this branch
+        // admits constant-target JSR as a recordable call, so the same
+        // starvation is reachable through `4EB9` and the retry precedence
+        // must cover it too.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0x5285, // ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0x4A41, // TST.W D1
+            0x6602, // BNE.S call  (taken; its target IS the call)
+            0x4E71, // NOP (skipped)
+            0x4EB9, 0x0000, 0x7022, // call: JSR ($7022).L
+            0x5241, // ADDQ.W #1,D1
+            0x51C8, 0xFFE4, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60DE, // BRA.S head
+            0x5282, // leaf: ADDQ.L #1,D2
+            0x4E75, // RTS
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+
+        let mut seen_call_trace = false;
+        for _ in 0..300 {
+            cpu.run_batch(&mut bus, 200, &[0]);
+            let observed =
+                TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+                    TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
+                        trace
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                    ),
+                    _ => None,
+                });
+            match observed {
+                Some(true) => seen_call_trace = true,
+                Some(false) => {
+                    panic!("a call-less prefix was installed, starving the permitted JSR retry")
+                }
+                None => {}
+            }
+        }
+        assert!(
+            seen_call_trace,
+            "the head should end up recording through its JSR"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
     fn a_branch_landing_on_a_call_still_yields_the_permitted_retry() {
         // The second way a prefix can outrank the retry, and the one the
         // salvage-only fix missed: the last recorded op here is an
