@@ -1023,7 +1023,6 @@ fn bench_link_unlk_frame_loop() {
     );
 }
 
-
 /// Exercise the retry-gated call-through: a loop whose body calls a
 /// two-op leaf through BSR.W. Base cannot record past the call and
 /// interprets the whole loop; with call-through the push, leaf, checked
@@ -1071,7 +1070,6 @@ fn bench_call_through_leaf() {
         f64::from(INSTRS) / elapsed / 1_000_000.0
     );
 }
-
 
 /// The call-through shape that needs two SMC intervals: the leaf sits at
 /// BSR.W's maximum forward reach and the loop body stores into the gap

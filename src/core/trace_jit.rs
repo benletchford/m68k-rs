@@ -1413,7 +1413,7 @@ impl TraceJit {
         // ungated recorder never reaches this and remains byte-identical
         // to the behavior the opportunity ranking is built on.
         if recording.allow_call_through
-            && let Some(call_op) = decode_call_op(cpu, bus, executed_pc, cpu.ir as u16)
+            && let Some(call_op) = decode_call_op(cpu, bus, executed_pc, cpu.ir as u16, cpu_type)
         {
             match call_op.op {
                 JitTraceOp::CallThrough { return_pc } => {
@@ -2322,6 +2322,7 @@ fn decode_call_op<B: AddressBus>(
     bus: &mut B,
     pc: u32,
     opcode: u16,
+    cpu_type: CpuType,
 ) -> Option<TraceBuildOp> {
     if opcode == 0x4E75 {
         return Some(TraceBuildOp {
@@ -2343,7 +2344,10 @@ fn decode_call_op<B: AddressBus>(
             let ext = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
             (pc.wrapping_add(4), Some(ext), None)
         }
-        0xFF => {
+        // BSR.L exists only on 68020+. On earlier models the 0xFF byte is
+        // the short displacement -1, with no extension words: reading any
+        // would add bus accesses the guest never performs.
+        0xFF if !is_pre_68020(cpu_type) => {
             let hi = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
             let lo = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
             (pc.wrapping_add(6), Some(hi), Some(lo))
@@ -10269,6 +10273,98 @@ mod portable_tests {
         assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "flags agree");
     }
 
+    #[test]
+    fn bsr_ff_call_decode_is_cpu_aware() {
+        // On pre-68020 models, 0x61FF is BSR.S with displacement -1: it has
+        // no extension words, and decoding it as a call must not read the
+        // bus at all. A bus that panics on any access proves it.
+        struct FaultingBus;
+        impl super::super::memory::AddressBus for FaultingBus {
+            fn read_byte(&mut self, _: u32) -> u8 {
+                panic!("pre-68020 BSR 0xFF decode must not read the bus")
+            }
+            fn read_word(&mut self, _: u32) -> u16 {
+                panic!("pre-68020 BSR 0xFF decode must not read the bus")
+            }
+            fn read_long(&mut self, _: u32) -> u32 {
+                panic!("pre-68020 BSR 0xFF decode must not read the bus")
+            }
+            fn write_byte(&mut self, _: u32, _: u8) {}
+            fn write_word(&mut self, _: u32, _: u16) {}
+            fn write_long(&mut self, _: u32, _: u32) {}
+        }
+        for cpu_type in [CpuType::M68000, CpuType::M68010, CpuType::SCC68070] {
+            let mut dcpu = cpu();
+            dcpu.set_cpu_type(cpu_type);
+            let trace = decode_call_op(&dcpu, &mut FaultingBus, 0x0100, 0x61FF, cpu_type)
+                .expect("pre-68020 0x61FF still decodes as a short call");
+            assert!(
+                matches!(
+                    trace.op,
+                    JitTraceOp::CallThrough {
+                        return_pc: 0x0102,
+                        ..
+                    }
+                ),
+                "{cpu_type:?}: the return PC is the short form's"
+            );
+            assert!(
+                trace.extension.is_none() && trace.extension2.is_none(),
+                "{cpu_type:?}: no extension words are recorded"
+            );
+        }
+
+        // On 68020+ the same opcode is BSR.L: exactly the two displacement
+        // words are read, and the return PC clears them.
+        struct WordBus {
+            words: [u16; 2],
+            reads: Vec<u32>,
+        }
+        impl super::super::memory::AddressBus for WordBus {
+            fn read_byte(&mut self, _: u32) -> u8 {
+                unreachable!()
+            }
+            fn read_word(&mut self, address: u32) -> u16 {
+                self.reads.push(address);
+                self.words[((address - 0x0102) / 2) as usize]
+            }
+            fn read_long(&mut self, address: u32) -> u32 {
+                let high = self.read_word(address);
+                let low = self.read_word(address.wrapping_add(2));
+                (u32::from(high) << 16) | u32::from(low)
+            }
+            fn write_byte(&mut self, _: u32, _: u8) {}
+            fn write_word(&mut self, _: u32, _: u16) {}
+            fn write_long(&mut self, _: u32, _: u32) {}
+        }
+        for cpu_type in [CpuType::M68020, CpuType::M68040] {
+            let mut dcpu = cpu();
+            dcpu.set_cpu_type(cpu_type);
+            let mut bus = WordBus {
+                words: [0x0001, 0x2340],
+                reads: Vec::new(),
+            };
+            let trace = decode_call_op(&dcpu, &mut bus, 0x0100, 0x61FF, cpu_type)
+                .expect("68020+ 0x61FF decodes as BSR.L");
+            assert!(matches!(
+                trace.op,
+                JitTraceOp::CallThrough {
+                    return_pc: 0x0106,
+                    ..
+                }
+            ));
+            assert_eq!(
+                (trace.extension, trace.extension2),
+                (Some(0x0001), Some(0x2340)),
+                "{cpu_type:?}: both displacement words recorded"
+            );
+            assert_eq!(
+                bus.reads,
+                vec![0x0102, 0x0104],
+                "{cpu_type:?}: exactly the two operand words are read"
+            );
+        }
+    }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
