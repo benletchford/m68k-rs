@@ -10544,7 +10544,8 @@ mod portable_tests {
             };
             let mut emem = vec![0u8; 0x1000];
             let mut expected = prepare(&mut emem);
-            let expected_packed = execute_portable_trace(&mut expected, &ops, CodeSpans::caller(0x0100, trace_end));
+            let expected_packed =
+                execute_portable_trace(&mut expected, &ops, CodeSpans::caller(0x0100, trace_end));
             let mut amem = vec![0u8; 0x1000];
             let mut actual = prepare(&mut amem);
             let mut jit = TraceJit::new();
@@ -11172,7 +11173,8 @@ mod portable_tests {
         portable.set_d(2, 0x1111_0000);
         portable.set_ccr(0x10);
         attach_window(&mut portable, &mut pmem);
-        let ppacked = execute_portable_trace(&mut portable, &ops, 0x0100, 0x010A);
+        let ppacked =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x010A));
         assert_eq!(ppacked, packed, "retired count and cycles agree");
         assert_eq!(portable.d(1), native.d(1));
         assert_eq!(portable.d(2), native.d(2));
@@ -11231,9 +11233,12 @@ mod portable_tests {
                 ),
                 "{label}"
             );
-            let pcycles =
-                execute_portable_op(&mut pcpu, t, 0x0100, 0x0100 + words.len() as u32 * 2)
-                    .unwrap_or_else(|| panic!("{label}: portable executes"));
+            let pcycles = execute_portable_op(
+                &mut pcpu,
+                t,
+                CodeSpans::caller(0x0100, 0x0100 + words.len() as u32 * 2),
+            )
+            .unwrap_or_else(|| panic!("{label}: portable executes"));
             assert_eq!(pcpu.dar, icpu.dar, "{label}: registers");
             assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "{label}: NZVCX");
             // The memory-ALU family charges conservative cycle maxima

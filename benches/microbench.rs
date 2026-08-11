@@ -1901,6 +1901,10 @@ fn main() {
         bench_clr_abs_loop();
         return;
     }
+    if only.as_deref() == Some("memory-and") {
+        bench_memory_and_loop();
+        return;
+    }
     if only.as_deref() == Some("salvage-prefix") {
         bench_salvaged_prefix_loop();
         return;
@@ -2064,6 +2068,51 @@ fn bench_clr_abs_loop() {
     assert_eq!(bus.read_byte(0x4002), 0xAA, "untouched byte kept");
     println!(
         "batch     absolute CLR loop       {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
+/// The census exemplar behind twenty-three of the top-forty blocked
+/// heads: AND.W of a displaced structure field. Base blocks the head at
+/// the AND.
+fn bench_memory_and_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0xC268, 0x0010, // head: AND.W ($10,A0),D1
+        0x5283, // ADDQ.L #1,D3
+        0x51C8, 0xFFF8, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60F2, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_word_at(0x3010, 0x0FF0);
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x3000);
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(1, 0xFFFF_F0F0);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    println!(
+        "batch     memory and loop         {:8.1} M instr/s",
         f64::from(INSTRS) / elapsed / 1_000_000.0
     );
 }

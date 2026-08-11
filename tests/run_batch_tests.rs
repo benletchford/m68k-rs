@@ -1591,3 +1591,25 @@ fn rewritten_continuation_head_after_side_exit_matches_step() {
         },
     );
 }
+
+/// The census exemplar: AND.W of a displaced field into a register,
+/// with a counter.
+#[test]
+fn memory_and_loop_matches_step() {
+    let words = &[
+        0xC268, 0x0010, // $1000: AND.W ($10,A0),D1
+        0x5283, // $1004: ADDQ.L #1,D3
+        0x51C8, 0xFFF8, // $1006: DBRA D0,$1000
+        0x5347, // $100A: SUBQ.W #1,D7
+        0x6602, // $100C: BNE.S $1010
+        0xA000, // $100E: sentinel
+        0x707F, // $1010: MOVEQ #127,D0
+        0x60EC, // $1012: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("memory AND loop", words, CpuType::M68040, |cpu| {
+        cpu.set_a(0, 0x3000);
+        cpu.set_d(1, 0xFFFF_F0F0);
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}
