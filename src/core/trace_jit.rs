@@ -1307,7 +1307,6 @@ impl TraceJit {
         // the branch went). Ops are execution-ordered, so the trimmed
         // trace revalidates and runs exactly what the guest executed.
         if end == RecordingEnd::Blocker
-            && !call_retry_pending
             && !recording.ops.last().is_some_and(|op| op.op.ends_trace())
             && let Some(last_terminal) = recording.ops.iter().rposition(|op| op.op.ends_trace())
             && last_terminal + 1 >= SALVAGE_MIN_OPS
@@ -1339,6 +1338,22 @@ impl TraceJit {
                 extension2: op.extension2,
             })
             .collect();
+        if call_retry_pending {
+            // Nothing recorded before an unpermitted call may become a
+            // compiled trace, however that region ends. A region whose
+            // last op is an ordinary terminal -- a recorded branch whose
+            // target IS the call -- compiles perfectly well, and
+            // installing it starves the retry exactly as a salvaged
+            // prefix does: the rearm below only fires for a rejected
+            // head. Reject unconditionally; the permitted retry records
+            // this same region again with the call included.
+            push_probe_skip(cpu, start_pc);
+            self.slots[idx] = TraceSlot::Rejected {
+                pc: start_pc,
+                cpu_type,
+            };
+            return;
+        }
         let outcome =
             self.compile_decoded_ops_reason(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc));
         #[cfg(feature = "trace-profile")]
@@ -13794,6 +13809,75 @@ mod portable_tests {
             &jit.slots[idx],
             TraceSlot::Rejected { pc: 0x0300, .. }
         ));
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn a_branch_landing_on_a_call_still_yields_the_permitted_retry() {
+        // The second way a prefix can outrank the retry, and the one the
+        // salvage-only fix missed: the last recorded op here is an
+        // ordinary terminal -- a conditional branch whose TARGET is the
+        // unpermitted BSR -- so the region compiles without ever entering
+        // the salvage trim. Installing it starves the retry just the same.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0x5285, // ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0x4A41, // TST.W D1
+            0x6702, // BEQ.S call   (taken; its target IS the call)
+            0x4E71, // NOP
+            0x6100, 0x000C, // call: BSR.W leaf
+            0x5241, // ADDQ.W #1,D1
+            0x51C8, 0xFFE6, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60E0, // BRA.S head
+            0x5282, // leaf: ADDQ.L #1,D2
+            0x4E75, // RTS
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+
+        // Inspect the head's slot as it evolves. A call-less trace
+        // installed at ANY point has already starved the retry, even if
+        // later slot churn eventually replaces it -- so asserting on the
+        // end state alone cannot see the defect.
+        let mut seen_call_trace = false;
+        for _ in 0..300 {
+            cpu.run_batch(&mut bus, 200, &[0]);
+            let observed =
+                TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+                    TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
+                        trace
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                    ),
+                    _ => None,
+                });
+            match observed {
+                Some(true) => seen_call_trace = true,
+                Some(false) => {
+                    panic!("a call-less prefix was installed, starving the permitted retry")
+                }
+                None => {}
+            }
+        }
+        assert!(
+            seen_call_trace,
+            "the head should end up recording through its call"
+        );
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
