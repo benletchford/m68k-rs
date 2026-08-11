@@ -1203,6 +1203,24 @@ fn fastmem_differential_fuzz_memory_ops() {
 /// Fill 64 longs at $2000 with a changing pattern, then copy them to $3000
 /// with the classic `MOVE.L (A0)+,(A1)+ / DBRA` inner loop. Both loops run
 /// hot enough to compile and iterate inside the JIT.
+/// Absolute-addressed CLR (the 4238/4239 gameplay census heads) must stay
+/// exact through the whole record/compile/execute lifecycle, including the
+/// flag pattern (Z set, NVC clear, X preserved) and re-dirtied targets.
+#[test]
+fn mem_trace_clr_absolute_matches_step() {
+    let words = &[
+        0x4278, 0x2000, // $1000: CLR.W ($2000).W
+        0x42B9, 0x0000, 0x2004, // $1004: CLR.L ($2004).L
+        0x4239, 0x0000, 0x2003, // $100A: CLR.B ($2003).L
+        0x31C0, 0x2000, // $1010: MOVE.W D0,($2000).W  (re-dirty the target)
+        0x51C8, 0xFFEA, // $1014: DBRA D0,$1000
+        0xA000, // $1018: sentinel
+    ];
+    assert_fastmem_matches_step("clr absolute", words, CpuType::M68000, |cpu| {
+        cpu.set_d(0, 300);
+    });
+}
+
 #[test]
 fn mem_trace_memcpy_loop_matches_step() {
     let words = &[
