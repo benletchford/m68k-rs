@@ -1182,17 +1182,26 @@ impl TraceJit {
                 cpu_type: counted_type,
                 hits,
                 adaptive_rerecords,
+                allow_call_through,
             } if *counted_pc == exit_pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
                 if entry_watched || *hits < TRACE_HOT_THRESHOLD || self.recording.is_some() {
                     return ExitSeed::None;
                 }
                 let adaptive_rerecords = *adaptive_rerecords;
+                // A seeded candidate carries whatever call permission its
+                // slot holds: a head rearmed after a call blocker keeps
+                // its permitted retry even when the recording that finally
+                // starts came from an exit seed rather than a backward
+                // branch.
+                let allow_call_through = *allow_call_through;
                 self.recording = Some(TraceRecording {
                     start_pc: exit_pc,
                     cpu_type,
                     ops: Vec::with_capacity(TRACE_MAX_OPS),
                     adaptive_rerecords,
+                    allow_call_through,
+                    pending_return: None,
                 });
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_recording(exit_pc, cpu_type);
@@ -1208,6 +1217,7 @@ impl TraceJit {
                     cpu_type,
                     hits: 1,
                     adaptive_rerecords: 0,
+                    allow_call_through: false,
                 };
                 ExitSeed::None
             }
@@ -10306,6 +10316,640 @@ mod portable_tests {
         assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "flags agree");
     }
 
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn zero_budget_entry_never_consumes_a_validation_miss() {
+        // A chained continuation is entered with the parent's leftover
+        // budget, which is zero when the parent retired the final
+        // permitted instruction. Entering the child then must not touch
+        // anything: its validation would otherwise consume a rewritten
+        // first opcode as a miss and hand run_batch one instruction past
+        // its exact budget. This drives the child exactly as the chain
+        // site does.
+        let continuation_ops = vec![
+            TraceBuildOp {
+                opcode: 0x5285,
+                extension: None,
+                extension2: None,
+                pc: 0x010A,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 5,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x5286,
+                extension: None,
+                extension2: None,
+                pc: 0x010C,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 6,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60FA,
+                extension: None,
+                extension2: None,
+                pc: 0x010E,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -6,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let words: [u16; 3] = [0x5285, 0x5286, 0x60FA];
+        let run = |budget: u32| {
+            let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+            for (index, word) in words.iter().enumerate() {
+                bus.write_word(0x010A + index as u32 * 2, *word);
+            }
+            let mut cpu = CpuCore::new();
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_sr(0x2700);
+            cpu.pc = 0x010A;
+            cpu.cycles_remaining = 1_000_000;
+            let mut jit = TraceJit::new();
+            let continuation = jit
+                .compile_decoded_ops(
+                    &cpu,
+                    0x010A,
+                    CpuType::M68040,
+                    continuation_ops.clone(),
+                    None,
+                )
+                .expect("continuation compiles");
+            jit.slots[trace_cache_index(0x010A)] = TraceSlot::Compiled(continuation);
+            // The first opcode changes after compilation.
+            bus.write_word(0x010A, 0x4E71);
+            let result = jit.try_execute(
+                &mut cpu,
+                &mut bus,
+                CpuType::M68040,
+                budget,
+                false,
+                &[],
+                TRACE_EXIT_CHAIN_BUDGET,
+            );
+            (result, cpu.pc)
+        };
+
+        // Zero budget: no validation, no consumption -- the count and PC
+        // stay exactly at the boundary.
+        let (result, pc) = run(0);
+        assert!(
+            result.is_none(),
+            "zero-budget entry returns to the caller untouched"
+        );
+        assert_eq!(pc, 0x010A, "PC stays at the boundary");
+
+        // One instruction of budget: consuming the changed opcode as a
+        // validation miss is the correct SMC handling and fits the count.
+        let (result, pc) = run(1);
+        assert!(
+            matches!(result, Some((CachedRunResult::Miss(0x4E71), 0))),
+            "with budget to act the miss surfaces"
+        );
+        assert_eq!(pc, 0x010C, "the miss consumed the changed opcode");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn short_blocked_recordings_still_reject() {
+        // A five-op prefix whose last terminal sits at op four: below
+        // SALVAGE_MIN_OPS the head must reject exactly as before. (The
+        // blocker must not directly follow the branch: a recording whose
+        // last op is already a terminal compiles today without salvage.)
+        const A: u32 = 0x0100;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x4A42, // TST.W D2
+            0x6602, // BNE.S +2 (always taken)
+            0x4E71, // NOP (skipped)
+            0x5284, // ADDQ.L #1,D4
+            0x4E57, 0x0000, // LINK A7,#0 -- refused by design (A7 exclusion)
+            0x4E5F, // UNLK A7 -- likewise; the pair nets zero stack motion
+            0x51C8, 0xFFEC, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60E6, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(6, 0x3000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        cpu.run_batch(&mut bus, 40_000, &[0]);
+        TRACE_JIT.with_borrow(|jit| {
+            assert!(
+                matches!(
+                    &jit.slots[trace_cache_index(A)],
+                    TraceSlot::Rejected { pc, .. } if *pc == A
+                ),
+                "a four-op prefix is below the salvage bar"
+            );
+        });
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_clr_to_absolute_matches_portable_and_bails_atomically() {
+        // Case 0: CLR.W (xxx).W. Case 1: CLR.L (xxx).L. Case 2: CLR.B
+        // (xxx).L — the gameplay census head (4239).
+        let cases: [(u16, u16, Option<u16>, JitTraceOp, usize, usize); 3] = [
+            (
+                0x4278,
+                0x0320,
+                None,
+                JitTraceOp::ClrMem {
+                    size: Size::Word,
+                    dst: JitEa::AbsWord(0x0320),
+                },
+                0x0320,
+                2,
+            ),
+            (
+                0x42B9,
+                0x0000,
+                Some(0x0328),
+                JitTraceOp::ClrMem {
+                    size: Size::Long,
+                    dst: JitEa::AbsLong(0x0328),
+                },
+                0x0328,
+                4,
+            ),
+            (
+                0x4239,
+                0x0000,
+                Some(0x0327),
+                JitTraceOp::ClrMem {
+                    size: Size::Byte,
+                    dst: JitEa::AbsLong(0x0327),
+                },
+                0x0327,
+                1,
+            ),
+        ];
+        for (case, (opcode, ext, ext2, op, cleared, len)) in cases.iter().enumerate() {
+            let clr_len: u32 = if ext2.is_some() { 6 } else { 4 };
+            let branch_pc = 0x0100 + clr_len;
+            let displacement = -(clr_len as i32) - 2;
+            let branch_opcode = 0x6000 | (displacement as u8 as u16);
+            let clr = TraceBuildOp {
+                opcode: *opcode,
+                extension: Some(*ext),
+                extension2: *ext2,
+                pc: 0x0100,
+                op: *op,
+            };
+            let branch = TraceBuildOp {
+                opcode: branch_opcode,
+                extension: None,
+                extension2: None,
+                pc: branch_pc,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let ops = vec![clr, branch];
+            let trace_end = branch_pc + 2;
+            let prepare = |mem: &mut Vec<u8>| {
+                mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                mem[0x0102..0x0104].copy_from_slice(&ext.to_be_bytes());
+                if let Some(ext2) = ext2 {
+                    mem[0x0104..0x0106].copy_from_slice(&ext2.to_be_bytes());
+                }
+                mem[0x0300..0x0400].fill(0xAA);
+                let mut c = cpu();
+                c.set_cpu_type(CpuType::M68040);
+                c.set_ccr(0x10);
+                attach_window(&mut c, mem);
+                c
+            };
+            let mut emem = vec![0u8; 0x1000];
+            let mut expected = prepare(&mut emem);
+            let expected_packed = execute_portable_trace(&mut expected, &ops, CodeSpans::caller(0x0100, trace_end));
+            let mut amem = vec![0u8; 0x1000];
+            let mut actual = prepare(&mut amem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+                .expect("absolute CLR loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(
+                actual_packed, expected_packed,
+                "case {case}: cycles/retired"
+            );
+            assert_ne!(expected_packed, 0, "case {case}: the trace ran");
+            assert_eq!(actual.dar, expected.dar, "case {case}: registers");
+            assert_eq!(actual.get_ccr(), expected.get_ccr(), "case {case}: ccr");
+            assert_eq!(
+                actual.get_ccr() & 0x1F,
+                0x14,
+                "case {case}: Z set, NVC clear, X preserved"
+            );
+            assert_eq!(amem, emem, "case {case}: memory");
+            for offset in 0..*len {
+                assert_eq!(amem[cleared + offset], 0, "case {case}: byte cleared");
+            }
+            assert_eq!(amem[cleared - 1], 0xAA, "case {case}: preceding byte kept");
+            assert_eq!(
+                amem[cleared + len],
+                0xAA,
+                "case {case}: following byte kept"
+            );
+        }
+
+        // A CLR aimed at the trace's own extension word must bail on both
+        // paths with nothing committed.
+        let clr = TraceBuildOp {
+            opcode: 0x4278,
+            extension: Some(0x0102),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::ClrMem {
+                size: Size::Word,
+                dst: JitEa::AbsWord(0x0102),
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let ops = vec![clr, branch];
+        let prepare = |mem: &mut Vec<u8>| {
+            mem[0x0100..0x0102].copy_from_slice(&0x4278u16.to_be_bytes());
+            mem[0x0102..0x0104].copy_from_slice(&0x0102u16.to_be_bytes());
+            let mut c = cpu();
+            c.set_cpu_type(CpuType::M68040);
+            c.set_ccr(0x10);
+            attach_window(&mut c, mem);
+            c
+        };
+        let mut pmem = vec![0u8; 0x1000];
+        let mut pcpu = prepare(&mut pmem);
+        let packed = execute_portable_trace(&mut pcpu, &ops, CodeSpans::caller(0x0100, 0x0106));
+        assert_eq!(packed, 0, "portable bails on a store into code");
+        assert_eq!(pcpu.pc, 0x0100);
+        assert_eq!(pcpu.get_ccr(), 0x10);
+        assert_eq!(
+            pmem[0x0102..0x0104],
+            [0x01, 0x02],
+            "extension word untouched"
+        );
+        let mut nmem = vec![0u8; 0x1000];
+        let mut ncpu = prepare(&mut nmem);
+        let before = ncpu.dar;
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&ncpu, 0x0100, CpuType::M68040, ops, Some(0x0100))
+            .expect("self-aimed absolute CLR still compiles");
+        let packed = unsafe { compiled.call_native(&mut ncpu, 1) };
+        assert_eq!(packed, 0, "native bails on a store into code");
+        assert_eq!(ncpu.pc, 0x0100);
+        assert_eq!(ncpu.dar, before);
+        assert_eq!(ncpu.get_ccr(), 0x10);
+        assert_eq!(nmem, pmem, "native bail commits nothing");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn guard_exits_seed_and_chain_a_continuation_trace() {
+        // Mixed-path loop: EORI.B #1,D1 flips Z every iteration, so the
+        // head trace guard-exits on ~half of all calls forever -- the shape
+        // adaptive re-recording cannot settle. Exit seeding must form a
+        // second compiled trace inside the loop body.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x0A01, 0x0001, // EORI.B #1,D1
+            0x6602, // BNE.S +2
+            0x5282, // ADDQ.L #1,D2
+            0x1ADC, // MOVE.B (A4)+,(A5)+
+            0x5283, // ADDQ.L #1,D3 (keeps both continuations >= 3 ops)
+            0x51C8, 0xFFF2, // DBRA D0,head
+            0x60EE, // BRA.S head (outer restart to keep it hot)
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(4, 0x3000);
+        cpu.set_a(5, 0x4000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        let result = cpu.run_batch(&mut bus, 50_000, &[0]);
+        assert_eq!(result.instructions, 50_000, "loop runs to budget");
+
+        let loop_pcs: Vec<u32> = (0..8).map(|w| CODE_BASE + w * 2).collect();
+        let compiled = TRACE_JIT.with_borrow(|jit| {
+            loop_pcs
+                .iter()
+                .filter(|&&pc| {
+                    matches!(
+                        &jit.slots[trace_cache_index(pc)],
+                        TraceSlot::Compiled(CompiledTrace { pc: cpc, .. }) if *cpc == pc
+                    )
+                })
+                .count()
+        });
+        assert!(
+            compiled >= 2,
+            "exit seeding should compile a continuation inside the loop \
+             body in addition to the head trace (found {compiled})"
+        );
+    }
+
+    #[test]
+    fn clr_to_absolute_decodes_with_exact_extents() {
+        let dcpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        // 42B8 = CLR.L (xxx).W with a negative address: sign-extends.
+        bus.write_word(0x0100, 0x42B8);
+        bus.write_word(0x0102, 0x8100);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("CLR.L (xxx).W should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::ClrMem {
+                size: Size::Long,
+                dst: JitEa::AbsWord(0xFFFF_8100),
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x8100));
+        assert!(trace.extension2.is_none(), "abs.W carries one extension");
+
+        // 4279 = CLR.W (xxx).L assembles the address from both words.
+        bus.write_word(0x0100, 0x4279);
+        bus.write_word(0x0102, 0x0001);
+        bus.write_word(0x0104, 0x4208);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("CLR.W (xxx).L should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::ClrMem {
+                size: Size::Word,
+                dst: JitEa::AbsLong(0x0001_4208),
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x0001));
+        assert_eq!(trace.extension2, Some(0x4208));
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn clr_to_absolute_cycles_match_the_interpreter_on_a_68000() {
+        // One loop pass over all three widths, compiled for a 68000,
+        // against the step interpreter's charge for the same sequence.
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x4278,
+                extension: Some(0x0320),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::ClrMem {
+                    size: Size::Word,
+                    dst: JitEa::AbsWord(0x0320),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x42B9,
+                extension: Some(0x0000),
+                extension2: Some(0x0328),
+                pc: 0x0104,
+                op: JitTraceOp::ClrMem {
+                    size: Size::Long,
+                    dst: JitEa::AbsLong(0x0328),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4239,
+                extension: Some(0x0000),
+                extension2: Some(0x0327),
+                pc: 0x010A,
+                op: JitTraceOp::ClrMem {
+                    size: Size::Byte,
+                    dst: JitEa::AbsLong(0x0327),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60EE,
+                extension: None,
+                extension2: None,
+                pc: 0x0110,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -18,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let words: [u16; 9] = [
+            0x4278, 0x0320, 0x42B9, 0x0000, 0x0328, 0x4239, 0x0000, 0x0327, 0x60EE,
+        ];
+        let prepare = |mem: &mut Vec<u8>| {
+            for (index, word) in words.iter().enumerate() {
+                let at = 0x0100 + index * 2;
+                mem[at..at + 2].copy_from_slice(&word.to_be_bytes());
+            }
+            mem[0x0300..0x0400].fill(0xAA);
+            let mut c = cpu();
+            c.set_cpu_type(CpuType::M68000);
+            attach_window(&mut c, mem);
+            c
+        };
+        let mut nmem = vec![0u8; 0x1000];
+        let mut ncpu = prepare(&mut nmem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&ncpu, 0x0100, CpuType::M68000, ops, Some(0x0100))
+            .expect("absolute CLR sequence should compile for a 68000");
+        let packed = unsafe { compiled.call_native(&mut ncpu, 1) };
+        assert_eq!((packed >> 32) as u32, 4, "all four ops retired");
+        let native_cycles = packed as u32;
+
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word(0x0100 + index as u32 * 2, *word);
+        }
+        let mut scpu = CpuCore::new();
+        scpu.set_cpu_type(CpuType::M68000);
+        scpu.set_sr(0x2700);
+        scpu.pc = 0x0100;
+        let mut step_cycles: u32 = 0;
+        for _ in 0..4 {
+            match scpu.step(&mut bus) {
+                crate::StepResult::Ok { cycles } => step_cycles += cycles as u32,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        assert_eq!(scpu.pc, 0x0100, "step run wrapped back to the head");
+        assert_eq!(
+            native_cycles, step_cycles,
+            "native charge equals the 68000 interpreter's"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn chained_continuation_miss_surfaces_the_rewritten_opcode() {
+        // Three deterministic phases against a step() twin, with identical
+        // external mutations at identical instruction counts:
+        //   1. The branch predicate holds, so the head trace compiles on
+        //      the taken spine -- which EXCLUDES the continuation.
+        //   2. The predicate is flipped externally; every head call now
+        //      guard-exits, seeding and compiling the continuation, and
+        //      the parent chains into it. Kept short so adaptive
+        //      re-recording (64-call window) cannot replace the head spine.
+        //   3. The continuation's first opcode is rewritten externally
+        //      (ADDQ.L #1,D2 -> ADDQ.L #2,D2) in both twins. The next
+        //      chained entry must surface the validation miss so the
+        //      rewritten opcode is dispatched; silently dropping the miss
+        //      skips the instruction and diverges D2.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0xB206, // head: CMP.B D6,D1
+            0x6706, // BEQ.S skip (taken while D1 == D6)
+            0x5282, // cont: ADDQ.L #1,D2   <- rewritten in phase 3
+            0x1ADC, // MOVE.B (A4)+,(A5)+
+            0x5283, // ADDQ.L #1,D3
+            0x51C8, 0xFFF4, // skip: DBRA D0,head
+            0x60F0, // BRA.S head
+        ];
+        let mk = |bus: &mut super::super::memory::LinearMemoryBus| {
+            for (index, word) in words.iter().enumerate() {
+                bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+            }
+            let mut cpu = CpuCore::new();
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_sr(0x2700);
+            cpu.pc = CODE_BASE;
+            cpu.set_a(4, 0x3000);
+            cpu.set_a(5, 0x4000);
+            cpu.set_a(7, 0x9000);
+            cpu.set_d(0, 0x7FFF);
+            cpu.set_d(1, 5);
+            cpu.set_d(6, 5); // equal: BEQ taken
+            cpu
+        };
+        let mut bus_a = super::super::memory::LinearMemoryBus::new(0x10000);
+        let mut cpu_a = mk(&mut bus_a); // step twin
+        let mut bus_b = super::super::memory::LinearMemoryBus::new(0x10000);
+        let mut cpu_b = mk(&mut bus_b); // run_batch twin
+
+        let step_n =
+            |cpu: &mut CpuCore, bus: &mut super::super::memory::LinearMemoryBus, n: u32| {
+                for _ in 0..n {
+                    assert!(matches!(cpu.step(bus), crate::StepResult::Ok { .. }));
+                }
+            };
+        let batch_n =
+            |cpu: &mut CpuCore, bus: &mut super::super::memory::LinearMemoryBus, n: u32| {
+                let mut left = n;
+                while left > 0 {
+                    let r = cpu.run_batch(bus, left, &[0]);
+                    assert!(r.instructions > 0, "batch made no progress");
+                    left -= r.instructions;
+                }
+            };
+
+        // Phase 1: 30 instructions of taken-spine iterations.
+        step_n(&mut cpu_a, &mut bus_a, 30);
+        batch_n(&mut cpu_b, &mut bus_b, 30);
+        // Phase 2: flip the predicate in both twins; 30 instructions of
+        // guard exits, seeding, and chaining.
+        cpu_a.set_d(1, 9);
+        cpu_b.set_d(1, 9);
+        step_n(&mut cpu_a, &mut bus_a, 30);
+        batch_n(&mut cpu_b, &mut bus_b, 30);
+        // The continuation must exist as its own compiled trace for phase 3
+        // to test anything.
+        let cont_pc = CODE_BASE + 4;
+        let cont_compiled = TRACE_JIT.with_borrow(|jit| {
+            matches!(
+                &jit.slots[trace_cache_index(cont_pc)],
+                TraceSlot::Compiled(CompiledTrace { pc, .. }) if *pc == cont_pc
+            )
+        });
+        assert!(cont_compiled, "phase 2 must compile the continuation");
+        // Phase 3: rewrite the continuation head in both twins, then run
+        // one full not-taken iteration through each.
+        bus_a.write_word_at(cont_pc, 0x5482);
+        bus_b.write_word_at(cont_pc, 0x5482);
+        step_n(&mut cpu_a, &mut bus_a, 6);
+        batch_n(&mut cpu_b, &mut bus_b, 6);
+
+        assert_eq!(cpu_b.dar, cpu_a.dar, "registers diverged (D2 skip?)");
+        assert_eq!(cpu_b.pc, cpu_a.pc, "pc diverged");
+        assert_eq!(cpu_b.get_ccr(), cpu_a.get_ccr(), "ccr diverged");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn blocked_recording_without_a_branch_still_rejects() {
+        // A straight-line prefix has no terminal to trim to; the head
+        // must reject exactly as before regardless of length.
+        const A: u32 = 0x0100;
+        let words = [
+            0x5282, 0x5283, 0x5284, 0x5285, 0x5286, 0x5287, 0x5281, 0x5280,
+            0x4A41, // nine straight-line ops, no branch
+            0x4E57, 0x0000, // LINK A7,#0 -- refused by design (A7 exclusion)
+            0x4E5F, // UNLK A7 -- likewise; the pair nets zero stack motion
+            0x51C8, 0xFFE6, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60E0, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(6, 0x3000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        cpu.run_batch(&mut bus, 40_000, &[0]);
+        TRACE_JIT.with_borrow(|jit| {
+            assert!(
+                matches!(
+                    &jit.slots[trace_cache_index(A)],
+                    TraceSlot::Rejected { pc, .. } if *pc == A
+                ),
+                "no recorded branch means nothing to salvage"
+            );
+        });
+    }
+
     #[test]
     fn bsr_ff_call_decode_is_cpu_aware() {
         // On pre-68020 models, 0x61FF is BSR.S with displacement -1: it has
@@ -13956,45 +14600,64 @@ mod portable_tests {
         // branch compiles and the tail stays interpreted.
         const A: u32 = 0x0100;
         let words = [
-            0x0A01, 0x0001, // EORI.B #1,D1
-            0x6602, // BNE.S +2
-            0x5282, // ADDQ.L #1,D2
-            0x1ADC, // MOVE.B (A4)+,(A5)+
-            0x5283, // ADDQ.L #1,D3 (keeps both continuations >= 3 ops)
-            0x51C8, 0xFFF2, // DBRA D0,head
-            0x60EE, // BRA.S head (outer restart to keep it hot)
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0x5285, // ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0x5281, // ADDQ.L #1,D1
+            0x4A41, // TST.W D1
+            0x6602, // BNE.S +2 (always taken: D1 counts up)
+            0x4E71, // NOP (skipped)
+            0x4A42, // TST.W D2 -- past the branch: no terminal to stop at
+            0x4A42, // TST.W D2
+            0x4E57, 0x0000, // LINK A7,#0 -- refused by design (A7 exclusion)
+            0x4E5F, // UNLK A7 -- likewise; the pair nets zero stack motion
+            0x51C8, 0xFFE0, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60DA, // BRA.S head
         ];
         let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
         for (index, word) in words.iter().enumerate() {
-            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+            bus.write_word_at(A + index as u32 * 2, *word);
         }
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_sr(0x2700);
-        cpu.pc = CODE_BASE;
-        cpu.set_a(4, 0x3000);
-        cpu.set_a(5, 0x4000);
+        cpu.pc = A;
+        cpu.set_a(6, 0x3000);
         cpu.set_a(7, 0x9000);
         cpu.set_d(0, 0x7F);
-        let result = cpu.run_batch(&mut bus, 50_000, &[0]);
-        assert_eq!(result.instructions, 50_000, "loop runs to budget");
-
-        let loop_pcs: Vec<u32> = (0..8).map(|w| CODE_BASE + w * 2).collect();
-        let compiled = TRACE_JIT.with_borrow(|jit| {
-            loop_pcs
-                .iter()
-                .filter(|&&pc| {
-                    matches!(
-                        &jit.slots[trace_cache_index(pc)],
-                        TraceSlot::Compiled(CompiledTrace { pc: cpc, .. }) if *cpc == pc
-                    )
-                })
-                .count()
-        });
+        let result = cpu.run_batch(&mut bus, 40_000, &[0]);
+        assert_eq!(result.instructions, 40_000, "loop runs to budget");
+        // Every iteration bumps D2..D7 and D1 exactly once each.
+        assert!(cpu.d(2) > 2_000, "the loop actually iterated");
         assert!(
-            compiled >= 2,
-            "exit seeding should compile a continuation inside the loop \
-             body in addition to the head trace (found {compiled})"
+            cpu.d(2).abs_diff(cpu.d(3)) <= 1 && cpu.d(2).abs_diff(cpu.d(7)) <= 1,
+            "counters advance in lockstep"
+        );
+        let salvaged = TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(A)] {
+            TraceSlot::Compiled(trace) if trace.pc == A => Some((
+                trace.ops.len(),
+                matches!(
+                    trace.ops.last().map(|op| op.op),
+                    Some(JitTraceOp::Branch { .. })
+                ),
+                trace
+                    .ops
+                    .iter()
+                    .all(|op| op.opcode != 0x4E57 && op.opcode != 0x4E5F),
+            )),
+            _ => None,
+        });
+        let (ops, ends_in_branch, excludes_blocked_tail) =
+            salvaged.expect("the blocked head compiles its salvageable prefix");
+        assert_eq!(ops, 9, "trimmed at the recorded branch");
+        assert!(ends_in_branch, "the trimmed terminal is the branch");
+        assert!(
+            excludes_blocked_tail,
+            "the unsupported tail is not recorded"
         );
     }
 
