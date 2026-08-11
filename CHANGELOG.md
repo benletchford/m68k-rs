@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.7](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.6...m68k-v0.10.7) (2026-08-11)
+
+
+### Performance Improvements
+
+* salvage a blocked recording's prefix through its last branch ([0c64208](https://github.com/benletchford/m68k-rs/commit/0c64208069ed0fe4b2ccbab7841a76c4253119da))
+
 ## [0.10.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.5...m68k-v0.10.6) (2026-08-10)
 
 
