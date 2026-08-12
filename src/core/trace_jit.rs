@@ -351,6 +351,7 @@ pub(crate) enum JitTraceOp {
     /// trace. Admitted only on a call-through retry recording.
     CallThrough {
         return_pc: u32,
+        cycles: i32,
     },
     /// The callee's RTS: pops the return address and bails unless it
     /// equals the recorded call's return -- a different return value is
@@ -662,6 +663,15 @@ pub(crate) struct TraceJit {
     next_func: u32,
     slots: Vec<TraceSlot>,
     recording: Option<TraceRecording>,
+    /// Heads that have earned call-through permission: a recording here
+    /// blocked at a recordable call, so future candidacy at the same pc
+    /// starts with permission instead of re-earning it through a doomed
+    /// probe attempt. Two-way per index: the gameplay profile shows hot
+    /// call-heads landing in the same slot (two of its worst cyclers
+    /// collide), and one spare way absorbs exactly that. Still lossy
+    /// beyond two -- losing an entry only costs the one extra blocked
+    /// attempt that was the universal price before the table existed.
+    earned_call_permission: Vec<[u32; 2]>,
 }
 
 impl fmt::Debug for TraceJit {
@@ -695,6 +705,7 @@ impl TraceJit {
             next_func: 0,
             slots: (0..TRACE_CACHE_SIZE).map(|_| TraceSlot::Empty).collect(),
             recording: None,
+            earned_call_permission: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
         }
     }
 
@@ -1017,12 +1028,18 @@ impl TraceJit {
             }
             if rerecord_dominant_path {
                 let adaptive_rerecords = trace.adaptive_rerecords.saturating_add(1);
+                // A slot recreated from scratch must consult the durable
+                // grant, or a head that already earned permission pays a
+                // fresh permissionless blocker every time its slot is
+                // replaced -- which is exactly what the side table exists
+                // to prevent.
+                let allow_call_through = self.has_call_permission(pc);
                 self.slots[idx] = TraceSlot::Counting {
                     pc,
                     cpu_type,
                     hits: 0,
                     adaptive_rerecords,
-                    allow_call_through: false,
+                    allow_call_through,
                 };
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
@@ -1118,6 +1135,28 @@ impl TraceJit {
         }
     }
 
+    fn grant_call_permission(&mut self, pc: u32) {
+        let ways = &mut self.earned_call_permission[trace_cache_index(pc)];
+        if ways[0] == pc || ways[1] == pc {
+            return;
+        }
+        if ways[0] == u32::MAX {
+            ways[0] = pc;
+        } else if ways[1] == u32::MAX {
+            ways[1] = pc;
+        } else {
+            // Both ways live: rotate so persistent pairs survive and a
+            // third colliding head still makes progress eventually.
+            ways[1] = ways[0];
+            ways[0] = pc;
+        }
+    }
+
+    fn has_call_permission(&self, pc: u32) -> bool {
+        let ways = &self.earned_call_permission[trace_cache_index(pc)];
+        ways[0] == pc || ways[1] == pc
+    }
+
     fn record_trace_target(&mut self, pc: u32, cpu_type: CpuType) {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         if self.module.is_none() {
@@ -1146,7 +1185,7 @@ impl TraceJit {
                     cpu_type,
                     hits: 1,
                     adaptive_rerecords: 0,
-                    allow_call_through: false,
+                    allow_call_through: self.has_call_permission(pc),
                 };
                 TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
             }
@@ -1164,6 +1203,10 @@ impl TraceJit {
         entry_watched: bool,
     ) -> ExitSeed {
         let idx = trace_cache_index(exit_pc);
+        // Read the durable grant before borrowing the slot mutably: a
+        // candidate created here must carry the permission its head
+        // already earned.
+        let permission = self.has_call_permission(exit_pc);
         match &mut self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
@@ -1217,7 +1260,7 @@ impl TraceJit {
                     cpu_type,
                     hits: 1,
                     adaptive_rerecords: 0,
-                    allow_call_through: false,
+                    allow_call_through: permission,
                 };
                 ExitSeed::None
             }
@@ -1459,7 +1502,7 @@ impl TraceJit {
             && let Some(call_op) = decode_call_op(cpu, bus, executed_pc, cpu.ir as u16, cpu_type)
         {
             match call_op.op {
-                JitTraceOp::CallThrough { return_pc } => {
+                JitTraceOp::CallThrough { return_pc, .. } => {
                     let recording = self.recording.as_mut().unwrap();
                     if recording.pending_return.is_some() {
                         // Depth cap: a nested call ends the region at the
@@ -1535,8 +1578,7 @@ impl TraceJit {
             // Everything else about this path (blocker attribution, the
             // rejected slot the ranking counts) is unchanged; the flag is
             // applied after the normal bookkeeping below.
-            let call_retry =
-                !recording.allow_call_through && matches!(cpu.ir as u16, w if w & 0xFF00 == 0x6100);
+            let call_retry = !recording.allow_call_through && is_recordable_call(cpu.ir as u16);
             #[cfg(feature = "trace-profile")]
             {
                 // Diagnostics read through the fastmem window only. The
@@ -1571,6 +1613,7 @@ impl TraceJit {
             }
             self.finish_recording_with_retry(cpu, executed_pc, RecordingEnd::Blocker, call_retry);
             if call_retry {
+                self.grant_call_permission(start_pc);
                 let idx = trace_cache_index(start_pc);
                 if matches!(&self.slots[idx], TraceSlot::Rejected { pc, .. } if *pc == start_pc) {
                     self.slots[idx] = TraceSlot::Counting {
@@ -2360,6 +2403,12 @@ const CALL_THROUGH_MAX_SPAN: u32 = 0x1000;
 /// only when the active recording carries call-through permission, so
 /// the ungated recorder remains byte-identical to the ranked-blocker
 /// behavior the opportunity profile is built on.
+/// Whether an opcode is a call the recorder can record through: any BSR,
+/// or a JSR whose target is a decode-time constant.
+fn is_recordable_call(opcode: u16) -> bool {
+    opcode & 0xFF00 == 0x6100 || opcode == 0x4EBA || opcode == 0x4EB9
+}
+
 fn decode_call_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -2376,6 +2425,36 @@ fn decode_call_op<B: AddressBus>(
             // The expected return is filled in by the recorder from the
             // pending call; zero here is never emitted.
             op: JitTraceOp::RtsReturn { expected_return: 0 },
+        });
+    }
+    // JSR forms whose target is a decode-time constant record exactly
+    // like BSR: the push is a constant return address and execution
+    // follows the jump. MC68000 charges: JSR d16(PC) 18, JSR (xxx).L 20.
+    if opcode == 0x4EBA {
+        let ext = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+        return Some(TraceBuildOp {
+            opcode,
+            extension: Some(ext),
+            extension2: None,
+            pc,
+            op: JitTraceOp::CallThrough {
+                return_pc: pc.wrapping_add(4),
+                cycles: 18,
+            },
+        });
+    }
+    if opcode == 0x4EB9 {
+        let hi = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+        let lo = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+        return Some(TraceBuildOp {
+            opcode,
+            extension: Some(hi),
+            extension2: Some(lo),
+            pc,
+            op: JitTraceOp::CallThrough {
+                return_pc: pc.wrapping_add(6),
+                cycles: 20,
+            },
         });
     }
     if opcode & 0xFF00 != 0x6100 {
@@ -2402,7 +2481,10 @@ fn decode_call_op<B: AddressBus>(
         extension,
         extension2,
         pc,
-        op: JitTraceOp::CallThrough { return_pc },
+        op: JitTraceOp::CallThrough {
+            return_pc,
+            cycles: 18,
+        },
     })
 }
 
@@ -2717,7 +2799,7 @@ impl JitTraceOp {
             Self::Unlk { .. } => 12,
             // MC68000 BSR is 18(2/2) for every displacement width; RTS is
             // 16(4/0).
-            Self::CallThrough { .. } => 18,
+            Self::CallThrough { cycles, .. } => cycles,
             Self::RtsReturn { .. } => 16,
         }
     }
@@ -6566,7 +6648,7 @@ fn emit_call_through(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::CallThrough { return_pc } = trace.op else {
+    let JitTraceOp::CallThrough { return_pc, .. } = trace.op else {
         unreachable!("expected a call-through trace op")
     };
     let bail = builder.create_block();
@@ -6624,7 +6706,7 @@ fn execute_portable_call_through(
     trace: TraceBuildOp,
     spans: CodeSpans,
 ) -> Option<i32> {
-    let JitTraceOp::CallThrough { return_pc } = trace.op else {
+    let JitTraceOp::CallThrough { return_pc, .. } = trace.op else {
         return None;
     };
     if cpu.fm_len == 0 {
@@ -10316,6 +10398,59 @@ mod portable_tests {
         assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "flags agree");
     }
 
+    #[test]
+    fn a_revived_head_carries_its_durable_call_permission() {
+        // The grant is durable precisely so a head does not have to earn
+        // permission again every time its cache slot is replaced. Two ways
+        // a slot is created from scratch have to honour it: a candidate
+        // seeded from a guarded exit, and a slot recreated by adaptive
+        // re-recording. Without this the head pays a fresh permissionless
+        // call blocker despite holding the grant.
+        const HEAD: u32 = 0x0100;
+        let mut jit = TraceJit::new();
+        jit.grant_call_permission(HEAD);
+        assert!(jit.has_call_permission(HEAD));
+
+        // Stomp the slot, as an unrelated head sharing this index would.
+        let idx = trace_cache_index(HEAD);
+        jit.slots[idx] = TraceSlot::Empty;
+
+        // Revive it through the exit-seeding path.
+        assert!(matches!(
+            jit.note_trace_exit(HEAD, CpuType::M68040, false),
+            ExitSeed::None
+        ));
+        match &jit.slots[idx] {
+            TraceSlot::Counting {
+                pc,
+                allow_call_through,
+                ..
+            } => {
+                assert_eq!(*pc, HEAD);
+                assert!(
+                    *allow_call_through,
+                    "a revived candidate must carry the durable grant"
+                );
+            }
+            _ => panic!("the exit seed should have created a counting slot"),
+        }
+
+        // A head with no grant is still created without permission.
+        const OTHER: u32 = 0x0200;
+        let other_idx = trace_cache_index(OTHER);
+        jit.slots[other_idx] = TraceSlot::Empty;
+        let _ = jit.note_trace_exit(OTHER, CpuType::M68040, false);
+        match &jit.slots[other_idx] {
+            TraceSlot::Counting {
+                allow_call_through, ..
+            } => assert!(
+                !*allow_call_through,
+                "permission must come from the grant, not from being revived"
+            ),
+            _ => panic!("expected a counting slot"),
+        }
+    }
+
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn zero_budget_entry_never_consumes_a_validation_miss() {
@@ -11732,7 +11867,10 @@ mod portable_tests {
             extension: Some(0x0010),
             extension2: None,
             pc: 0x0100,
-            op: JitTraceOp::CallThrough { return_pc: 0x0104 },
+            op: JitTraceOp::CallThrough {
+                return_pc: 0x0104,
+                cycles: 18,
+            },
         };
         let ret = TraceBuildOp {
             opcode: 0x4E75,
@@ -11865,7 +12003,10 @@ mod portable_tests {
                 extension: Some(0x7FFE),
                 extension2: None,
                 pc: 0x0100,
-                op: JitTraceOp::CallThrough { return_pc: 0x0104 },
+                op: JitTraceOp::CallThrough {
+                    return_pc: 0x0104,
+                    cycles: 18,
+                },
             },
             TraceBuildOp {
                 opcode: 0x4E75,
@@ -14462,6 +14603,70 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
+    fn a_branch_landing_on_a_jsr_still_yields_the_permitted_retry() {
+        // The JSR counterpart of the branch-ended prefix case: this branch
+        // admits constant-target JSR as a recordable call, so the same
+        // starvation is reachable through `4EB9` and the retry precedence
+        // must cover it too.
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0x5285, // ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0x4A41, // TST.W D1
+            0x6602, // BNE.S call  (taken; its target IS the call)
+            0x4E71, // NOP (skipped)
+            0x4EB9, 0x0000, 0x7022, // call: JSR ($7022).L
+            0x5241, // ADDQ.W #1,D1
+            0x51C8, 0xFFE4, // DBRA D0,head
+            0x707F, // MOVEQ #127,D0
+            0x60DE, // BRA.S head
+            0x5282, // leaf: ADDQ.L #1,D2
+            0x4E75, // RTS
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+
+        let mut seen_call_trace = false;
+        for _ in 0..300 {
+            cpu.run_batch(&mut bus, 200, &[0]);
+            let observed =
+                TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+                    TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
+                        trace
+                            .ops
+                            .iter()
+                            .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                    ),
+                    _ => None,
+                });
+            match observed {
+                Some(true) => seen_call_trace = true,
+                Some(false) => {
+                    panic!("a call-less prefix was installed, starving the permitted JSR retry")
+                }
+                None => {}
+            }
+        }
+        assert!(
+            seen_call_trace,
+            "the head should end up recording through its JSR"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
     fn a_branch_landing_on_a_call_still_yields_the_permitted_retry() {
         // The second way a prefix can outrank the retry, and the one the
         // salvage-only fix missed: the last recorded op here is an
@@ -14816,7 +15021,10 @@ mod portable_tests {
                     extension: Some(0x000E),
                     extension2: None,
                     pc: 0x0100,
-                    op: JitTraceOp::CallThrough { return_pc: 0x0104 },
+                    op: JitTraceOp::CallThrough {
+                        return_pc: 0x0104,
+                        cycles: 18,
+                    },
                 },
                 TraceBuildOp {
                     opcode: 0x7001,
@@ -14899,5 +15107,118 @@ mod portable_tests {
             .expect("a near-branching callee compiles");
         assert_eq!(near.callee_start, 0x0110);
         assert_eq!(near.callee_end, 0x0134 + 4);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn jsr_constant_targets_record_through_on_retry() {
+        // JSR d16(PC) and JSR (xxx).L have decode-time-constant targets,
+        // so they record through exactly like BSR: push the constant
+        // return, record the leaf inline, guard the RTS.
+        for (label, call_words, leaf_offset) in [
+            ("JSR d16(PC)", vec![0x4EBAu16, 0x000E], 0x10u32),
+            ("JSR (xxx).L", vec![0x4EB9, 0x0000, 0x0112], 0x12),
+        ] {
+            const A: u32 = 0x0100;
+            let mut words = call_words.clone();
+            words.extend([
+                0x5283, // ADDQ.L #1,D3
+                0x51C8, 0,      // DBRA D0,head (ext patched below)
+                0x707F, // MOVEQ #127,D0
+                0,      // BRA.S head (patched below)
+            ]);
+            // Pad to the leaf offset, then the leaf.
+            while (words.len() as u32) < leaf_offset / 2 {
+                words.push(0x4E71);
+            }
+            words.extend([0x5282, 0x4E75]); // leaf: ADDQ.L #1,D2 ; RTS
+            // Patch the branch displacements from the layout.
+            let dbra_ext_index = call_words.len() + 2;
+            let dbra_ext_addr = A + dbra_ext_index as u32 * 2;
+            words[dbra_ext_index] = (A.wrapping_sub(dbra_ext_addr)) as u16;
+            let bra_index = call_words.len() + 4;
+            let bra_addr = A + bra_index as u32 * 2;
+            words[bra_index] = 0x6000 | (A.wrapping_sub(bra_addr + 2) & 0xFF) as u16;
+
+            let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+            for (index, word) in words.iter().enumerate() {
+                bus.write_word_at(A + index as u32 * 2, *word);
+            }
+            let mut cpu = CpuCore::new();
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_sr(0x2700);
+            cpu.pc = A;
+            cpu.set_a(7, 0x9000);
+            cpu.set_d(0, 0x7F);
+            let result = cpu.run_batch(&mut bus, 40_000, &[0]);
+            assert_eq!(result.instructions, 40_000, "{label}: runs to budget");
+            assert!(
+                cpu.d(2).abs_diff(cpu.d(3)) <= 1,
+                "{label}: leaf and tail in lockstep: d2={} d3={}",
+                cpu.d(2),
+                cpu.d(3)
+            );
+            assert!(cpu.d(2) > 2_000, "{label}: the loop actually iterated");
+            let compiled = TRACE_JIT.with_borrow(|jit| {
+                matches!(&jit.slots[trace_cache_index(A)],
+                    TraceSlot::Compiled(t) if t.pc == A
+                        && t.ops.iter().any(|op| matches!(op.op, JitTraceOp::CallThrough { .. }))
+                        && t.ops.iter().any(|op| matches!(op.op, JitTraceOp::RtsReturn { .. })))
+            });
+            assert!(compiled, "{label}: records through on the retry");
+        }
+    }
+
+    #[test]
+    fn earned_call_permission_survives_a_slot_stomp() {
+        // The durable-permission contract: once a head's recording blocks
+        // at a recordable call, fresh candidacy at that pc starts with
+        // call-through permission even after a colliding head stomps the
+        // slot -- so a revived head goes straight to its permitted
+        // recording instead of re-earning the bit through a doomed probe.
+        let mut jit = TraceJit::new();
+        const HEAD: u32 = 0x0100;
+        // A pc that collides in the direct-mapped cache: same index, +2 in
+        // the shifted bit above the mask.
+        const COLLIDER: u32 = HEAD + ((TRACE_CACHE_SIZE as u32) << 1);
+        assert_eq!(trace_cache_index(HEAD), trace_cache_index(COLLIDER));
+
+        jit.grant_call_permission(HEAD);
+        // The colliding head takes the slot.
+        jit.record_trace_target(COLLIDER, CpuType::M68040);
+        assert!(matches!(
+            &jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Counting { pc, .. } if *pc == COLLIDER
+        ));
+        // The original head stomps back: fresh candidacy must carry the
+        // earned permission.
+        jit.record_trace_target(HEAD, CpuType::M68040);
+        assert!(
+            matches!(
+                &jit.slots[trace_cache_index(HEAD)],
+                TraceSlot::Counting {
+                    pc,
+                    allow_call_through: true,
+                    ..
+                } if *pc == HEAD
+            ),
+            "revived candidacy carries the earned permission"
+        );
+        // A head that never earned it starts without it.
+        jit.record_trace_target(COLLIDER, CpuType::M68040);
+        assert!(matches!(
+            &jit.slots[trace_cache_index(COLLIDER)],
+            TraceSlot::Counting {
+                pc,
+                allow_call_through: false,
+                ..
+            } if *pc == COLLIDER
+        ));
+        // Two colliding call-heads both keep their permission: the
+        // gameplay profile's two worst cyclers share one index, and the
+        // second table way exists for exactly that pair.
+        jit.grant_call_permission(COLLIDER);
+        assert!(jit.has_call_permission(HEAD));
+        assert!(jit.has_call_permission(COLLIDER));
     }
 }
