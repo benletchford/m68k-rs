@@ -16143,4 +16143,93 @@ mod portable_tests {
         assert_eq!(portable.a(7), native.a(7));
         assert_eq!(pmem, mem, "memory effects agree");
     }
+
+    /// The MOVEM range guard has to honour the *second* code interval, not
+    /// just the caller's. A call-through trace carries a far callee, and a
+    /// predecrement frame push whose range straddles the callee's own bytes
+    /// must bail with nothing committed -- exactly as a single-word store
+    /// aimed there does. A caller-only range check would let it through and
+    /// the trace would overwrite the code it is about to return into.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn movem_predec_into_far_callee_code_bails_before_committing() {
+        let mut ops = far_call_store_loop_ops();
+        // Replace the plain store with a MOVEM.L push through A0. Two
+        // registers, so the range is [A0-8, A0).
+        ops[2] = TraceBuildOp {
+            opcode: 0x48E0,
+            extension: Some(0x0300),
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::MovemLongPredec {
+                base: 0,
+                mask: 0x0300,
+                cycles: 24,
+            },
+        };
+        let spans = CodeSpans {
+            code_start: 0x0100,
+            code_end: 0x0108,
+            callee_start: 0x8100,
+            callee_end: 0x8102,
+        };
+
+        // A0 = 0x8108 puts the range at [0x8100, 0x8108): it covers the
+        // callee's bytes and misses the caller's entirely.
+        let prepare = |mem: &mut [u8]| {
+            let mut c = cpu();
+            c.set_cpu_type(CpuType::M68040);
+            c.set_a(7, 0x0800);
+            c.set_a(0, 0x8108);
+            c.set_d(0, 0xDEAD_BEEF);
+            c.set_d(1, 0xFEED_FACE);
+            attach_window(&mut c, mem);
+            c
+        };
+
+        let mut mem = vec![0u8; 0x10000];
+        let mut native = prepare(&mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("far call/MOVEM trace should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!(
+            (packed >> 32) as u32,
+            2,
+            "the call and return retired; the callee-code MOVEM did not"
+        );
+        assert_eq!(
+            &mem[0x8100..0x8108],
+            &[0u8; 8],
+            "nothing from the bailed transfer committed"
+        );
+        assert_eq!(native.a(0), 0x8108, "the base register did not move");
+        assert_eq!(native.pc, 0x0104, "resume at the MOVEM for full dispatch");
+
+        let mut pmem = vec![0u8; 0x10000];
+        let mut portable = prepare(&mut pmem);
+        let ppacked = execute_portable_trace(&mut portable, &ops, spans);
+        assert_eq!(
+            (ppacked >> 32) as u32,
+            2,
+            "portable bails on the same transfer"
+        );
+        assert_eq!(&pmem[0x8100..0x8108], &[0u8; 8]);
+        assert_eq!(portable.a(0), 0x8108);
+
+        // The discriminator: moved clear of both intervals, the very same
+        // transfer must retire. Without this the test would also pass if
+        // MOVEM simply never compiled inside a call-through trace.
+        let mut gapmem = vec![0u8; 0x10000];
+        let mut gap = prepare(&mut gapmem);
+        gap.set_a(0, 0x4000);
+        let gpacked = execute_portable_trace(&mut gap, &ops, spans);
+        assert_eq!(
+            (gpacked >> 32) as u32,
+            4,
+            "a transfer clear of both intervals retires"
+        );
+        assert_eq!(gap.a(0), 0x3FF8, "the base register moved for the push");
+    }
 }
