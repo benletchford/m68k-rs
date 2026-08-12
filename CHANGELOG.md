@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.12](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.11...m68k-v0.10.12) (2026-08-12)
+
+
+### Performance Improvements
+
+* record through constant-target JSRs and make call permission durable ([0d8cdc7](https://github.com/benletchford/m68k-rs/commit/0d8cdc7c537d2669faf8024d3838dd3176d3e3e2))
+
 ## [0.10.11](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.10...m68k-v0.10.11) (2026-08-12)
 
 
