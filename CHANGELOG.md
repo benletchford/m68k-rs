@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.11](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.10...m68k-v0.10.11) (2026-08-12)
+
+
+### Performance Improvements
+
+* record through BSR calls on a retry, with per-segment SMC intervals ([8cf482f](https://github.com/benletchford/m68k-rs/commit/8cf482f03b03e684f2f666d9ee1cc94094772c8f))
+
 ## [0.10.10](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.9...m68k-v0.10.10) (2026-08-11)
 
 
