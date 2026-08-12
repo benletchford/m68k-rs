@@ -1595,6 +1595,27 @@ fn rewritten_continuation_head_after_side_exit_matches_step() {
 /// The census exemplar: AND.W of a displaced field into a register,
 /// with a counter.
 #[test]
+fn lea_abs_loop_matches_step() {
+    let words = &[
+        0x41F9, 0x0000, 0x3000, // $1000: LEA ($3000).L,A0
+        0x30BC, 0x0042, // $1006: MOVE.W #$42,(A0)
+        0x5283, // $100A: ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0x5347, // $1010: SUBQ.W #1,D7
+        0x6602, // $1012: BNE.S $1016
+        0xA000, // $1014: sentinel
+        0x707F, // $1016: MOVEQ #127,D0
+        0x60E6, // $1018: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("LEA abs loop", words, CpuType::M68040, |cpu| {
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}
+
+/// The census exemplar: AND.W of a displaced field into a register,
+/// with a counter.
+#[test]
 fn memory_and_loop_matches_step() {
     let words = &[
         0xC268, 0x0010, // $1000: AND.W ($10,A0),D1

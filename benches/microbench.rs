@@ -1905,6 +1905,18 @@ fn main() {
         bench_memory_and_loop();
         return;
     }
+    if only.as_deref() == Some("lea-abs") {
+        bench_lea_abs_loop();
+        return;
+    }
+    if only.as_deref() == Some("clr-abs") {
+        bench_clr_abs_loop();
+        return;
+    }
+    if only.as_deref() == Some("memory-and") {
+        bench_memory_and_loop();
+        return;
+    }
     if only.as_deref() == Some("salvage-prefix") {
         bench_salvaged_prefix_loop();
         return;
@@ -2079,25 +2091,23 @@ fn bench_memory_and_loop() {
     const INSTRS: u32 = 100_000_000;
     const CODE_BASE: u32 = 0x6000;
     let words = [
-        0xC268, 0x0010, // head: AND.W ($10,A0),D1
+        0x41F9, 0x0000, 0x3000, // head: LEA ($3000).L,A0
+        0x30BC, 0x0042, // MOVE.W #$42,(A0)
         0x5283, // ADDQ.L #1,D3
-        0x51C8, 0xFFF8, // DBRA D0,head
+        0x51C8, 0xFFF2, // DBRA D0,head
         0x707F, // MOVEQ #127,D0
-        0x60F2, // BRA.S head
+        0x60EC, // BRA.S head
     ];
     let mut bus = LinearMemoryBus::new(0x1_0000);
     for (index, word) in words.iter().enumerate() {
         bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
     }
-    bus.write_word_at(0x3010, 0x0FF0);
     let prepare_cpu = || {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_sr(0x2700);
         cpu.pc = CODE_BASE;
-        cpu.set_a(0, 0x3000);
         cpu.set_a(7, 0x8000);
-        cpu.set_d(1, 0xFFFF_F0F0);
         cpu.set_d(0, 0x7F);
         cpu
     };
@@ -2111,8 +2121,61 @@ fn bench_memory_and_loop() {
     assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
     let elapsed = start.elapsed().as_secs_f64();
     assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    assert_eq!(
+        bus.read_word(0x3000),
+        0x0042,
+        "the store lands via the loaded address"
+    );
     println!(
-        "batch     memory and loop         {:8.1} M instr/s",
+        "batch     lea abs loop            {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
+/// LEA of an absolute address feeding a store -- the shape behind
+/// twenty of the top-forty blocked heads in the gameplay census. Base
+/// blocks the head at the LEA.
+fn bench_lea_abs_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x41F9, 0x0000, 0x3000, // head: LEA ($3000).L,A0
+        0x30BC, 0x0042, // MOVE.W #$42,(A0)
+        0x5283, // ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60EC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    assert_eq!(
+        bus.read_word(0x3000),
+        0x0042,
+        "the store lands via the loaded address"
+    );
+    println!(
+        "batch     lea abs loop            {:8.1} M instr/s",
         f64::from(INSTRS) / elapsed / 1_000_000.0
     );
 }
