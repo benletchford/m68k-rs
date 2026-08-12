@@ -1818,34 +1818,33 @@ fn bench_set<B: BenchBus>(label: &str) {
     );
 }
 
-/// Exercise the absolute-addressed TST forms the gameplay census
-/// flagged (4A39/4A79 heads): all three widths against fixed targets.
-fn bench_tst_abs_loop() {
-    // Outer cycles of 514 instructions end exactly at the outer label
-    // with the targets untouched (TST writes nothing).
+/// Exercise the three-extension-word forms the gameplay census named:
+/// CMPI.W to an absolute long address, MOVE.B immediate to an absolute
+/// long address, and MOVE.L immediate to a displaced destination.
+fn bench_third_ext_loop() {
+    // Outer cycles of 514 instructions end exactly at the outer label.
     const CYCLES: u32 = 408_560;
     const INSTRS: u32 = CYCLES * 514;
     const CODE_BASE: u32 = 0x7000;
     let words = [
         0x727F, // outer: MOVEQ #127,D1
-        0x4A78, 0x4000, // inner: TST.W ($4000).W
-        0x4AB9, 0x0000, 0x4004, // TST.L ($4004).L
-        0x4A39, 0x0000, 0x4003, // TST.B ($4003).L
-        0x51C9, 0xFFEE, // DBRA D1,inner
-        0x60E8, // BRA.S outer
+        0x0C79, 0x0042, 0x0000, 0x4000, // inner: CMPI.W #$42,($4000).L
+        0x13FC, 0x00A5, 0x0000, 0x4003, // MOVE.B #$A5,($4003).L
+        0x2B7C, 0xDEAD, 0xBEEF, 0x0010, // MOVE.L #$DEADBEEF,($10,A5)
+        0x51C9, 0xFFE6, // DBRA D1,inner
+        0x60E0, // BRA.S outer
     ];
     let mut bus = LinearMemoryBus::new(0x10000);
     for (index, word) in words.iter().enumerate() {
         bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
     }
-    for address in 0x4000..0x4008 {
-        bus.write_byte(address, 0xAA);
-    }
+    bus.write_word_at(0x4000, 0x0042);
     let prepare_cpu = || {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_sr(0x2700);
         cpu.pc = CODE_BASE;
+        cpu.set_a(5, 0x4100);
         cpu
     };
     let mut warm_cpu = prepare_cpu();
@@ -1858,11 +1857,11 @@ fn bench_tst_abs_loop() {
     assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
     let elapsed = start.elapsed().as_secs_f64();
     assert_eq!(cpu.pc, CODE_BASE, "the run ends exactly at the outer label");
-    for address in 0x4000..0x4008 {
-        assert_eq!(bus.read_byte(address), 0xAA, "TST writes nothing");
-    }
+    assert_eq!(bus.read_word(0x4000), 0x0042, "compared word untouched");
+    assert_eq!(bus.read_byte(0x4003), 0xA5, "immediate byte stored");
+    assert_eq!(bus.read_long(0x4110), 0xDEAD_BEEF, "immediate long stored");
     println!(
-        "batch     absolute TST loop       {:8.1} M instr/s",
+        "batch     third-extension loop    {:8.1} M instr/s",
         f64::from(INSTRS) / elapsed / 1_000_000.0
     );
 }
@@ -1946,8 +1945,8 @@ fn main() {
         bench_far_call_through_leaf();
         return;
     }
-    if only.as_deref() == Some("tst-abs") {
-        bench_tst_abs_loop();
+    if only.as_deref() == Some("third-ext") {
+        bench_third_ext_loop();
         return;
     }
     if only.as_deref() == Some("clr-abs") {

@@ -1203,21 +1203,35 @@ fn fastmem_differential_fuzz_memory_ops() {
 /// Fill 64 longs at $2000 with a changing pattern, then copy them to $3000
 /// with the classic `MOVE.L (A0)+,(A1)+ / DBRA` inner loop. Both loops run
 /// hot enough to compile and iterate inside the JIT.
-/// Absolute-addressed CLR (the 4238/4239 gameplay census heads) must stay
-/// exact through the whole record/compile/execute lifecycle, including the
-/// flag pattern (Z set, NVC clear, X preserved) and re-dirtied targets.
+/// A hot loop whose head instruction carries three extension words
+/// (CMPI.W #imm,(xxx).L). After the loop goes native, a second phase
+/// patches the THIRD word — the low half of the absolute address — and
+/// re-enters. Head revalidation (the contiguous one-slice compare
+/// against the trace's assembled code bytes, which include the third
+/// word) must catch the change and re-record; a stale trace would keep
+/// comparing the old address and diverge from step() in D5. The per-op
+/// fallback walk also carries the third word; its live cases are
+/// non-contiguous traces, which need call coverage and are exercised
+/// in the session bundles.
 #[test]
-fn mem_trace_clr_absolute_matches_step() {
+fn mem_trace_third_extension_word_revalidates() {
     let words = &[
-        0x4278, 0x2000, // $1000: CLR.W ($2000).W
-        0x42B9, 0x0000, 0x2004, // $1004: CLR.L ($2004).L
-        0x4239, 0x0000, 0x2003, // $100A: CLR.B ($2003).L
-        0x31C0, 0x2000, // $1010: MOVE.W D0,($2000).W  (re-dirty the target)
-        0x51C8, 0xFFEA, // $1014: DBRA D0,$1000
-        0xA000, // $1018: sentinel
+        0x0C79, 0x0042, 0x0000, 0x2000, // $1000: CMPI.W #$42,($2000).L
+        0x6702, // $1008: BEQ.S $100C
+        0x5245, // $100A: ADDQ.W #1,D5
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000   (ext at $100E: $1000-$100E)
+        0x4A44, // $1010: TST.W D4
+        0x660E, // $1012: BNE.S $1022             ($1022-$1014 = 0x0E)
+        0x5244, // $1014: ADDQ.W #1,D4
+        0x31FC, 0x2004, 0x1006, // $1016: MOVE.W #$2004,($1006).W
+        0x303C, 0x012C, // $101C: MOVE.W #300,D0
+        0x60DE, // $1020: BRA.S $1000             ($1000-$1022 = -0x22)
+        0xA000, // $1022: sentinel
     ];
-    assert_fastmem_matches_step("clr absolute", words, CpuType::M68000, |cpu| {
+    assert_fastmem_matches_step("third-ext revalidation", words, CpuType::M68020, |cpu| {
         cpu.set_d(0, 300);
+        cpu.set_d(4, 0);
+        cpu.set_d(5, 0);
     });
 }
 
@@ -1629,5 +1643,40 @@ fn memory_and_loop_matches_step() {
         cpu.set_d(1, 0xFFFF_F0F0);
         cpu.set_d(0, 50);
         cpu.set_d(7, 5);
+    });
+}
+
+/// Fill 64 longs at $2000 with a changing pattern, then copy them to $3000
+/// with the classic `MOVE.L (A0)+,(A1)+ / DBRA` inner loop. Both loops run
+/// hot enough to compile and iterate inside the JIT.
+/// A hot loop whose head instruction carries three extension words
+/// (CMPI.W #imm,(xxx).L). After the loop goes native, a second phase
+/// patches the THIRD word — the low half of the absolute address — and
+/// re-enters. Head revalidation (the contiguous one-slice compare
+/// against the trace's assembled code bytes, which include the third
+/// word) must catch the change and re-record; a stale trace would keep
+/// comparing the old address and diverge from step() in D5. The per-op
+/// fallback walk also carries the third word; its live cases are
+/// non-contiguous traces, which need call coverage and are exercised
+/// in the session bundles.
+#[test]
+fn mem_trace_third_extension_word_revalidates() {
+    let words = &[
+        0x0C79, 0x0042, 0x0000, 0x2000, // $1000: CMPI.W #$42,($2000).L
+        0x6702, // $1008: BEQ.S $100C
+        0x5245, // $100A: ADDQ.W #1,D5
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000   (ext at $100E: $1000-$100E)
+        0x4A44, // $1010: TST.W D4
+        0x660E, // $1012: BNE.S $1022             ($1022-$1014 = 0x0E)
+        0x5244, // $1014: ADDQ.W #1,D4
+        0x31FC, 0x2004, 0x1006, // $1016: MOVE.W #$2004,($1006).W
+        0x303C, 0x012C, // $101C: MOVE.W #300,D0
+        0x60DE, // $1020: BRA.S $1000             ($1000-$1022 = -0x22)
+        0xA000, // $1022: sentinel
+    ];
+    assert_fastmem_matches_step("third-ext revalidation", words, CpuType::M68020, |cpu| {
+        cpu.set_d(0, 300);
+        cpu.set_d(4, 0);
+        cpu.set_d(5, 0);
     });
 }

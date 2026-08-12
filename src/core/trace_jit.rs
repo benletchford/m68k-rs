@@ -536,13 +536,16 @@ struct TraceBuildOp {
     opcode: u16,
     extension: Option<u16>,
     extension2: Option<u16>,
+    extension3: Option<u16>,
     pc: u32,
     op: JitTraceOp,
 }
 
 impl TraceBuildOp {
     fn length(self) -> u8 {
-        2 + 2 * u8::from(self.extension.is_some()) + 2 * u8::from(self.extension2.is_some())
+        2 + 2 * u8::from(self.extension.is_some())
+            + 2 * u8::from(self.extension2.is_some())
+            + 2 * u8::from(self.extension3.is_some())
     }
 }
 
@@ -837,6 +840,17 @@ impl TraceJit {
                     }
                     if let Some(expected) = op.extension2 {
                         let addr = cpu.address(op.pc.wrapping_add(4));
+                        match bus.try_read_word(addr) {
+                            Ok(extension) if extension == expected => {}
+                            Ok(_) => {
+                                miss = Some((index, op.pc, op.opcode));
+                                break;
+                            }
+                            Err(_) => return None,
+                        }
+                    }
+                    if let Some(expected) = op.extension3 {
+                        let addr = cpu.address(op.pc.wrapping_add(6));
                         match bus.try_read_word(addr) {
                             Ok(extension) if extension == expected => {}
                             Ok(_) => {
@@ -1389,6 +1403,7 @@ impl TraceJit {
                 opcode: op.opcode,
                 extension: op.extension,
                 extension2: op.extension2,
+                extension3: op.extension3,
             })
             .collect();
         if call_retry_pending {
@@ -1596,6 +1611,7 @@ impl TraceJit {
                         opcode: op.opcode,
                         extension: op.extension,
                         extension2: op.extension2,
+                        extension3: op.extension3,
                     })
                     .collect();
                 super::trace_profile::note_blocker(
@@ -1731,6 +1747,9 @@ impl TraceJit {
                 code.extend_from_slice(&extension.to_be_bytes());
             }
             if let Some(extension) = op.extension2 {
+                code.extend_from_slice(&extension.to_be_bytes());
+            }
+            if let Some(extension) = op.extension3 {
                 code.extend_from_slice(&extension.to_be_bytes());
             }
         }
@@ -2421,6 +2440,10 @@ fn decode_call_op<B: AddressBus>(
             opcode,
             extension: None,
             extension2: None,
+            // No call form reaches three extension words: the widest is
+            // BSR.L / JSR (xxx).L at two. The slot is explicitly empty so
+            // revalidation never reads a stale third word for these ops.
+            extension3: None,
             pc,
             // The expected return is filled in by the recorder from the
             // pending call; zero here is never emitted.
@@ -2436,6 +2459,10 @@ fn decode_call_op<B: AddressBus>(
             opcode,
             extension: Some(ext),
             extension2: None,
+            // No call form reaches three extension words: the widest is
+            // BSR.L / JSR (xxx).L at two. The slot is explicitly empty so
+            // revalidation never reads a stale third word for these ops.
+            extension3: None,
             pc,
             op: JitTraceOp::CallThrough {
                 return_pc: pc.wrapping_add(4),
@@ -2450,6 +2477,7 @@ fn decode_call_op<B: AddressBus>(
             opcode,
             extension: Some(hi),
             extension2: Some(lo),
+            extension3: None,
             pc,
             op: JitTraceOp::CallThrough {
                 return_pc: pc.wrapping_add(6),
@@ -2480,6 +2508,7 @@ fn decode_call_op<B: AddressBus>(
         opcode,
         extension,
         extension2,
+        extension3: None,
         pc,
         op: JitTraceOp::CallThrough {
             return_pc,
@@ -2747,7 +2776,11 @@ impl JitTraceOp {
             Self::AluMemToReg { .. } => 24,
             // MC68000 CMPI.W uses an eight-cycle base plus the ten-cycle
             // brief-indexed effective-address read.
-            Self::CmpiWordMem { .. } => 18,
+            Self::CmpiWordMem { src, .. } => match src {
+                JitEa::AbsWord(_) => 16,
+                JitEa::AbsLong(_) => 20,
+                _ => 18,
+            },
             // TST is a four-cycle operation plus the indexed EA read
             // (M68000UM); byte and word reads have the same EA cost.
             Self::TstMem { size, src } => match (size, src) {
@@ -2776,9 +2809,13 @@ impl JitTraceOp {
             // displacement; long pays the extra immediate fetch.
             Self::MoveImmMem { size, dst, .. } => match (size, dst) {
                 (Size::Long, JitEa::Disp(_, _)) => 24,
+                (Size::Long, JitEa::Index { .. }) => 26,
+                (Size::Long, JitEa::AbsWord(_)) => 24,
                 (Size::Long, _) => 20,
                 (_, JitEa::Index { .. }) => 18,
                 (_, JitEa::Disp(_, _)) => 16,
+                (_, JitEa::AbsWord(_)) => 16,
+                (_, JitEa::AbsLong(_)) => 20,
                 _ => 12,
             },
             Self::AddrCmpMemToReg { .. } => 24,
@@ -2888,6 +2925,7 @@ fn decode_trace_op<B: AddressBus>(
         opcode,
         extension: None,
         extension2: None,
+        extension3: None,
         pc,
         op,
     })
@@ -2909,6 +2947,7 @@ fn decode_link_unlk_trace_op<B: AddressBus>(
             opcode,
             extension: Some(extension),
             extension2: None,
+            extension3: None,
             pc,
             op: JitTraceOp::Link {
                 reg,
@@ -2921,6 +2960,7 @@ fn decode_link_unlk_trace_op<B: AddressBus>(
             opcode,
             extension: None,
             extension2: None,
+            extension3: None,
             pc,
             op: JitTraceOp::Unlk { reg },
         });
@@ -2949,6 +2989,7 @@ fn decode_long_mul_data_reg_trace_op<B: AddressBus>(
         opcode,
         extension: Some(extension),
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::MulLongDataReg {
             src: (opcode & 7) as u8,
@@ -3000,6 +3041,7 @@ fn decode_binary_immediate_data_reg_trace_op<B: AddressBus>(
         opcode,
         extension: Some(extension),
         extension2,
+        extension3: None,
         pc,
         op: JitTraceOp::BinaryImmediateDataReg {
             op,
@@ -3038,6 +3080,7 @@ fn decode_mul_word_immediate_trace_op<B: AddressBus>(
         opcode,
         extension: Some(extension),
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::MulWordImmediate {
             immediate: extension,
@@ -3061,18 +3104,38 @@ fn decode_cmpi_word_mem_trace_op<B: AddressBus>(
     let DecodedMemOp::AluImm {
         op: BinaryOp::Cmp,
         size: Size::Word,
-        dst: FastEa::AnIndex(base),
+        dst: ea,
     } = DecodedMemOp::decode(cpu_type, opcode)?
     else {
         return None;
     };
     let immediate = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
-    let ea_extension = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
-    let src = decode_jit_ea(6, u16::from(base), ea_extension, cpu_type)?;
+    let (src, extension2, extension3) = match ea {
+        FastEa::AnIndex(base) => {
+            let ea_extension = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+            let src = decode_jit_ea(6, u16::from(base), ea_extension, cpu_type)?;
+            (src, Some(ea_extension), None)
+        }
+        FastEa::AbsW => {
+            let addr = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+            (JitEa::AbsWord(addr as i16 as i32 as u32), Some(addr), None)
+        }
+        FastEa::AbsL => {
+            let hi = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+            let lo = bus.try_read_word(cpu.address(pc.wrapping_add(6))).ok()?;
+            (
+                JitEa::AbsLong((u32::from(hi) << 16) | u32::from(lo)),
+                Some(hi),
+                Some(lo),
+            )
+        }
+        _ => return None,
+    };
     Some(TraceBuildOp {
         opcode,
         extension: Some(immediate),
-        extension2: Some(ea_extension),
+        extension2,
+        extension3,
         pc,
         op: JitTraceOp::CmpiWordMem { immediate, src },
     })
@@ -3108,6 +3171,7 @@ fn decode_addr_cmp_immediate_trace_op<B: AddressBus>(
         opcode,
         extension: Some(extension),
         extension2,
+        extension3: None,
         pc,
         op: JitTraceOp::AddrCmpImmediate {
             immediate,
@@ -3143,6 +3207,7 @@ fn decode_movem_word_postinc_trace_op<B: AddressBus>(
         opcode,
         extension: Some(mask),
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::MovemWordPostInc {
             base: (opcode & 7) as u8,
@@ -3160,6 +3225,7 @@ fn decode_indirect_jsr_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
         opcode,
         extension: None,
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::IndirectJsr {
             reg: (opcode & 7) as u8,
@@ -3182,6 +3248,7 @@ fn decode_dbcc_trace_op<B: AddressBus>(
         opcode,
         extension: Some(extension),
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::Dbcc {
             condition: ((opcode >> 8) & 0xF) as u8,
@@ -3211,6 +3278,7 @@ fn decode_branch_word_trace_op<B: AddressBus>(
         opcode,
         extension: Some(extension),
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::Branch {
             condition,
@@ -3488,6 +3556,7 @@ fn decode_an_disp_trace_op<B: AddressBus>(
         opcode,
         extension,
         extension2,
+        extension3: None,
         pc,
         op,
     })
@@ -3498,16 +3567,17 @@ fn decode_an_disp_trace_op<B: AddressBus>(
 /// words are captured in execution order for validation and
 /// self-modification checks.
 /// Decode `MOVE #imm,<memory>` for the destination forms that fit the
-/// two extension-word budget: byte/word immediates to `(An)`, `(An)+`,
-/// `-(An)`, and `(d16,An)`, and long immediates to the extension-less
-/// destinations. `MOVE.L #imm,(d16,An)` needs three extension words and
-/// stays on the decoded path.
+/// recorder's three extension-word slots: every width to `(An)`, `(An)+`,
+/// `-(An)`, `(d16,An)`, brief-indexed, and `(xxx).W`, and byte/word
+/// immediates to `(xxx).L`. Only `MOVE.L #imm,(xxx).L` — four extension
+/// words — stays on the decoded path.
 fn decode_move_imm_mem_trace_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
     pc: u32,
     opcode: u16,
 ) -> Option<TraceBuildOp> {
+    let mut extension3: Option<u16> = None;
     let size = match opcode >> 12 {
         1 => Size::Byte,
         3 => Size::Word,
@@ -3547,26 +3617,49 @@ fn decode_move_imm_mem_trace_op<B: AddressBus>(
         3 => (JitEa::PostInc(dst_reg), extension2),
         4 => (JitEa::PreDec(dst_reg), extension2),
         5 => {
-            if size == Size::Long {
-                // Three extension words in total; TraceBuildOp carries two.
-                return None;
-            }
             let displacement = read_ext(2 + 2 * imm_words, bus)?;
-            (
-                JitEa::Disp(dst_reg, displacement as i16),
-                Some(displacement),
-            )
+            if size == Size::Long {
+                extension3 = Some(displacement);
+                (JitEa::Disp(dst_reg, displacement as i16), extension2)
+            } else {
+                (
+                    JitEa::Disp(dst_reg, displacement as i16),
+                    Some(displacement),
+                )
+            }
         }
         6 => {
+            let brief = read_ext(2 + 2 * imm_words, bus)?;
+            let ea = decode_jit_ea(6, u16::from(dst_reg), brief, cpu.cpu_type)?;
             if size == Size::Long {
-                // Immediate high/low plus the brief extension word exceed
-                // TraceBuildOp's two extension slots.
+                extension3 = Some(brief);
+                (ea, extension2)
+            } else {
+                (ea, Some(brief))
+            }
+        }
+        7 if dst_reg == 0 => {
+            let addr = read_ext(2 + 2 * imm_words, bus)?;
+            let ea = JitEa::AbsWord(addr as i16 as i32 as u32);
+            if size == Size::Long {
+                extension3 = Some(addr);
+                (ea, extension2)
+            } else {
+                (ea, Some(addr))
+            }
+        }
+        7 if dst_reg == 1 => {
+            if size == Size::Long {
+                // Immediate high/low plus a two-word address exceed even
+                // the three extension slots.
                 return None;
             }
-            let brief = read_ext(2 + 2 * imm_words, bus)?;
+            let hi = read_ext(2 + 2 * imm_words, bus)?;
+            let lo = read_ext(4 + 2 * imm_words, bus)?;
+            extension3 = Some(lo);
             (
-                decode_jit_ea(6, u16::from(dst_reg), brief, cpu.cpu_type)?,
-                Some(brief),
+                JitEa::AbsLong((u32::from(hi) << 16) | u32::from(lo)),
+                Some(hi),
             )
         }
         _ => return None,
@@ -3575,6 +3668,7 @@ fn decode_move_imm_mem_trace_op<B: AddressBus>(
         opcode,
         extension,
         extension2,
+        extension3,
         pc,
         op: JitTraceOp::MoveImmMem { size, value, dst },
     })
@@ -3636,6 +3730,7 @@ fn decode_move_mem_trace_op<B: AddressBus>(
         opcode,
         extension: (extension_count >= 1).then_some(extensions[0]),
         extension2: (extension_count >= 2).then_some(extensions[1]),
+        extension3: None,
         pc,
         op: JitTraceOp::MoveMem { size, src, dst },
     })
@@ -3673,6 +3768,7 @@ fn decode_add_reg_to_mem_trace_op<B: AddressBus>(
         opcode,
         extension,
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::AddRegToMem {
             is_sub,
@@ -3724,6 +3820,7 @@ fn decode_alu_mem_to_reg_trace_op<B: AddressBus>(
         opcode,
         extension,
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::AluMemToReg { op, size, src, dst },
     })
@@ -3763,6 +3860,7 @@ fn decode_addr_cmp_mem_to_reg_trace_op<B: AddressBus>(
         opcode,
         extension,
         extension2: None,
+        extension3: None,
         pc,
         op: JitTraceOp::AddrCmpMemToReg { size, src, dst },
     })
@@ -4231,12 +4329,14 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_cmpi_word_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
-    let JitTraceOp::CmpiWordMem {
-        src: JitEa::Index { base, .. },
-        ..
-    } = trace.op
-    else {
+    let JitTraceOp::CmpiWordMem { src, .. } = trace.op else {
         return None;
+    };
+    let dst = match src {
+        JitEa::Index { base, .. } => FastEa::AnIndex(base),
+        JitEa::AbsWord(_) => FastEa::AbsW,
+        JitEa::AbsLong(_) => FastEa::AbsL,
+        _ => return None,
     };
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
@@ -4245,7 +4345,7 @@ fn execute_portable_cmpi_word_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Opt
         DecodedMemOp::AluImm {
             op: BinaryOp::Cmp,
             size: Size::Word,
-            dst: FastEa::AnIndex(base),
+            dst,
         },
     ) {
         Some(trace.op.max_cycles())
@@ -4419,6 +4519,7 @@ fn execute_portable_move_imm_mem(
                 None,
             )
         }
+        JitEa::AbsWord(a) | JitEa::AbsLong(a) => (0, a, None),
         _ => return None,
     };
     let off = locate(cpu, addr)?;
@@ -6367,6 +6468,7 @@ fn emit_move_imm_mem(
             let address = builder.ins().iadd(base, index);
             (builder.ins().iadd_imm(address, displacement as i64), None)
         }
+        JitEa::AbsWord(address) | JitEa::AbsLong(address) => (iconst_u32(builder, address), None),
         _ => unreachable!("immediate MOVE decoder admitted an unsupported EA"),
     };
     let (off, masked) = checked_window_off(builder, env, bail, address, size);
@@ -6479,19 +6581,8 @@ fn emit_cmpi_word_mem(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::CmpiWordMem {
-        immediate,
-        src:
-            JitEa::Index {
-                base,
-                index,
-                index_long,
-                scale,
-                displacement,
-            },
-    } = trace.op
-    else {
-        unreachable!("indexed CMPI decoder admitted an unsupported EA")
+    let JitTraceOp::CmpiWordMem { immediate, src } = trace.op else {
+        unreachable!("emit_cmpi_word_mem called for a non-CMPI op")
     };
     let bail = builder.create_block();
     bails.push(BailReq {
@@ -6500,21 +6591,33 @@ fn emit_cmpi_word_mem(
         at,
     });
 
-    let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
-    let raw_index = load_reg(builder, cpu, index);
-    let index = if index_long {
-        raw_index
-    } else {
-        let word = builder.ins().ireduce(types::I16, raw_index);
-        builder.ins().sextend(types::I32, word)
+    let address = match src {
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let address = builder.ins().iadd(base, index);
+            builder.ins().iadd_imm(address, displacement as i64)
+        }
+        JitEa::AbsWord(address) | JitEa::AbsLong(address) => iconst_u32(builder, address),
+        _ => unreachable!("indexed CMPI decoder admitted an unsupported EA"),
     };
-    let index = if scale == 0 {
-        index
-    } else {
-        builder.ins().ishl_imm(index, i64::from(scale))
-    };
-    let address = builder.ins().iadd(base, index);
-    let address = builder.ins().iadd_imm(address, displacement as i64);
     let (off, _) = checked_window_off(builder, env, bail, address, Size::Word);
     let dst_value = window_load(builder, env, off, Size::Word);
     let immediate = iconst_u32(builder, u32::from(immediate));
@@ -8243,6 +8346,7 @@ mod portable_tests {
             opcode: 0x4A70,
             extension: Some(0x0800),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::TstMem {
                 size: Size::Word,
@@ -8357,6 +8461,7 @@ mod portable_tests {
                 opcode: 0x22D8,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -8368,6 +8473,7 @@ mod portable_tests {
                 opcode: 0x51C8,
                 extension: Some(0xFFFC),
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Dbcc {
                     condition: 1,
@@ -8451,6 +8557,7 @@ mod portable_tests {
             opcode: 0x30D8,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::MoveMem {
                 size: Size::Word,
@@ -8472,6 +8579,7 @@ mod portable_tests {
             opcode: 0x4C98,
             extension: Some(0x00FE),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::MovemWordPostInc {
                 base: 0,
@@ -8570,6 +8678,7 @@ mod portable_tests {
                 opcode: 0x51C8,
                 extension: Some(0xFFFA),
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::Dbcc {
                     condition: 1,
@@ -8796,6 +8905,7 @@ mod portable_tests {
             opcode: 0x4E90,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::IndirectJsr { reg: 0 },
         };
@@ -8823,6 +8933,7 @@ mod portable_tests {
             opcode: 0x4E90,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::IndirectJsr { reg: 0 },
         };
@@ -8850,6 +8961,7 @@ mod portable_tests {
             opcode: 0xB210,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Cmp,
@@ -8880,6 +8992,7 @@ mod portable_tests {
             opcode: 0xB270,
             extension: Some(0x2004),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Cmp,
@@ -8956,6 +9069,7 @@ mod portable_tests {
             opcode: 0x0C70,
             extension: Some(0xFFFF),
             extension2: Some(0x0000),
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::CmpiWordMem {
                 immediate: 0xFFFF,
@@ -8972,6 +9086,7 @@ mod portable_tests {
             opcode: 0x60F8,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0106,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -9102,6 +9217,7 @@ mod portable_tests {
             opcode: 0x4840,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::Swap { reg: 0 },
         };
@@ -9211,6 +9327,7 @@ mod portable_tests {
             opcode: 0x486D,
             extension: Some(0x0040),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::PeaDisp {
                 reg: 5,
@@ -9221,6 +9338,7 @@ mod portable_tests {
             opcode: 0x60FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -9277,6 +9395,7 @@ mod portable_tests {
             opcode: 0x486F,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::PeaDisp {
                 reg: 7,
@@ -9412,6 +9531,7 @@ mod portable_tests {
             opcode: 0x43F0,
             extension: Some(0x2004),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::LeaIndex {
                 src: JitEa::Index {
@@ -9429,6 +9549,7 @@ mod portable_tests {
             opcode: 0x60FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -9500,6 +9621,7 @@ mod portable_tests {
                     opcode: if signed { 0xC1FC } else { 0xC0FC },
                     extension: Some(immediate),
                     extension2: None,
+                    extension3: None,
                     pc: 0x0100,
                     op,
                 };
@@ -9587,6 +9709,7 @@ mod portable_tests {
                     opcode: if signed { 0xC1FC } else { 0xC0FC },
                     extension: Some(immediate),
                     extension2: None,
+                    extension3: None,
                     pc: 0x0100,
                     op,
                 };
@@ -9667,6 +9790,7 @@ mod portable_tests {
                     opcode,
                     extension: Some(immediate),
                     extension2: None,
+                    extension3: None,
                     pc: 0x0100,
                     op: JitTraceOp::MulWordImmediate {
                         immediate,
@@ -9679,6 +9803,7 @@ mod portable_tests {
                     opcode: 0x60FA,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: 0x0104,
                     op: JitTraceOp::Branch {
                         condition: 0,
@@ -9768,6 +9893,7 @@ mod portable_tests {
                 opcode: 0x9190,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddRegToMem {
                     is_sub: true,
@@ -9780,6 +9906,7 @@ mod portable_tests {
                 opcode: 0x60FC,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -9855,6 +9982,7 @@ mod portable_tests {
                                 opcode: 0xE2A0,
                                 extension: None,
                                 extension2: None,
+                                extension3: None,
                                 pc: 0x0100,
                                 op: JitTraceOp::ShiftReg {
                                     reg: 0,
@@ -9869,6 +9997,7 @@ mod portable_tests {
                                 opcode: 0x60FC,
                                 extension: None,
                                 extension2: None,
+                                extension3: None,
                                 pc: 0x0102,
                                 op: JitTraceOp::Branch {
                                     condition: 0,
@@ -9932,6 +10061,7 @@ mod portable_tests {
             opcode: 0xE2A0,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::ShiftReg {
                 reg: 0,
@@ -9946,6 +10076,7 @@ mod portable_tests {
             opcode: 0x60FC,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0102,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -10134,6 +10265,7 @@ mod portable_tests {
                 opcode: *opcode,
                 extension: Some(if *opcode == 0x3180 { 0x2004 } else { 0xA008 }),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::MoveMem {
                     size: Size::Word,
@@ -10145,6 +10277,7 @@ mod portable_tests {
                 opcode: 0x60FA,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -10290,6 +10423,7 @@ mod portable_tests {
                 opcode: *opcode,
                 extension: Some(*extension),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: *op,
             };
@@ -10297,6 +10431,7 @@ mod portable_tests {
                 opcode: 0x60FA,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -10499,6 +10634,7 @@ mod portable_tests {
                 opcode: 0x5285,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x010A,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 5,
@@ -10511,6 +10647,7 @@ mod portable_tests {
                 opcode: 0x5286,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x010C,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 6,
@@ -10523,6 +10660,7 @@ mod portable_tests {
                 opcode: 0x60FA,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x010E,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -10680,6 +10818,7 @@ mod portable_tests {
                 opcode: *opcode,
                 extension: Some(*ext),
                 extension2: *ext2,
+                extension3: None,
                 pc: 0x0100,
                 op: *op,
             };
@@ -10687,6 +10826,7 @@ mod portable_tests {
                 opcode: branch_opcode,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: branch_pc,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -10751,6 +10891,7 @@ mod portable_tests {
             opcode: 0x4278,
             extension: Some(0x0102),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::ClrMem {
                 size: Size::Word,
@@ -10761,6 +10902,7 @@ mod portable_tests {
             opcode: 0x60FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -10902,6 +11044,7 @@ mod portable_tests {
                 opcode: 0x4278,
                 extension: Some(0x0320),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::ClrMem {
                     size: Size::Word,
@@ -10912,6 +11055,7 @@ mod portable_tests {
                 opcode: 0x42B9,
                 extension: Some(0x0000),
                 extension2: Some(0x0328),
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::ClrMem {
                     size: Size::Long,
@@ -10922,6 +11066,7 @@ mod portable_tests {
                 opcode: 0x4239,
                 extension: Some(0x0000),
                 extension2: Some(0x0327),
+                extension3: None,
                 pc: 0x010A,
                 op: JitTraceOp::ClrMem {
                     size: Size::Byte,
@@ -10932,6 +11077,7 @@ mod portable_tests {
                 opcode: 0x60EE,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0110,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -11268,6 +11414,7 @@ mod portable_tests {
                 opcode: 0xC268,
                 extension: Some(0x0010),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AluMemToReg {
                     op: JitBinaryOp::And,
@@ -11280,6 +11427,7 @@ mod portable_tests {
                 opcode: 0x8468,
                 extension: Some(0x0012),
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::AluMemToReg {
                     op: JitBinaryOp::Or,
@@ -11292,6 +11440,7 @@ mod portable_tests {
                 opcode: 0x60F6,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0108,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -11426,6 +11575,7 @@ mod portable_tests {
             opcode: 0x42A7,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::ClrMem {
                 size: Size::Long,
@@ -11436,6 +11586,7 @@ mod portable_tests {
             opcode: 0x60FC,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0102,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -11554,13 +11705,28 @@ mod portable_tests {
                 dst: JitEa::Disp(5, 0x0010),
             }
         ));
-        // MOVE.L #imm,(d16,An) needs three extension words: stays decoded.
+        // MOVE.L #imm,(d16,An) carries three extension words: immediate
+        // high/low plus the displacement in the third slot (the 2D7C
+        // census shape).
         bus.write_word(0x0100, 0x2B7C);
-        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040);
-        assert!(
-            !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
-            "three-extension form must not decode as MoveImmMem"
+        bus.write_word(0x0102, 0xDEAD);
+        bus.write_word(0x0104, 0xBEEF);
+        bus.write_word(0x0106, 0x0010);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.L #imm,(d16,An) should decode with three extensions");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Long,
+                value: 0xDEAD_BEEF,
+                dst: JitEa::Disp(5, 0x0010),
+            }
+        ));
+        assert_eq!(
+            (t.extension, t.extension2, t.extension3),
+            (Some(0xDEAD), Some(0xBEEF), Some(0x0010))
         );
+        assert_eq!(t.length(), 8, "opcode plus three extension words");
         // 31BC = MOVE.W #imm,(d8,A0,Xn): the immediate word plus the brief
         // extension fit the two-slot budget.
         bus.write_word(0x0100, 0x31BC);
@@ -11582,12 +11748,50 @@ mod portable_tests {
                 },
             }
         ));
-        // ...but the long form would need three words and stays decoded.
+        // The long indexed form carries its brief word in the third slot.
         bus.write_word(0x0100, 0x21BC);
+        bus.write_word(0x0102, 0xCAFE);
+        bus.write_word(0x0104, 0xF00D);
+        bus.write_word(0x0106, 0x2004); // (4,A0,D2.W)
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.L #imm,(d8,An,Xn) should decode with three extensions");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Long,
+                value: 0xCAFE_F00D,
+                dst: JitEa::Index { base: 0, .. },
+            }
+        ));
+        assert_eq!(t.extension3, Some(0x2004));
+
+        // MOVE.B #imm,(xxx).L -- the 13FC census head: immediate low byte,
+        // then the two address words.
+        bus.write_word(0x0100, 0x13FC);
+        bus.write_word(0x0102, 0x00A5);
+        bus.write_word(0x0104, 0x0000);
+        bus.write_word(0x0106, 0x0327);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.B #imm,(xxx).L should decode with three extensions");
+        assert!(matches!(
+            t.op,
+            JitTraceOp::MoveImmMem {
+                size: Size::Byte,
+                value: 0xA5,
+                dst: JitEa::AbsLong(0x0327),
+            }
+        ));
+        assert_eq!(
+            (t.extension, t.extension2, t.extension3),
+            (Some(0x00A5), Some(0x0000), Some(0x0327))
+        );
+
+        // MOVE.L #imm,(xxx).L would need four words and stays out.
+        bus.write_word(0x0100, 0x23FC);
         let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040);
         assert!(
             !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
-            "long immediate to an indexed destination must stay decoded"
+            "four-extension form must not decode as MoveImmMem"
         );
     }
 
@@ -11649,6 +11853,7 @@ mod portable_tests {
                 opcode: *opcode,
                 extension: *ext,
                 extension2: *ext2,
+                extension3: None,
                 pc: 0x0100,
                 op: *op,
             };
@@ -11657,6 +11862,7 @@ mod portable_tests {
                 opcode: 0x60FE,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100 + oplen,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -11899,6 +12105,7 @@ mod portable_tests {
             opcode: 0x6100,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::CallThrough {
                 return_pc: 0x0104,
@@ -11909,6 +12116,7 @@ mod portable_tests {
             opcode: 0x4E75,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0112,
             op: JitTraceOp::RtsReturn {
                 expected_return: 0x0999, // never what the call pushes
@@ -11918,6 +12126,7 @@ mod portable_tests {
             opcode: 0x60EC,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -12035,6 +12244,7 @@ mod portable_tests {
                 opcode: 0x6100,
                 extension: Some(0x7FFE),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::CallThrough {
                     return_pc: 0x0104,
@@ -12045,6 +12255,7 @@ mod portable_tests {
                 opcode: 0x4E75,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x8100,
                 op: JitTraceOp::RtsReturn {
                     expected_return: 0x0104,
@@ -12054,6 +12265,7 @@ mod portable_tests {
                 opcode: 0x3083, // MOVE.W D3,(A0)
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::MoveMem {
                     size: Size::Word,
@@ -12065,6 +12277,7 @@ mod portable_tests {
                 opcode: 0x60F8,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0106,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -12197,6 +12410,7 @@ mod portable_tests {
             opcode: 0xB270,
             extension: Some(0x2004),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Cmp,
@@ -12215,6 +12429,7 @@ mod portable_tests {
             opcode: 0x60FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -12283,6 +12498,7 @@ mod portable_tests {
             opcode: 0xB6E9,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AddrCmpMemToReg {
                 size: Size::Word,
@@ -12310,6 +12526,7 @@ mod portable_tests {
             opcode: 0xB7E9,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AddrCmpMemToReg {
                 size: Size::Long,
@@ -12321,6 +12538,7 @@ mod portable_tests {
             opcode: 0x60FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -12381,6 +12599,7 @@ mod portable_tests {
             opcode: 0x5497,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::MemAddqSubq {
                 data: 2,
@@ -12393,6 +12612,7 @@ mod portable_tests {
             opcode: 0x60FC,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0102,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -12457,6 +12677,7 @@ mod portable_tests {
                 opcode: 0x4C03,
                 extension: Some(extension),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::MulLongDataReg {
                     src: 3,
@@ -12468,6 +12689,7 @@ mod portable_tests {
                 opcode: 0x60FA,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -12518,6 +12740,7 @@ mod portable_tests {
             opcode: 0xBCFC,
             extension: Some(0xFFFF),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AddrCmpImmediate {
                 immediate: 0xFFFF,
@@ -12530,6 +12753,7 @@ mod portable_tests {
             opcode: 0x60FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 0,
@@ -12585,6 +12809,7 @@ mod portable_tests {
             opcode: 0xBC6E,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Cmp,
@@ -12618,6 +12843,7 @@ mod portable_tests {
             opcode: 0xDE6D,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Add,
@@ -12646,6 +12872,7 @@ mod portable_tests {
             opcode: 0x986D,
             extension: Some(0x0010),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Sub,
@@ -12697,6 +12924,7 @@ mod portable_tests {
                         opcode,
                         extension: displacement.map(|disp| disp as u16),
                         extension2: None,
+                        extension3: None,
                         pc: 0x0100,
                         op: JitTraceOp::AluMemToReg {
                             op: JitBinaryOp::Add,
@@ -12709,6 +12937,7 @@ mod portable_tests {
                         opcode: 0x6000 | branch_displacement as u8 as u16,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: branch_pc,
                         op: JitTraceOp::Branch {
                             condition: 0,
@@ -12789,6 +13018,7 @@ mod portable_tests {
                     opcode: 0x986D,
                     extension: Some(0x0010),
                     extension2: None,
+                    extension3: None,
                     pc: 0x0100,
                     op: JitTraceOp::AluMemToReg {
                         op: JitBinaryOp::Sub,
@@ -12801,6 +13031,7 @@ mod portable_tests {
                     opcode: 0x60FA,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: 0x0104,
                     op: JitTraceOp::Branch {
                         condition: 0,
@@ -12834,6 +13065,7 @@ mod portable_tests {
                     opcode: 0x7001 | (u16::from(reg) << 9),
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: 0x0100 + index as u32 * 2,
                     op: JitTraceOp::Moveq { reg, data: 1 },
                 });
@@ -12842,6 +13074,7 @@ mod portable_tests {
                 opcode: 0x4E90,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100 + (count - 1) as u32 * 2,
                 op: JitTraceOp::IndirectJsr { reg: 0 },
             });
@@ -12882,6 +13115,7 @@ mod portable_tests {
                 opcode: 0x7201,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::Moveq { reg: 1, data: 1 },
             },
@@ -12889,6 +13123,7 @@ mod portable_tests {
                 opcode: 0x7402,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Moveq { reg: 2, data: 2 },
             },
@@ -12896,6 +13131,7 @@ mod portable_tests {
                 opcode: 0x7603,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::Moveq { reg: 3, data: 3 },
             },
@@ -12903,6 +13139,7 @@ mod portable_tests {
                 opcode: 0x7804,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0106,
                 op: JitTraceOp::Moveq { reg: 4, data: 4 },
             },
@@ -12910,6 +13147,7 @@ mod portable_tests {
                 opcode: 0x7A05,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0108,
                 op: JitTraceOp::Moveq { reg: 5, data: 5 },
             },
@@ -12917,6 +13155,7 @@ mod portable_tests {
                 opcode: 0xDE6D,
                 extension: Some(0x0010),
                 extension2: None,
+                extension3: None,
                 pc: 0x010A,
                 op: JitTraceOp::AluMemToReg {
                     op: JitBinaryOp::Add,
@@ -12929,6 +13168,7 @@ mod portable_tests {
                 opcode: 0x4E90,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x010E,
                 op: JitTraceOp::IndirectJsr { reg: 0 },
             },
@@ -12994,6 +13234,7 @@ mod portable_tests {
                 opcode: 0x4A2D,
                 extension: Some(0x0100),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AnDispUnary {
                     op: JitUnaryOp::Tst,
@@ -13006,6 +13247,7 @@ mod portable_tests {
                 opcode: 0x082D,
                 extension: Some(3),
                 extension2: Some(0x0100),
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::AnDispBit {
                     op: JitBitOp::Test,
@@ -13018,6 +13260,7 @@ mod portable_tests {
                 opcode: 0x1B40,
                 extension: Some(0x0100),
                 extension2: None,
+                extension3: None,
                 pc: 0x010A,
                 op: JitTraceOp::MoveMem {
                     size: Size::Byte,
@@ -13029,6 +13272,7 @@ mod portable_tests {
                 opcode: 0x422D,
                 extension: Some(0x0100),
                 extension2: None,
+                extension3: None,
                 pc: 0x010E,
                 op: JitTraceOp::AnDispUnary {
                     op: JitUnaryOp::Clr,
@@ -13041,6 +13285,7 @@ mod portable_tests {
                 opcode: 0x322D,
                 extension: Some(0x0100),
                 extension2: None,
+                extension3: None,
                 pc: 0x0112,
                 op: JitTraceOp::MoveMem {
                     size: Size::Word,
@@ -13052,6 +13297,7 @@ mod portable_tests {
                 opcode: 0x526D,
                 extension: Some(0x0100),
                 extension2: None,
+                extension3: None,
                 pc: 0x0116,
                 op: JitTraceOp::MemAddqSubq {
                     data: 1,
@@ -13064,6 +13310,7 @@ mod portable_tests {
                 opcode: 0x2F2D,
                 extension: Some(0x0100),
                 extension2: None,
+                extension3: None,
                 pc: 0x011A,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -13075,6 +13322,7 @@ mod portable_tests {
                 opcode: 0x588F,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x011E,
                 op: JitTraceOp::AddqSubqAddr {
                     reg: 7,
@@ -13086,6 +13334,7 @@ mod portable_tests {
                 opcode: 0x60DE,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0120,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -13126,6 +13375,7 @@ mod portable_tests {
                 opcode: 0x5280,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 0,
@@ -13138,6 +13388,7 @@ mod portable_tests {
                 opcode: 0x60FC,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -13171,6 +13422,7 @@ mod portable_tests {
                 opcode: 0x5280,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 0,
@@ -13183,6 +13435,7 @@ mod portable_tests {
                 opcode: 0x60FC,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -13215,6 +13468,7 @@ mod portable_tests {
                 opcode: 0x5340,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 0,
@@ -13227,6 +13481,7 @@ mod portable_tests {
                 opcode: 0x66FC,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 6,
@@ -13262,6 +13517,7 @@ mod portable_tests {
                 opcode: 0x5340,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 0,
@@ -13274,6 +13530,7 @@ mod portable_tests {
                 opcode: 0x66FC,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 6,
@@ -13286,6 +13543,7 @@ mod portable_tests {
                 opcode: 0x5281,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::AddqSubqReg {
                     reg: 1,
@@ -13315,6 +13573,7 @@ mod portable_tests {
             opcode: 0xE188,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::ShiftReg {
                 reg: 0,
@@ -13445,6 +13704,7 @@ mod portable_tests {
                         opcode,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: 0x0100,
                         op: JitTraceOp::ShiftReg {
                             reg: 7,
@@ -13459,6 +13719,7 @@ mod portable_tests {
                         opcode: 0x60FC,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: 0x0102,
                         op: JitTraceOp::Branch {
                             condition: 0,
@@ -13538,6 +13799,7 @@ mod portable_tests {
                         opcode,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: 0x0100,
                         op: JitTraceOp::ShiftReg {
                             reg: 0,
@@ -13552,6 +13814,7 @@ mod portable_tests {
                         opcode: 0x60FC,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: 0x0102,
                         op: JitTraceOp::Branch {
                             condition: 0,
@@ -13613,6 +13876,7 @@ mod portable_tests {
                 opcode: 0x2029, // MOVE.L $0010(A1),D0
                 extension: Some(0x0010),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -13624,6 +13888,7 @@ mod portable_tests {
                 opcode: 0xE088, // LSR.L #8,D0
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::ShiftReg {
                     reg: 0,
@@ -13638,6 +13903,7 @@ mod portable_tests {
                 opcode: 0xD1A9, // ADD.L D0,$0018(A1)
                 extension: Some(0x0018),
                 extension2: None,
+                extension3: None,
                 pc: 0x0106,
                 op: JitTraceOp::AddRegToMem {
                     is_sub: false,
@@ -13650,6 +13916,7 @@ mod portable_tests {
                 opcode: 0x2029, // MOVE.L $0018(A1),D0
                 extension: Some(0x0018),
                 extension2: None,
+                extension3: None,
                 pc: 0x010A,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -13661,6 +13928,7 @@ mod portable_tests {
                 opcode: 0xE088, // LSR.L #8,D0
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x010E,
                 op: JitTraceOp::ShiftReg {
                     reg: 0,
@@ -13675,6 +13943,7 @@ mod portable_tests {
                 opcode: 0xD080, // ADD.L D0,D0
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0110,
                 op: JitTraceOp::BinaryDataReg {
                     op: JitBinaryOp::Add,
@@ -13688,6 +13957,7 @@ mod portable_tests {
                 opcode: 0x2069, // MOVEA.L $0008(A1),A0
                 extension: Some(0x0008),
                 extension2: None,
+                extension3: None,
                 pc: 0x0112,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -13699,6 +13969,7 @@ mod portable_tests {
                 opcode: 0xD1C0, // ADDA.L D0,A0
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0116,
                 op: JitTraceOp::AddrDataReg {
                     op: JitAddrOp::Adda,
@@ -13711,6 +13982,7 @@ mod portable_tests {
                 opcode: 0x2348, // MOVE.L A0,$0020(A1)
                 extension: Some(0x0020),
                 extension2: None,
+                extension3: None,
                 pc: 0x0118,
                 op: JitTraceOp::MoveMem {
                     size: Size::Long,
@@ -13722,6 +13994,7 @@ mod portable_tests {
                 opcode: 0x60E2, // BRA.S $0100
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x011C,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -13813,6 +14086,7 @@ mod portable_tests {
                         opcode,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: 0x0100,
                         op: JitTraceOp::ShiftReg {
                             reg: 0,
@@ -13827,6 +14101,7 @@ mod portable_tests {
                         opcode: 0x60FC,
                         extension: None,
                         extension2: None,
+                        extension3: None,
                         pc: 0x0102,
                         op: JitTraceOp::Branch {
                             condition: 0,
@@ -13879,6 +14154,7 @@ mod portable_tests {
             opcode: 0x67FA,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0104,
             op: JitTraceOp::Branch {
                 condition: 7,
@@ -13891,6 +14167,7 @@ mod portable_tests {
             opcode: 0xB26D,
             extension: Some(0xFFF0),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AluMemToReg {
                 op: JitBinaryOp::Cmp,
@@ -13907,6 +14184,7 @@ mod portable_tests {
             opcode: 0x4A6D,
             extension: Some(0xFFF0),
             extension2: None,
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AnDispUnary {
                 op: JitUnaryOp::Tst,
@@ -13925,6 +14203,7 @@ mod portable_tests {
             opcode: 0x5280,
             extension: None,
             extension2: None,
+            extension3: None,
             pc: 0x0102,
             op: JitTraceOp::AddqSubqReg {
                 reg: 0,
@@ -13965,6 +14244,7 @@ mod portable_tests {
             opcode: 0x082D,
             extension: Some(0x0003),
             extension2: Some(0xFFF0),
+            extension3: None,
             pc: 0x0100,
             op: JitTraceOp::AnDispBit {
                 op: JitBitOp::Test,
@@ -14417,6 +14697,7 @@ mod portable_tests {
                 opcode: 0x4E56,
                 extension: Some(0xFFF8),
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::Link {
                     reg: 6,
@@ -14427,6 +14708,7 @@ mod portable_tests {
                 opcode: 0x4E5E,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0104,
                 op: JitTraceOp::Unlk { reg: 6 },
             },
@@ -14434,6 +14716,7 @@ mod portable_tests {
                 opcode: 0x60F8,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0106,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -14546,6 +14829,7 @@ mod portable_tests {
                 opcode: 0x4E5E,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0100,
                 op: JitTraceOp::Unlk { reg: 6 },
             },
@@ -14553,6 +14837,7 @@ mod portable_tests {
                 opcode: 0x60FC,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: 0x0102,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -15053,6 +15338,7 @@ mod portable_tests {
                     opcode: 0x6100,
                     extension: Some(0x000E),
                     extension2: None,
+                    extension3: None,
                     pc: 0x0100,
                     op: JitTraceOp::CallThrough {
                         return_pc: 0x0104,
@@ -15063,6 +15349,7 @@ mod portable_tests {
                     opcode: 0x7001,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: 0x0110,
                     op: JitTraceOp::Moveq { reg: 0, data: 1 },
                 },
@@ -15070,6 +15357,7 @@ mod portable_tests {
                     opcode: 0x6000,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: 0x0112,
                     op: JitTraceOp::Branch {
                         condition: 0,
@@ -15082,6 +15370,7 @@ mod portable_tests {
                     opcode: 0x7201,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: branch_target,
                     op: JitTraceOp::Moveq { reg: 1, data: 1 },
                 },
@@ -15089,6 +15378,7 @@ mod portable_tests {
                     opcode: 0x4E75,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: branch_target.wrapping_add(2),
                     op: JitTraceOp::RtsReturn {
                         expected_return: 0x0104,
@@ -15098,6 +15388,7 @@ mod portable_tests {
                     opcode: 0x60FA,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                     pc: 0x0104,
                     op: JitTraceOp::Branch {
                         condition: 0,
@@ -15256,88 +15547,89 @@ mod portable_tests {
     }
 
     #[test]
-    fn tst_from_absolute_decodes_with_exact_extents() {
+    fn cmpi_to_absolute_decodes_with_exact_extents() {
         let dcpu = cpu();
         let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
-        // 4AB8 = TST.L (xxx).W with a negative address: sign-extends.
-        bus.write_word(0x0100, 0x4AB8);
-        bus.write_word(0x0102, 0x8100);
-        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
-            .expect("TST.L (xxx).W should decode");
+        // 0C78 = CMPI.W #imm,(xxx).W: two extensions, no third.
+        bus.write_word(0x0100, 0x0C78);
+        bus.write_word(0x0102, 0x0042);
+        bus.write_word(0x0104, 0x8100);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("CMPI.W #imm,(xxx).W should decode");
         assert!(matches!(
-            trace.op,
-            JitTraceOp::TstMem {
-                size: Size::Long,
+            t.op,
+            JitTraceOp::CmpiWordMem {
+                immediate: 0x0042,
                 src: JitEa::AbsWord(0xFFFF_8100),
             }
         ));
-        assert_eq!(trace.extension, Some(0x8100));
-        assert!(trace.extension2.is_none(), "abs.W carries one extension");
+        assert_eq!(
+            (t.extension, t.extension2, t.extension3),
+            (Some(0x0042), Some(0x8100), None)
+        );
 
-        // 4A79 = TST.W (xxx).L assembles the address from both words.
-        bus.write_word(0x0100, 0x4A79);
-        bus.write_word(0x0102, 0x0001);
-        bus.write_word(0x0104, 0x4208);
-        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
-            .expect("TST.W (xxx).L should decode");
+        // 0C79 = CMPI.W #imm,(xxx).L — the census head: the address low
+        // word rides in the third slot.
+        bus.write_word(0x0100, 0x0C79);
+        bus.write_word(0x0102, 0x0042);
+        bus.write_word(0x0104, 0x0001);
+        bus.write_word(0x0106, 0x4208);
+        let t = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("CMPI.W #imm,(xxx).L should decode with three extensions");
         assert!(matches!(
-            trace.op,
-            JitTraceOp::TstMem {
-                size: Size::Word,
+            t.op,
+            JitTraceOp::CmpiWordMem {
+                immediate: 0x0042,
                 src: JitEa::AbsLong(0x0001_4208),
             }
         ));
-        assert_eq!(trace.extension, Some(0x0001));
-        assert_eq!(trace.extension2, Some(0x4208));
+        assert_eq!(
+            (t.extension, t.extension2, t.extension3),
+            (Some(0x0042), Some(0x0001), Some(0x4208))
+        );
+        assert_eq!(t.length(), 8, "opcode plus three extension words");
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
-    fn native_tst_from_absolute_matches_portable_with_exact_flags() {
-        // Case 0: TST.W (xxx).W of a negative word (N). Case 1: TST.L
-        // (xxx).L of zero (Z). Case 2: TST.B (xxx).L — the census head
-        // (4A39) — of a positive byte (neither). X stays set throughout.
-        let cases: [(u16, u16, Option<u16>, JitTraceOp, u8); 3] = [
+    fn native_cmpi_absolute_matches_portable_with_exact_flags() {
+        // Case 0: equal compare through (xxx).W (Z). Case 1: smaller
+        // operand through (xxx).L (N and C from the borrow). X stays set;
+        // memory is read-only throughout.
+        let cases: [(u16, u16, u16, Option<u16>, JitTraceOp, u8); 2] = [
             (
-                0x4A78,
+                0x0C78,
+                0x0042,
                 0x0320,
                 None,
-                JitTraceOp::TstMem {
-                    size: Size::Word,
+                JitTraceOp::CmpiWordMem {
+                    immediate: 0x0042,
                     src: JitEa::AbsWord(0x0320),
-                },
-                0x18,
-            ),
-            (
-                0x4AB9,
-                0x0000,
-                Some(0x0328),
-                JitTraceOp::TstMem {
-                    size: Size::Long,
-                    src: JitEa::AbsLong(0x0328),
                 },
                 0x14,
             ),
             (
-                0x4A39,
+                0x0C79,
+                0x0042,
                 0x0000,
-                Some(0x0327),
-                JitTraceOp::TstMem {
-                    size: Size::Byte,
-                    src: JitEa::AbsLong(0x0327),
+                Some(0x0324),
+                JitTraceOp::CmpiWordMem {
+                    immediate: 0x0042,
+                    src: JitEa::AbsLong(0x0324),
                 },
-                0x10,
+                0x19,
             ),
         ];
-        for (case, (opcode, ext, ext2, op, want_ccr)) in cases.iter().enumerate() {
-            let tst_len: u32 = if ext2.is_some() { 6 } else { 4 };
-            let branch_pc = 0x0100 + tst_len;
-            let displacement = -(tst_len as i32) - 2;
+        for (case, (opcode, imm, ext2, ext3, op, want_ccr)) in cases.iter().enumerate() {
+            let len: u32 = if ext3.is_some() { 8 } else { 6 };
+            let branch_pc = 0x0100 + len;
+            let displacement = -(len as i32) - 2;
             let branch_opcode = 0x6000 | (displacement as u8 as u16);
-            let tst = TraceBuildOp {
+            let cmpi = TraceBuildOp {
                 opcode: *opcode,
-                extension: Some(*ext),
-                extension2: *ext2,
+                extension: Some(*imm),
+                extension2: Some(*ext2),
+                extension3: *ext3,
                 pc: 0x0100,
                 op: *op,
             };
@@ -15345,6 +15637,7 @@ mod portable_tests {
                 opcode: branch_opcode,
                 extension: None,
                 extension2: None,
+                extension3: None,
                 pc: branch_pc,
                 op: JitTraceOp::Branch {
                     condition: 0,
@@ -15353,18 +15646,18 @@ mod portable_tests {
                     expected_taken: None,
                 },
             };
-            let ops = vec![tst, branch];
+            let ops = vec![cmpi, branch];
             let trace_end = branch_pc + 2;
             let prepare = |mem: &mut Vec<u8>| {
                 mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
-                mem[0x0102..0x0104].copy_from_slice(&ext.to_be_bytes());
-                if let Some(ext2) = ext2 {
-                    mem[0x0104..0x0106].copy_from_slice(&ext2.to_be_bytes());
+                mem[0x0102..0x0104].copy_from_slice(&imm.to_be_bytes());
+                mem[0x0104..0x0106].copy_from_slice(&ext2.to_be_bytes());
+                if let Some(ext3) = ext3 {
+                    mem[0x0106..0x0108].copy_from_slice(&ext3.to_be_bytes());
                 }
                 mem[0x0300..0x0400].fill(0xAA);
-                mem[0x0320..0x0322].copy_from_slice(&0x8001u16.to_be_bytes());
-                mem[0x0328..0x032C].fill(0x00);
-                mem[0x0327] = 0x7F;
+                mem[0x0320..0x0322].copy_from_slice(&0x0042u16.to_be_bytes());
+                mem[0x0324..0x0326].copy_from_slice(&0x0010u16.to_be_bytes());
                 let mut c = cpu();
                 c.set_cpu_type(CpuType::M68040);
                 c.set_ccr(0x10);
@@ -15381,7 +15674,7 @@ mod portable_tests {
             let mut jit = TraceJit::new();
             let compiled = jit
                 .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
-                .expect("absolute TST loop should compile");
+                .expect("absolute CMPI loop should compile");
             let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
             assert_eq!(
                 actual_packed, expected_packed,
@@ -15400,61 +15693,174 @@ mod portable_tests {
                 "case {case}: exact flags with X preserved"
             );
             assert_eq!(amem, emem, "case {case}: memory parity");
-            assert_eq!(amem, before_mem, "case {case}: TST writes nothing");
+            assert_eq!(amem, before_mem, "case {case}: CMPI writes nothing");
         }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
-    fn tst_from_absolute_cycles_match_the_interpreter_on_a_68000() {
-        // One loop pass over all three widths, compiled for a 68000,
-        // against the step interpreter's charge for the same sequence.
-        let ops = vec![
-            TraceBuildOp {
-                opcode: 0x4A78,
-                extension: Some(0x0320),
-                extension2: None,
-                pc: 0x0100,
-                op: JitTraceOp::TstMem {
-                    size: Size::Word,
-                    src: JitEa::AbsWord(0x0320),
-                },
-            },
-            TraceBuildOp {
-                opcode: 0x4AB9,
-                extension: Some(0x0000),
-                extension2: Some(0x0328),
-                pc: 0x0104,
-                op: JitTraceOp::TstMem {
+    #[allow(clippy::type_complexity)]
+    fn native_three_extension_immediate_stores_match_portable() {
+        // Case 0: MOVE.L #imm,(d16,A5) — the 2D7C census shape (A5-based
+        // here; the mechanism is identical). Case 1: MOVE.B #imm,(xxx).L —
+        // the 13FC census head.
+        let cases: [(u16, [Option<u16>; 3], JitTraceOp, usize, usize, u32); 2] = [
+            (
+                0x2B7C,
+                [Some(0xDEAD), Some(0xBEEF), Some(0x0020)],
+                JitTraceOp::MoveImmMem {
                     size: Size::Long,
-                    src: JitEa::AbsLong(0x0328),
+                    value: 0xDEAD_BEEF,
+                    dst: JitEa::Disp(5, 0x0020),
                 },
-            },
-            TraceBuildOp {
-                opcode: 0x4A39,
-                extension: Some(0x0000),
-                extension2: Some(0x0327),
-                pc: 0x010A,
-                op: JitTraceOp::TstMem {
+                0x0320,
+                4,
+                0xDEAD_BEEF,
+            ),
+            (
+                0x13FC,
+                [Some(0x00A5), Some(0x0000), Some(0x0327)],
+                JitTraceOp::MoveImmMem {
                     size: Size::Byte,
-                    src: JitEa::AbsLong(0x0327),
+                    value: 0xA5,
+                    dst: JitEa::AbsLong(0x0327),
                 },
-            },
-            TraceBuildOp {
-                opcode: 0x60EE,
+                0x0327,
+                1,
+                0xA5,
+            ),
+        ];
+        for (case, (opcode, exts, op, target, len, value)) in cases.iter().enumerate() {
+            let op_len: u32 = 2 + 2 * exts.iter().flatten().count() as u32;
+            let branch_pc = 0x0100 + op_len;
+            let displacement = -(op_len as i32) - 2;
+            let branch_opcode = 0x6000 | (displacement as u8 as u16);
+            let store = TraceBuildOp {
+                opcode: *opcode,
+                extension: exts[0],
+                extension2: exts[1],
+                extension3: exts[2],
+                pc: 0x0100,
+                op: *op,
+            };
+            let branch = TraceBuildOp {
+                opcode: branch_opcode,
                 extension: None,
                 extension2: None,
-                pc: 0x0110,
+                extension3: None,
+                pc: branch_pc,
                 op: JitTraceOp::Branch {
                     condition: 0,
-                    displacement: -18,
+                    displacement,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let ops = vec![store, branch];
+            let trace_end = branch_pc + 2;
+            let prepare = |mem: &mut Vec<u8>| {
+                mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                for (slot, ext) in exts.iter().enumerate() {
+                    if let Some(ext) = ext {
+                        let at = 0x0102 + slot * 2;
+                        mem[at..at + 2].copy_from_slice(&ext.to_be_bytes());
+                    }
+                }
+                mem[0x0300..0x0400].fill(0xAA);
+                let mut c = cpu();
+                c.set_cpu_type(CpuType::M68040);
+                c.set_a(5, 0x0300);
+                c.set_ccr(0x10);
+                attach_window(&mut c, mem);
+                c
+            };
+            let mut emem = vec![0u8; 0x1000];
+            let mut expected = prepare(&mut emem);
+            let expected_packed =
+                execute_portable_trace(&mut expected, &ops, CodeSpans::caller(0x0100, trace_end));
+            let mut amem = vec![0u8; 0x1000];
+            let mut actual = prepare(&mut amem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+                .expect("three-extension immediate store should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(
+                actual_packed, expected_packed,
+                "case {case}: cycles/retired"
+            );
+            assert_ne!(expected_packed, 0, "case {case}: the trace ran");
+            assert_eq!(actual.dar, expected.dar, "case {case}: registers");
+            assert_eq!(actual.get_ccr(), expected.get_ccr(), "case {case}: ccr");
+            assert_eq!(amem, emem, "case {case}: memory parity");
+            let mut stored: u32 = 0;
+            for offset in 0..*len {
+                stored = (stored << 8) | u32::from(amem[target + offset]);
+            }
+            assert_eq!(stored, *value, "case {case}: stored value");
+            assert_eq!(amem[target - 1], 0xAA, "case {case}: preceding byte kept");
+            assert_eq!(amem[target + len], 0xAA, "case {case}: following byte kept");
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn three_extension_forms_cycles_match_the_interpreter_on_a_68000() {
+        // The three admitted census shapes in one pass on a 68000, against
+        // the step interpreter's charge.
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x0C79,
+                extension: Some(0x0042),
+                extension2: Some(0x0000),
+                extension3: Some(0x0320),
+                pc: 0x0100,
+                op: JitTraceOp::CmpiWordMem {
+                    immediate: 0x0042,
+                    src: JitEa::AbsLong(0x0320),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x13FC,
+                extension: Some(0x00A5),
+                extension2: Some(0x0000),
+                extension3: Some(0x0327),
+                pc: 0x0108,
+                op: JitTraceOp::MoveImmMem {
+                    size: Size::Byte,
+                    value: 0xA5,
+                    dst: JitEa::AbsLong(0x0327),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x2B7C,
+                extension: Some(0xDEAD),
+                extension2: Some(0xBEEF),
+                extension3: Some(0x0030),
+                pc: 0x0110,
+                op: JitTraceOp::MoveImmMem {
+                    size: Size::Long,
+                    value: 0xDEAD_BEEF,
+                    dst: JitEa::Disp(5, 0x0030),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60E6,
+                extension: None,
+                extension2: None,
+                extension3: None,
+                pc: 0x0118,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -26,
                     length: 2,
                     expected_taken: None,
                 },
             },
         ];
-        let words: [u16; 9] = [
-            0x4A78, 0x0320, 0x4AB9, 0x0000, 0x0328, 0x4A39, 0x0000, 0x0327, 0x60EE,
+        let words: [u16; 13] = [
+            0x0C79, 0x0042, 0x0000, 0x0320, 0x13FC, 0x00A5, 0x0000, 0x0327, 0x2B7C, 0xDEAD, 0xBEEF,
+            0x0030, 0x60E6,
         ];
         let prepare = |mem: &mut Vec<u8>| {
             for (index, word) in words.iter().enumerate() {
@@ -15464,6 +15870,7 @@ mod portable_tests {
             mem[0x0300..0x0400].fill(0xAA);
             let mut c = cpu();
             c.set_cpu_type(CpuType::M68000);
+            c.set_a(5, 0x0300);
             attach_window(&mut c, mem);
             c
         };
@@ -15472,7 +15879,7 @@ mod portable_tests {
         let mut jit = TraceJit::new();
         let compiled = jit
             .compile_decoded_ops(&ncpu, 0x0100, CpuType::M68000, ops, Some(0x0100))
-            .expect("absolute TST sequence should compile for a 68000");
+            .expect("three-extension sequence should compile for a 68000");
         let packed = unsafe { compiled.call_native(&mut ncpu, 1) };
         assert_eq!((packed >> 32) as u32, 4, "all four ops retired");
         let native_cycles = packed as u32;
@@ -15485,6 +15892,7 @@ mod portable_tests {
         scpu.set_cpu_type(CpuType::M68000);
         scpu.set_sr(0x2700);
         scpu.pc = 0x0100;
+        scpu.set_a(5, 0x0300);
         let mut step_cycles: u32 = 0;
         for _ in 0..4 {
             match scpu.step(&mut bus) {

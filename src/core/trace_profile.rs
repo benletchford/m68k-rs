@@ -155,6 +155,8 @@ pub struct TraceShapeOp {
     pub extension: Option<u16>,
     /// Second extension word captured by the trace decoder, if any.
     pub extension2: Option<u16>,
+    /// Third extension word captured by the trace decoder, if any.
+    pub extension3: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -574,6 +576,9 @@ impl TraceProfileSnapshot {
                 if let Some(extension) = op.extension2 {
                     let _ = write!(out, "/{extension:04X}");
                 }
+                if let Some(extension) = op.extension3 {
+                    let _ = write!(out, "/{extension:04X}");
+                }
             }
             let _ = writeln!(out);
         }
@@ -630,6 +635,9 @@ impl TraceProfileSnapshot {
                 if let Some(extension) = op.extension2 {
                     let _ = write!(out, "/{extension:04X}");
                 }
+                if let Some(extension) = op.extension3 {
+                    let _ = write!(out, "/{extension:04X}");
+                }
             }
             let _ = writeln!(out);
         }
@@ -658,6 +666,9 @@ impl TraceProfileSnapshot {
                     let _ = write!(out, "/{extension:04X}");
                 }
                 if let Some(extension) = op.extension2 {
+                    let _ = write!(out, "/{extension:04X}");
+                }
+                if let Some(extension) = op.extension3 {
                     let _ = write!(out, "/{extension:04X}");
                 }
             }
@@ -1195,6 +1206,7 @@ mod tests {
                 opcode: 0x7000 + index as u16,
                 extension: None,
                 extension2: None,
+                extension3: None,
             })
             .collect()
     }
@@ -1329,12 +1341,14 @@ mod tests {
                     opcode: 0x7000,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                 },
                 TraceShapeOp {
                     pc: 0x102,
                     opcode: 0x60fc,
                     extension: None,
                     extension2: None,
+                    extension3: None,
                 },
             ],
         );
