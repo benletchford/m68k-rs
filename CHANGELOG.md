@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.13](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.12...m68k-v0.10.13) (2026-08-12)
+
+
+### Performance Improvements
+
+* admit absolute-addressed TST into the memory-TST family ([#117](https://github.com/benletchford/m68k-rs/issues/117)) ([d5af2c4](https://github.com/benletchford/m68k-rs/commit/d5af2c490533abe8ab611b5ede7616e55dd9cbf3))
+
 ## [0.10.12](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.11...m68k-v0.10.12) (2026-08-12)
 
 
