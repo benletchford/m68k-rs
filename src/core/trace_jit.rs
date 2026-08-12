@@ -15906,4 +15906,56 @@ mod portable_tests {
             "native charge equals the 68000 interpreter's"
         );
     }
+
+    /// The call forms have to take part in the three-slot budget like any
+    /// other op: each claims exactly the extension words it reads, and the
+    /// third slot is explicitly empty. If a call left `extension3` filled
+    /// in from anywhere, per-op revalidation would compare a word two
+    /// bytes past the instruction and force a spurious miss every entry.
+    #[test]
+    fn call_forms_claim_their_extension_words_and_no_third() {
+        let dcpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+
+        // RTS: opcode only.
+        bus.write_word(0x0100, 0x4E75);
+        let rts = decode_call_op(&dcpu, &mut bus, 0x0100, 0x4E75, CpuType::M68040)
+            .expect("RTS should decode");
+        assert!(matches!(rts.op, JitTraceOp::RtsReturn { .. }));
+        assert_eq!(
+            (rts.extension, rts.extension2, rts.extension3),
+            (None, None, None)
+        );
+        assert_eq!(rts.length(), 2);
+
+        // BSR.W: one extension word.
+        bus.write_word(0x0100, 0x6100);
+        bus.write_word(0x0102, 0x0010);
+        let bsr = decode_call_op(&dcpu, &mut bus, 0x0100, 0x6100, CpuType::M68040)
+            .expect("BSR.W should decode");
+        assert!(matches!(bsr.op, JitTraceOp::CallThrough { .. }));
+        assert_eq!(
+            (bsr.extension, bsr.extension2, bsr.extension3),
+            (Some(0x0010), None, None)
+        );
+        assert_eq!(bsr.length(), 4);
+
+        // BSR.L and JSR (xxx).L: the widest call forms, two words each and
+        // never a third.
+        for (opcode, label) in [(0x61FFu16, "BSR.L"), (0x4EB9, "JSR (xxx).L")] {
+            bus.write_word(0x0100, opcode);
+            bus.write_word(0x0102, 0x0000);
+            bus.write_word(0x0104, 0x0200);
+            bus.write_word(0x0106, 0xFFFF); // would-be third word
+            let t = decode_call_op(&dcpu, &mut bus, 0x0100, opcode, CpuType::M68040)
+                .unwrap_or_else(|| panic!("{label} should decode"));
+            assert!(matches!(t.op, JitTraceOp::CallThrough { .. }), "{label}");
+            assert_eq!(
+                (t.extension, t.extension2, t.extension3),
+                (Some(0x0000), Some(0x0200), None),
+                "{label}: two claimed words, no third"
+            );
+            assert_eq!(t.length(), 6, "{label}");
+        }
+    }
 }
