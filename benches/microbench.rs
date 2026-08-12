@@ -1023,34 +1023,33 @@ fn bench_link_unlk_frame_loop() {
     );
 }
 
-/// Exercise the absolute-addressed CLR forms the gameplay census
-/// flagged (4238/4239 heads): all three widths against fixed targets.
-fn bench_clr_abs_loop() {
-    // Outer cycles of 514 instructions end exactly at the outer label
-    // with the three targets cleared and the guard byte untouched.
-    const CYCLES: u32 = 408_560;
-    const INSTRS: u32 = CYCLES * 514;
-    const CODE_BASE: u32 = 0x7000;
+/// Exercise the retry-gated call-through: a loop whose body calls a
+/// two-op leaf through BSR.W. Base cannot record past the call and
+/// interprets the whole loop; with call-through the push, leaf, checked
+/// return, and tail compile as one native trace.
+fn bench_call_through_leaf() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
     let words = [
-        0x727F, // outer: MOVEQ #127,D1
-        0x4278, 0x4000, // inner: CLR.W ($4000).W
-        0x42B9, 0x0000, 0x4004, // CLR.L ($4004).L
-        0x4239, 0x0000, 0x4003, // CLR.B ($4003).L
-        0x51C9, 0xFFEE, // DBRA D1,inner
-        0x60E8, // BRA.S outer
+        0x6100, 0x000C, // head: BSR.W leaf
+        0x5283, // ADDQ.L #1,D3
+        0x51C8, 0xFFF8, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60F2, // BRA.S head
+        0x5282, // leaf: ADDQ.L #1,D2
+        0x4E75, // RTS
     ];
-    let mut bus = LinearMemoryBus::new(0x10000);
+    let mut bus = LinearMemoryBus::new(0x1_0000);
     for (index, word) in words.iter().enumerate() {
         bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
-    }
-    for address in 0x4000..0x4008 {
-        bus.write_byte(address, 0xAA);
     }
     let prepare_cpu = || {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_sr(0x2700);
         cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
         cpu
     };
     let mut warm_cpu = prepare_cpu();
@@ -1062,13 +1061,81 @@ fn bench_clr_abs_loop() {
     let start = Instant::now();
     assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
     let elapsed = start.elapsed().as_secs_f64();
-    assert_eq!(cpu.pc, CODE_BASE, "the run ends exactly at the outer label");
-    for address in (0x4000..0x4002).chain(0x4003..0x4008) {
-        assert_eq!(bus.read_byte(address), 0, "target byte cleared");
-    }
-    assert_eq!(bus.read_byte(0x4002), 0xAA, "untouched byte kept");
+    assert!(
+        cpu.d(2).abs_diff(cpu.d(3)) <= 1,
+        "leaf and tail in lockstep"
+    );
     println!(
-        "batch     absolute CLR loop       {:8.1} M instr/s",
+        "batch     call-through leaf       {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
+/// The call-through shape that needs two SMC intervals: the leaf sits at
+/// BSR.W's maximum forward reach and the loop body stores into the gap
+/// between the code regions. A unified caller..callee interval would
+/// false-bail that store every iteration (and the old per-call span cap
+/// rejected the far call outright), so base interprets the whole loop.
+fn bench_far_call_through_leaf() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    const LEAF: u32 = CODE_BASE + 0x8000;
+    const GAP_SLOT: u32 = 0xA000;
+    let bsr_disp = (LEAF - (CODE_BASE + 2)) as u16;
+    let dbra_disp = CODE_BASE.wrapping_sub(CODE_BASE + 0x0A) as u16;
+    let bra_disp = CODE_BASE.wrapping_sub(CODE_BASE + 0x10) as u8;
+    let caller = [
+        0x6100,
+        bsr_disp, // head: BSR.W leaf
+        0x5283,   // ADDQ.L #1,D3
+        0x3083,   // MOVE.W D3,(A0)  (store into the gap)
+        0x51C8,
+        dbra_disp,                    // DBRA D0,head
+        0x707F,                       // MOVEQ #127,D0
+        0x6000 | u16::from(bra_disp), // BRA.S head
+    ];
+    let leaf_words = [
+        0x5282, // leaf: ADDQ.L #1,D2
+        0x4E75, // RTS
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in caller.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    for (index, word) in leaf_words.iter().enumerate() {
+        bus.write_word_at(LEAF + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_a(0, GAP_SLOT);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(
+        cpu.d(2).abs_diff(cpu.d(3)) <= 1,
+        "leaf and tail in lockstep"
+    );
+    // The budget may stop between the ADDQ and the store, so the stored
+    // word trails D3 by at most one.
+    assert!(
+        (cpu.d(3) & 0xFFFF).abs_diff(u32::from(bus.read_word(GAP_SLOT))) <= 1,
+        "the gap store lands every iteration"
+    );
+    println!(
+        "batch     far call-through+store  {:8.1} M instr/s",
         f64::from(INSTRS) / elapsed / 1_000_000.0
     );
 }
@@ -1822,12 +1889,20 @@ fn main() {
         bench_link_unlk_frame_loop();
         return;
     }
-    if only.as_deref() == Some("memory-and") {
-        bench_memory_and_loop();
+    if only.as_deref() == Some("call-through") {
+        bench_call_through_leaf();
+        return;
+    }
+    if only.as_deref() == Some("far-call-through") {
+        bench_far_call_through_leaf();
         return;
     }
     if only.as_deref() == Some("clr-abs") {
         bench_clr_abs_loop();
+        return;
+    }
+    if only.as_deref() == Some("memory-and") {
+        bench_memory_and_loop();
         return;
     }
     if only.as_deref() == Some("salvage-prefix") {
@@ -1945,6 +2020,56 @@ fn main() {
             200_000_000,
         );
     }
+}
+
+/// Exercise the absolute-addressed CLR forms the gameplay census
+/// flagged (4238/4239 heads): all three widths against fixed targets.
+fn bench_clr_abs_loop() {
+    // Outer cycles of 514 instructions end exactly at the outer label
+    // with the three targets cleared and the guard byte untouched.
+    const CYCLES: u32 = 408_560;
+    const INSTRS: u32 = CYCLES * 514;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x727F, // outer: MOVEQ #127,D1
+        0x4278, 0x4000, // inner: CLR.W ($4000).W
+        0x42B9, 0x0000, 0x4004, // CLR.L ($4004).L
+        0x4239, 0x0000, 0x4003, // CLR.B ($4003).L
+        0x51C9, 0xFFEE, // DBRA D1,inner
+        0x60E8, // BRA.S outer
+    ];
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    for address in 0x4000..0x4008 {
+        bus.write_byte(address, 0xAA);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.pc, CODE_BASE, "the run ends exactly at the outer label");
+    for address in (0x4000..0x4002).chain(0x4003..0x4008) {
+        assert_eq!(bus.read_byte(address), 0, "target byte cleared");
+    }
+    assert_eq!(bus.read_byte(0x4002), 0xAA, "untouched byte kept");
+    println!(
+        "batch     absolute CLR loop       {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
 }
 
 /// The census exemplar behind twenty-three of the top-forty blocked

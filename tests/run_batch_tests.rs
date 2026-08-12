@@ -1241,65 +1241,59 @@ fn mem_trace_memcpy_loop_matches_step() {
     });
 }
 
-/// A mixed-path loop: the comparison alternates every iteration, so the
-/// conditional branch never settles and whichever path the head trace
-/// records, it guard-exits on ~half of all calls forever -- the shape
-/// adaptive re-recording cannot fix. Exit-seeded candidacy forms a second
-/// trace at the exit target and chains into it; everything must still
-/// match step() exactly through recording, promotion, and chaining.
+/// A loop calling a two-op leaf through BSR.W: the call-through retry
+/// records push, callee, checked return, and loop tail as one trace.
+/// Everything must match step() exactly through the whole lifecycle --
+/// first blocked recording, retry, compile, and native chaining.
 #[test]
-fn mixed_path_loop_with_exit_seeded_continuation_matches_step() {
+fn call_through_leaf_loop_matches_step() {
     let words = &[
-        0x0A01, 0x0001, // $1000: EORI.B #1,D1   (Z flips every iteration)
-        0x6602, // $1004: BNE.S $1008
-        0x5282, // $1006: ADDQ.L #1,D2
-        0x1ADC, // $1008: MOVE.B (A4)+,(A5)+
-        0x5283, // $100A: ADDQ.L #1,D3 (keeps both continuations >= 3 ops)
-        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
-        0xA000, // $1010: sentinel
+        0x6100, 0x0012, // $1000: BSR.W $1014
+        0x5283, // $1004: ADDQ.L #1,D3
+        0x51C8, 0xFFF8, // $1006: DBRA D0,$1000
+        0x5347, // $100A: SUBQ.W #1,D7
+        0x6602, // $100C: BNE.S $1010
+        0xA000, // $100E: sentinel
+        0x707F, // $1010: MOVEQ #127,D0
+        0x60EC, // $1012: BRA.S $1000
+        0x5282, // $1014: leaf: ADDQ.L #1,D2
+        0x4E75, // $1016: RTS
     ];
-    assert_fastmem_matches_step("mixed-path exit seed", words, CpuType::M68040, |cpu| {
-        cpu.set_a(4, 0x3000);
-        cpu.set_a(5, 0x4000);
-        cpu.set_d(0, 255);
-        cpu.set_d(1, 0);
-        cpu.set_d(2, 0);
+    assert_fastmem_matches_step("call-through leaf", words, CpuType::M68040, |cpu| {
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
     });
 }
 
-/// Self-modifying code aimed at a chained continuation: the outer section
-/// rewrites the continuation's first opcode every round (EORI toggles
-/// ADDQ.L #1,D2 and ADDQ.L #2,D2), so the parent trace side-exits into a
-/// compiled continuation whose first opcode changed. The chain must
-/// surface that miss so the rewritten opcode is dispatched -- silently
-/// dropping it would skip the instruction and diverge D2 from step().
+/// The same loop-calls-leaf shape with the leaf at BSR.W's maximum
+/// forward reach (32KB away). The caller's and callee's code get
+/// separate SMC store intervals, so the far call is admitted; the whole
+/// lifecycle must still match step() exactly.
 #[test]
-fn rewritten_continuation_head_after_side_exit_matches_step() {
-    let words = &[
-        0x0A01, 0x0001, // $1000: EORI.B #1,D1  (Z flips every iteration)
-        0x6602, // $1004: BNE.S $1008
-        0x5282, // $1006: ADDQ.L #1,D2   <- rewritten between rounds
-        0x1ADC, // $1008: MOVE.B (A4)+,(A5)+
-        0x5283, // $100A: ADDQ.L #1,D3
-        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
-        0x0A78, 0x0600, 0x1006, // $1010: EORI.W #$0600,($1006).W
-        0x707F, // $1016: MOVEQ #127,D0
-        0x5347, // $1018: SUBQ.W #1,D7
-        0x66E4, // $101A: BNE.S $1000
-        0xA000, // $101C: sentinel
+fn far_leaf_call_through_matches_step() {
+    let leaf = 0x9000u32;
+    let bsr_disp = (leaf - (0x1000 + 2)) as u16;
+    let mut words = vec![
+        0x6100, bsr_disp, // $1000: BSR.W $9000
+        0x5283,   // $1004: ADDQ.L #1,D3
+        0x51C8, 0xFFF8, // $1006: DBRA D0,$1000
+        0x5347, // $100A: SUBQ.W #1,D7
+        0x6602, // $100C: BNE.S $1010
+        0xA000, // $100E: sentinel
+        0x707F, // $1010: MOVEQ #127,D0
+        0x60EC, // $1012: BRA.S $1000
     ];
-    assert_fastmem_matches_step(
-        "rewritten continuation head",
-        words,
-        CpuType::M68040,
-        |cpu| {
-            cpu.set_a(4, 0x3000);
-            cpu.set_a(5, 0x4000);
-            cpu.set_d(0, 127);
-            cpu.set_d(1, 0);
-            cpu.set_d(7, 6);
-        },
-    );
+    // Never-executed filler up to the leaf.
+    words.resize(((leaf - 0x1000) / 2) as usize, 0x4E71);
+    words.extend([
+        0x5282, // $9000: leaf: ADDQ.L #1,D2
+        0x4E75, // $9002: RTS
+    ]);
+    assert_fastmem_matches_step("far-leaf call-through", &words, CpuType::M68040, |cpu| {
+        cpu.set_a(7, 0x8000); // stack well clear of both code regions
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
 }
 
 /// A memory operation followed immediately by DBRA is a common 68k copy-loop
@@ -1535,6 +1529,67 @@ fn salvaged_prefix_loop_matches_step() {
         cpu.set_d(0, 50);
         cpu.set_d(7, 5);
     });
+}
+
+/// A mixed-path loop: the comparison alternates every iteration, so the
+/// conditional branch never settles and whichever path the head trace
+/// records, it guard-exits on ~half of all calls forever -- the shape
+/// adaptive re-recording cannot fix. Exit-seeded candidacy forms a second
+/// trace at the exit target and chains into it; everything must still
+/// match step() exactly through recording, promotion, and chaining.
+#[test]
+fn mixed_path_loop_with_exit_seeded_continuation_matches_step() {
+    let words = &[
+        0x0A01, 0x0001, // $1000: EORI.B #1,D1   (Z flips every iteration)
+        0x6602, // $1004: BNE.S $1008
+        0x5282, // $1006: ADDQ.L #1,D2
+        0x1ADC, // $1008: MOVE.B (A4)+,(A5)+
+        0x5283, // $100A: ADDQ.L #1,D3 (keeps both continuations >= 3 ops)
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0xA000, // $1010: sentinel
+    ];
+    assert_fastmem_matches_step("mixed-path exit seed", words, CpuType::M68040, |cpu| {
+        cpu.set_a(4, 0x3000);
+        cpu.set_a(5, 0x4000);
+        cpu.set_d(0, 255);
+        cpu.set_d(1, 0);
+        cpu.set_d(2, 0);
+    });
+}
+
+/// Self-modifying code aimed at a chained continuation: the outer section
+/// rewrites the continuation's first opcode every round (EORI toggles
+/// ADDQ.L #1,D2 and ADDQ.L #2,D2), so the parent trace side-exits into a
+/// compiled continuation whose first opcode changed. The chain must
+/// surface that miss so the rewritten opcode is dispatched -- silently
+/// dropping it would skip the instruction and diverge D2 from step().
+#[test]
+fn rewritten_continuation_head_after_side_exit_matches_step() {
+    let words = &[
+        0x0A01, 0x0001, // $1000: EORI.B #1,D1  (Z flips every iteration)
+        0x6602, // $1004: BNE.S $1008
+        0x5282, // $1006: ADDQ.L #1,D2   <- rewritten between rounds
+        0x1ADC, // $1008: MOVE.B (A4)+,(A5)+
+        0x5283, // $100A: ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0x0A78, 0x0600, 0x1006, // $1010: EORI.W #$0600,($1006).W
+        0x707F, // $1016: MOVEQ #127,D0
+        0x5347, // $1018: SUBQ.W #1,D7
+        0x66E4, // $101A: BNE.S $1000
+        0xA000, // $101C: sentinel
+    ];
+    assert_fastmem_matches_step(
+        "rewritten continuation head",
+        words,
+        CpuType::M68040,
+        |cpu| {
+            cpu.set_a(4, 0x3000);
+            cpu.set_a(5, 0x4000);
+            cpu.set_d(0, 127);
+            cpu.set_d(1, 0);
+            cpu.set_d(7, 6);
+        },
+    );
 }
 
 /// The census exemplar: AND.W of a displaced field into a register,
