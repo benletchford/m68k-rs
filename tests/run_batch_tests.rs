@@ -1221,6 +1221,24 @@ fn mem_trace_clr_absolute_matches_step() {
     });
 }
 
+/// Absolute-addressed TST (the 4A39/4A79 gameplay census heads) must stay
+/// exact through the whole record/compile/execute lifecycle, with the
+/// tested word re-dirtied every pass so the flags keep changing.
+#[test]
+fn mem_trace_tst_absolute_matches_step() {
+    let words = &[
+        0x4A78, 0x2000, // $1000: TST.W ($2000).W
+        0x4AB9, 0x0000, 0x2004, // $1004: TST.L ($2004).L
+        0x4A39, 0x0000, 0x2003, // $100A: TST.B ($2003).L
+        0x31C0, 0x2000, // $1010: MOVE.W D0,($2000).W  (re-dirty the target)
+        0x51C8, 0xFFEA, // $1014: DBRA D0,$1000
+        0xA000, // $1018: sentinel
+    ];
+    assert_fastmem_matches_step("tst absolute", words, CpuType::M68000, |cpu| {
+        cpu.set_d(0, 300);
+    });
+}
+
 #[test]
 fn mem_trace_memcpy_loop_matches_step() {
     let words = &[
