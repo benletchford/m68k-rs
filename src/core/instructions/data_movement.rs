@@ -517,10 +517,6 @@ impl CpuCore {
                 self.set_a(reg as usize, addr);
             }
         } else {
-            if self.cpu_type == CpuType::M68000 && size == Size::Long {
-                let _ = self.read_16(bus, addr);
-            }
-
             // Normal order: D0..D7, A0..A7
             for i in 0..16 {
                 if mask & (1 << i) != 0 {
@@ -539,9 +535,12 @@ impl CpuCore {
                 self.set_a(reg as usize, addr);
             }
 
-            // 68000 MOVEM memory-to-register has one discarded word read:
-            // before long transfers, after word transfers.
-            if self.cpu_type == CpuType::M68000 && size == Size::Word {
+            // 68000 MOVEM memory-to-register performs one discarded word
+            // read after the last operand, for both word and long
+            // transfers. The placement is observable: drivers such as
+            // lide.device point MOVEM.L at the end of a read-sensitive
+            // I/O window so that this extra access falls just outside it.
+            if self.cpu_type == CpuType::M68000 {
                 let _ = self.read_16(bus, addr);
             }
         }
@@ -898,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn m68000_movem_long_memory_to_register_dummies_before_first_transfer() {
+    fn m68000_movem_long_memory_to_register_dummies_after_last_transfer() {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68000);
         let mut bus = TraceBus::default();
@@ -916,8 +915,8 @@ mod tests {
             bus.events,
             vec![
                 Event::ReadWord(0x1000),
-                Event::ReadWord(0x1000),
                 Event::ReadWord(0x1002),
+                Event::ReadWord(0x1004),
             ]
         );
     }
