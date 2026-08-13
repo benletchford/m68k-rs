@@ -15958,4 +15958,252 @@ mod portable_tests {
             assert_eq!(t.length(), 6, "{label}");
         }
     }
+
+    #[test]
+    fn tst_from_absolute_decodes_with_exact_extents() {
+        let dcpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        // 4AB8 = TST.L (xxx).W with a negative address: sign-extends.
+        bus.write_word(0x0100, 0x4AB8);
+        bus.write_word(0x0102, 0x8100);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("TST.L (xxx).W should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::TstMem {
+                size: Size::Long,
+                src: JitEa::AbsWord(0xFFFF_8100),
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x8100));
+        assert!(trace.extension2.is_none(), "abs.W carries one extension");
+
+        // 4A79 = TST.W (xxx).L assembles the address from both words.
+        bus.write_word(0x0100, 0x4A79);
+        bus.write_word(0x0102, 0x0001);
+        bus.write_word(0x0104, 0x4208);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("TST.W (xxx).L should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::TstMem {
+                size: Size::Word,
+                src: JitEa::AbsLong(0x0001_4208),
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x0001));
+        assert_eq!(trace.extension2, Some(0x4208));
+    }
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn tst_from_absolute_cycles_match_the_interpreter_on_a_68000() {
+        // One loop pass over all three widths, compiled for a 68000,
+        // against the step interpreter's charge for the same sequence.
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x4A78,
+                extension: Some(0x0320),
+                extension2: None,
+                extension3: None,
+                pc: 0x0100,
+                op: JitTraceOp::TstMem {
+                    size: Size::Word,
+                    src: JitEa::AbsWord(0x0320),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4AB9,
+                extension: Some(0x0000),
+                extension2: Some(0x0328),
+                extension3: None,
+                pc: 0x0104,
+                op: JitTraceOp::TstMem {
+                    size: Size::Long,
+                    src: JitEa::AbsLong(0x0328),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4A39,
+                extension: Some(0x0000),
+                extension2: Some(0x0327),
+                extension3: None,
+                pc: 0x010A,
+                op: JitTraceOp::TstMem {
+                    size: Size::Byte,
+                    src: JitEa::AbsLong(0x0327),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60EE,
+                extension: None,
+                extension2: None,
+                extension3: None,
+                pc: 0x0110,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -18,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let words: [u16; 9] = [
+            0x4A78, 0x0320, 0x4AB9, 0x0000, 0x0328, 0x4A39, 0x0000, 0x0327, 0x60EE,
+        ];
+        let prepare = |mem: &mut Vec<u8>| {
+            for (index, word) in words.iter().enumerate() {
+                let at = 0x0100 + index * 2;
+                mem[at..at + 2].copy_from_slice(&word.to_be_bytes());
+            }
+            mem[0x0300..0x0400].fill(0xAA);
+            let mut c = cpu();
+            c.set_cpu_type(CpuType::M68000);
+            attach_window(&mut c, mem);
+            c
+        };
+        let mut nmem = vec![0u8; 0x1000];
+        let mut ncpu = prepare(&mut nmem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&ncpu, 0x0100, CpuType::M68000, ops, Some(0x0100))
+            .expect("absolute TST sequence should compile for a 68000");
+        let packed = unsafe { compiled.call_native(&mut ncpu, 1) };
+        assert_eq!((packed >> 32) as u32, 4, "all four ops retired");
+        let native_cycles = packed as u32;
+
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word(0x0100 + index as u32 * 2, *word);
+        }
+        let mut scpu = CpuCore::new();
+        scpu.set_cpu_type(CpuType::M68000);
+        scpu.set_sr(0x2700);
+        scpu.pc = 0x0100;
+        let mut step_cycles: u32 = 0;
+        for _ in 0..4 {
+            match scpu.step(&mut bus) {
+                crate::StepResult::Ok { cycles } => step_cycles += cycles as u32,
+                other => panic!("unexpected step result {other:?}"),
+            }
+        }
+        assert_eq!(scpu.pc, 0x0100, "step run wrapped back to the head");
+        assert_eq!(
+            native_cycles, step_cycles,
+            "native charge equals the 68000 interpreter's"
+        );
+    }
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_tst_from_absolute_matches_portable_with_exact_flags() {
+        // Case 0: TST.W (xxx).W of a negative word (N). Case 1: TST.L
+        // (xxx).L of zero (Z). Case 2: TST.B (xxx).L — the census head
+        // (4A39) — of a positive byte (neither). X stays set throughout.
+        let cases: [(u16, u16, Option<u16>, JitTraceOp, u8); 3] = [
+            (
+                0x4A78,
+                0x0320,
+                None,
+                JitTraceOp::TstMem {
+                    size: Size::Word,
+                    src: JitEa::AbsWord(0x0320),
+                },
+                0x18,
+            ),
+            (
+                0x4AB9,
+                0x0000,
+                Some(0x0328),
+                JitTraceOp::TstMem {
+                    size: Size::Long,
+                    src: JitEa::AbsLong(0x0328),
+                },
+                0x14,
+            ),
+            (
+                0x4A39,
+                0x0000,
+                Some(0x0327),
+                JitTraceOp::TstMem {
+                    size: Size::Byte,
+                    src: JitEa::AbsLong(0x0327),
+                },
+                0x10,
+            ),
+        ];
+        for (case, (opcode, ext, ext2, op, want_ccr)) in cases.iter().enumerate() {
+            let tst_len: u32 = if ext2.is_some() { 6 } else { 4 };
+            let branch_pc = 0x0100 + tst_len;
+            let displacement = -(tst_len as i32) - 2;
+            let branch_opcode = 0x6000 | (displacement as u8 as u16);
+            let tst = TraceBuildOp {
+                opcode: *opcode,
+                extension: Some(*ext),
+                extension2: *ext2,
+                extension3: None,
+                pc: 0x0100,
+                op: *op,
+            };
+            let branch = TraceBuildOp {
+                opcode: branch_opcode,
+                extension: None,
+                extension2: None,
+                extension3: None,
+                pc: branch_pc,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let ops = vec![tst, branch];
+            let trace_end = branch_pc + 2;
+            let prepare = |mem: &mut Vec<u8>| {
+                mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                mem[0x0102..0x0104].copy_from_slice(&ext.to_be_bytes());
+                if let Some(ext2) = ext2 {
+                    mem[0x0104..0x0106].copy_from_slice(&ext2.to_be_bytes());
+                }
+                mem[0x0300..0x0400].fill(0xAA);
+                mem[0x0320..0x0322].copy_from_slice(&0x8001u16.to_be_bytes());
+                mem[0x0328..0x032C].fill(0x00);
+                mem[0x0327] = 0x7F;
+                let mut c = cpu();
+                c.set_cpu_type(CpuType::M68040);
+                c.set_ccr(0x10);
+                attach_window(&mut c, mem);
+                c
+            };
+            let mut emem = vec![0u8; 0x1000];
+            let mut expected = prepare(&mut emem);
+            let expected_packed =
+                execute_portable_trace(&mut expected, &ops, CodeSpans::caller(0x0100, trace_end));
+            let mut amem = vec![0u8; 0x1000];
+            let mut actual = prepare(&mut amem);
+            let before_mem = amem.clone();
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+                .expect("absolute TST loop should compile");
+            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            assert_eq!(
+                actual_packed, expected_packed,
+                "case {case}: cycles/retired"
+            );
+            assert_ne!(expected_packed, 0, "case {case}: the trace ran");
+            assert_eq!(actual.dar, expected.dar, "case {case}: registers");
+            assert_eq!(
+                actual.get_ccr(),
+                expected.get_ccr(),
+                "case {case}: ccr parity"
+            );
+            assert_eq!(
+                actual.get_ccr() & 0x1F,
+                *want_ccr,
+                "case {case}: exact flags with X preserved"
+            );
+            assert_eq!(amem, emem, "case {case}: memory parity");
+            assert_eq!(amem, before_mem, "case {case}: TST writes nothing");
+        }
+    }
 }

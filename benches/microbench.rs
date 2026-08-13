@@ -1949,6 +1949,10 @@ fn main() {
         bench_third_ext_loop();
         return;
     }
+    if only.as_deref() == Some("tst-abs") {
+        bench_tst_abs_loop();
+        return;
+    }
     if only.as_deref() == Some("clr-abs") {
         bench_clr_abs_loop();
         return;
@@ -2165,6 +2169,55 @@ fn bench_memory_and_loop() {
     assert!(cpu.d(3) > 5_000, "the loop actually iterated");
     println!(
         "batch     memory and loop         {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
+/// Exercise the absolute-addressed TST forms the gameplay census
+/// flagged (4A39/4A79 heads): all three widths against fixed targets.
+fn bench_tst_abs_loop() {
+    // Outer cycles of 514 instructions end exactly at the outer label
+    // with the targets untouched (TST writes nothing).
+    const CYCLES: u32 = 408_560;
+    const INSTRS: u32 = CYCLES * 514;
+    const CODE_BASE: u32 = 0x7000;
+    let words = [
+        0x727F, // outer: MOVEQ #127,D1
+        0x4A78, 0x4000, // inner: TST.W ($4000).W
+        0x4AB9, 0x0000, 0x4004, // TST.L ($4004).L
+        0x4A39, 0x0000, 0x4003, // TST.B ($4003).L
+        0x51C9, 0xFFEE, // DBRA D1,inner
+        0x60E8, // BRA.S outer
+    ];
+    let mut bus = LinearMemoryBus::new(0x10000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    for address in 0x4000..0x4008 {
+        bus.write_byte(address, 0xAA);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert_eq!(cpu.pc, CODE_BASE, "the run ends exactly at the outer label");
+    for address in 0x4000..0x4008 {
+        assert_eq!(bus.read_byte(address), 0xAA, "TST writes nothing");
+    }
+    println!(
+        "batch     absolute TST loop       {:8.1} M instr/s",
         f64::from(INSTRS) / elapsed / 1_000_000.0
     );
 }
