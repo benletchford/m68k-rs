@@ -517,10 +517,6 @@ impl CpuCore {
                 self.set_a(reg as usize, addr);
             }
         } else {
-            if self.cpu_type == CpuType::M68000 && size == Size::Long {
-                let _ = self.read_16(bus, addr);
-            }
-
             // Normal order: D0..D7, A0..A7
             for i in 0..16 {
                 if mask & (1 << i) != 0 {
@@ -539,9 +535,14 @@ impl CpuCore {
                 self.set_a(reg as usize, addr);
             }
 
-            // 68000 MOVEM memory-to-register has one discarded word read:
-            // before long transfers, after word transfers.
-            if self.cpu_type == CpuType::M68000 && size == Size::Word {
+            // 68000/68010 MOVEM memory-to-register performs one discarded
+            // word read after the last operand, for both word and long
+            // transfers (both CPUs' timing tables list 3+n / 3+2n reads,
+            // leaving exactly one read unaccounted for after the opcode,
+            // mask, and operands). The placement is observable: drivers such as
+            // lide.device point MOVEM.L at the end of a read-sensitive
+            // I/O window so that this extra access falls just outside it.
+            if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) {
                 let _ = self.read_16(bus, addr);
             }
         }
@@ -898,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn m68000_movem_long_memory_to_register_dummies_before_first_transfer() {
+    fn m68000_movem_long_memory_to_register_dummies_after_last_transfer() {
         let mut cpu = CpuCore::new();
         cpu.set_cpu_type(CpuType::M68000);
         let mut bus = TraceBus::default();
@@ -916,8 +917,32 @@ mod tests {
             bus.events,
             vec![
                 Event::ReadWord(0x1000),
+                Event::ReadWord(0x1002),
+                Event::ReadWord(0x1004),
+            ]
+        );
+    }
+
+    #[test]
+    fn m68010_movem_long_memory_to_register_dummies_after_last_transfer() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68010);
+        let mut bus = TraceBus::default();
+        cpu.dar[10] = 0x1000;
+
+        cpu.exec_movem_to_reg(
+            &mut bus,
+            Size::Long,
+            AddressingMode::AddressIndirect(2),
+            0x0001,
+        );
+
+        assert_eq!(
+            bus.events,
+            vec![
                 Event::ReadWord(0x1000),
                 Event::ReadWord(0x1002),
+                Event::ReadWord(0x1004),
             ]
         );
     }
