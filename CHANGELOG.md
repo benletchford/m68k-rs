@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.14](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.13...m68k-v0.10.14) (2026-08-14)
+
+
+### Bug Fixes
+
+* **m68000/m68010:** issue MOVEM mem-to-reg discarded read after long transfers ([#126](https://github.com/benletchford/m68k-rs/issues/126)) ([9d1fbe0](https://github.com/benletchford/m68k-rs/commit/9d1fbe0984a7f24fbb46ddf62da1034bd6925e24))
+
 ## [0.10.13](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.12...m68k-v0.10.13) (2026-08-12)
 
 
