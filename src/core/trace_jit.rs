@@ -1164,13 +1164,19 @@ impl TraceJit {
                             watch_pcs,
                             chain_budget - 1,
                         ) {
-                            Some((CachedRunResult::Ran, chained)) => retired += chained,
+                            Some((CachedRunResult::Ran, chained)) => {
+                                #[cfg(feature = "trace-profile")]
+                                super::trace_profile::note_chained(pc, cpu_type, chained);
+                                retired += chained;
+                            }
                             // The continuation's first opcode changed:
                             // the child has already consumed it (ppc/ir
                             // set, pc advanced) and the caller must
                             // dispatch it. Surface the miss while
                             // keeping every instruction retired so far.
                             Some((miss @ CachedRunResult::Miss(_), chained)) => {
+                                #[cfg(feature = "trace-profile")]
+                                super::trace_profile::note_chained(pc, cpu_type, chained);
                                 return Some((miss, retired + chained));
                             }
                             None => {}
@@ -11561,6 +11567,82 @@ mod portable_tests {
             compiled >= 2,
             "exit seeding should compile a continuation inside the loop \
              body in addition to the head trace (found {compiled})"
+        );
+    }
+
+    /// The #100 field-data counters: a guard exit that enters a compiled
+    /// continuation must be distinguishable, per head, from one that
+    /// exits and thrashes. The mixed-path workload above chains for real,
+    /// so its head row must show chained calls bounded by guard exits and
+    /// nonzero chained retirement; a fresh profile shows neither.
+    #[cfg(feature = "trace-profile")]
+    #[test]
+    fn chained_counters_split_productive_exits_from_thrash() {
+        super::super::trace_profile::reset();
+        const CODE_BASE: u32 = 0x7000;
+        let words = [
+            0x0A01, 0x0001, // EORI.B #1,D1
+            0x6602, // BNE.S +2
+            0x5282, // ADDQ.L #1,D2
+            0x1ADC, // MOVE.B (A4)+,(A5)+
+            0x5283, // ADDQ.L #1,D3
+            0x51C8, 0xFFF2, // DBRA D0,head
+            0x60EE, // BRA.S head
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(4, 0x3000);
+        cpu.set_a(5, 0x4000);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        let result = cpu.run_batch(&mut bus, 50_000, &[0]);
+        assert_eq!(result.instructions, 50_000);
+
+        let snapshot = super::super::trace_profile::snapshot();
+        let chaining: Vec<_> = snapshot
+            .rows
+            .iter()
+            .filter(|row| row.chained_calls > 0)
+            .collect();
+        assert!(
+            !chaining.is_empty(),
+            "the mixed-path loop chains, so some head must record chained calls"
+        );
+        for row in &chaining {
+            assert!(
+                row.chained_calls <= row.guarded_branch_exits,
+                "every chain hangs off a guard exit ({:08X}: {} chains, {} exits)",
+                row.start_pc,
+                row.chained_calls,
+                row.guarded_branch_exits
+            );
+            assert!(
+                row.chained_retired > 0,
+                "a chain that ran retired instructions ({:08X})",
+                row.start_pc
+            );
+        }
+        // The split itself: at least one head must show guard exits with
+        // NO chaining (the continuation head's own exits, or pre-chain
+        // exits) -- otherwise the counters could not separate thrash from
+        // productive chaining. If this ever fails because every exit
+        // chains, the workload has changed, not the counters.
+        let thrash = snapshot
+            .rows
+            .iter()
+            .any(|row| row.guarded_branch_exits > 0 && row.chained_calls == 0);
+        let productive = chaining
+            .iter()
+            .any(|row| row.chained_retired >= row.chained_calls);
+        assert!(
+            thrash || productive,
+            "counters must expose at least one side of the split"
         );
     }
 

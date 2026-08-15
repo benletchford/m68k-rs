@@ -48,6 +48,14 @@ pub struct TraceProfileRow {
     pub jit_retired: u64,
     /// Exits caused by a guarded branch taking an unrecorded direction.
     pub guarded_branch_exits: u64,
+    /// Guard exits at this head that entered a compiled continuation
+    /// trace (bounded chaining). `guarded_branch_exits` alone cannot
+    /// separate a parent that exits and thrashes from one that exits and
+    /// chains productively; this and `chained_retired` make the split.
+    pub chained_calls: u64,
+    /// Guest instructions retired by continuation chains entered from
+    /// this head's guard exits.
+    pub chained_retired: u64,
     /// Trace re-recordings triggered by adaptive branch behavior.
     pub adaptive_rerecords: u64,
     /// The head's recorded loop was classified as a pure poll (a wait):
@@ -494,13 +502,13 @@ impl TraceProfileSnapshot {
         let _ = writeln!(out, "compiled traces by retired instructions");
         let _ = writeln!(
             out,
-            "rank  start_pc  ops      calls      retired avg_ops guard_exits rerecords"
+            "rank  start_pc  ops      calls      retired avg_ops guard_exits chained chain_retired rerecords"
         );
         for (rank, row) in compiled_rows.iter().take(40).enumerate() {
             let average = row.jit_retired as f64 / row.native_calls as f64;
             let _ = writeln!(
                 out,
-                "{:>4}  {:08X}  {:>3} {:>10} {:>12} {:>7.2} {:>11} {:>9}",
+                "{:>4}  {:08X}  {:>3} {:>10} {:>12} {:>7.2} {:>11} {:>7} {:>13} {:>9}",
                 rank + 1,
                 row.start_pc,
                 row.compiled_ops,
@@ -508,6 +516,8 @@ impl TraceProfileSnapshot {
                 row.jit_retired,
                 average,
                 row.guarded_branch_exits,
+                row.chained_calls,
+                row.chained_retired,
                 row.adaptive_rerecords
             );
         }
@@ -730,6 +740,9 @@ struct Row {
     native_calls: u64,
     jit_retired: u64,
     guarded_branch_exits: u64,
+    /// See `TraceProfileRow::chained_calls` / `chained_retired`.
+    chained_calls: u64,
+    chained_retired: u64,
     adaptive_rerecords: u64,
     wait_hits: u64,
     /// Whether the most recent completed recording at this head was a
@@ -865,6 +878,8 @@ impl Profile {
                 native_calls: row.native_calls,
                 jit_retired: row.jit_retired,
                 guarded_branch_exits: row.guarded_branch_exits,
+                chained_calls: row.chained_calls,
+                chained_retired: row.chained_retired,
                 adaptive_rerecords: row.adaptive_rerecords,
                 wait_hits: row.wait_hits,
             })
@@ -1156,6 +1171,16 @@ pub(crate) fn note_guarded_branch_exit(pc: u32, cpu_type: CpuType) {
     PROFILE.with_borrow_mut(|profile| {
         let row = profile.0.row(pc, cpu_type);
         row.guarded_branch_exits = row.guarded_branch_exits.saturating_add(1);
+    });
+}
+
+/// A guard exit at `pc` entered a compiled continuation trace which
+/// retired `retired` guest instructions before returning (or missing).
+pub(crate) fn note_chained(pc: u32, cpu_type: CpuType, retired: u32) {
+    PROFILE.with_borrow_mut(|profile| {
+        let row = profile.0.row(pc, cpu_type);
+        row.chained_calls = row.chained_calls.saturating_add(1);
+        row.chained_retired = row.chained_retired.saturating_add(u64::from(retired));
     });
 }
 
