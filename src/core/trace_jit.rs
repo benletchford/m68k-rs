@@ -691,9 +691,40 @@ impl fmt::Debug for TraceJit {
 }
 
 impl TraceJit {
+    /// Flags for the JIT module.
+    ///
+    /// Cranelift's default leaves the IR verifier on. A CPU profile of EV
+    /// Override puts trace compilation at ~7% of the process, several
+    /// times what executing the compiled traces costs, with the verifier a
+    /// large part of it.
+    ///
+    /// The verifier checks IR this crate emits, so it earns its keep in
+    /// debug and test builds -- where a malformed emission should fail
+    /// loudly and near its cause -- and is overhead in release, which runs
+    /// the same emitters the suite already covers.
+    ///
+    /// `opt_level` is deliberately left at cranelift's default. Raising it
+    /// to `speed` trades compile time for code quality, and on this
+    /// workload compilation costs several times what execution does, so it
+    /// measured as a wash-to-regression: verifier-off alone is -7.3% CPU
+    /// (t=-2.85, 7 of 8 paired runs), and adding `opt_level=speed` gives
+    /// back the whole win.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    const JIT_FLAGS: &'static [(&'static str, &'static str)] = if cfg!(debug_assertions) {
+        &[("enable_verifier", "true")]
+    } else {
+        &[("enable_verifier", "false")]
+    };
+
     fn new() -> Self {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-        let module = JITBuilder::new(default_libcall_names())
+        // Cranelift defaults leave the IR verifier on and optimisation off.
+        // A CPU profile of EV Override puts trace compilation at ~7% of the
+        // process -- several times what executing the compiled traces costs
+        // -- with the verifier and register allocator the largest parts. The
+        // verifier checks IR this crate generates, so it earns its keep in
+        // debug and test builds and is pure overhead in release.
+        let module = JITBuilder::with_flags(Self::JIT_FLAGS, default_libcall_names())
             .ok()
             .map(JITModule::new);
         Self {
