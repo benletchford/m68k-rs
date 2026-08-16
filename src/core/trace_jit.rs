@@ -672,6 +672,20 @@ pub(crate) struct TraceJit {
     /// beyond two -- losing an entry only costs the one extra blocked
     /// attempt that was the universal price before the table existed.
     earned_call_permission: Vec<[u32; 2]>,
+    /// Heads whose recording ended for a STRUCTURAL reason -- no trace
+    /// terminal, too short, or indirect-JSR too short -- after any
+    /// call-through retry was spent. A `Rejected` slot
+    /// alone does not survive: a cache alias counting into the same
+    /// index evicts it, and the next backward-branch hit re-installs the
+    /// head as a fresh candidate, so a structurally uncompilable loop
+    /// re-records forever (profiled: one EV Override head recorded 2,959
+    /// times in a session, 16 ops deep each time, for 21K hits). This
+    /// side table remembers the verdict across evictions the way
+    /// `earned_call_permission` remembers permission. Blocker and backend
+    /// rejections are deliberately excluded: opcode coverage can change
+    /// them, structure cannot. Cleared on trace invalidation (SMC) so a
+    /// rewritten region can retry.
+    structurally_rejected: Vec<[u32; 2]>,
 }
 
 impl fmt::Debug for TraceJit {
@@ -706,6 +720,7 @@ impl TraceJit {
             slots: (0..TRACE_CACHE_SIZE).map(|_| TraceSlot::Empty).collect(),
             recording: None,
             earned_call_permission: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
+            structurally_rejected: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
         }
     }
 
@@ -853,6 +868,9 @@ impl TraceJit {
                 self.slots[idx] = TraceSlot::Empty;
                 // The trace at this target is gone; re-arm the per-CPU
                 // filters so the loop can be re-recorded and re-probed.
+                // Code changed under this head, so any structural verdict
+                // about the old bytes is void too.
+                self.forget_structural_rejection(pc);
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
                 if index > 0 {
@@ -1157,6 +1175,35 @@ impl TraceJit {
         ways[0] == pc || ways[1] == pc
     }
 
+    fn remember_structural_rejection(&mut self, pc: u32) {
+        let ways = &mut self.structurally_rejected[trace_cache_index(pc)];
+        if ways[0] == pc || ways[1] == pc {
+            return;
+        }
+        if ways[0] == u32::MAX {
+            ways[0] = pc;
+        } else if ways[1] == u32::MAX {
+            ways[1] = pc;
+        } else {
+            ways[1] = ways[0];
+            ways[0] = pc;
+        }
+    }
+
+    fn is_structurally_rejected(&self, pc: u32) -> bool {
+        let ways = &self.structurally_rejected[trace_cache_index(pc)];
+        ways[0] == pc || ways[1] == pc
+    }
+
+    fn forget_structural_rejection(&mut self, pc: u32) {
+        let ways = &mut self.structurally_rejected[trace_cache_index(pc)];
+        for way in ways.iter_mut() {
+            if *way == pc {
+                *way = u32::MAX;
+            }
+        }
+    }
+
     fn record_trace_target(&mut self, pc: u32, cpu_type: CpuType) {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         if self.module.is_none() {
@@ -1180,6 +1227,12 @@ impl TraceJit {
                 cpu_type: rejected_type,
             } if *rejected_pc == pc && *rejected_type == cpu_type => {}
             _ => {
+                if self.is_structurally_rejected(pc) {
+                    // The slot was evicted by an alias, but the verdict
+                    // stands: re-installing the head would only re-record
+                    // the same uncompilable region.
+                    return;
+                }
                 self.slots[idx] = TraceSlot::Counting {
                     pc,
                     cpu_type,
@@ -1207,6 +1260,7 @@ impl TraceJit {
         // candidate created here must carry the permission its head
         // already earned.
         let permission = self.has_call_permission(exit_pc);
+        let structurally_rejected = self.is_structurally_rejected(exit_pc);
         match &mut self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
@@ -1255,6 +1309,9 @@ impl TraceJit {
                 cpu_type: rejected_type,
             } if *rejected_pc == exit_pc && *rejected_type == cpu_type => ExitSeed::None,
             slot => {
+                if structurally_rejected {
+                    return ExitSeed::None;
+                }
                 *slot = TraceSlot::Counting {
                     pc: exit_pc,
                     cpu_type,
@@ -1419,8 +1476,22 @@ impl TraceJit {
                 }
                 TraceSlot::Compiled(trace)
             }
-            Err(_) => {
+            Err(reason) => {
                 push_probe_skip(cpu, start_pc);
+                // WaitLoop is deliberately NOT durable: a wait can stop
+                // waiting (the polled value changes and the loop falls
+                // through), and the head must then re-record to find its
+                // real blocker -- `wait_then_eviction_then_fall_through_
+                // restores_the_blocker` pins that. The three below are
+                // static properties of the recorded path.
+                if matches!(
+                    reason,
+                    RegionRejectReason::NoTraceTerminal
+                        | RegionRejectReason::TooShort
+                        | RegionRejectReason::IndirectJsrTooShort
+                ) {
+                    self.remember_structural_rejection(start_pc);
+                }
                 TraceSlot::Rejected {
                     pc: start_pc,
                     cpu_type,
@@ -15497,5 +15568,104 @@ mod portable_tests {
             native_cycles, step_cycles,
             "native charge equals the 68000 interpreter's"
         );
+    }
+}
+
+#[cfg(all(test, feature = "trace-profile"))]
+mod durable_rejection_tests {
+    //! A head whose recording ends for a structural reason must not be
+    //! re-recorded after a cache alias evicts its `Rejected` slot. This is
+    //! the profiled EV Override flight storm: one head recorded 2,959
+    //! times in a session, 16 ops deep each time, all `no-trace-terminal`.
+
+    use super::*;
+    use crate::LinearMemoryBus;
+
+    fn attempts_for(pc: u32) -> u64 {
+        super::super::trace_profile::snapshot()
+            .rows
+            .iter()
+            .find(|row| row.start_pc == pc)
+            .map_or(0, |row| row.recording_attempts)
+    }
+
+    fn cpu_at(pc: u32) -> CpuCore {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68000);
+        cpu.set_sr(0x2700);
+        cpu.pc = pc;
+        cpu.set_a(7, 0x8000);
+        cpu
+    }
+
+    /// Two loop heads 8KB apart share a trace-cache slot
+    /// (`trace_cache_index` = (pc>>1)&0xFFF). HEAD_A's loop crosses a
+    /// trap-free stretch and then JUMPS AWAY through a computed JMP before
+    /// any backward branch closes it, so every recording ends
+    /// `no-trace-terminal`; HEAD_B is an ordinary tight loop whose
+    /// candidacy overwrites A's `Rejected` slot each time it counts.
+    const HEAD_A: u32 = 0x1000;
+    const HEAD_B: u32 = 0x1000 + 0x2000; // same (pc>>1)&0xFFF
+
+    fn build_bus() -> LinearMemoryBus {
+        let mut bus = LinearMemoryBus::new(0x10000);
+        // HEAD_A: ADDQ.L #1,D0; ADDQ.L #1,D1; ADDQ.L #1,D2; ADDQ.L #1,D3;
+        //         JMP (A0)                 -- A0 = HEAD_B (structural dead end)
+        for (i, w) in [0x5280u16, 0x5281, 0x5282, 0x5283, 0x4ED0]
+            .iter()
+            .enumerate()
+        {
+            bus.load(HEAD_A + 2 * i as u32, &w.to_be_bytes());
+        }
+        // HEAD_B: SUBQ.W #1,D7; BNE.S HEAD_B ; then JMP (A1) -- A1 = HEAD_A
+        for (i, w) in [0x5347u16, 0x66FC, 0x4ED1].iter().enumerate() {
+            bus.load(HEAD_B + 2 * i as u32, &w.to_be_bytes());
+        }
+        bus
+    }
+
+    #[test]
+    fn structural_rejection_survives_slot_eviction() {
+        let mut bus = build_bus();
+        let mut cpu = cpu_at(HEAD_A);
+        cpu.set_a(0, HEAD_B);
+        cpu.set_a(1, HEAD_A);
+        // HEAD_A is only ever entered by the JMP from HEAD_B's exit; give it
+        // backward-branch hits by making HEAD_B's fallthrough jump back.
+        // Each outer round: A's 4 ops, then B spins D7 iterations, then back.
+        cpu.set_d(7, 3);
+        for _ in 0..40 {
+            cpu.set_d(7, 3);
+            cpu.pc = HEAD_A;
+            cpu.run_batch(&mut bus, 200, &[]);
+        }
+        let attempts_after_warmup = attempts_for(HEAD_A);
+        assert!(
+            TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_A)),
+            "HEAD_A must be remembered as structurally rejected (attempts={attempts_after_warmup})"
+        );
+        // Keep going: B keeps counting into the shared slot (evicting A's
+        // Rejected marker); A must not record again.
+        for _ in 0..200 {
+            cpu.set_d(7, 3);
+            cpu.pc = HEAD_A;
+            cpu.run_batch(&mut bus, 200, &[]);
+        }
+        let attempts_final = attempts_for(HEAD_A);
+        assert_eq!(
+            attempts_final, attempts_after_warmup,
+            "a structurally rejected head must not re-record after eviction"
+        );
+    }
+
+    #[test]
+    fn rewritten_code_clears_the_structural_verdict() {
+        // Once remembered, HEAD_A stays refused -- until its code changes.
+        TRACE_JIT.with_borrow_mut(|jit| {
+            jit.remember_structural_rejection(HEAD_A);
+            assert!(jit.is_structurally_rejected(HEAD_A));
+            jit.forget_structural_rejection(HEAD_A);
+            assert!(!jit.is_structurally_rejected(HEAD_A));
+        });
     }
 }
