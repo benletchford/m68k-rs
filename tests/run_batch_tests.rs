@@ -1632,6 +1632,82 @@ fn memory_and_loop_matches_step() {
     });
 }
 
+/// A trap-punctuated loop (a common gameplay shape): every segment
+/// between A-lines becomes a compiled trace under the stage-1 trap-crossing
+/// design, and the batched run must stay bit-identical to step() with the
+/// same host-emulated no-op traps.
+#[test]
+fn trap_punctuated_loop_matches_step_across_aline_dispatch() {
+    let words: &[u16] = &[
+        0x5282, // $1000: ADDQ.L #1,D2
+        0x5283, // ADDQ.L #1,D3
+        0xD682, // ADD.L D2,D3
+        0xA123, // trap 1
+        0x5285, // ADDQ.L #1,D5
+        0xDA83, // ADD.L D3,D5
+        0x3685, // MOVE.W D5,(A3)
+        0xA124, // trap 2
+        0x4A41, // TST.W D1
+        0x5281, // ADDQ.L #1,D1
+        0x51C8, 0xFFEA, // DBRA D0,$1000
+        0xA000, // sentinel
+    ];
+    let bytes = assemble(words);
+    let mk_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0x1000;
+        cpu.set_sr(0x2700);
+        cpu.set_a(7, 0x9000);
+        cpu.set_a(3, 0x4000);
+        cpu.set_d(0, 500);
+        cpu
+    };
+
+    let mut bus_a = FastRamBus::new(0x20000);
+    bus_a.fm_len = 0;
+    bus_a.load(0x1000, &bytes);
+    let mut cpu_a = mk_cpu();
+    let mut steps: u64 = 0;
+    loop {
+        match cpu_a.step(&mut bus_a) {
+            m68k::StepResult::Ok { .. } => steps += 1,
+            m68k::StepResult::AlineTrap { opcode: 0xA000 } => break,
+            m68k::StepResult::AlineTrap { .. } => {} // host no-op trap
+            other => panic!("unexpected step result {other:?}"),
+        }
+        assert!(steps < 10_000_000, "step run diverged");
+    }
+
+    let mut bus_b = FastRamBus::new(0x20000);
+    bus_b.load(0x1000, &bytes);
+    let mut cpu_b = mk_cpu();
+    let mut batched: u64 = 0;
+    loop {
+        let result = cpu_b.run_batch(&mut bus_b, 4_096, &[]);
+        batched += result.instructions as u64;
+        match result.exit {
+            BatchExit::BudgetExhausted => continue,
+            BatchExit::AlineTrap { opcode: 0xA000 } => break,
+            BatchExit::AlineTrap { .. } => continue, // host no-op trap
+            other => panic!("unexpected batch exit {other:?}"),
+        }
+    }
+
+    assert_eq!(steps, batched, "instruction count");
+    assert_eq!(cpu_a.pc, cpu_b.pc, "pc");
+    assert_eq!(cpu_a.get_sr(), cpu_b.get_sr(), "sr");
+    for i in 0..8 {
+        assert_eq!(cpu_a.d(i), cpu_b.d(i), "D{i}");
+        assert_eq!(cpu_a.a(i), cpu_b.a(i), "A{i}");
+    }
+    assert_eq!(bus_a.mem, bus_b.mem, "memory contents");
+    assert_eq!(cpu_b.d(1), 501, "the loop ran to completion");
+}
+
+/// The ROM caller-save idiom: MOVEM.L push, body, MOVEM.L pop, loop.
+/// The counters live outside the saved mask (the pop restores D2/D3/A2
+/// every iteration). Must match step() exactly through the lifecycle.
 /// PEA of an absolute address in a loop, rebalanced each iteration.
 #[test]
 fn pea_abs_loop_matches_step() {

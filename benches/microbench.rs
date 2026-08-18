@@ -1923,6 +1923,153 @@ fn bench_movem_frame_loop() {
     );
 }
 
+/// A trap-punctuated loop, a dominant profiled gameplay shape: short
+/// straight-line runs separated by A-lines the host emulates. The bench's
+/// dispatch loop plays the host (each A-line is a no-op that costs one
+/// batch round trip), so the number reflects segment execution plus the
+/// per-segment boundary -- the stage-1 trap-crossing question.
+fn bench_trap_segment_loop() {
+    const INSTRS: u64 = 50_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x5282, // head: ADDQ.L #1,D2
+        0x5283, // ADDQ.L #1,D3
+        0xD682, // ADD.L D2,D3
+        0x2003, // MOVE.L D3,D0- scratch
+        0x4A41, // TST.W D1
+        0xA123, // trap 1
+        0x5285, // ADDQ.L #1,D5
+        0xDA83, // ADD.L D3,D5
+        0x2005, // MOVE.L D5,D0
+        0x4A42, // TST.W D2
+        0xA124, // trap 2
+        0x5281, // ADDQ.L #1,D1
+        0x4A43, // TST.W D3
+        0x51CF, 0xFFE4, // DBRA D7,head
+        0x707F, // MOVEQ #127,D7
+        0x60DE, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(7, 0x7F);
+        cpu
+    };
+    let drive = |cpu: &mut CpuCore, bus: &mut LinearMemoryBus, budget: u64| -> u64 {
+        let mut retired = 0u64;
+        while retired < budget {
+            let chunk = (budget - retired).min(4_096) as u32;
+            let result = cpu.run_batch(bus, chunk, &[]);
+            retired += u64::from(result.instructions);
+            match result.exit {
+                m68k::BatchExit::BudgetExhausted => {}
+                m68k::BatchExit::AlineTrap { .. } => {} // host no-op dispatch
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        retired
+    };
+    let mut warm_cpu = prepare_cpu();
+    drive(&mut warm_cpu, &mut bus, 5_000_000);
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    let retired = drive(&mut cpu, &mut bus, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(2) > 5_000, "the loop actually iterated");
+    assert!(
+        cpu.d(1).abs_diff(cpu.d(2)) <= 1,
+        "the two per-iteration counters advance in lockstep"
+    );
+    println!(
+        "batch     trap segment loop       {:8.1} M instr/s",
+        retired as f64 / elapsed / 1_000_000.0
+    );
+}
+
+/// The measured real-world segment shape: ~9-op straight-line runs between
+/// A-lines (a dominant profiled gameplay pattern), so the boundary
+/// cost amortizes over twice the work of the short variant above.
+fn bench_trap_segment_loop_long() {
+    const INSTRS: u64 = 50_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x5282, // head: ADDQ.L #1,D2
+        0x5283, // ADDQ.L #1,D3
+        0xD682, // ADD.L D2,D3
+        0x2003, // MOVE.L D3,D0 - scratch
+        0x4A41, // TST.W D1
+        0x5284, // ADDQ.L #1,D4
+        0xD883, // ADD.L D3,D4
+        0x2004, // MOVE.L D4,D0
+        0x4A42, // TST.W D2
+        0xA123, // trap 1
+        0x5285, // ADDQ.L #1,D5
+        0xDA83, // ADD.L D3,D5
+        0x2005, // MOVE.L D5,D0
+        0x4A44, // TST.W D4
+        0x5286, // ADDQ.L #1,D6
+        0xDC85, // ADD.L D5,D6
+        0x2006, // MOVE.L D6,D0
+        0x4A45, // TST.W D5
+        0x5287, // ADDQ.L #1,D7 - clobbered by the DBRA counter reload path
+        0xA124, // trap 2
+        0x5281, // ADDQ.L #1,D1
+        0x4A43, // TST.W D3
+        0x51CF, 0xFFD2, // DBRA D7,head
+        0x7E7F, // MOVEQ #127,D7
+        0x60CC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(7, 0x7F);
+        cpu
+    };
+    let drive = |cpu: &mut CpuCore, bus: &mut LinearMemoryBus, budget: u64| -> u64 {
+        let mut retired = 0u64;
+        while retired < budget {
+            let chunk = (budget - retired).min(4_096) as u32;
+            let result = cpu.run_batch(bus, chunk, &[]);
+            retired += u64::from(result.instructions);
+            match result.exit {
+                m68k::BatchExit::BudgetExhausted => {}
+                m68k::BatchExit::AlineTrap { .. } => {} // host no-op dispatch
+                other => panic!("unexpected exit {other:?}"),
+            }
+        }
+        retired
+    };
+    let mut warm_cpu = prepare_cpu();
+    drive(&mut warm_cpu, &mut bus, 5_000_000);
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    let retired = drive(&mut cpu, &mut bus, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(2) > 5_000, "the loop actually iterated");
+    assert!(
+        cpu.d(1).abs_diff(cpu.d(2)) <= 1,
+        "the two per-iteration counters advance in lockstep"
+    );
+    println!(
+        "batch     trap segment loop long  {:8.1} M instr/s",
+        retired as f64 / elapsed / 1_000_000.0
+    );
+}
+
 /// PEA of an absolute address, rebalanced -- the profile's second-widest
 /// blocked head class after MOVEM. Base blocks the head at the PEA.
 fn bench_pea_abs_loop() {
@@ -2142,6 +2289,14 @@ fn main() {
     }
     if only.as_deref() == Some("movem") {
         bench_movem_frame_loop();
+        return;
+    }
+    if only.as_deref() == Some("trap-segments") {
+        bench_trap_segment_loop();
+        return;
+    }
+    if only.as_deref() == Some("trap-segments-long") {
+        bench_trap_segment_loop_long();
         return;
     }
     if only.as_deref() == Some("pea-abs") {
