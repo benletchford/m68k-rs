@@ -16658,50 +16658,48 @@ mod durable_rejection_tests {
     }
 
     /// The inverse regression of the compiled-before gate: a genuinely
-    /// compilable head whose FIRST recording happens to take the
+    /// compilable head whose FIRST recordings happen to take a
     /// non-closing path must not be permanently poisoned -- a later
     /// execution that takes the closing path must still compile it.
     ///
-    /// HEAD_C's shape is data-dependent: while D6 != 0 the loop body
-    /// escapes through a computed JMP before any backward branch closes
-    /// it (every recording ends `no-trace-terminal`); once D6 == 0 the
-    /// short path closes the loop with `BNE.S` back to the head, which is
-    /// a perfectly compilable trace.
-    const HEAD_C: u32 = 0x2000;
-    const AWAY: u32 = 0x4100; // different cache index than HEAD_C
+    /// HEAD_C is a MID-LOOP entry (the profiled audio-mixer shape): the
+    /// wrap path branches back to the loop top ABOVE the head and flows
+    /// sequentially into the head again, so a recording revisits its own
+    /// start at a non-branch op and ends `no-trace-terminal` (no salvage:
+    /// there is no blocker). Once D7 enters at 1 with D6 == 0, the exit
+    /// path's `BEQ.S` closes a 4-op trace back to HEAD_C, which compiles.
+    const HEAD_C: u32 = 0x2008;
+    const DRIVER: u32 = 0x4100; // different cache index than HEAD_C
 
     #[test]
     fn a_first_sample_no_terminal_head_can_still_compile_later() {
         let mut bus = LinearMemoryBus::new(0x10000);
-        // HEAD_C: ADDQ.L #1,D0; ADDQ.L #1,D1; ADDQ.L #1,D2; TST.W D6;
-        //         BEQ.S close; JMP (A0)          -- A0 = AWAY
-        // close:  SUBQ.W #1,D7; BNE.S HEAD_C; JMP (A1) -- A1 = HEAD_C
+        // loop_top: ADDQ.L #1,D1; ADDQ.L #1,D2; ADDQ.L #1,D3; ADDQ.L #1,D4
+        // HEAD_C:   SUBQ.W #1,D7; BNE.S loop_top
+        //           TST.W D6; BEQ.S HEAD_C; JMP (A1)
         for (i, w) in [
-            0x5280u16, 0x5281, 0x5282, 0x4A46, 0x6702, 0x4ED0, 0x5347, 0x66F0, 0x4ED1,
+            0x5281u16, 0x5282, 0x5283, 0x5284, 0x5347, 0x66F4, 0x4A46, 0x67F8, 0x4ED1,
         ]
         .iter()
         .enumerate()
         {
-            bus.load(HEAD_C + 2 * i as u32, &w.to_be_bytes());
+            bus.load(0x2000 + 2 * i as u32, &w.to_be_bytes());
         }
-        // AWAY: SUBQ.W #1,D5; BNE.S AWAY; JMP (A2) -- A2 = HEAD_C
-        for (i, w) in [0x5345u16, 0x66FC, 0x4ED2].iter().enumerate() {
-            bus.load(AWAY + 2 * i as u32, &w.to_be_bytes());
-        }
-        let mut cpu = cpu_at(HEAD_C);
-        cpu.set_a(0, AWAY);
+        // DRIVER: JMP (A0) -- the only candidacy source for HEAD_C.
+        bus.load(DRIVER, &0x4ED0u16.to_be_bytes());
+        let mut cpu = cpu_at(DRIVER);
+        cpu.set_a(0, HEAD_C);
         cpu.set_a(1, HEAD_C);
-        cpu.set_a(2, HEAD_C);
 
-        // Phase 1: D6 != 0, every pass escapes through the JMP. Stop at
-        // the FIRST completed recording attempt.
+        // Phase 1: D7 is topped up every round, so the wrap branch is
+        // always taken and every recording from HEAD_C flows through
+        // loop_top sequentially back into HEAD_C: `no-trace-terminal`.
         cpu.set_d(6, 1);
         let mut recorded = false;
         for _ in 0..60 {
-            cpu.set_d(5, 3);
-            cpu.set_d(7, 3);
-            cpu.pc = HEAD_C;
-            cpu.run_batch(&mut bus, 100, &[]);
+            cpu.set_d(7, 0x4000);
+            cpu.pc = DRIVER;
+            cpu.run_batch(&mut bus, 32, &[]);
             if attempts_for(HEAD_C) >= 1 {
                 recorded = true;
                 break;
@@ -16709,21 +16707,27 @@ mod durable_rejection_tests {
         }
         assert!(recorded, "HEAD_C must record at least once in phase 1");
         assert!(
+            TRACE_JIT.with_borrow(|jit| jit.has_no_terminal_strikes(HEAD_C)),
+            "the phase-1 recording must have ended no-trace-terminal"
+        );
+        assert!(
             !TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_C)),
             "one non-closing recording on a never-compiled head must not \
              be a durable verdict (attempts={})",
             attempts_for(HEAD_C)
         );
 
-        // Phase 2: D6 == 0, the closing path. The head must re-arm (it
-        // holds strikes, not a verdict) and compile.
+        // Phase 2: enter with D7 == 1 and D6 == 0 -- SUBQ leaves zero, the
+        // wrap is not taken, and BEQ.S closes back to HEAD_C. The batch
+        // ends exactly at the close, so every armed recording sees only
+        // this clean path. The head must re-arm (it holds strikes, not a
+        // verdict) and compile.
         cpu.set_d(6, 0);
         let mut compiled = false;
         for _ in 0..80 {
-            cpu.set_d(5, 3);
-            cpu.set_d(7, 3);
-            cpu.pc = HEAD_C;
-            cpu.run_batch(&mut bus, 100, &[]);
+            cpu.set_d(7, 1);
+            cpu.pc = DRIVER;
+            cpu.run_batch(&mut bus, 5, &[]);
             compiled = TRACE_JIT.with_borrow(|jit| {
                 matches!(
                     &jit.slots[trace_cache_index(HEAD_C)],
