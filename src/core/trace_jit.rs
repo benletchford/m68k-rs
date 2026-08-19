@@ -3234,6 +3234,26 @@ fn decode_an_disp_trace_op<B: AddressBus>(
     let (extension, extension2, op) = match decoded {
         DecodedMemOp::Tst {
             size,
+            ea: FastEa::AnInd(reg),
+        } => {
+            // TST.B/W/L (An): plain register-indirect is (0,An). Reuse the
+            // proven AnDispUnary path with a zero displacement and no
+            // extension word. This unblocks hot pointer-chasing loops that
+            // test the node at (An) each iteration -- without it the whole
+            // loop rejects at its first instruction and runs interpreted.
+            (
+                None,
+                None,
+                JitTraceOp::AnDispUnary {
+                    op: JitUnaryOp::Tst,
+                    size,
+                    reg,
+                    displacement: 0,
+                },
+            )
+        }
+        DecodedMemOp::Tst {
+            size,
             ea: FastEa::AnDisp(reg),
         } => {
             let displacement = read_ext(2, bus)?;
@@ -15253,6 +15273,58 @@ mod portable_tests {
         jit.grant_call_permission(COLLIDER);
         assert!(jit.has_call_permission(HEAD));
         assert!(jit.has_call_permission(COLLIDER));
+    }
+
+    #[test]
+    fn tst_from_register_indirect_decodes_as_zero_displacement() {
+        let dcpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        // 4A52 = TST.W (A2): plain register-indirect, no extension word.
+        // Decodes as the (0,An) special case of the AnDispUnary path.
+        bus.write_word(0x0100, 0x4A52);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("TST.W (A2) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::AnDispUnary {
+                op: JitUnaryOp::Tst,
+                size: Size::Word,
+                reg: 2,
+                displacement: 0,
+            }
+        ));
+        assert!(
+            trace.extension.is_none() && trace.extension2.is_none(),
+            "(An) carries no extension word"
+        );
+
+        // 4A93 = TST.L (A3).
+        bus.write_word(0x0100, 0x4A93);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("TST.L (A3) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::AnDispUnary {
+                op: JitUnaryOp::Tst,
+                size: Size::Long,
+                reg: 3,
+                displacement: 0,
+            }
+        ));
+
+        // 4A12 = TST.B (A2).
+        bus.write_word(0x0100, 0x4A12);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("TST.B (A2) should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::AnDispUnary {
+                op: JitUnaryOp::Tst,
+                size: Size::Byte,
+                reg: 2,
+                displacement: 0,
+            }
+        ));
     }
 
     #[test]
