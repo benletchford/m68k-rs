@@ -686,6 +686,11 @@ pub(crate) struct TraceJit {
     /// them, structure cannot. Cleared on trace invalidation (SMC) so a
     /// rewritten region can retry.
     structurally_rejected: Vec<[u32; 2]>,
+    /// Heads (by pc, 2-way per cache index) that have compiled a valid trace
+    /// at least once. A NoTraceTerminal rejection on such a head is treated
+    /// as a transient data-dependent path (re-recordable), NOT a durable
+    /// structural verdict -- see finish_recording_with_retry / record_trace_target.
+    compiled_before: Vec<[u32; 2]>,
 }
 
 impl fmt::Debug for TraceJit {
@@ -721,6 +726,7 @@ impl TraceJit {
             recording: None,
             earned_call_permission: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
             structurally_rejected: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
+            compiled_before: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
         }
     }
 
@@ -1190,6 +1196,26 @@ impl TraceJit {
         }
     }
 
+    fn remember_compiled(&mut self, pc: u32) {
+        let ways = &mut self.compiled_before[trace_cache_index(pc)];
+        if ways[0] == pc || ways[1] == pc {
+            return;
+        }
+        if ways[0] == u32::MAX {
+            ways[0] = pc;
+        } else if ways[1] == u32::MAX {
+            ways[1] = pc;
+        } else {
+            ways[1] = ways[0];
+            ways[0] = pc;
+        }
+    }
+
+    fn has_compiled_before(&self, pc: u32) -> bool {
+        let ways = &self.compiled_before[trace_cache_index(pc)];
+        ways[0] == pc || ways[1] == pc
+    }
+
     fn is_structurally_rejected(&self, pc: u32) -> bool {
         let ways = &self.structurally_rejected[trace_cache_index(pc)];
         ways[0] == pc || ways[1] == pc
@@ -1225,7 +1251,28 @@ impl TraceJit {
             TraceSlot::Rejected {
                 pc: rejected_pc,
                 cpu_type: rejected_type,
-            } if *rejected_pc == pc && *rejected_type == cpu_type => {}
+            } if *rejected_pc == pc && *rejected_type == cpu_type => {
+                // A head that has ALREADY compiled a valid trace at least
+                // once is demonstrably compilable. A same-pc Rejected slot
+                // that is NOT structurally rejected is therefore a transient
+                // NoTraceTerminal from a data-dependent path the linear
+                // recorder could not close this pass (the canonical case is
+                // a nested loop's outer head). Re-arm it so the next hot pass
+                // can re-record the compilable shape, instead of leaving it
+                // Rejected until an eviction that -- with durable structural
+                // rejection -- never revives it. Durable (structurally
+                // rejected) heads are left alone.
+                if self.has_compiled_before(pc) && !self.is_structurally_rejected(pc) {
+                    self.slots[idx] = TraceSlot::Counting {
+                        pc,
+                        cpu_type,
+                        hits: 1,
+                        adaptive_rerecords: 0,
+                        allow_call_through: self.has_call_permission(pc),
+                    };
+                    TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
+                }
+            }
             _ => {
                 if self.is_structurally_rejected(pc) {
                     // The slot was evicted by an alias, but the verdict
@@ -1474,6 +1521,10 @@ impl TraceJit {
                 if adaptive_rerecords >= TRACE_MAX_ADAPTIVE_RERECORDS {
                     trace.adaptive_branch = false;
                 }
+                // Record that this head is demonstrably compilable, so a
+                // later data-dependent NoTraceTerminal pass re-records rather
+                // than permanently poisoning it.
+                self.remember_compiled(start_pc);
                 TraceSlot::Compiled(trace)
             }
             Err(reason) => {
@@ -1484,12 +1535,25 @@ impl TraceJit {
                 // real blocker -- `wait_then_eviction_then_fall_through_
                 // restores_the_blocker` pins that. The three below are
                 // static properties of the recorded path.
-                if matches!(
+                // TooShort and IndirectJsrTooShort are genuinely static
+                // properties of the recorded region and stay durable.
+                // NoTraceTerminal is NOT static for a loop head that records
+                // data-dependent-length paths: a nested loop's outer head
+                // reaches an already-recorded pc at a non-branch op on some
+                // passes (rejecting) and closes cleanly on others
+                // (compiling). Making it durable on a head that has ALREADY
+                // compiled permanently filters a demonstrably-compilable hot
+                // loop out of probing (measured: a hot audio-mixer loop ran
+                // 99.5% of its iterations interpreted this way). So
+                // NoTraceTerminal is durable only for a head that has never
+                // compiled; a compiled-before head stays re-recordable
+                // (record_trace_target re-arms it).
+                let durable = matches!(
                     reason,
-                    RegionRejectReason::NoTraceTerminal
-                        | RegionRejectReason::TooShort
-                        | RegionRejectReason::IndirectJsrTooShort
-                ) {
+                    RegionRejectReason::TooShort | RegionRejectReason::IndirectJsrTooShort
+                ) || (matches!(reason, RegionRejectReason::NoTraceTerminal)
+                    && !self.has_compiled_before(start_pc));
+                if durable {
                     self.remember_structural_rejection(start_pc);
                 }
                 TraceSlot::Rejected {
@@ -15667,5 +15731,93 @@ mod durable_rejection_tests {
             jit.forget_structural_rejection(HEAD_A);
             assert!(!jit.is_structurally_rejected(HEAD_A));
         });
+    }
+
+    #[test]
+    fn a_compiled_head_is_exempt_from_the_durable_no_terminal_verdict() {
+        // The durability gate in finish_recording_with_retry marks a
+        // NoTraceTerminal rejection durable only when the head has NEVER
+        // compiled. A head that has compiled at least once (a nested loop's
+        // outer head, which closes cleanly on some data-dependent passes and
+        // stops on a non-terminal on others) is exempt, so it can re-record
+        // its compilable shape instead of being permanently filtered out.
+        TRACE_JIT.with_borrow_mut(|jit| {
+            // Never-compiled head: NoTraceTerminal IS durable (unchanged).
+            assert!(!jit.has_compiled_before(HEAD_B));
+            let durable_b = !jit.has_compiled_before(HEAD_B);
+            assert!(durable_b, "a never-compiled head stays durably rejected");
+
+            // Compiled-before head: NoTraceTerminal is NOT durable.
+            jit.remember_compiled(HEAD_A);
+            assert!(jit.has_compiled_before(HEAD_A));
+            let durable_a = !jit.has_compiled_before(HEAD_A);
+            assert!(
+                !durable_a,
+                "a head that has compiled before must be exempt from the \
+                 durable NoTraceTerminal verdict so it can re-record"
+            );
+
+            // The two-way table distinguishes distinct heads that alias to
+            // the same cache index only up to its width; a compiled head is
+            // still not confused with a fresh one.
+            assert!(!jit.has_compiled_before(HEAD_B));
+        });
+    }
+
+    #[test]
+    fn compiled_before_is_two_way_and_pc_specific() {
+        TRACE_JIT.with_borrow_mut(|jit| {
+            jit.remember_compiled(HEAD_A);
+            jit.remember_compiled(HEAD_B);
+            assert!(jit.has_compiled_before(HEAD_A));
+            assert!(jit.has_compiled_before(HEAD_B));
+            // A pc that never compiled is not reported as compiled.
+            assert!(!jit.has_compiled_before(HEAD_A.wrapping_add(0x10000)));
+        });
+    }
+
+    #[test]
+    fn a_compiled_before_head_is_not_durably_rejected_by_no_terminal() {
+        // Regression guard for the nested-loop poison. HEAD_A always records
+        // a `no-trace-terminal` shape (it JMPs away before any backward
+        // branch closes it) -- `structural_rejection_survives_slot_eviction`
+        // proves an UN-compiled HEAD_A is durably rejected and frozen. Here
+        // we mark HEAD_A as having compiled before (as a real compile would,
+        // via `remember_compiled` on the Ok path) and assert the OPPOSITE:
+        // a demonstrably-compilable head is NOT durably poisoned by a later
+        // no-terminal pass, and keeps re-recording. Without the
+        // `compiled_before` gate this assertion fails (HEAD_A is frozen).
+        let mut bus = build_bus();
+        let mut cpu = cpu_at(HEAD_A);
+        cpu.set_a(0, HEAD_B);
+        cpu.set_a(1, HEAD_A);
+        TRACE_JIT.with_borrow_mut(|jit| jit.remember_compiled(HEAD_A));
+
+        for _ in 0..40 {
+            cpu.set_d(7, 3);
+            cpu.pc = HEAD_A;
+            cpu.run_batch(&mut bus, 200, &[]);
+        }
+        assert!(
+            !TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_A)),
+            "a compiled-before head must NOT be durably rejected by a \
+             no-terminal pass"
+        );
+        let attempts_mid = attempts_for(HEAD_A);
+
+        // It must keep re-recording (record_trace_target re-arms it), not
+        // freeze the way a structurally rejected head does.
+        for _ in 0..40 {
+            cpu.set_d(7, 3);
+            cpu.pc = HEAD_A;
+            cpu.run_batch(&mut bus, 200, &[]);
+        }
+        assert!(
+            attempts_for(HEAD_A) > attempts_mid,
+            "a compiled-before head keeps re-recording (attempts must grow: \
+             {} -> {})",
+            attempts_mid,
+            attempts_for(HEAD_A)
+        );
     }
 }
