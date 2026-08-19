@@ -377,6 +377,26 @@ pub(crate) enum JitTraceOp {
         data_mask: u8,
         cycles: i32,
     },
+    /// `MOVEM.L <register list>,-(An)`: the caller-save push. One
+    /// bounds/alignment/self-modification check covers the whole
+    /// contiguous range before any store commits, so a bail commits
+    /// nothing; the base register is never in the admitted list (its
+    /// stored value is generation-dependent) and updates last.
+    MovemLongPredec {
+        base: u8,
+        mask: u16,
+        cycles: i32,
+    },
+    /// `MOVEM.L (An)+,<register list>`: the restore pop. One bounds and
+    /// alignment check covers the whole range before any register
+    /// writes; the base register is never in the admitted list (its
+    /// loaded value would be overwritten by the final address) and
+    /// updates last.
+    MovemLongPostInc {
+        base: u8,
+        mask: u16,
+        cycles: i32,
+    },
     /// Read-only ALU operation from fast memory to a data register. The
     /// decoder admits measured CMP/ADD/SUB `(An)`/`d16(An)`/`d8(An,Xn)`
     /// sources.
@@ -1802,6 +1822,8 @@ impl TraceJit {
                     | JitTraceOp::PeaDisp { .. }
                     | JitTraceOp::Link { .. }
                     | JitTraceOp::Unlk { .. }
+                    | JitTraceOp::MovemLongPredec { .. }
+                    | JitTraceOp::MovemLongPostInc { .. }
                     | JitTraceOp::MemAddqSubq { .. }
                     | JitTraceOp::AnDispBit { .. }
                     | JitTraceOp::IndirectJsr { .. }
@@ -2091,6 +2113,21 @@ impl TraceJit {
                     JitTraceOp::MemAddqSubq { .. } => {
                         let env = mem_env.as_ref().expect("MemAddqSubq implies a window env");
                         emit_mem_addq_subq(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::MovemLongPredec { .. } => {
+                        let env = mem_env.as_ref().expect("MOVEM implies a window env");
+                        emit_movem_long_predec(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
+                    JitTraceOp::MovemLongPostInc { .. } => {
+                        let env = mem_env.as_ref().expect("MOVEM implies a window env");
+                        emit_movem_long_postinc(
+                            &mut builder,
+                            cpu_ptr,
+                            *op,
+                            env,
+                            &mut bails,
+                            bail_at,
+                        )
                     }
                     JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
                         let env = mem_env.as_ref().expect("AnDisp implies a window env");
@@ -2385,6 +2422,8 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::PeaDisp { .. }
             | JitTraceOp::Link { .. }
             | JitTraceOp::Unlk { .. }
+            | JitTraceOp::MovemLongPredec { .. }
+            | JitTraceOp::MovemLongPostInc { .. }
             | JitTraceOp::ClrMem { .. }
             | JitTraceOp::MoveImmMem { .. }
             | JitTraceOp::CallThrough { .. }
@@ -2744,6 +2783,7 @@ impl JitTraceOp {
                 4 + src_c + dst_c
             }
             Self::MovemWordPostInc { cycles, .. } => cycles,
+            Self::MovemLongPredec { cycles, .. } | Self::MovemLongPostInc { cycles, .. } => cycles,
             Self::AluMemToReg { .. } => 24,
             // MC68000 CMPI.W uses an eight-cycle base plus the ten-cycle
             // brief-indexed effective-address read.
@@ -2826,6 +2866,24 @@ impl JitTraceOp {
     }
 }
 
+/// The registers a predecrement MOVEM mask names, in ascending-address
+/// order. The predec mask is bit-reversed (bit 0 = A7 .. bit 15 = D0) and
+/// transfers run highest-register-first into descending addresses, which
+/// leaves ascending addresses holding ascending registers -- so both
+/// executors walk bits 15..0.
+fn movem_predec_regs_ascending(mask: u16) -> impl Iterator<Item = usize> + Clone {
+    (0..16)
+        .rev()
+        .filter(move |i| mask & (1u16 << i) != 0)
+        .map(|i| 15 - i)
+}
+
+/// The registers a postincrement MOVEM mask names, in ascending-address
+/// order (bit 0 = D0 .. bit 15 = A7, transfers ascend).
+fn movem_postinc_regs_ascending(mask: u16) -> impl Iterator<Item = usize> + Clone {
+    (0..16).filter(move |i| mask & (1u16 << i) != 0)
+}
+
 fn decode_trace_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -2873,6 +2931,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_movem_word_postinc_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_movem_long_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
     if let Some(op) = decode_move_imm_mem_trace_op(cpu, bus, pc, opcode) {
@@ -2926,6 +2987,59 @@ fn decode_link_unlk_trace_op<B: AddressBus>(
         });
     }
     None
+}
+
+/// Decode the long register-mask MOVEM pair the gameplay profile names:
+/// the caller-save `MOVEM.L regs,-(An)` push and the `MOVEM.L (An)+,regs`
+/// restore. A base register inside its own list is never admitted (the
+/// predec store's value is generation-dependent; the postinc load is
+/// overwritten by the final address). `(An)+`/`-(An)` carry no per-mode
+/// timing overhead on any CPU path, so the cycle charge is the plain
+/// MC68000 formula.
+fn decode_movem_long_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    let to_mem_predec = (opcode & 0xFFF8) == 0x48E0;
+    let to_reg_postinc = (opcode & 0xFFF8) == 0x4CD8;
+    if !to_mem_predec && !to_reg_postinc {
+        return None;
+    }
+    let base = (opcode & 7) as u8;
+    let mask = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    if mask == 0 {
+        return None;
+    }
+    let count = mask.count_ones() as i32;
+    let op = if to_mem_predec {
+        // Predec mask is bit-reversed: An sits at bit 15 - (8 + n).
+        if mask & (1u16 << (7 - base)) != 0 {
+            return None;
+        }
+        JitTraceOp::MovemLongPredec {
+            base,
+            mask,
+            cycles: 8 + 8 * count,
+        }
+    } else {
+        if mask & (1u16 << (8 + base)) != 0 {
+            return None;
+        }
+        JitTraceOp::MovemLongPostInc {
+            base,
+            mask,
+            cycles: 12 + 8 * count,
+        }
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(mask),
+        extension2: None,
+        pc,
+        op,
+    })
 }
 
 /// Decode the register-source, 32-bit-result form of the 68020 long
@@ -3908,6 +4022,12 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     if matches!(op.op, JitTraceOp::MemAddqSubq { .. }) {
         return execute_portable_mem_addq_subq(cpu, op, spans);
     }
+    if matches!(op.op, JitTraceOp::MovemLongPredec { .. }) {
+        return execute_portable_movem_long_predec(cpu, op, spans);
+    }
+    if matches!(op.op, JitTraceOp::MovemLongPostInc { .. }) {
+        return execute_portable_movem_long_postinc(cpu, op);
+    }
     if matches!(op.op, JitTraceOp::Link { .. }) {
         return execute_portable_link(cpu, op, spans);
     }
@@ -3977,6 +4097,82 @@ fn execute_portable_movem_word_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -
     cpu.dar[8 + base as usize] = raw.wrapping_add(bytes);
     cpu.pc = trace.pc.wrapping_add(4);
     Some(cycles)
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_movem_long_predec(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    spans: CodeSpans,
+) -> Option<i32> {
+    let JitTraceOp::MovemLongPredec { base, mask, .. } = trace.op else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let total = 4 * mask.count_ones();
+    let base_val = cpu.dar[8 + base as usize];
+    let new_base = base_val.wrapping_sub(total);
+    if cpu.is_pre_68020 && (new_base & 1) != 0 {
+        return None;
+    }
+    let masked = new_base & cpu.address_mask;
+    let off = masked.wrapping_sub(cpu.fm_base);
+    // A window shorter than the whole transfer would wrap the limit into a
+    // large unsigned value and accept any offset; reject it first, as the
+    // word-MOVEM helper does.
+    if total > cpu.fm_len || off > cpu.fm_len - total {
+        return None;
+    }
+    // The whole transfer must miss both code intervals: the caller's and,
+    // for a call-through trace, the callee's.
+    if spans.store_hits_code(masked, total) {
+        return None;
+    }
+    for (slot, reg) in movem_predec_regs_ascending(mask).enumerate() {
+        let value = cpu.dar[reg];
+        unsafe {
+            let p = (cpu.fm_ptr as *mut u8).add(off as usize + 4 * slot);
+            let b = value.to_be_bytes();
+            *p = b[0];
+            *p.add(1) = b[1];
+            *p.add(2) = b[2];
+            *p.add(3) = b[3];
+        }
+    }
+    cpu.dar[8 + base as usize] = new_base;
+    Some(trace.op.max_cycles())
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_movem_long_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::MovemLongPostInc { base, mask, .. } = trace.op else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let total = 4 * mask.count_ones();
+    let base_val = cpu.dar[8 + base as usize];
+    if cpu.is_pre_68020 && (base_val & 1) != 0 {
+        return None;
+    }
+    let off = (base_val & cpu.address_mask).wrapping_sub(cpu.fm_base);
+    // See the predecrement path: a short window must bail before the
+    // limit arithmetic wraps.
+    if total > cpu.fm_len || off > cpu.fm_len - total {
+        return None;
+    }
+    for (slot, reg) in movem_postinc_regs_ascending(mask).enumerate() {
+        let value = unsafe {
+            let p = (cpu.fm_ptr as *const u8).add(off as usize + 4 * slot);
+            u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+        };
+        cpu.dar[reg] = value;
+    }
+    cpu.dar[8 + base as usize] = base_val.wrapping_add(total);
+    Some(trace.op.max_cycles())
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
@@ -5276,6 +5472,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::RtsReturn { .. } => {
             unreachable!("RtsReturn is handled by execute_portable_rts_return")
         }
+        JitTraceOp::MovemLongPredec { .. } | JitTraceOp::MovemLongPostInc { .. } => {
+            unreachable!("MOVEM.L is handled by execute_portable_movem_long_predec/postinc")
+        }
     }
 }
 
@@ -5904,6 +6103,9 @@ fn emit_jit_op(
         JitTraceOp::Link { .. } | JitTraceOp::Unlk { .. } => {
             unreachable!("LINK/UNLK are emitted by emit_link/emit_unlk")
         }
+        JitTraceOp::MovemLongPredec { .. } | JitTraceOp::MovemLongPostInc { .. } => {
+            unreachable!("MOVEM.L is emitted by emit_movem_long_predec/postinc")
+        }
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
             unreachable!("AnDisp ops are emitted by emit_an_disp_mem")
         }
@@ -6115,6 +6317,85 @@ fn emit_movem_word_postinc(
 }
 
 /// Big-endian sized store of (sized) `value` into the window.
+/// Emit `MOVEM.L <regs>,-(An)`. One range check covers the whole
+/// transfer; stores run in ascending-address order from the decremented
+/// base; the base register updates after every store commits.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_movem_long_predec(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::MovemLongPredec { base, mask, .. } = trace.op else {
+        unreachable!("expected MOVEM.L predec trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+    let total = 4 * mask.count_ones();
+    let base_val = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    let new_base = builder.ins().iadd_imm(base_val, -(total as i64));
+    let (off, masked) = checked_window_off_range(builder, env, bail, new_base, total);
+    guard_store_range_not_code(builder, env, bail, masked, total);
+    for (slot, reg) in movem_predec_regs_ascending(mask).enumerate() {
+        let direct = if reg < 8 {
+            JitDirectReg::Data(reg as u8)
+        } else {
+            JitDirectReg::Addr((reg - 8) as u8)
+        };
+        let value = load_reg(builder, cpu, direct);
+        let slot_off = builder.ins().iadd_imm(off, 4 * slot as i64);
+        window_store(builder, env, slot_off, Size::Long, value);
+    }
+    store_reg(builder, cpu, JitDirectReg::Addr(base), new_base);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit `MOVEM.L (An)+,<regs>`. One range check covers the whole
+/// transfer; loads run in ascending-address order; the base register
+/// updates after every register write.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_movem_long_postinc(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::MovemLongPostInc { base, mask, .. } = trace.op else {
+        unreachable!("expected MOVEM.L postinc trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+    let total = 4 * mask.count_ones();
+    let base_val = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    let (off, _) = checked_window_off_range(builder, env, bail, base_val, total);
+    for (slot, reg) in movem_postinc_regs_ascending(mask).enumerate() {
+        let slot_off = builder.ins().iadd_imm(off, 4 * slot as i64);
+        let value = window_load(builder, env, slot_off, Size::Long);
+        let direct = if reg < 8 {
+            JitDirectReg::Data(reg as u8)
+        } else {
+            JitDirectReg::Addr((reg - 8) as u8)
+        };
+        store_reg(builder, cpu, direct, value);
+    }
+    let new_base = builder.ins().iadd_imm(base_val, total as i64);
+    store_reg(builder, cpu, JitDirectReg::Addr(base), new_base);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn window_store(
     builder: &mut FunctionBuilder<'_>,
@@ -6162,6 +6443,74 @@ fn guard_store_not_code(
     // A call-through trace's callee is a second, disjoint code interval;
     // stores between the two regions are legal. Ordinary traces have a
     // zero-width callee interval and emit nothing here.
+    if env.callee_end > env.callee_start {
+        let lt_end = builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThan, masked, env.callee_end as i64);
+        let gt_start =
+            builder
+                .ins()
+                .icmp_imm(IntCC::UnsignedGreaterThan, past, env.callee_start as i64);
+        let in_callee = builder.ins().band(lt_end, gt_start);
+        bad = builder.ins().bor(bad, in_callee);
+    }
+    branch_guard(builder, bail, bad);
+}
+
+/// Bounds/alignment-check a contiguous `bytes`-long window access
+/// starting at `addr`. Like `checked_window_off` with a compile-time
+/// length: one check covers a whole MOVEM transfer, so every register
+/// slot is validated before anything commits.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn checked_window_off_range(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    bail: Block,
+    addr: Value,
+    bytes: u32,
+) -> (Value, Value) {
+    if env.aligned_only {
+        let low = builder.ins().band_imm(addr, 1);
+        let bad = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
+        branch_guard(builder, bail, bad);
+    }
+    // A window shorter than the whole transfer must bail before the limit
+    // below wraps to a large unsigned value and admits every offset.
+    let short_window =
+        builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
+    branch_guard(builder, bail, short_window);
+    let masked = builder.ins().band_imm(addr, env.address_mask as i64);
+    let off = builder.ins().isub(masked, env.fm_base);
+    let limit = builder.ins().iadd_imm(env.fm_len, -(bytes as i64));
+    let bad = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+    branch_guard(builder, bail, bad);
+    (off, masked)
+}
+
+/// Self-modification guard for a contiguous `bytes`-long store range:
+/// bail when [masked, masked+bytes) overlaps the trace's own code.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn guard_store_range_not_code(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    bail: Block,
+    masked: Value,
+    bytes: u32,
+) {
+    let lt_end = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedLessThan, masked, env.code_end as i64);
+    let past = builder.ins().iadd_imm(masked, bytes as i64);
+    let gt_start = builder
+        .ins()
+        .icmp_imm(IntCC::UnsignedGreaterThan, past, env.code_start as i64);
+    let mut bad = builder.ins().band(lt_end, gt_start);
+    // Same two-interval rule as `guard_store_not_code`: a call-through
+    // trace's callee is a second, disjoint code interval, and a MOVEM
+    // transfer that straddles it must bail before anything commits.
+    // Ordinary traces have a zero-width callee interval and emit nothing.
     if env.callee_end > env.callee_start {
         let lt_end = builder
             .ins()
@@ -15497,5 +15846,390 @@ mod portable_tests {
             native_cycles, step_cycles,
             "native charge equals the 68000 interpreter's"
         );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn movem_long_bails_atomically() {
+        // Out of window: the push range underflows the slab.
+        let ops = movem_roundtrip_ops();
+        let mut mem = vec![0u8; 0x1000];
+        let mut c = cpu();
+        c.set_cpu_type(CpuType::M68040);
+        c.set_d(2, 0xAAAA_0001);
+        c.set_a(7, 0x0008);
+        attach_window(&mut c, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&c, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("MOVEM round-trip loop should compile");
+        let packed = unsafe { compiled.call_native(&mut c, 1) };
+        assert_eq!((packed >> 32) as u32, 0, "bails before any store");
+        assert_eq!(c.a(7), 0x0008, "base untouched");
+        assert!(mem.iter().all(|&b| b == 0), "nothing committed");
+
+        // Store into the trace's own code: in-window, aligned, guarded.
+        let mut mem2 = vec![0u8; 0x1000];
+        let mut c2 = cpu();
+        c2.set_cpu_type(CpuType::M68040);
+        c2.set_a(7, 0x010A);
+        attach_window(&mut c2, &mut mem2);
+        let packed2 = unsafe { compiled.call_native(&mut c2, 1) };
+        assert_eq!((packed2 >> 32) as u32, 0, "own-span push bails");
+        assert_eq!(c2.a(7), 0x010A);
+
+        // Pre-68020 alignment: an odd base bails before anything moves.
+        let ops_68000 = movem_roundtrip_ops();
+        let mut mem3 = vec![0u8; 0x1000];
+        let mut c3 = cpu();
+        c3.set_cpu_type(CpuType::M68000);
+        c3.set_a(7, 0x0801);
+        attach_window(&mut c3, &mut mem3);
+        let mut jit3 = TraceJit::new();
+        let compiled3 = jit3
+            .compile_decoded_ops(
+                &c3,
+                0x0100,
+                CpuType::M68000,
+                ops_68000.clone(),
+                Some(0x0100),
+            )
+            .expect("MOVEM loop should compile for the 68000 too");
+        let packed3 = unsafe { compiled3.call_native(&mut c3, 1) };
+        assert_eq!((packed3 >> 32) as u32, 0, "odd base bails");
+        assert_eq!(c3.a(7), 0x0801);
+
+        // Portable parity for all three bails.
+        let mut pmem = vec![0u8; 0x1000];
+        let mut p = cpu();
+        p.set_cpu_type(CpuType::M68040);
+        p.set_a(7, 0x0008);
+        attach_window(&mut p, &mut pmem);
+        assert_eq!(
+            (execute_portable_trace(&mut p, &ops, CodeSpans::caller(0x0100, 0x010A)) >> 32) as u32,
+            0
+        );
+        p.set_a(7, 0x010A);
+        assert_eq!(
+            (execute_portable_trace(&mut p, &ops, CodeSpans::caller(0x0100, 0x010A)) >> 32) as u32,
+            0
+        );
+        let mut p3 = cpu();
+        p3.set_cpu_type(CpuType::M68000);
+        p3.set_a(7, 0x0801);
+        let mut pmem3 = vec![0u8; 0x1000];
+        attach_window(&mut p3, &mut pmem3);
+        assert_eq!(
+            (execute_portable_trace(&mut p3, &ops_68000, CodeSpans::caller(0x0100, 0x010A)) >> 32)
+                as u32,
+            0
+        );
+        assert_eq!(p3.a(7), 0x0801);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn movem_long_bails_on_a_window_shorter_than_the_transfer() {
+        // A nonempty window smaller than the whole transfer must bail on
+        // both engines with nothing committed. Before the precondition,
+        // the limit `fm_len - total` wrapped to a huge unsigned value, so
+        // offset zero passed the range check and the raw-pointer writes
+        // ran past the end of the window.
+        //
+        // Twelve bytes move (D2, D3, A2); the window is eight.
+        const SHORT: u32 = 8;
+        let push_op = TraceBuildOp {
+            opcode: 0x48E7,
+            extension: Some(0x3020),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::MovemLongPredec {
+                base: 7,
+                mask: 0x3020,
+                cycles: 32,
+            },
+        };
+        let pop_op = TraceBuildOp {
+            opcode: 0x4CDF,
+            extension: Some(0x3020),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::MovemLongPostInc {
+                base: 7,
+                mask: 0x3020,
+                cycles: 36,
+            },
+        };
+        let tail = TraceBuildOp {
+            opcode: 0x60FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+
+        for (label, op) in [("store", push_op), ("load", pop_op)] {
+            // The trailing bytes are the canary: a transfer that ignores
+            // the short window writes straight through them.
+            let mut mem = vec![0xAAu8; 0x1000];
+            let mut native = cpu();
+            native.set_cpu_type(CpuType::M68040);
+            native.set_d(2, 0x1111_2222);
+            native.set_d(3, 0x3333_4444);
+            native.set_a(2, 0x5555_6666);
+            native.set_a(7, 0x000C);
+            attach_window(&mut native, &mut mem);
+            native.fm_len = SHORT;
+            let before_regs = native.dar;
+            let before_mem = mem.clone();
+
+            let ops = vec![op, tail];
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+                .expect("MOVEM loop should still compile");
+            let packed = unsafe { compiled.call_native(&mut native, 1) };
+            assert_eq!(packed, 0, "{label}: native bails on the short window");
+            assert_eq!(native.dar, before_regs, "{label}: no register committed");
+            assert_eq!(mem, before_mem, "{label}: no byte written");
+
+            let mut pmem = vec![0xAAu8; 0x1000];
+            let mut portable = cpu();
+            portable.set_cpu_type(CpuType::M68040);
+            portable.set_d(2, 0x1111_2222);
+            portable.set_d(3, 0x3333_4444);
+            portable.set_a(2, 0x5555_6666);
+            portable.set_a(7, 0x000C);
+            attach_window(&mut portable, &mut pmem);
+            portable.fm_len = SHORT;
+            let ppacked =
+                execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x0106));
+            assert_eq!(ppacked, 0, "{label}: portable bails on the short window");
+            assert_eq!(
+                portable.dar, before_regs,
+                "{label}: portable commits no register"
+            );
+            assert_eq!(pmem, before_mem, "{label}: portable writes no byte");
+        }
+    }
+
+    #[test]
+    fn movem_long_decodes_and_excludes_base_in_list() {
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        let cpu = CpuCore::new();
+        // MOVEM.L D2/D3/A2,-(A7): predec mask bit 15-r -> 0x3020.
+        bus.write_word_at(0x0102, 0x3020);
+        let push = decode_movem_long_trace_op(&cpu, &mut bus, 0x0100, 0x48E7).unwrap();
+        assert!(matches!(
+            push.op,
+            JitTraceOp::MovemLongPredec {
+                base: 7,
+                mask: 0x3020,
+                cycles: 32
+            }
+        ));
+        assert_eq!(push.length(), 4);
+        // MOVEM.L (A7)+,D2/D3/A2: normal mask bit r -> 0x040C.
+        bus.write_word_at(0x0202, 0x040C);
+        let pop = decode_movem_long_trace_op(&cpu, &mut bus, 0x0200, 0x4CDF).unwrap();
+        assert!(matches!(
+            pop.op,
+            JitTraceOp::MovemLongPostInc {
+                base: 7,
+                mask: 0x040C,
+                cycles: 36
+            }
+        ));
+        assert_eq!(pop.length(), 4);
+        // The base register inside its own list is never admitted: the
+        // predec store's value is generation-dependent, the postinc load
+        // is overwritten by the final address.
+        bus.write_word_at(0x0302, 0x0001); // predec bit 0 = A7
+        assert!(decode_movem_long_trace_op(&cpu, &mut bus, 0x0300, 0x48E7).is_none());
+        bus.write_word_at(0x0402, 0x8000); // postinc bit 15 = A7
+        assert!(decode_movem_long_trace_op(&cpu, &mut bus, 0x0400, 0x4CDF).is_none());
+        // Word-size and other-EA forms fall back to the interpreter.
+        bus.write_word_at(0x0502, 0x0004);
+        assert!(decode_movem_long_trace_op(&cpu, &mut bus, 0x0500, 0x48A7).is_none());
+        assert!(decode_movem_long_trace_op(&cpu, &mut bus, 0x0500, 0x48D0).is_none());
+        // An empty mask falls back.
+        bus.write_word_at(0x0602, 0x0000);
+        assert!(decode_movem_long_trace_op(&cpu, &mut bus, 0x0600, 0x48E7).is_none());
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    fn movem_roundtrip_ops() -> Vec<TraceBuildOp> {
+        vec![
+            TraceBuildOp {
+                opcode: 0x48E7,
+                extension: Some(0x3020),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::MovemLongPredec {
+                    base: 7,
+                    mask: 0x3020,
+                    cycles: 32,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4CDF,
+                extension: Some(0x040C),
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::MovemLongPostInc {
+                    base: 7,
+                    mask: 0x040C,
+                    cycles: 36,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60F6,
+                extension: None,
+                extension2: None,
+                pc: 0x0108,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -10,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ]
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_movem_long_matches_portable() {
+        let ops = movem_roundtrip_ops();
+        let mut mem = vec![0u8; 0x1000];
+        let mut native = cpu();
+        native.set_cpu_type(CpuType::M68040);
+        native.set_d(2, 0x1111_2222);
+        native.set_d(3, 0x3333_4444);
+        native.set_a(2, 0x5555_6666);
+        native.set_a(7, 0x0800);
+        attach_window(&mut native, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("MOVEM round-trip loop should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!((packed >> 32) as u32, 3, "all ops retired");
+        assert_eq!(native.a(7), 0x0800, "stack balanced after push+pop");
+        assert_eq!(native.d(2), 0x1111_2222);
+        assert_eq!(native.d(3), 0x3333_4444);
+        assert_eq!(native.a(2), 0x5555_6666);
+        // Ascending addresses hold ascending registers: D2, D3, A2.
+        assert_eq!(&mem[0x07F4..0x07F8], &0x1111_2222u32.to_be_bytes());
+        assert_eq!(&mem[0x07F8..0x07FC], &0x3333_4444u32.to_be_bytes());
+        assert_eq!(&mem[0x07FC..0x0800], &0x5555_6666u32.to_be_bytes());
+
+        let mut pmem = vec![0u8; 0x1000];
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_d(2, 0x1111_2222);
+        portable.set_d(3, 0x3333_4444);
+        portable.set_a(2, 0x5555_6666);
+        portable.set_a(7, 0x0800);
+        attach_window(&mut portable, &mut pmem);
+        let ppacked =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x010A));
+        assert_eq!(ppacked, packed, "retired count and cycles agree");
+        assert_eq!(portable.a(7), native.a(7));
+        assert_eq!(pmem, mem, "memory effects agree");
+    }
+
+    /// The MOVEM range guard has to honour the *second* code interval, not
+    /// just the caller's. A call-through trace carries a far callee, and a
+    /// predecrement frame push whose range straddles the callee's own bytes
+    /// must bail with nothing committed -- exactly as a single-word store
+    /// aimed there does. A caller-only range check would let it through and
+    /// the trace would overwrite the code it is about to return into.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn movem_predec_into_far_callee_code_bails_before_committing() {
+        let mut ops = far_call_store_loop_ops();
+        // Replace the plain store with a MOVEM.L push through A0. Two
+        // registers, so the range is [A0-8, A0).
+        ops[2] = TraceBuildOp {
+            opcode: 0x48E0,
+            extension: Some(0x0300),
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::MovemLongPredec {
+                base: 0,
+                mask: 0x0300,
+                cycles: 24,
+            },
+        };
+        let spans = CodeSpans {
+            code_start: 0x0100,
+            code_end: 0x0108,
+            callee_start: 0x8100,
+            callee_end: 0x8102,
+        };
+
+        // A0 = 0x8108 puts the range at [0x8100, 0x8108): it covers the
+        // callee's bytes and misses the caller's entirely.
+        let prepare = |mem: &mut [u8]| {
+            let mut c = cpu();
+            c.set_cpu_type(CpuType::M68040);
+            c.set_a(7, 0x0800);
+            c.set_a(0, 0x8108);
+            c.set_d(0, 0xDEAD_BEEF);
+            c.set_d(1, 0xFEED_FACE);
+            attach_window(&mut c, mem);
+            c
+        };
+
+        let mut mem = vec![0u8; 0x10000];
+        let mut native = prepare(&mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("far call/MOVEM trace should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!(
+            (packed >> 32) as u32,
+            2,
+            "the call and return retired; the callee-code MOVEM did not"
+        );
+        assert_eq!(
+            &mem[0x8100..0x8108],
+            &[0u8; 8],
+            "nothing from the bailed transfer committed"
+        );
+        assert_eq!(native.a(0), 0x8108, "the base register did not move");
+        assert_eq!(native.pc, 0x0104, "resume at the MOVEM for full dispatch");
+
+        let mut pmem = vec![0u8; 0x10000];
+        let mut portable = prepare(&mut pmem);
+        let ppacked = execute_portable_trace(&mut portable, &ops, spans);
+        assert_eq!(
+            (ppacked >> 32) as u32,
+            2,
+            "portable bails on the same transfer"
+        );
+        assert_eq!(&pmem[0x8100..0x8108], &[0u8; 8]);
+        assert_eq!(portable.a(0), 0x8108);
+
+        // The discriminator: moved clear of both intervals, the very same
+        // transfer must retire. Without this the test would also pass if
+        // MOVEM simply never compiled inside a call-through trace.
+        let mut gapmem = vec![0u8; 0x10000];
+        let mut gap = prepare(&mut gapmem);
+        gap.set_a(0, 0x4000);
+        let gpacked = execute_portable_trace(&mut gap, &ops, spans);
+        assert_eq!(
+            (gpacked >> 32) as u32,
+            4,
+            "a transfer clear of both intervals retires"
+        );
+        assert_eq!(gap.a(0), 0x3FF8, "the base register moved for the push");
     }
 }

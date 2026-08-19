@@ -1631,3 +1631,31 @@ fn memory_and_loop_matches_step() {
         cpu.set_d(7, 5);
     });
 }
+
+/// The ROM caller-save idiom: MOVEM.L push, body, MOVEM.L pop, loop.
+/// The counters live outside the saved mask (the pop restores D2/D3/A2
+/// every iteration). Must match step() exactly through the lifecycle.
+#[test]
+fn movem_long_roundtrip_loop_matches_step() {
+    let words = &[
+        0x48E7, 0x3020, // $1000: MOVEM.L D2/D3/A2,-(SP)
+        0x5284, // $1004: ADDQ.L #1,D4
+        0x5285, // $1006: ADDQ.L #1,D5
+        0x3684, // $1008: MOVE.W D4,(A3)
+        0x4CDF, 0x040C, // $100A: MOVEM.L (SP)+,D2/D3/A2
+        0x51C8, 0xFFF0, // $100E: DBRA D0,$1000
+        0x5347, // $1012: SUBQ.W #1,D7
+        0x6602, // $1014: BNE.S $1018
+        0xA000, // $1016: sentinel
+        0x707F, // $1018: MOVEQ #127,D0
+        0x60E4, // $101A: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("MOVEM.L round-trip loop", words, CpuType::M68040, |cpu| {
+        cpu.set_d(2, 0x1111_2222);
+        cpu.set_d(3, 0x3333_4444);
+        cpu.set_a(2, 0x5555_6666);
+        cpu.set_a(3, 0x4000);
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}

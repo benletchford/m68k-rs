@@ -1867,6 +1867,62 @@ fn bench_tst_abs_loop() {
     );
 }
 
+/// The ROM caller-save idiom the gameplay profile names as the top
+/// blocked class after LINK admission: MOVEM.L push, a short body,
+/// MOVEM.L pop, loop. Base cannot admit the register-mask forms and
+/// interprets the whole loop.
+fn bench_movem_frame_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x48E7, 0x3020, // head: MOVEM.L D2/D3/A2,-(SP)
+        0x5284, // ADDQ.L #1,D4
+        0x5285, // ADDQ.L #1,D5
+        0x3684, // MOVE.W D4,(A3)
+        0x4CDF, 0x040C, // MOVEM.L (SP)+,D2/D3/A2
+        0x51C8, 0xFFF0, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60EA, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(3, 0x4000);
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(4) > 5_000, "the loop actually iterated");
+    assert!(
+        cpu.d(4).abs_diff(cpu.d(5)) <= 1,
+        "counters advance in lockstep"
+    );
+    assert!(
+        cpu.a(7) == 0x8000 || cpu.a(7) == 0x7FF4,
+        "stack balanced or exactly mid-bracket: {:#06x}",
+        cpu.a(7)
+    );
+    println!(
+        "batch     movem frame loop        {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 fn main() {
     println!("m68k microbench");
     let only = std::env::args().nth(1);
@@ -1948,6 +2004,10 @@ fn main() {
     }
     if only.as_deref() == Some("tst-abs") {
         bench_tst_abs_loop();
+        return;
+    }
+    if only.as_deref() == Some("movem") {
+        bench_movem_frame_loop();
         return;
     }
     if only.as_deref() == Some("clr-abs") {
