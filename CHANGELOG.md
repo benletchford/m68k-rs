@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.11.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.14...m68k-v0.11.0) (2026-08-20)
+
+
+### Features
+
+* **profile:** add per-head chained-call and retirement counters ([dea0b11](https://github.com/benletchford/m68k-rs/commit/dea0b1170c7be3271300fa06e822bf919a051ea6))
+
+
+### Bug Fixes
+
+* **jit:** use initialized TLS in rejection tests ([416198e](https://github.com/benletchford/m68k-rs/commit/416198ef6f7abb019fa4abde4f0373f66677f0da))
+
+
+### Performance Improvements
+
+* admit long register-mask MOVEM push/pop into traces ([#111](https://github.com/benletchford/m68k-rs/issues/111)) ([db55299](https://github.com/benletchford/m68k-rs/commit/db55299089cfe45dfbdd91b26ce151b9ea220e66))
+* admit the profiled small forms (PEA abs, CMPI.W d16, MOVE #imm,Dn) ([345f8fd](https://github.com/benletchford/m68k-rs/commit/345f8fd622e558ea9e46753c3551dc99dacd0d43))
+* **jit:** admit TST.B/W/L (An) into traces ([500bf92](https://github.com/benletchford/m68k-rs/commit/500bf9229ab0c9a13d74260a296cb0c327c80e14))
+* **jit:** const-initialize the trace-JIT thread-local ([5b791f6](https://github.com/benletchford/m68k-rs/commit/5b791f6027edfbfd072b9e28df2ce8553d065e55))
+* **jit:** make structural trace rejection durable safely ([6202aec](https://github.com/benletchford/m68k-rs/commit/6202aec49b7fa2db69f4a127a0594c268fe81a24))
+
 ## [0.10.14](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.13...m68k-v0.10.14) (2026-08-14)
 
 
