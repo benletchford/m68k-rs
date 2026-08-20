@@ -17118,7 +17118,7 @@ mod durable_rejection_tests {
         }
         let attempts_after_warmup = attempts_for(HEAD_A);
         assert!(
-            TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_A)),
+            with_trace_jit(|jit| jit.is_structurally_rejected(HEAD_A)),
             "HEAD_A must be remembered as structurally rejected (attempts={attempts_after_warmup})"
         );
         // Keep going: B keeps counting into the shared slot (evicting A's
@@ -17138,7 +17138,7 @@ mod durable_rejection_tests {
     #[test]
     fn rewritten_code_clears_the_structural_verdict() {
         // Once remembered, HEAD_A stays refused -- until its code changes.
-        TRACE_JIT.with_borrow_mut(|jit| {
+        with_trace_jit(|jit| {
             jit.remember_structural_rejection(HEAD_A);
             assert!(jit.is_structurally_rejected(HEAD_A));
             jit.forget_structural_rejection(HEAD_A);
@@ -17154,7 +17154,7 @@ mod durable_rejection_tests {
         // outer head, which closes cleanly on some data-dependent passes and
         // stops on a non-terminal on others) is exempt, so it can re-record
         // its compilable shape instead of being permanently filtered out.
-        TRACE_JIT.with_borrow_mut(|jit| {
+        with_trace_jit(|jit| {
             // Never-compiled head: NoTraceTerminal IS durable (unchanged).
             assert!(!jit.has_compiled_before(HEAD_B));
             let durable_b = !jit.has_compiled_before(HEAD_B);
@@ -17179,7 +17179,7 @@ mod durable_rejection_tests {
 
     #[test]
     fn compiled_before_is_two_way_and_pc_specific() {
-        TRACE_JIT.with_borrow_mut(|jit| {
+        with_trace_jit(|jit| {
             jit.remember_compiled(HEAD_A);
             jit.remember_compiled(HEAD_B);
             assert!(jit.has_compiled_before(HEAD_A));
@@ -17204,7 +17204,7 @@ mod durable_rejection_tests {
         let mut cpu = cpu_at(HEAD_A);
         cpu.set_a(0, HEAD_B);
         cpu.set_a(1, HEAD_A);
-        TRACE_JIT.with_borrow_mut(|jit| jit.remember_compiled(HEAD_A));
+        with_trace_jit(|jit| jit.remember_compiled(HEAD_A));
 
         for _ in 0..40 {
             cpu.set_d(7, 3);
@@ -17212,7 +17212,7 @@ mod durable_rejection_tests {
             cpu.run_batch(&mut bus, 200, &[]);
         }
         assert!(
-            !TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_A)),
+            !with_trace_jit(|jit| jit.is_structurally_rejected(HEAD_A)),
             "a compiled-before head must NOT be durably rejected by a \
              no-terminal pass"
         );
@@ -17236,7 +17236,7 @@ mod durable_rejection_tests {
 
     #[test]
     fn no_terminal_strikes_accumulate_to_durable_and_a_compile_clears_them() {
-        TRACE_JIT.with_borrow_mut(|jit| {
+        with_trace_jit(|jit| {
             // Strikes count per pc and only the limit-th makes the verdict
             // durable-eligible.
             for expected in 1..NO_TERMINAL_STRIKE_LIMIT {
@@ -17311,11 +17311,11 @@ mod durable_rejection_tests {
         }
         assert!(recorded, "HEAD_C must record at least once in phase 1");
         assert!(
-            TRACE_JIT.with_borrow(|jit| jit.has_no_terminal_strikes(HEAD_C)),
+            with_trace_jit(|jit| jit.has_no_terminal_strikes(HEAD_C)),
             "the phase-1 recording must have ended no-trace-terminal"
         );
         assert!(
-            !TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_C)),
+            !with_trace_jit(|jit| jit.is_structurally_rejected(HEAD_C)),
             "one non-closing recording on a never-compiled head must not \
              be a durable verdict (attempts={})",
             attempts_for(HEAD_C)
@@ -17332,7 +17332,7 @@ mod durable_rejection_tests {
             cpu.set_d(7, 1);
             cpu.pc = DRIVER;
             cpu.run_batch(&mut bus, 5, &[]);
-            compiled = TRACE_JIT.with_borrow(|jit| {
+            compiled = with_trace_jit(|jit| {
                 matches!(
                     &jit.slots[trace_cache_index(HEAD_C)],
                     TraceSlot::Compiled(trace) if trace.pc == HEAD_C
@@ -17347,11 +17347,11 @@ mod durable_rejection_tests {
             "the closing path must still compile a head whose first \
              recording was no-terminal (attempts={}, durable={})",
             attempts_for(HEAD_C),
-            TRACE_JIT.with_borrow(|jit| jit.is_structurally_rejected(HEAD_C))
+            with_trace_jit(|jit| jit.is_structurally_rejected(HEAD_C))
         );
         // The compile disproved the strikes.
         assert!(
-            !TRACE_JIT.with_borrow(|jit| jit.has_no_terminal_strikes(HEAD_C)),
+            !with_trace_jit(|jit| jit.has_no_terminal_strikes(HEAD_C)),
             "a successful compile clears the head's no-terminal strikes"
         );
     }
