@@ -204,6 +204,14 @@ pub(crate) enum JitTraceOp {
         reg: u8,
         data: u32,
     },
+    /// `MOVE.W/L #imm,Dn`: a full-width immediate load into a data
+    /// register. Pure register op -- NZ set from the sized value, VC
+    /// cleared, X preserved; word writes merge into the low word.
+    MoveImmReg {
+        reg: u8,
+        size: Size,
+        value: u32,
+    },
     UnaryDataReg {
         op: JitUnaryOp,
         reg: u8,
@@ -464,6 +472,13 @@ pub(crate) enum JitTraceOp {
     PeaDisp {
         reg: u8,
         displacement: i16,
+    },
+    /// `PEA (xxx).W` / `PEA (xxx).L`: push a constant address through the
+    /// checked window. Same store discipline as [`Self::PeaDisp`]; the
+    /// cycle charge carries the absolute form's extension-fetch cost.
+    PeaAbs {
+        address: u32,
+        cycles: i32,
     },
     /// `LINK An,#d16`: push An through the checked window, point An at the
     /// pushed frame, then move SP by the displacement. No condition code
@@ -1820,6 +1835,7 @@ impl TraceJit {
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::PeaDisp { .. }
+                    | JitTraceOp::PeaAbs { .. }
                     | JitTraceOp::Link { .. }
                     | JitTraceOp::Unlk { .. }
                     | JitTraceOp::MovemLongPredec { .. }
@@ -2149,8 +2165,8 @@ impl TraceJit {
                         let env = mem_env.as_ref().expect("RtsReturn implies a window env");
                         emit_rts_return(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
-                    JitTraceOp::PeaDisp { .. } => {
-                        let env = mem_env.as_ref().expect("PeaDisp implies a window env");
+                    JitTraceOp::PeaDisp { .. } | JitTraceOp::PeaAbs { .. } => {
+                        let env = mem_env.as_ref().expect("PEA implies a window env");
                         emit_pea_disp(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
                     _ => emit_jit_op(&mut builder, cpu_ptr, *op, aligned_only),
@@ -2420,11 +2436,13 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::MemAddqSubq { .. }
             | JitTraceOp::AnDispBit { .. }
             | JitTraceOp::PeaDisp { .. }
+            | JitTraceOp::PeaAbs { .. }
             | JitTraceOp::Link { .. }
             | JitTraceOp::Unlk { .. }
             | JitTraceOp::MovemLongPredec { .. }
             | JitTraceOp::MovemLongPostInc { .. }
             | JitTraceOp::ClrMem { .. }
+            | JitTraceOp::MoveImmReg { .. }
             | JitTraceOp::MoveImmMem { .. }
             | JitTraceOp::CallThrough { .. }
             | JitTraceOp::RtsReturn { .. } => return false,
@@ -2635,6 +2653,11 @@ impl JitTraceOp {
             Self::Nop => 4,
             Self::MoveReg { .. } => 4,
             Self::Moveq { .. } => 4,
+            // MC68000: 8(2/0) for the word form, 12(3/0) for the long.
+            Self::MoveImmReg {
+                size: Size::Word, ..
+            } => 8,
+            Self::MoveImmReg { .. } => 12,
             Self::UnaryDataReg { .. } => 6,
             Self::Swap { .. } => 4,
             Self::Ext { .. } => 4,
@@ -2787,7 +2810,13 @@ impl JitTraceOp {
             Self::AluMemToReg { .. } => 24,
             // MC68000 CMPI.W uses an eight-cycle base plus the ten-cycle
             // brief-indexed effective-address read.
-            Self::CmpiWordMem { .. } => 18,
+            // Indexed carries the brief-extension EA time; d16(An) is two
+            // cycles cheaper on the MC68000.
+            Self::CmpiWordMem {
+                src: JitEa::Index { .. },
+                ..
+            } => 18,
+            Self::CmpiWordMem { .. } => 16,
             // TST is a four-cycle operation plus the indexed EA read
             // (M68000UM); byte and word reads have the same EA cost.
             Self::TstMem { size, src } => match (size, src) {
@@ -2835,6 +2864,7 @@ impl JitTraceOp {
             // MC68000 PEA (d16,An): twelve-cycle push plus the four-cycle
             // displacement extension fetch.
             Self::PeaDisp { .. } => 16,
+            Self::PeaAbs { cycles, .. } => cycles,
             // Interpreter parity: exec_link charges 16, exec_unlk 12.
             Self::Link { .. } => 16,
             Self::Unlk { .. } => 12,
@@ -2934,6 +2964,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_movem_long_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_move_imm_reg_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
     if let Some(op) = decode_move_imm_mem_trace_op(cpu, bus, pc, opcode) {
@@ -3039,6 +3072,39 @@ fn decode_movem_long_trace_op<B: AddressBus>(
         extension2: None,
         pc,
         op,
+    })
+}
+
+/// Decode `MOVE.W #imm,Dn` / `MOVE.L #imm,Dn`. The full-width immediate
+/// loads the profile shows in ROM prologues (`203C` shapes); byte and
+/// address-register destinations fall back.
+fn decode_move_imm_reg_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    // 00ss rrr0 0011 1100: immediate source, data-register destination.
+    let size = match opcode & 0xF1FF {
+        0x303C => Size::Word,
+        0x203C => Size::Long,
+        _ => return None,
+    };
+    let reg = ((opcode >> 9) & 7) as u8;
+    let hi = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    let (value, extension2) = match size {
+        Size::Word => (u32::from(hi), None),
+        _ => {
+            let lo = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+            ((u32::from(hi) << 16) | u32::from(lo), Some(lo))
+        }
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(hi),
+        extension2,
+        pc,
+        op: JitTraceOp::MoveImmReg { reg, size, value },
     })
 }
 
@@ -3175,14 +3241,18 @@ fn decode_cmpi_word_mem_trace_op<B: AddressBus>(
     let DecodedMemOp::AluImm {
         op: BinaryOp::Cmp,
         size: Size::Word,
-        dst: FastEa::AnIndex(base),
+        dst,
     } = DecodedMemOp::decode(cpu_type, opcode)?
     else {
         return None;
     };
     let immediate = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
     let ea_extension = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
-    let src = decode_jit_ea(6, u16::from(base), ea_extension, cpu_type)?;
+    let src = match dst {
+        FastEa::AnIndex(base) => decode_jit_ea(6, u16::from(base), ea_extension, cpu_type)?,
+        FastEa::AnDisp(base) => JitEa::Disp(base, ea_extension as i16),
+        _ => return None,
+    };
     Some(TraceBuildOp {
         opcode,
         extension: Some(immediate),
@@ -3473,6 +3543,29 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                 JitTraceOp::PeaDisp {
                     reg,
                     displacement: displacement as i16,
+                },
+            )
+        }
+        DecodedMemOp::Pea { ea: FastEa::AbsW } => {
+            let extension = read_ext(2, bus)?;
+            (
+                Some(extension),
+                None,
+                JitTraceOp::PeaAbs {
+                    address: extension as i16 as i32 as u32,
+                    cycles: 16,
+                },
+            )
+        }
+        DecodedMemOp::Pea { ea: FastEa::AbsL } => {
+            let hi = read_ext(2, bus)?;
+            let lo = read_ext(4, bus)?;
+            (
+                Some(hi),
+                Some(lo),
+                JitTraceOp::PeaAbs {
+                    address: (u32::from(hi) << 16) | u32::from(lo),
+                    cycles: 20,
                 },
             )
         }
@@ -4040,7 +4133,10 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     if matches!(op.op, JitTraceOp::RtsReturn { .. }) {
         return execute_portable_rts_return(cpu, op);
     }
-    if matches!(op.op, JitTraceOp::PeaDisp { .. }) {
+    if matches!(
+        op.op,
+        JitTraceOp::PeaDisp { .. } | JitTraceOp::PeaAbs { .. }
+    ) {
         return execute_portable_pea_disp(cpu, op, spans);
     }
     if matches!(
@@ -4242,8 +4338,12 @@ fn execute_portable_pea_disp(
     trace: TraceBuildOp,
     spans: CodeSpans,
 ) -> Option<i32> {
-    let JitTraceOp::PeaDisp { reg, .. } = trace.op else {
-        return None;
+    let ea = match trace.op {
+        JitTraceOp::PeaDisp { reg, .. } => FastEa::AnDisp(reg),
+        // The opcode's EA field distinguishes the absolute widths.
+        JitTraceOp::PeaAbs { .. } if trace.opcode & 0x3F == 0x38 => FastEa::AbsW,
+        JitTraceOp::PeaAbs { .. } => FastEa::AbsL,
+        _ => return None,
     };
     let sp = cpu.dar[15].wrapping_sub(4);
     let masked = sp & cpu.address_mask;
@@ -4252,12 +4352,7 @@ fn execute_portable_pea_disp(
     }
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
-    if super::mem_ops::execute_mem_op(
-        cpu,
-        DecodedMemOp::Pea {
-            ea: FastEa::AnDisp(reg),
-        },
-    ) {
+    if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::Pea { ea }) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -4427,12 +4522,16 @@ fn execute_portable_alu_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Op
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_cmpi_word_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
-    let JitTraceOp::CmpiWordMem {
-        src: JitEa::Index { base, .. },
-        ..
-    } = trace.op
-    else {
-        return None;
+    let dst = match trace.op {
+        JitTraceOp::CmpiWordMem {
+            src: JitEa::Index { base, .. },
+            ..
+        } => FastEa::AnIndex(base),
+        JitTraceOp::CmpiWordMem {
+            src: JitEa::Disp(base, _),
+            ..
+        } => FastEa::AnDisp(base),
+        _ => return None,
     };
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
@@ -4441,7 +4540,7 @@ fn execute_portable_cmpi_word_mem(cpu: &mut CpuCore, trace: TraceBuildOp) -> Opt
         DecodedMemOp::AluImm {
             op: BinaryOp::Cmp,
             size: Size::Word,
-            dst: FastEa::AnIndex(base),
+            dst,
         },
     ) {
         Some(trace.op.max_cycles())
@@ -4930,6 +5029,11 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             cpu.v_flag = 0;
             cpu.c_flag = 0;
             4
+        }
+        JitTraceOp::MoveImmReg { reg, size, value } => {
+            portable_write_data_reg(cpu, reg, size, value);
+            cpu.set_logic_flags(value, size);
+            op.op.max_cycles()
         }
         JitTraceOp::MoveReg { src, dst, size } => {
             let value = portable_read_reg(cpu, src, size);
@@ -5460,8 +5564,8 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
             unreachable!("AnDisp ops are handled by execute_portable_an_disp")
         }
-        JitTraceOp::PeaDisp { .. } => {
-            unreachable!("PeaDisp is handled by execute_portable_pea_disp")
+        JitTraceOp::PeaDisp { .. } | JitTraceOp::PeaAbs { .. } => {
+            unreachable!("PEA is handled by execute_portable_pea_disp")
         }
         JitTraceOp::Link { .. } | JitTraceOp::Unlk { .. } => {
             unreachable!("LINK/UNLK are handled by execute_portable_link/unlk")
@@ -5503,6 +5607,12 @@ fn emit_jit_op(
     let trace_pc = op.pc;
     match op.op {
         JitTraceOp::Nop => cycles_const(builder, 4),
+        JitTraceOp::MoveImmReg { reg, size, value } => {
+            let imm = iconst_u32(builder, value);
+            write_data_reg_sized(builder, cpu, reg, size, imm);
+            set_logic_flags(builder, cpu, imm, size);
+            cycles_const(builder, op.op.max_cycles())
+        }
         JitTraceOp::Moveq { reg, data } => {
             let data = iconst_u32(builder, data);
             store_reg(builder, cpu, JitDirectReg::Data(reg), data);
@@ -6109,8 +6219,8 @@ fn emit_jit_op(
         JitTraceOp::AnDispUnary { .. } | JitTraceOp::AnDispBit { .. } => {
             unreachable!("AnDisp ops are emitted by emit_an_disp_mem")
         }
-        JitTraceOp::PeaDisp { .. } => {
-            unreachable!("PeaDisp is emitted by emit_pea_disp")
+        JitTraceOp::PeaDisp { .. } | JitTraceOp::PeaAbs { .. } => {
+            unreachable!("PEA is emitted by emit_pea_disp")
         }
         JitTraceOp::CallThrough { .. } => {
             unreachable!("CallThrough is emitted by emit_call_through")
@@ -6828,19 +6938,8 @@ fn emit_cmpi_word_mem(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::CmpiWordMem {
-        immediate,
-        src:
-            JitEa::Index {
-                base,
-                index,
-                index_long,
-                scale,
-                displacement,
-            },
-    } = trace.op
-    else {
-        unreachable!("indexed CMPI decoder admitted an unsupported EA")
+    let JitTraceOp::CmpiWordMem { immediate, src } = trace.op else {
+        unreachable!("expected a memory CMPI trace")
     };
     let bail = builder.create_block();
     bails.push(BailReq {
@@ -6849,21 +6948,36 @@ fn emit_cmpi_word_mem(
         at,
     });
 
-    let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
-    let raw_index = load_reg(builder, cpu, index);
-    let index = if index_long {
-        raw_index
-    } else {
-        let word = builder.ins().ireduce(types::I16, raw_index);
-        builder.ins().sextend(types::I32, word)
+    let address = match src {
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let address = builder.ins().iadd(base, index);
+            builder.ins().iadd_imm(address, displacement as i64)
+        }
+        JitEa::Disp(base, displacement) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            builder.ins().iadd_imm(base, displacement as i64)
+        }
+        _ => unreachable!("memory CMPI decoder admitted an unsupported EA"),
     };
-    let index = if scale == 0 {
-        index
-    } else {
-        builder.ins().ishl_imm(index, i64::from(scale))
-    };
-    let address = builder.ins().iadd(base, index);
-    let address = builder.ins().iadd_imm(address, displacement as i64);
     let (off, _) = checked_window_off(builder, env, bail, address, Size::Word);
     let dst_value = window_load(builder, env, off, Size::Word);
     let immediate = iconst_u32(builder, u32::from(immediate));
@@ -7300,9 +7414,6 @@ fn emit_pea_disp(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::PeaDisp { reg, displacement } = trace.op else {
-        unreachable!("expected PEA displacement trace")
-    };
     let bail = builder.create_block();
     bails.push(BailReq {
         block: bail,
@@ -7310,12 +7421,22 @@ fn emit_pea_disp(
         at,
     });
 
-    let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
-    let address = builder.ins().iadd_imm(base, displacement as i64);
-    let sp = if reg == 7 {
-        base
-    } else {
-        load_reg(builder, cpu, JitDirectReg::Addr(7))
+    let (address, sp) = match trace.op {
+        JitTraceOp::PeaDisp { reg, displacement } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            let address = builder.ins().iadd_imm(base, displacement as i64);
+            let sp = if reg == 7 {
+                base
+            } else {
+                load_reg(builder, cpu, JitDirectReg::Addr(7))
+            };
+            (address, sp)
+        }
+        JitTraceOp::PeaAbs { address, .. } => (
+            iconst_u32(builder, address),
+            load_reg(builder, cpu, JitDirectReg::Addr(7)),
+        ),
+        _ => unreachable!("expected a PEA trace"),
     };
     let new_sp = builder.ins().iadd_imm(sp, -4);
     let (off, masked) = checked_window_off(builder, env, bail, new_sp, Size::Long);
@@ -16231,5 +16352,410 @@ mod portable_tests {
             "a transfer clear of both intervals retires"
         );
         assert_eq!(gap.a(0), 0x3FF8, "the base register moved for the push");
+    }
+
+    #[test]
+    fn pea_abs_decodes_both_widths_with_sign_extension() {
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        let cpu = CpuCore::new();
+        bus.write_word_at(0x0100, 0x4878);
+        bus.write_word_at(0x0102, 0x3000);
+        let short = decode_trace_op(&cpu, &mut bus, 0x0100, CpuType::M68040).unwrap();
+        assert!(matches!(
+            short.op,
+            JitTraceOp::PeaAbs {
+                address: 0x3000,
+                cycles: 16
+            }
+        ));
+        assert_eq!(short.length(), 4);
+        // (xxx).W sign-extends.
+        bus.write_word_at(0x0202, 0x8000);
+        bus.write_word_at(0x0200, 0x4878);
+        let negative = decode_trace_op(&cpu, &mut bus, 0x0200, CpuType::M68040).unwrap();
+        assert!(matches!(
+            negative.op,
+            JitTraceOp::PeaAbs {
+                address: 0xFFFF_8000,
+                cycles: 16
+            }
+        ));
+        // (xxx).L carries two extension words.
+        bus.write_word_at(0x0300, 0x4879);
+        bus.write_word_at(0x0302, 0x0012);
+        bus.write_word_at(0x0304, 0x3456);
+        let long = decode_trace_op(&cpu, &mut bus, 0x0300, CpuType::M68040).unwrap();
+        assert!(matches!(
+            long.op,
+            JitTraceOp::PeaAbs {
+                address: 0x0012_3456,
+                cycles: 20
+            }
+        ));
+        assert_eq!(long.length(), 6);
+    }
+    #[test]
+    fn cmpi_word_disp_matches_the_interpreter_with_exact_68000_cycles() {
+        // The displacement form joins the indexed one; both differential
+        // against step() on a 68000 for exact flags and cycle charge.
+        let cases: [(&[u16], &str); 2] = [
+            (&[0x0C68, 0x0042, 0x0010], "CMPI.W #imm,(d16,A0)"),
+            (&[0x0C70, 0x0042, 0x2004], "CMPI.W #imm,(4,A0,D2.W)"),
+        ];
+        for (words, label) in cases {
+            let setup = |c: &mut CpuCore| {
+                c.set_cpu_type(CpuType::M68000);
+                c.set_a(0, 0x0300);
+                c.set_d(2, 0x0006);
+                c.set_ccr(0x10); // X must survive; NZVC must be rewritten
+                c.pc = 0x0100;
+            };
+            let mut ibus = super::super::memory::LinearMemoryBus::new(0x1000);
+            for (index, word) in words.iter().enumerate() {
+                ibus.write_word(0x0100 + index as u32 * 2, *word);
+            }
+            ibus.write_word(0x0310, 0x0042); // equal at d16 target -> Z
+            ibus.write_word(0x030A, 0x0041); // below at indexed target
+            let mut icpu = cpu();
+            setup(&mut icpu);
+            let icycles = match icpu.step(&mut ibus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+            let mut pmem = vec![0u8; 0x1000];
+            for (index, word) in words.iter().enumerate() {
+                pmem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            pmem[0x0310..0x0312].copy_from_slice(&0x0042u16.to_be_bytes());
+            pmem[0x030A..0x030C].copy_from_slice(&0x0041u16.to_be_bytes());
+            let mut pcpu = cpu();
+            setup(&mut pcpu);
+            attach_window(&mut pcpu, &mut pmem);
+            let t = decode_trace_op(&pcpu, &mut ibus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: should decode"));
+            assert!(matches!(t.op, JitTraceOp::CmpiWordMem { .. }), "{label}");
+            let pcycles = execute_portable_op(
+                &mut pcpu,
+                t,
+                CodeSpans::caller(0x0100, 0x0100 + words.len() as u32 * 2),
+            )
+            .unwrap_or_else(|| panic!("{label}: portable executes"));
+            assert_eq!(pcpu.dar, icpu.dar, "{label}: registers");
+            assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "{label}: NZVCX");
+            assert_eq!(
+                pcycles, icycles,
+                "{label}: the trace cycle charge must equal the 68000's"
+            );
+        }
+    }
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_cmpi_word_disp_matches_portable() {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x0C68,
+                extension: Some(0x0042),
+                extension2: Some(0x0010),
+                pc: 0x0100,
+                op: JitTraceOp::CmpiWordMem {
+                    immediate: 0x0042,
+                    src: JitEa::Disp(0, 0x0010),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60F8,
+                extension: None,
+                extension2: None,
+                pc: 0x0106,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -8,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let seed = |mem: &mut [u8]| {
+            for (index, word) in [0x0C68u16, 0x0042, 0x0010, 0x60F8].iter().enumerate() {
+                mem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+            mem[0x0310..0x0312].copy_from_slice(&0x0042u16.to_be_bytes());
+        };
+        let mut mem = vec![0u8; 0x1000];
+        seed(&mut mem);
+        let mut native = cpu();
+        native.set_cpu_type(CpuType::M68040);
+        native.set_a(0, 0x0300);
+        native.set_ccr(0x10);
+        attach_window(&mut native, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("CMPI disp loop should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!((packed >> 32) as u32, 2, "all ops retired");
+        assert_eq!(native.get_ccr() & 0x4, 0x4, "equal compare sets Z");
+        assert_ne!(native.get_ccr() & 0x10, 0, "X preserved");
+
+        let mut pmem = vec![0u8; 0x1000];
+        seed(&mut pmem);
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_a(0, 0x0300);
+        portable.set_ccr(0x10);
+        attach_window(&mut portable, &mut pmem);
+        let ppacked =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x0108));
+        assert_eq!(ppacked, packed, "retired count and cycles agree");
+        assert_eq!(portable.get_ccr(), native.get_ccr(), "flags agree");
+
+        // Out-of-window read bails with nothing committed on both paths.
+        let mut c2 = cpu();
+        c2.set_cpu_type(CpuType::M68040);
+        c2.set_a(0, 0x2000);
+        c2.set_ccr(0x10);
+        let mut mem2 = vec![0u8; 0x1000];
+        seed(&mut mem2);
+        attach_window(&mut c2, &mut mem2);
+        let packed2 = unsafe { compiled.call_native(&mut c2, 1) };
+        assert_eq!((packed2 >> 32) as u32, 0, "far read bails");
+        assert_eq!(c2.get_ccr(), 0x10, "flags untouched on the bail");
+    }
+    #[test]
+    fn move_imm_reg_decodes_and_matches_the_interpreter_with_exact_cycles() {
+        // Decode coverage plus a step() differential on a 68000 for exact
+        // flags and cycle charges of both widths.
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        let cpu0 = CpuCore::new();
+        bus.write_word_at(0x0100, 0x303C);
+        bus.write_word_at(0x0102, 0x8123);
+        let word = decode_trace_op(&cpu0, &mut bus, 0x0100, CpuType::M68040).unwrap();
+        assert!(matches!(
+            word.op,
+            JitTraceOp::MoveImmReg {
+                reg: 0,
+                size: Size::Word,
+                value: 0x8123
+            }
+        ));
+        assert_eq!(word.length(), 4);
+        bus.write_word_at(0x0200, 0x2A3C);
+        bus.write_word_at(0x0202, 0x0000);
+        bus.write_word_at(0x0204, 0xA89F);
+        let long = decode_trace_op(&cpu0, &mut bus, 0x0200, CpuType::M68040).unwrap();
+        assert!(matches!(
+            long.op,
+            JitTraceOp::MoveImmReg {
+                reg: 5,
+                size: Size::Long,
+                value: 0x0000_A89F
+            }
+        ));
+        assert_eq!(long.length(), 6);
+        // Byte and address-register destinations fall back.
+        bus.write_word_at(0x0300, 0x103C);
+        let byte = decode_trace_op(&cpu0, &mut bus, 0x0300, CpuType::M68040);
+        assert!(!matches!(
+            byte.map(|t| t.op),
+            Some(JitTraceOp::MoveImmReg { .. })
+        ));
+
+        let cases: [(&[u16], &str); 2] = [
+            (&[0x303C, 0x8123], "MOVE.W #imm,D0"),
+            (&[0x2A3C, 0x0000, 0xA89F], "MOVE.L #imm,D5"),
+        ];
+        for (words, label) in cases {
+            let setup = |c: &mut CpuCore| {
+                c.set_cpu_type(CpuType::M68000);
+                c.set_d(0, 0xAAAA_BBBB); // word write must merge low word
+                c.set_ccr(0x10); // X must survive; NZVC rewritten
+                c.pc = 0x0100;
+            };
+            let mut ibus = super::super::memory::LinearMemoryBus::new(0x1000);
+            for (index, word) in words.iter().enumerate() {
+                ibus.write_word(0x0100 + index as u32 * 2, *word);
+            }
+            let mut icpu = cpu();
+            setup(&mut icpu);
+            let icycles = match icpu.step(&mut ibus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+            let mut pcpu = cpu();
+            setup(&mut pcpu);
+            let t = decode_trace_op(&pcpu, &mut ibus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: should decode"));
+            let pcycles = execute_portable_reg_op(&mut pcpu, t);
+            assert_eq!(pcpu.dar, icpu.dar, "{label}: registers");
+            assert_eq!(pcpu.get_ccr(), icpu.get_ccr(), "{label}: NZVCX");
+            assert_eq!(
+                pcycles, icycles,
+                "{label}: the trace cycle charge must equal the 68000's"
+            );
+        }
+    }
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_move_imm_reg_matches_portable() {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x303C,
+                extension: Some(0x8123),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::MoveImmReg {
+                    reg: 0,
+                    size: Size::Word,
+                    value: 0x8123,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x2A3C,
+                extension: Some(0x0000),
+                extension2: Some(0xA89F),
+                pc: 0x0104,
+                op: JitTraceOp::MoveImmReg {
+                    reg: 5,
+                    size: Size::Long,
+                    value: 0x0000_A89F,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60F4,
+                extension: None,
+                extension2: None,
+                pc: 0x010A,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -12,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let mut mem = vec![0u8; 0x1000];
+        let mut native = cpu();
+        native.set_cpu_type(CpuType::M68040);
+        native.set_d(0, 0xAAAA_BBBB);
+        native.set_ccr(0x10);
+        attach_window(&mut native, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("immediate-load loop should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!((packed >> 32) as u32, 3, "all ops retired");
+        assert_eq!(native.d(0), 0xAAAA_8123, "word load merges the low word");
+        assert_eq!(native.d(5), 0x0000_A89F);
+        assert_ne!(native.get_ccr() & 0x10, 0, "X preserved");
+
+        let mut pmem = vec![0u8; 0x1000];
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_d(0, 0xAAAA_BBBB);
+        portable.set_ccr(0x10);
+        attach_window(&mut portable, &mut pmem);
+        let ppacked =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x010C));
+        assert_eq!(ppacked, packed, "retired count and cycles agree");
+        assert_eq!(portable.d(0), native.d(0));
+        assert_eq!(portable.d(5), native.d(5));
+        assert_eq!(portable.get_ccr(), native.get_ccr(), "flags agree");
+    }
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_pea_abs_matches_portable_and_bails_atomically() {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x4878,
+                extension: Some(0x3000),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::PeaAbs {
+                    address: 0x3000,
+                    cycles: 16,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x588F, // ADDQ.L #4,A7 rebalances the loop
+                extension: None,
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::AddqSubqAddr {
+                    reg: 7,
+                    data: 4,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x60F8,
+                extension: None,
+                extension2: None,
+                pc: 0x0106,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -8,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        // The portable executor re-reads extension words from the window
+        // (as run_batch always can); seed the instruction bytes in both
+        // arms' memory.
+        let seed_code = |mem: &mut [u8]| {
+            for (index, word) in [0x4878u16, 0x3000, 0x588F, 0x60F8].iter().enumerate() {
+                mem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+            }
+        };
+        let mut mem = vec![0u8; 0x1000];
+        seed_code(&mut mem);
+        let mut native = cpu();
+        native.set_cpu_type(CpuType::M68040);
+        native.set_a(7, 0x0800);
+        attach_window(&mut native, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("PEA abs loop should compile");
+        let packed = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!((packed >> 32) as u32, 3, "all ops retired");
+        assert_eq!(native.a(7), 0x0800, "push and rebalance cancel");
+        assert_eq!(
+            &mem[0x07FC..0x0800],
+            &0x0000_3000u32.to_be_bytes(),
+            "the constant address was pushed"
+        );
+
+        let mut pmem = vec![0u8; 0x1000];
+        seed_code(&mut pmem);
+        let mut portable = cpu();
+        portable.set_cpu_type(CpuType::M68040);
+        portable.set_a(7, 0x0800);
+        attach_window(&mut portable, &mut pmem);
+        let ppacked =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x0108));
+        assert_eq!(ppacked, packed, "retired count and cycles agree");
+        assert_eq!(pmem, mem, "memory effects agree");
+
+        // Own-span push bails with nothing committed, both paths.
+        let mut c2 = cpu();
+        c2.set_cpu_type(CpuType::M68040);
+        c2.set_a(7, 0x0106);
+        let mut mem2 = vec![0u8; 0x1000];
+        attach_window(&mut c2, &mut mem2);
+        let packed2 = unsafe { compiled.call_native(&mut c2, 1) };
+        assert_eq!((packed2 >> 32) as u32, 0, "own-span push bails");
+        assert_eq!(c2.a(7), 0x0106);
+        let mut p2 = cpu();
+        p2.set_cpu_type(CpuType::M68040);
+        p2.set_a(7, 0x0106);
+        let mut pmem2 = vec![0u8; 0x1000];
+        attach_window(&mut p2, &mut pmem2);
+        assert_eq!(
+            (execute_portable_trace(&mut p2, &ops, CodeSpans::caller(0x0100, 0x0108)) >> 32) as u32,
+            0
+        );
+        assert_eq!(p2.a(7), 0x0106);
     }
 }

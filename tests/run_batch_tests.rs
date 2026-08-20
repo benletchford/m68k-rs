@@ -1632,6 +1632,69 @@ fn memory_and_loop_matches_step() {
     });
 }
 
+/// PEA of an absolute address in a loop, rebalanced each iteration.
+#[test]
+fn pea_abs_loop_matches_step() {
+    let words = &[
+        0x4878, 0x3000, // $1000: PEA ($3000).W
+        0x588F, // $1004: ADDQ.L #4,A7
+        0x5283, // $1006: ADDQ.L #1,D3
+        0x51C8, 0xFFF6, // $1008: DBRA D0,$1000
+        0x5347, // $100C: SUBQ.W #1,D7
+        0x6602, // $100E: BNE.S $1012
+        0xA000, // $1010: sentinel
+        0x707F, // $1012: MOVEQ #127,D0
+        0x60EA, // $1014: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("PEA abs loop", words, CpuType::M68040, |cpu| {
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}
+
+/// CMPI.W against a displaced field with a counter mutation (a bare
+/// compare/branch pair is a pure poll and is refused by design).
+#[test]
+fn cmpi_word_disp_loop_matches_step() {
+    let words = &[
+        0x0C68, 0x0042, 0x0010, // $1000: CMPI.W #$42,($10,A0)
+        0x6602, // $1006: BNE.S $100A
+        0x4E71, // $1008: NOP
+        0x5283, // $100A: ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0x5347, // $1010: SUBQ.W #1,D7
+        0x6602, // $1012: BNE.S $1016
+        0xA000, // $1014: sentinel
+        0x707F, // $1016: MOVEQ #127,D0
+        0x60E6, // $1018: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("CMPI.W disp loop", words, CpuType::M68040, |cpu| {
+        cpu.set_a(0, 0x3000);
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}
+
+/// Full-width immediate loads in a loop -- the `203C` shapes ROM
+/// prologues use to stage trap selectors.
+#[test]
+fn move_imm_reg_loop_matches_step() {
+    let words = &[
+        0x323C, 0x8123, // $1000: MOVE.W #$8123,D1
+        0x2A3C, 0x0000, 0xA89F, // $1004: MOVE.L #$A89F,D5
+        0x5283, // $100A: ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // $100C: DBRA D0,$1000
+        0x5347, // $1010: SUBQ.W #1,D7
+        0x6602, // $1012: BNE.S $1016
+        0xA000, // $1014: sentinel
+        0x707F, // $1016: MOVEQ #127,D0
+        0x60E6, // $1018: BRA.S $1000
+    ];
+    assert_fastmem_matches_step("immediate-load loop", words, CpuType::M68040, |cpu| {
+        cpu.set_d(0, 50);
+        cpu.set_d(7, 5);
+    });
+}
 /// The ROM caller-save idiom: MOVEM.L push, body, MOVEM.L pop, loop.
 /// The counters live outside the saved mask (the pop restores D2/D3/A2
 /// every iteration). Must match step() exactly through the lifecycle.

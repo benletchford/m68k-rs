@@ -1923,6 +1923,140 @@ fn bench_movem_frame_loop() {
     );
 }
 
+/// PEA of an absolute address, rebalanced -- the profile's second-widest
+/// blocked head class after MOVEM. Base blocks the head at the PEA.
+fn bench_pea_abs_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x4878, 0x3000, // head: PEA ($3000).W
+        0x588F, // ADDQ.L #4,A7
+        0x5283, // ADDQ.L #1,D3
+        0x51C8, 0xFFF6, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60F0, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    assert_eq!(
+        bus.read_word(0x7FFE),
+        0x3000,
+        "the pushed constant lands below the rebalanced stack"
+    );
+    println!(
+        "batch     pea abs loop            {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+/// CMPI.W against a displaced structure field, with a counter mutation
+/// so the wait classifier admits the loop. Base blocks the head at the
+/// displacement form.
+fn bench_cmpi_disp_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x0C68, 0x0042, 0x0010, // head: CMPI.W #$42,($10,A0)
+        0x6602, // BNE.S +2
+        0x4E71, // NOP
+        0x5283, // ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60EC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    bus.write_word_at(0x3010, 0x0042);
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(0, 0x3000);
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    println!(
+        "batch     cmpi disp loop          {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+/// Full-width immediate loads (the `203C` trap-selector shapes), with a
+/// counter. Base blocks the head at the first load.
+fn bench_move_imm_reg_loop() {
+    const INSTRS: u32 = 100_000_000;
+    const CODE_BASE: u32 = 0x6000;
+    let words = [
+        0x323C, 0x8123, // head: MOVE.W #$8123,D1
+        0x2A3C, 0x0000, 0xA89F, // MOVE.L #$A89F,D5
+        0x5283, // ADDQ.L #1,D3
+        0x51C8, 0xFFF2, // DBRA D0,head
+        0x707F, // MOVEQ #127,D0
+        0x60EC, // BRA.S head
+    ];
+    let mut bus = LinearMemoryBus::new(0x1_0000);
+    for (index, word) in words.iter().enumerate() {
+        bus.write_word_at(CODE_BASE + index as u32 * 2, *word);
+    }
+    let prepare_cpu = || {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = CODE_BASE;
+        cpu.set_a(7, 0x8000);
+        cpu.set_d(0, 0x7F);
+        cpu
+    };
+    let mut warm_cpu = prepare_cpu();
+    assert_eq!(
+        warm_cpu.run_batch(&mut bus, 5_000_000, &[0]).instructions,
+        5_000_000
+    );
+    let mut cpu = prepare_cpu();
+    let start = Instant::now();
+    assert_eq!(cpu.run_batch(&mut bus, INSTRS, &[0]).instructions, INSTRS);
+    let elapsed = start.elapsed().as_secs_f64();
+    assert!(cpu.d(3) > 5_000, "the loop actually iterated");
+    assert_eq!(cpu.d(5), 0x0000_A89F, "the long load lands");
+    println!(
+        "batch     move imm reg loop       {:8.1} M instr/s",
+        f64::from(INSTRS) / elapsed / 1_000_000.0
+    );
+}
+
 fn main() {
     println!("m68k microbench");
     let only = std::env::args().nth(1);
@@ -2008,6 +2142,18 @@ fn main() {
     }
     if only.as_deref() == Some("movem") {
         bench_movem_frame_loop();
+        return;
+    }
+    if only.as_deref() == Some("pea-abs") {
+        bench_pea_abs_loop();
+        return;
+    }
+    if only.as_deref() == Some("cmpi-disp") {
+        bench_cmpi_disp_loop();
+        return;
+    }
+    if only.as_deref() == Some("move-imm-reg") {
+        bench_move_imm_reg_loop();
         return;
     }
     if only.as_deref() == Some("clr-abs") {
