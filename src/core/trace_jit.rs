@@ -97,7 +97,16 @@ enum NativeTraceFn {
 static TRACE_JIT_HAS_CANDIDATES: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    static TRACE_JIT: RefCell<TraceJit> = RefCell::new(TraceJit::new());
+    // Const-initialized so access compiles to a direct TLS slot read. The
+    // lazily-initialized form re-ran its platform once-guard on every
+    // access, and `try_execute_trace` probes once per batch entry and per
+    // backward branch -- in EV Override's crawl that guard alone was 4% of
+    // the main thread (252 of 6,417 sampled ms).
+    static TRACE_JIT: RefCell<Option<TraceJit>> = const { RefCell::new(None) };
+}
+/// Run `f` on the thread's trace-JIT state, creating it on first use.
+fn with_trace_jit<R>(f: impl FnOnce(&mut TraceJit) -> R) -> R {
+    TRACE_JIT.with_borrow_mut(|slot| f(slot.get_or_insert_with(TraceJit::new)))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2770,7 +2779,7 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
         return None;
     }
 
-    TRACE_JIT.with_borrow_mut(|jit| {
+    with_trace_jit(|jit| {
         jit.try_execute(
             cpu,
             bus,
@@ -2784,7 +2793,7 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
 }
 
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
-    TRACE_JIT.with_borrow_mut(|jit| jit.record_trace_target(pc, cpu_type));
+    with_trace_jit(|jit| jit.record_trace_target(pc, cpu_type));
 }
 
 /// Append one instruction that the interpreter just executed while a hot
@@ -2797,7 +2806,7 @@ pub(crate) fn record_executed<B: AddressBus>(
     next_pc: u32,
 ) {
     if cpu.trace_recording {
-        TRACE_JIT.with_borrow_mut(|jit| jit.record_executed(cpu, bus, executed_pc, next_pc));
+        with_trace_jit(|jit| jit.record_executed(cpu, bus, executed_pc, next_pc));
     }
 }
 
@@ -2806,8 +2815,7 @@ pub(crate) fn record_executed<B: AddressBus>(
 /// target is marked rejected.
 pub(crate) fn stop_recording(cpu: &mut CpuCore, cause: RecordingStop) {
     if cpu.trace_recording {
-        TRACE_JIT
-            .with_borrow_mut(|jit| jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause)));
+        with_trace_jit(|jit| jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause)));
     }
 }
 
@@ -2827,7 +2835,7 @@ pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool
         // Consult the actual direct-mapped slot instead of relying only on
         // the CPU's four-entry skip cache: a busy workload can evict a PC
         // from that tiny filter even though its trace remains rejected.
-        let rejected = TRACE_JIT.with_borrow(|jit| jit.is_rejected(pc, cpu_type));
+        let rejected = with_trace_jit(|jit| jit.is_rejected(pc, cpu_type));
         super::trace_profile::note_backward_edge(pc, cpu_type, rejected);
     }
     if cpu.trace_probe_skip.contains(&pc) {
@@ -11300,7 +11308,7 @@ mod portable_tests {
         cpu.set_a(7, 0x9000);
         cpu.set_d(0, 0x7F);
         cpu.run_batch(&mut bus, 40_000, &[0]);
-        TRACE_JIT.with_borrow(|jit| {
+        with_trace_jit(|jit| {
             assert!(
                 matches!(
                     &jit.slots[trace_cache_index(A)],
@@ -11518,7 +11526,7 @@ mod portable_tests {
         assert_eq!(result.instructions, 50_000, "loop runs to budget");
 
         let loop_pcs: Vec<u32> = (0..8).map(|w| CODE_BASE + w * 2).collect();
-        let compiled = TRACE_JIT.with_borrow(|jit| {
+        let compiled = with_trace_jit(|jit| {
             loop_pcs
                 .iter()
                 .filter(|&&pc| {
@@ -11742,7 +11750,7 @@ mod portable_tests {
         // The continuation must exist as its own compiled trace for phase 3
         // to test anything.
         let cont_pc = CODE_BASE + 4;
-        let cont_compiled = TRACE_JIT.with_borrow(|jit| {
+        let cont_compiled = with_trace_jit(|jit| {
             matches!(
                 &jit.slots[trace_cache_index(cont_pc)],
                 TraceSlot::Compiled(CompiledTrace { pc, .. }) if *pc == cont_pc
@@ -11788,7 +11796,7 @@ mod portable_tests {
         cpu.set_a(7, 0x9000);
         cpu.set_d(0, 0x7F);
         cpu.run_batch(&mut bus, 40_000, &[0]);
-        TRACE_JIT.with_borrow(|jit| {
+        with_trace_jit(|jit| {
             assert!(
                 matches!(
                     &jit.slots[trace_cache_index(A)],
@@ -11932,7 +11940,7 @@ mod portable_tests {
             cpu.d(2),
             cpu.d(3)
         );
-        let compiled = TRACE_JIT.with_borrow(|jit| {
+        let compiled = with_trace_jit(|jit| {
             matches!(&jit.slots[trace_cache_index(A)],
                 TraceSlot::Compiled(t) if t.pc == A
                     && t.ops.iter().any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })))
@@ -12548,7 +12556,7 @@ mod portable_tests {
             cpu.a(7)
         );
         let (compiled_ops, has_call, has_ret) =
-            TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(A)] {
+            with_trace_jit(|jit| match &jit.slots[trace_cache_index(A)] {
                 TraceSlot::Compiled(CompiledTrace { pc, ops, .. }) if *pc == A => (
                     ops.len(),
                     ops.iter()
@@ -12674,7 +12682,7 @@ mod portable_tests {
             cpu.d(3)
         );
         assert!(cpu.d(2) > 5_000, "the loop actually iterated");
-        let spans = TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(A)] {
+        let spans = with_trace_jit(|jit| match &jit.slots[trace_cache_index(A)] {
             TraceSlot::Compiled(trace) if trace.pc == A => {
                 assert!(
                     trace
@@ -15354,16 +15362,15 @@ mod portable_tests {
         let mut seen_call_trace = false;
         for _ in 0..300 {
             cpu.run_batch(&mut bus, 200, &[0]);
-            let observed =
-                TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
-                    TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
-                        trace
-                            .ops
-                            .iter()
-                            .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
-                    ),
-                    _ => None,
-                });
+            let observed = with_trace_jit(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+                TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
+                    trace
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                ),
+                _ => None,
+            });
             match observed {
                 Some(true) => seen_call_trace = true,
                 Some(false) => {
@@ -15425,16 +15432,15 @@ mod portable_tests {
         let mut seen_call_trace = false;
         for _ in 0..300 {
             cpu.run_batch(&mut bus, 200, &[0]);
-            let observed =
-                TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
-                    TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
-                        trace
-                            .ops
-                            .iter()
-                            .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
-                    ),
-                    _ => None,
-                });
+            let observed = with_trace_jit(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+                TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => Some(
+                    trace
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                ),
+                _ => None,
+            });
             match observed {
                 Some(true) => seen_call_trace = true,
                 Some(false) => {
@@ -15496,7 +15502,7 @@ mod portable_tests {
         assert_eq!(result.instructions, 60_000, "loop runs to budget");
 
         let (records_call, op_count) =
-            TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
+            with_trace_jit(|jit| match &jit.slots[trace_cache_index(CODE_BASE)] {
                 TraceSlot::Compiled(trace) if trace.pc == CODE_BASE => (
                     trace
                         .ops
@@ -15560,7 +15566,7 @@ mod portable_tests {
             cpu.d(2).abs_diff(cpu.d(3)) <= 1 && cpu.d(2).abs_diff(cpu.d(7)) <= 1,
             "counters advance in lockstep"
         );
-        let salvaged = TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(A)] {
+        let salvaged = with_trace_jit(|jit| match &jit.slots[trace_cache_index(A)] {
             TraceSlot::Compiled(trace) if trace.pc == A => Some((
                 trace.ops.len(),
                 matches!(
@@ -15616,13 +15622,13 @@ mod portable_tests {
         let result = cpu.run_batch(&mut bus, 20_000, &[0]);
         assert_eq!(result.instructions, 20_000, "loop runs to budget");
         let bail_pc = CODE_BASE + 2; // the MOVE that memory-bails
-        let touched = TRACE_JIT.with_borrow(|jit| match &jit.slots[trace_cache_index(bail_pc)] {
+        let touched = with_trace_jit(|jit| match &jit.slots[trace_cache_index(bail_pc)] {
             TraceSlot::Counting { pc, .. } if *pc == bail_pc => true,
             TraceSlot::Compiled(CompiledTrace { pc, .. }) if *pc == bail_pc => true,
             TraceSlot::Rejected { pc, .. } if *pc == bail_pc => true,
             _ => false,
         });
-        let dump = TRACE_JIT.with_borrow(|jit| {
+        let dump = with_trace_jit(|jit| {
             (0..5u32)
                 .map(|w| {
                     let pc = CODE_BASE + w * 2;
@@ -15708,7 +15714,7 @@ mod portable_tests {
                 !cpu.trace_recording,
                 "no recording survives a watched run_batch return"
             );
-            TRACE_JIT.with_borrow(|jit| {
+            with_trace_jit(|jit| {
                 assert!(
                     jit.recording.is_none(),
                     "no recorder state survives a watched run_batch return"
@@ -15872,7 +15878,7 @@ mod portable_tests {
                 cpu.d(3)
             );
             assert!(cpu.d(2) > 2_000, "{label}: the loop actually iterated");
-            let compiled = TRACE_JIT.with_borrow(|jit| {
+            let compiled = with_trace_jit(|jit| {
                 matches!(&jit.slots[trace_cache_index(A)],
                     TraceSlot::Compiled(t) if t.pc == A
                         && t.ops.iter().any(|op| matches!(op.op, JitTraceOp::CallThrough { .. }))
