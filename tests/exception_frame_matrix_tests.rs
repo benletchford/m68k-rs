@@ -323,6 +323,55 @@ fn trace_pushes_format_2_on_020_plus() {
     }
 }
 
+/// T0 trace (trace on change of flow; the 68020/030/040 -- the 68060
+/// dropped the mode): sequential instructions must NOT trace, and every
+/// return must -- including RTD, whose handler was the one flow change
+/// that skipped the flag, hiding RTD returns from T0-stepping debuggers.
+#[test]
+fn t0_traces_rtd_returns_like_rts() {
+    const RETURN: u32 = 0x0500;
+    let t0_models = [CpuType::M68020, CpuType::M68030, CpuType::M68040];
+
+    // Sequential flow under T0: no trace.
+    for cpu_type in t0_models {
+        let mut bus = TestBus::new(0x10000);
+        let mut cpu = user_mode_cpu(&mut bus, cpu_type, 0x4000); // T0 set
+        bus.write_word(CODE, 0x7000); // MOVEQ #0,D0 (sequential)
+
+        step_once(&mut cpu, &mut bus);
+        assert_eq!(
+            cpu.pc,
+            CODE + 2,
+            "{cpu_type:?}: sequential flow does not T0-trace"
+        );
+        assert!(!cpu.is_supervisor(), "{cpu_type:?}: no exception was taken");
+    }
+
+    // RTS and RTD #4 under T0: both are changes of flow, both trace, and
+    // the group-2 frame stacks the return target as the next PC.
+    for words in [[0x4E75u16, 0x4E71], [0x4E74, 0x0004]] {
+        for cpu_type in t0_models {
+            let mut bus = TestBus::new(0x10000);
+            let mut cpu = user_mode_cpu(&mut bus, cpu_type, 0x4000); // T0 set
+            bus.write_word(CODE, words[0]);
+            bus.write_word(CODE + 2, words[1]);
+            bus.write_long(USP, RETURN); // the popped return target
+
+            step_once(&mut cpu, &mut bus);
+            check_frame(
+                &cpu,
+                &mut bus,
+                cpu_type,
+                &ExpectedFrame {
+                    vector: 9,
+                    stacked_pc: RETURN,
+                    format_2_instr: Some(CODE),
+                },
+            );
+        }
+    }
+}
+
 /// Illegal instruction: format $0 with the FAULTING instruction's PC, so
 /// the handler can decode or patch the opcode (AmigaOS SetFunction-style
 /// trap emulation depends on it).
