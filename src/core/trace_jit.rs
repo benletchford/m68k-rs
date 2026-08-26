@@ -493,6 +493,21 @@ pub(crate) enum JitTraceOp {
     RtsReturn {
         expected_return: u32,
     },
+    /// A bare RTS/RTD terminal: the region is a subroutine body whose
+    /// return target differs per caller, so the return executes
+    /// architecturally -- pop, stack displacement, jump -- and the trace
+    /// exits at the popped address. Exit seeding compiles each caller's
+    /// continuation and ordinary bounded chaining connects them. This is
+    /// deliberately UNGUARDED: the exit is the architectural jump itself,
+    /// and the target-selection investigation measured that specializing
+    /// one dynamic target of a polymorphic site does not pay.
+    ReturnExit {
+        /// RTD's post-pop stack adjustment; 0 for RTS.
+        displacement: i16,
+        /// Decode-time constant: 16 for RTS, 20 for RTD (the
+        /// interpreter's charges).
+        cycles: i32,
+    },
     /// MOVE/MOVEA with at least one register-indirect operand, executed
     /// against the fastmem window (`dst == Addr` is MOVEA). Traces
     /// containing this op only run while a window is active; every access
@@ -1174,6 +1189,17 @@ impl TraceJit {
             if instr_budget < ops_len {
                 return None;
             }
+            // A ReturnExit completion lands at a per-caller continuation
+            // the trace cannot name statically. Those exits must seed
+            // candidacy the way guarded branch exits do: the clean-link
+            // rule only fires when the exit target is ALREADY a compiled
+            // head, which a fresh continuation never is, so without this
+            // the continuations after a returning subroutine would only
+            // ever compile by luck of a backward branch.
+            let ends_in_return_exit = trace
+                .ops
+                .last()
+                .is_some_and(|op| matches!(op.op, JitTraceOp::ReturnExit { .. }));
             // A generated loop clearly amortizes the ABI boundary for
             // profiled mixed 3+-op and read-only loops. A
             // two-op read/write MoveMem loop is already dominated by its two
@@ -1384,7 +1410,12 @@ impl TraceJit {
             if clean_link_exit {
                 super::trace_profile::note_link_exit(pc, cpu_type);
             }
-            if (guarded_branch_exit || clean_link_exit)
+            // A clean ReturnExit completion seeds its dynamic target
+            // (each caller's continuation) even when nothing is compiled
+            // there yet; see `ends_in_return_exit` above.
+            let return_exit_completion =
+                ends_in_return_exit && !guarded_branch_exit && !partial_call_this_entry;
+            if (guarded_branch_exit || clean_link_exit || return_exit_completion)
                 && !single_iter
                 && chain_budget > 0
                 && cpu.pc != pc
@@ -2300,8 +2331,16 @@ impl TraceJit {
                         return;
                     }
                     // An RTS with no pending call is the head function's
-                    // own return: not ours to record through.
-                    self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                    // own return: record it as the region's dynamic-exit
+                    // terminal, exactly as the ungated recorder would.
+                    recording.ops.push(TraceBuildOp {
+                        op: JitTraceOp::ReturnExit {
+                            displacement: 0,
+                            cycles: 16,
+                        },
+                        ..call_op
+                    });
+                    self.finish_recording(cpu, next_pc, RecordingEnd::Region);
                     return;
                 }
                 _ => unreachable!(),
@@ -2419,6 +2458,15 @@ impl TraceJit {
                 return;
             }
             JitTraceOp::IndirectJsr { .. } => {
+                self.recording.as_mut().unwrap().ops.push(op);
+                self.finish_recording(cpu, next_pc, RecordingEnd::Region);
+                return;
+            }
+            // A bare return is the region's dynamic exit: the trace ends
+            // here and execution continues at whatever address the guest
+            // stack held (next_pc), which exit seeding turns into a
+            // per-caller continuation head.
+            JitTraceOp::ReturnExit { .. } => {
                 self.recording.as_mut().unwrap().ops.push(op);
                 self.finish_recording(cpu, next_pc, RecordingEnd::Region);
                 return;
@@ -2546,10 +2594,19 @@ impl TraceJit {
             }
         }
 
-        let ends_in_indirect_jsr = ops
-            .last()
-            .is_some_and(|op| matches!(op.op, JitTraceOp::IndirectJsr { .. }));
-        if ends_in_indirect_jsr && ops.len() < TRACE_MIN_INDIRECT_JSR_OPS {
+        // Both dynamic-exit terminals -- an indirect call and a bare
+        // return -- pay the same per-entry shape (validation, the ABI
+        // boundary, an exit whose target the trace cannot name), so both
+        // reuse the measured indirect-call break-even length. Without
+        // this, every two-op "pop and return" stub in the guest would
+        // claim a cache slot at negative value.
+        let ends_in_dynamic_exit = ops.last().is_some_and(|op| {
+            matches!(
+                op.op,
+                JitTraceOp::IndirectJsr { .. } | JitTraceOp::ReturnExit { .. }
+            )
+        });
+        if ends_in_dynamic_exit && ops.len() < TRACE_MIN_INDIRECT_JSR_OPS {
             return Err(RegionRejectReason::IndirectJsrTooShort);
         }
 
@@ -2567,7 +2624,7 @@ impl TraceJit {
         // Trap-boundary segments get no exemption: a TrapExit adds trap
         // dispatch and re-entry on top of the fixed costs.
         if !self_loop
-            && !ends_in_indirect_jsr
+            && !ends_in_dynamic_exit
             && ops.len() < TRACE_MIN_INDIRECT_JSR_OPS
             && ops.iter().any(|op| {
                 matches!(
@@ -2625,6 +2682,7 @@ impl TraceJit {
                     | JitTraceOp::IndirectJsr { .. }
                     | JitTraceOp::CallThrough { .. }
                     | JitTraceOp::RtsReturn { .. }
+                    | JitTraceOp::ReturnExit { .. }
             )
         });
 
@@ -3072,6 +3130,10 @@ impl TraceJit {
                         let env = mem_env.as_ref().expect("RtsReturn implies a window env");
                         emit_rts_return(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
+                    JitTraceOp::ReturnExit { .. } => {
+                        let env = mem_env.as_ref().expect("ReturnExit implies a window env");
+                        emit_return_exit(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
                     JitTraceOp::PeaInd { .. }
                     | JitTraceOp::PeaDisp { .. }
                     | JitTraceOp::PeaAbs { .. } => {
@@ -3374,7 +3436,8 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::MoveImmReg { .. }
             | JitTraceOp::MoveImmMem { .. }
             | JitTraceOp::CallThrough { .. }
-            | JitTraceOp::RtsReturn { .. } => return false,
+            | JitTraceOp::RtsReturn { .. }
+            | JitTraceOp::ReturnExit { .. } => return false,
         }
     }
     mem_written_flags != 0 && consumed & !mem_written_flags == 0
@@ -3865,6 +3928,7 @@ impl JitTraceOp {
             // 16(4/0).
             Self::CallThrough { cycles, .. } => cycles,
             Self::RtsReturn { .. } => 16,
+            Self::ReturnExit { cycles, .. } => cycles,
         }
     }
 
@@ -3879,6 +3943,7 @@ impl JitTraceOp {
                     ..
                 }
                 | Self::TrapExit
+                | Self::ReturnExit { .. }
         )
     }
 
@@ -3977,6 +4042,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_indirect_jsr_trace_op(pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_return_exit_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_link_unlk_trace_op(cpu, bus, pc, opcode) {
@@ -4407,6 +4475,46 @@ fn decode_indirect_jsr_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
             reg: (opcode & 7) as u8,
         },
     })
+}
+
+/// Bare RTS (0x4E75) and RTD #d16 (0x4E74, 68010+), admitted as the
+/// region's dynamic-exit terminal. Not decoded here: RTR/RTE touch the
+/// status register, and MOVEM-restore epilogues are already separate ops.
+fn decode_return_exit_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    match opcode {
+        0x4E75 => Some(TraceBuildOp {
+            opcode,
+            extension: None,
+            extension2: None,
+            pc,
+            op: JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            },
+        }),
+        // The interpreter's gate exactly: RTD is illegal only on the
+        // original M68000.
+        0x4E74 if cpu_type != CpuType::M68000 => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            Some(TraceBuildOp {
+                opcode,
+                extension: Some(extension),
+                extension2: None,
+                pc,
+                op: JitTraceOp::ReturnExit {
+                    displacement: extension as i16,
+                    cycles: 20,
+                },
+            })
+        }
+        _ => None,
+    }
 }
 
 fn decode_dbcc_trace_op<B: AddressBus>(
@@ -5505,6 +5613,9 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     }
     if matches!(op.op, JitTraceOp::RtsReturn { .. }) {
         return execute_portable_rts_return(cpu, op);
+    }
+    if matches!(op.op, JitTraceOp::ReturnExit { .. }) {
+        return execute_portable_return_exit(cpu, op);
     }
     if matches!(
         op.op,
@@ -7060,6 +7171,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::RtsReturn { .. } => {
             unreachable!("RtsReturn is handled by execute_portable_rts_return")
         }
+        JitTraceOp::ReturnExit { .. } => {
+            unreachable!("ReturnExit is handled by execute_portable_return_exit")
+        }
         JitTraceOp::MovemLongPredec { .. } | JitTraceOp::MovemLongPostInc { .. } => {
             unreachable!("MOVEM.L is handled by execute_portable_movem_long_predec/postinc")
         }
@@ -7100,6 +7214,9 @@ fn emit_jit_op(
         // the exit plumbing); an unguarded one never compiles.
         JitTraceOp::PcIndexJmp { .. } => {
             unreachable!("PcIndexJmp reaches emit_jit_op")
+        }
+        JitTraceOp::ReturnExit { .. } => {
+            unreachable!("ReturnExit is routed to emit_return_exit by the main emit loop")
         }
         JitTraceOp::Nop => cycles_const(builder, 4),
         JitTraceOp::MoveImmReg { reg, size, value } => {
@@ -8771,6 +8888,45 @@ fn emit_rts_return(
     cycles_const(builder, trace.op.max_cycles())
 }
 
+/// Emit the dynamic-exit return terminal: pop the return address through
+/// the checked window, deallocate (RTD's displacement folds into the
+/// same stack-pointer add), and store the popped target as the exit PC.
+/// No guard -- the exit is the architectural jump itself. The stack read
+/// is checked before any state changes, so a bail re-executes the return
+/// via full dispatch.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_return_exit(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::ReturnExit {
+        displacement,
+        cycles,
+    } = trace.op
+    else {
+        unreachable!("expected a return-exit trace op")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+    let sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
+    let (off, _) = checked_window_off(builder, env, bail, sp, Size::Long);
+    let target = window_load(builder, env, off, Size::Long);
+    let new_sp = builder.ins().iadd_imm(sp, 4 + i64::from(displacement));
+    store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    // Interpreter parity: both returns change flow (T0 trace sees both).
+    store_bool(builder, cpu, offset_of!(CpuCore, change_of_flow), true);
+    store_value_u32(builder, cpu, offset_of!(CpuCore, pc), target);
+    cycles_const(builder, cycles)
+}
+
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_call_through(
     cpu: &mut CpuCore,
@@ -8805,6 +8961,40 @@ fn execute_portable_call_through(
     }
     cpu.dar[15] = new_sp;
     Some(trace.op.max_cycles())
+}
+
+/// The dynamic-exit return terminal: pop the return address, deallocate
+/// (RTD), and land the trace exit at the popped target. No expected-value
+/// guard -- the exit IS the architectural jump.
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_return_exit(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::ReturnExit {
+        displacement,
+        cycles,
+    } = trace.op
+    else {
+        return None;
+    };
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let sp = cpu.dar[15];
+    if cpu.is_pre_68020 && (sp & 1) != 0 {
+        return None;
+    }
+    let off = (sp & cpu.address_mask).wrapping_sub(cpu.fm_base);
+    if off > cpu.fm_len - 4 {
+        return None;
+    }
+    let target = unsafe {
+        let p = (cpu.fm_ptr as *const u8).add(off as usize);
+        u32::from_be_bytes([*p, *p.add(1), *p.add(2), *p.add(3)])
+    };
+    cpu.dar[15] = sp.wrapping_add(4).wrapping_add(displacement as i32 as u32);
+    // Interpreter parity: both returns change flow (T0 trace sees both).
+    cpu.change_of_flow = true;
+    cpu.pc = target;
+    Some(cycles)
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
@@ -11393,6 +11583,139 @@ mod portable_tests {
         assert_eq!(cpu.pc, 0x0444);
         assert!(!cpu.change_of_flow);
         assert!(mem.iter().all(|&byte| byte == 0));
+    }
+
+    #[test]
+    fn decodes_return_exit_trace_boundary() {
+        let cpu = cpu();
+        let mut mem = super::super::memory::LinearMemoryBus::new(0x1000);
+        mem.write_word(0x0100, 0x4E75); // RTS
+        let rts = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(rts.extension, None);
+        assert_eq!(rts.length(), 2);
+        assert!(matches!(
+            rts.op,
+            JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            }
+        ));
+        assert!(rts.op.ends_trace());
+
+        // RTD #d16 decodes exactly where the interpreter accepts it: on
+        // everything but the original M68000.
+        mem.write_word(0x0100, 0x4E74);
+        mem.write_word(0x0102, 0x0008);
+        assert!(
+            decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).is_none(),
+            "RTD is illegal on the M68000"
+        );
+        let rtd = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68010).unwrap();
+        assert_eq!(rtd.extension, Some(0x0008));
+        assert_eq!(rtd.length(), 4);
+        assert!(matches!(
+            rtd.op,
+            JitTraceOp::ReturnExit {
+                displacement: 8,
+                cycles: 20,
+            }
+        ));
+
+        // The displacement is signed: RTD #-4.
+        mem.write_word(0x0102, 0xFFFC);
+        let rtd = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68020).unwrap();
+        assert!(matches!(
+            rtd.op,
+            JitTraceOp::ReturnExit {
+                displacement: -4,
+                cycles: 20,
+            }
+        ));
+    }
+
+    #[test]
+    fn portable_return_exit_pops_and_exits_at_dynamic_target() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0800..0x0804].copy_from_slice(&0x0456u32.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(7, 0x0800);
+        cpu.change_of_flow = false;
+
+        let op = TraceBuildOp {
+            opcode: 0x4E75,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            },
+        };
+        assert_eq!(
+            execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
+            Some(16)
+        );
+        assert_eq!(cpu.a(7), 0x0804);
+        assert_eq!(cpu.pc, 0x0456);
+        assert!(cpu.change_of_flow);
+    }
+
+    #[test]
+    fn portable_return_exit_rtd_deallocates_arguments() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0800..0x0804].copy_from_slice(&0x0456u32.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(7, 0x0800);
+        cpu.change_of_flow = false;
+
+        let op = TraceBuildOp {
+            opcode: 0x4E74,
+            extension: Some(0x0008),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::ReturnExit {
+                displacement: 8,
+                cycles: 20,
+            },
+        };
+        assert_eq!(
+            execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0104)),
+            Some(20)
+        );
+        assert_eq!(cpu.a(7), 0x080C, "pop plus the argument deallocation");
+        assert_eq!(cpu.pc, 0x0456);
+        // Interpreter parity: RTD changes flow exactly as RTS does.
+        assert!(cpu.change_of_flow);
+    }
+
+    #[test]
+    fn portable_return_exit_bails_without_partial_state() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(7, 0x0FFE); // the 4-byte pop runs off the window's end
+        cpu.pc = 0x0444;
+        cpu.change_of_flow = false;
+
+        let op = TraceBuildOp {
+            opcode: 0x4E75,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            },
+        };
+        assert_eq!(
+            execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
+            None
+        );
+        assert_eq!(cpu.a(7), 0x0FFE);
+        assert_eq!(cpu.pc, 0x0444);
+        assert!(!cpu.change_of_flow);
     }
 
     #[test]
@@ -16290,6 +16613,292 @@ mod portable_tests {
         assert_eq!(bail.pc, 0x010E, "retry the unexecuted call");
         assert!(!bail.change_of_flow);
         assert!(bail_mem[0x07FC..0x0800].iter().all(|&byte| byte == 0));
+    }
+
+    /// A `count`-op region: `count - 1` MOVEQs then a bare RTS terminal.
+    fn rts_region_ops(count: usize) -> Vec<TraceBuildOp> {
+        let mut ops = Vec::new();
+        for index in 0..count - 1 {
+            let reg = (index & 7) as u8;
+            ops.push(TraceBuildOp {
+                opcode: 0x7001 | (u16::from(reg) << 9),
+                extension: None,
+                extension2: None,
+                pc: 0x0100 + index as u32 * 2,
+                op: JitTraceOp::Moveq { reg, data: 1 },
+            });
+        }
+        ops.push(TraceBuildOp {
+            opcode: 0x4E75,
+            extension: None,
+            extension2: None,
+            pc: 0x0100 + (count - 1) as u32 * 2,
+            op: JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            },
+        });
+        ops
+    }
+
+    #[test]
+    fn return_exit_reuses_the_indirect_call_break_even_length() {
+        let compile_cpu = cpu();
+        let mut jit = TraceJit::new();
+        assert!(
+            jit.compile_decoded_ops(
+                &compile_cpu,
+                0x0100,
+                CpuType::M68000,
+                rts_region_ops(TRACE_MIN_INDIRECT_JSR_OPS - 1),
+                Some(0x0456),
+            )
+            .is_none(),
+            "a six-op return region should remain decoded"
+        );
+        assert!(
+            jit.compile_decoded_ops(
+                &compile_cpu,
+                0x0100,
+                CpuType::M68000,
+                rts_region_ops(TRACE_MIN_INDIRECT_JSR_OPS),
+                Some(0x0456),
+            )
+            .is_some(),
+            "a seven-op return region should compile"
+        );
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_return_exit_commits_only_after_stack_check() {
+        let compile_cpu = cpu();
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(
+                &compile_cpu,
+                0x0100,
+                CpuType::M68000,
+                rts_region_ops(7),
+                Some(0x0456),
+            )
+            .expect("the RTS-terminated region should compile");
+
+        let prepare = |stack: u32| {
+            let mut cpu = cpu();
+            let mut mem = vec![0u8; 0x1000];
+            mem[0x0800..0x0804].copy_from_slice(&0x0456u32.to_be_bytes());
+            attach_window(&mut cpu, &mut mem);
+            cpu.set_a(7, stack);
+            cpu.change_of_flow = false;
+            (cpu, mem)
+        };
+
+        let (mut success, _success_mem) = prepare(0x0800);
+        let packed = unsafe { compiled.call_native(&mut success, 1) };
+        assert_eq!((packed >> 32) as u32, 7);
+        assert_eq!(packed as u32 as i32, 40); // six MOVEQs + RTS
+        assert_eq!(success.a(7), 0x0804);
+        assert_eq!(success.pc, 0x0456, "the exit lands at the popped target");
+        assert_eq!(success.ppc, 0x010C);
+        assert_eq!(success.ir, 0x4E75);
+        assert!(success.change_of_flow);
+
+        // The pop runs off the window's end: nothing from the return
+        // commits, and the exit retries the RTS through full dispatch.
+        let (mut bail, _bail_mem) = prepare(0x0FFE);
+        let packed = unsafe { compiled.call_native(&mut bail, 1) };
+        assert_eq!((packed >> 32) as u32, 6);
+        assert_eq!(packed as u32 as i32, 24);
+        assert_eq!(bail.a(7), 0x0FFE, "the return did not commit");
+        assert_eq!(bail.pc, 0x010C, "retry the unexecuted return");
+        assert!(!bail.change_of_flow);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_return_exit_rtd_applies_displacement() {
+        let mut ops = rts_region_ops(7);
+        *ops.last_mut().unwrap() = TraceBuildOp {
+            opcode: 0x4E74,
+            extension: Some(0x0008),
+            extension2: None,
+            pc: 0x010C,
+            op: JitTraceOp::ReturnExit {
+                displacement: 8,
+                cycles: 20,
+            },
+        };
+        let compile_cpu = cpu();
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&compile_cpu, 0x0100, CpuType::M68010, ops, Some(0x0456))
+            .expect("the RTD-terminated region should compile");
+
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68010);
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0800..0x0804].copy_from_slice(&0x0456u32.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(7, 0x0800);
+        cpu.change_of_flow = false;
+
+        let packed = unsafe { compiled.call_native(&mut cpu, 1) };
+        assert_eq!((packed >> 32) as u32, 7);
+        assert_eq!(packed as u32 as i32, 44); // six MOVEQs + RTD
+        assert_eq!(cpu.a(7), 0x080C, "pop plus the argument deallocation");
+        assert_eq!(cpu.pc, 0x0456);
+        // Interpreter parity: RTD changes flow exactly as RTS does.
+        assert!(cpu.change_of_flow);
+    }
+
+    #[test]
+    fn recorder_records_bare_rts_as_return_exit_terminal() {
+        // The permissionless recorder reaches a bare RTS: the return must
+        // close the region AS its dynamic-exit terminal instead of ending
+        // the recording at a blocker.
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x010C, 0x4E75);
+        let mut prefix = rts_region_ops(7);
+        prefix.pop();
+        let mut cpu = cpu();
+        let mut jit = TraceJit::new();
+        jit.recording = Some(TraceRecording {
+            start_pc: 0x0100,
+            cpu_type: CpuType::M68000,
+            ops: prefix,
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            pending_return: None,
+            skip_record_until: None,
+            from_exit_seed: false,
+        });
+        cpu.trace_recording = true;
+        cpu.ir = 0x4E75;
+        jit.record_executed(&mut cpu, &mut bus, 0x010C, 0x0456);
+        assert!(jit.recording.is_none(), "the return closed the region");
+        let TraceSlot::Compiled(trace) = &jit.slots[trace_cache_index(0x0100)] else {
+            panic!("the RTS-terminated region should have compiled");
+        };
+        assert_eq!(trace.ops.len(), 7);
+        assert!(matches!(
+            trace.ops.last().unwrap().op,
+            JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            }
+        ));
+    }
+
+    #[test]
+    fn call_through_head_rts_records_as_return_exit_terminal() {
+        // In a call-through recording, an RTS with NO pending recorded
+        // call is the head function's own return -- also a dynamic-exit
+        // terminal, via the decode_call_op interception path.
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x010C, 0x4E75);
+        let mut prefix = rts_region_ops(7);
+        prefix.pop();
+        let mut cpu = cpu();
+        let mut jit = TraceJit::new();
+        jit.recording = Some(TraceRecording {
+            start_pc: 0x0100,
+            cpu_type: CpuType::M68000,
+            ops: prefix,
+            adaptive_rerecords: 0,
+            allow_call_through: true,
+            pending_return: None,
+            skip_record_until: None,
+            from_exit_seed: false,
+        });
+        cpu.trace_recording = true;
+        cpu.ir = 0x4E75;
+        jit.record_executed(&mut cpu, &mut bus, 0x010C, 0x0456);
+        assert!(jit.recording.is_none(), "the return closed the region");
+        let TraceSlot::Compiled(trace) = &jit.slots[trace_cache_index(0x0100)] else {
+            panic!("the RTS-terminated region should have compiled");
+        };
+        assert!(matches!(
+            trace.ops.last().unwrap().op,
+            JitTraceOp::ReturnExit {
+                displacement: 0,
+                cycles: 16,
+            }
+        ));
+    }
+
+    #[test]
+    fn return_exit_completion_seeds_the_dynamic_target() {
+        // A clean ReturnExit completion lands at a per-caller continuation
+        // nothing has compiled yet. The exit must seed candidacy there --
+        // the clean-link rule alone never would (it requires an already-
+        // compiled head) -- and a second completion promotes the seed to
+        // an exit-seeded recording.
+        let ops = rts_region_ops(7);
+        let mut mem = vec![0u8; 0x1000];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for op in &ops {
+            bus.write_word(op.pc, op.opcode);
+            mem[op.pc as usize..op.pc as usize + 2].copy_from_slice(&op.opcode.to_be_bytes());
+        }
+        mem[0x0800..0x0804].copy_from_slice(&0x0456u32.to_be_bytes());
+
+        let mut cpu = cpu();
+        attach_window(&mut cpu, &mut mem);
+        cpu.cycles_remaining = 1_000_000;
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&cpu, 0x0100, CpuType::M68000, ops, Some(0x0456))
+            .expect("the RTS-terminated region should compile");
+        jit.slots[trace_cache_index(0x0100)] = TraceSlot::Compiled(compiled);
+
+        cpu.pc = 0x0100;
+        cpu.set_a(7, 0x0800);
+        assert!(matches!(
+            jit.try_execute(
+                &mut cpu,
+                &mut bus,
+                CpuType::M68000,
+                100,
+                false,
+                &[],
+                TRACE_EXIT_CHAIN_BUDGET
+            ),
+            Some((CachedRunResult::Ran, 7))
+        ));
+        assert_eq!(cpu.pc, 0x0456);
+        assert!(matches!(
+            &jit.slots[trace_cache_index(0x0456)],
+            TraceSlot::Counting {
+                pc: 0x0456,
+                hits: 1,
+                ..
+            }
+        ));
+
+        // The second completion crosses the hot threshold: the
+        // continuation starts an exit-seeded recording.
+        cpu.pc = 0x0100;
+        cpu.set_a(7, 0x0800);
+        assert!(matches!(
+            jit.try_execute(
+                &mut cpu,
+                &mut bus,
+                CpuType::M68000,
+                100,
+                false,
+                &[],
+                TRACE_EXIT_CHAIN_BUDGET
+            ),
+            Some((CachedRunResult::Ran, 7))
+        ));
+        assert_eq!(
+            jit.recording
+                .as_ref()
+                .map(|r| (r.start_pc, r.from_exit_seed)),
+            Some((0x0456, true)),
+            "the continuation records from the return's exit seed"
+        );
     }
 
     #[test]
