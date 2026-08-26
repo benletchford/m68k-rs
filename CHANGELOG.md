@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.11.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.0...m68k-v0.11.1) (2026-08-26)
+
+
+### Bug Fixes
+
+* **cpu:** RTD raises change_of_flow so T0 trace sees it ([05fafbf](https://github.com/benletchford/m68k-rs/commit/05fafbfbd79c0ff40cee835b69c8aa9af7b59552))
+
+
+### Performance Improvements
+
+* **jit:** compile trap-punctuated segments via TrapExit terminals ([1e81706](https://github.com/benletchford/m68k-rs/commit/1e817060336fafff3bd216b4d20f364b18482dfb))
+
 ## [0.11.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.10.14...m68k-v0.11.0) (2026-08-20)
 
 
