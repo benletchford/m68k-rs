@@ -1379,6 +1379,9 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             if cpu.cpu_type == CpuType::M68000 {
                 illegal_instruction(cpu, bus)
             } else {
+                // RTD changes flow exactly as RTS does; T0 trace mode
+                // (trace on change of flow, 68020+) must see it.
+                cpu.change_of_flow = true;
                 let disp = cpu.read_imm_16(bus) as i16 as i32;
                 cpu.pc = cpu.pull_32(bus);
                 cpu.dar[15] = (cpu.dar[15] as i32).wrapping_add(disp) as u32;
