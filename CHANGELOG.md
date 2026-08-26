@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.11.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.1...m68k-v0.11.2) (2026-08-26)
+
+
+### Performance Improvements
+
+* **jit:** admit ADDA memory sources and immediate register bit operations ([5add08b](https://github.com/benletchford/m68k-rs/commit/5add08b0f7e2cedc197821f4dc58ab189ca55abf))
+* **jit:** bare RTS/RTD becomes a dynamic-exit trace terminal ([4c29568](https://github.com/benletchford/m68k-rs/commit/4c29568d387f70d38e237973b21b2c18709c8f27))
+* **jit:** expand traces with effective-address ops and short-branch if-conversion ([2389334](https://github.com/benletchford/m68k-rs/commit/23893346f70cefd93fc4c189f0cce229020fdf99))
+* **jit:** scope the memory-ALU amortization refusal to short regions ([386eee9](https://github.com/benletchford/m68k-rs/commit/386eee97932ffd7425e32b8ba6dd3da89ba7debb))
+* **jit:** trace through bytecode dispatchers ([86e698a](https://github.com/benletchford/m68k-rs/commit/86e698a4b355df75038903983ba231597c2ebceb))
+
 ## [0.11.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.0...m68k-v0.11.1) (2026-08-26)
 
 
