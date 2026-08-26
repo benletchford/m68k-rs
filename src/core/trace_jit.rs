@@ -410,6 +410,18 @@ pub(crate) enum JitTraceOp {
         bit_reg: u8,
         dst: u8,
     },
+    /// BTST/BCHG/BCLR/BSET `#imm,Dn` — the static-bit-number register
+    /// forms (the dynamic `Dn,Dn` forms are `BitReg`). The bit number is
+    /// reduced modulo 32 while recording, so the exact cycle charge
+    /// (including the 68000's extension-word fetch and the pre-68020
+    /// upper-half surcharge for the modifying ops) is a decode-time
+    /// constant.
+    BitImmReg {
+        op: JitBitOp,
+        bit: u8,
+        dst: u8,
+        cycles: i32,
+    },
     Exg {
         opcode: u16,
     },
@@ -559,6 +571,14 @@ pub(crate) enum JitTraceOp {
     /// destination is always the full address register and a word source is
     /// sign-extended before the 32-bit comparison.
     AddrCmpMemToReg {
+        size: Size,
+        src: JitEa,
+        dst: u8,
+    },
+    /// ADDA.W/L through `(An)` or `d16(An)`: the pointer-arithmetic
+    /// sibling of `AddrCmpMemToReg`. A word source is sign-extended, the
+    /// full address register is written, and no condition code changes.
+    AddaMemToReg {
         size: Size,
         src: JitEa,
         dst: u8,
@@ -2582,6 +2602,7 @@ impl TraceJit {
                     | JitTraceOp::ClrMem { .. }
                     | JitTraceOp::MoveImmMem { .. }
                     | JitTraceOp::AddrCmpMemToReg { .. }
+                    | JitTraceOp::AddaMemToReg { .. }
                     | JitTraceOp::AddRegToMem { .. }
                     | JitTraceOp::AnDispUnary { .. }
                     | JitTraceOp::PeaInd { .. }
@@ -2992,6 +3013,10 @@ impl TraceJit {
                             bail_at,
                         )
                     }
+                    JitTraceOp::AddaMemToReg { .. } => {
+                        let env = mem_env.as_ref().expect("AddaMemToReg implies a window env");
+                        emit_adda_mem_to_reg(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
                     JitTraceOp::AddRegToMem { .. } => {
                         let env = mem_env.as_ref().expect("AddRegToMem implies a window env");
                         emit_add_reg_to_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
@@ -3313,6 +3338,7 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::LeaAbs { .. }
             | JitTraceOp::AddSubxReg { .. }
             | JitTraceOp::BitReg { .. }
+            | JitTraceOp::BitImmReg { .. }
             | JitTraceOp::Exg { .. }
             | JitTraceOp::Ext { .. }
             | JitTraceOp::Extb { .. }
@@ -3324,6 +3350,7 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::MoveMem { .. }
             | JitTraceOp::MovemWordPostInc { .. }
             | JitTraceOp::AluMemToReg { .. }
+            | JitTraceOp::AddaMemToReg { .. }
             | JitTraceOp::AnDispUnary { .. }
             | JitTraceOp::AddRegToMem { .. }
             | JitTraceOp::MemAddqSubq { .. }
@@ -3631,6 +3658,7 @@ impl JitTraceOp {
                 ..
             } => 10,
             Self::BitReg { .. } => 8,
+            Self::BitImmReg { cycles, .. } => cycles,
             Self::SccDataReg { .. } => 6,
             Self::Exg { .. } => 6,
             Self::ShiftReg {
@@ -3793,6 +3821,19 @@ impl JitTraceOp {
                 _ => 12,
             },
             Self::AddrCmpMemToReg { .. } => 24,
+            // MC68000 ADDA: word base 8, long-memory base 6, plus the
+            // source EA fetch (4/8 for (An), 8/12 for d16(An)). Memory
+            // traces only run in instruction-budgeted fastmem mode, but
+            // keeping this bound exact avoids needlessly pessimistic
+            // headroom and keeps portable/native accounting aligned with
+            // the interpreter's reference model.
+            Self::AddaMemToReg { size, src, .. } => match (size, src) {
+                (Size::Word, JitEa::Ind(_)) => 12,
+                (Size::Long, JitEa::Ind(_)) => 14,
+                (Size::Word, JitEa::Disp(_, _)) => 16,
+                (Size::Long, JitEa::Disp(_, _)) => 18,
+                _ => unreachable!("ADDA decoder admitted unsupported EA"),
+            },
             Self::AddRegToMem { size, dst, .. } => match (size, dst) {
                 (Size::Long, JitEa::Disp(_, _)) => 24,
                 (Size::Long, _) => 20,
@@ -3936,6 +3977,9 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_binary_immediate_data_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
+    if let Some(op) = decode_bit_imm_reg_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
     if let Some(op) = decode_mul_word_immediate_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
@@ -3955,6 +3999,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_addr_cmp_mem_to_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_adda_mem_to_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_add_reg_to_mem_trace_op(cpu, bus, pc, opcode, cpu_type) {
@@ -5114,6 +5161,117 @@ fn decode_addr_cmp_mem_to_reg_trace_op<B: AddressBus>(
     })
 }
 
+/// ADDA.W/L `<ea>,An` through `(An)` or `d16(An)` sources. The SC2K
+/// interpreted-retirement census ranks `ADDA.W d16(An),An` (pointer
+/// advanced by a struct field) as the single blocker in front of the
+/// heaviest interpreted region, so the mutating form earns admission with
+/// the same source set as the compare. SUBA stays out: the decoded-memory
+/// tier does not decode it, and no measured region blocks on it.
+fn decode_adda_mem_to_reg_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluAddr {
+        op: AddrOp::Adda,
+        size,
+        src,
+        dst,
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    let (src, extension) = match src {
+        FastEa::AnInd(reg) => (JitEa::Ind(reg), None),
+        FastEa::AnDisp(reg) => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (JitEa::Disp(reg, extension as i16), Some(extension))
+        }
+        _ => return None,
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension,
+        extension2: None,
+        pc,
+        op: JitTraceOp::AddaMemToReg { size, src, dst },
+    })
+}
+
+/// BTST/BCHG/BCLR/BSET `#imm,Dn`: the static-bit-number siblings of the
+/// already admitted dynamic `BitReg` forms. The bit number is reduced
+/// modulo 32 and the exact per-CPU cycle charge is computed here, so
+/// execution is a constant-mask register operation.
+fn decode_bit_imm_reg_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    // 0000 1000 oo 000 rrr: static bit number, register-direct destination.
+    if opcode & 0xFF38 != 0x0800 {
+        return None;
+    }
+    let op = match (opcode >> 6) & 3 {
+        0 => JitBitOp::Test,
+        1 => JitBitOp::Change,
+        2 => JitBitOp::Clear,
+        3 => JitBitOp::Set,
+        _ => unreachable!(),
+    };
+    let dst = (opcode & 7) as u8;
+    let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    let bit = (extension & 31) as u8;
+    // The interpreter's charges: the 68000 pays the extension fetch on top
+    // of the dynamic-form base (bitop_cycles), other pre-68020 CPUs charge
+    // the dynamic-form legacy cost, and 68020+ charge the flat post-020
+    // cost. The modifying ops add 2 clocks pre-68020 when the bit lives in
+    // the upper register half; BTST does not.
+    let m68000 = cpu.cpu_type == CpuType::M68000;
+    let hi = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
+    let cycles = match op {
+        JitBitOp::Test => {
+            if m68000 {
+                10
+            } else {
+                6
+            }
+        }
+        JitBitOp::Change | JitBitOp::Set => {
+            if m68000 {
+                10 + hi
+            } else if cpu.is_pre_68020 {
+                6 + hi
+            } else {
+                8
+            }
+        }
+        JitBitOp::Clear => {
+            if m68000 {
+                12 + hi
+            } else if cpu.is_pre_68020 {
+                8 + hi
+            } else {
+                10
+            }
+        }
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(extension),
+        extension2: None,
+        pc,
+        op: JitTraceOp::BitImmReg {
+            op,
+            bit,
+            dst,
+            cycles,
+        },
+    })
+}
+
 fn decode_jit_ea(mode: u16, reg: u16, extension: u16, cpu_type: CpuType) -> Option<JitEa> {
     Some(match mode & 7 {
         0 => JitEa::Data(reg as u8),
@@ -5312,6 +5470,9 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     }
     if matches!(op.op, JitTraceOp::AddrCmpMemToReg { .. }) {
         return execute_portable_addr_cmp_mem_to_reg(cpu, op);
+    }
+    if matches!(op.op, JitTraceOp::AddaMemToReg { .. }) {
+        return execute_portable_adda_mem_to_reg(cpu, op);
     }
     if matches!(op.op, JitTraceOp::AddRegToMem { .. }) {
         return execute_portable_add_reg_to_mem(cpu, op, spans);
@@ -5952,6 +6113,34 @@ fn execute_portable_addr_cmp_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) 
         cpu,
         DecodedMemOp::AluAddr {
             op: AddrOp::Cmpa,
+            size,
+            src,
+            dst,
+        },
+    ) {
+        Some(trace.op.max_cycles())
+    } else {
+        cpu.pc = old_pc;
+        None
+    }
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_adda_mem_to_reg(cpu: &mut CpuCore, trace: TraceBuildOp) -> Option<i32> {
+    let JitTraceOp::AddaMemToReg { size, src, dst } = trace.op else {
+        return None;
+    };
+    let src = match src {
+        JitEa::Ind(reg) => FastEa::AnInd(reg),
+        JitEa::Disp(reg, _) => FastEa::AnDisp(reg),
+        _ => return None,
+    };
+    let old_pc = cpu.pc;
+    cpu.pc = trace.pc.wrapping_add(2);
+    if super::mem_ops::execute_mem_op(
+        cpu,
+        DecodedMemOp::AluAddr {
+            op: AddrOp::Adda,
             size,
             src,
             dst,
@@ -6658,6 +6847,24 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
                 4
             }
         }
+        JitTraceOp::BitImmReg {
+            op,
+            bit,
+            dst,
+            cycles,
+        } => {
+            let mask = 1u32 << bit;
+            let dst = dst as usize;
+            let value = cpu.dar[dst];
+            cpu.not_z_flag = if value & mask != 0 { 1 } else { 0 };
+            match op {
+                JitBitOp::Test => {}
+                JitBitOp::Change => cpu.dar[dst] = value ^ mask,
+                JitBitOp::Clear => cpu.dar[dst] = value & !mask,
+                JitBitOp::Set => cpu.dar[dst] = value | mask,
+            }
+            cycles
+        }
         JitTraceOp::BitReg { op, bit_reg, dst } => {
             let bit = cpu.dar[bit_reg as usize] & 31;
             let mask = 1u32 << bit;
@@ -6820,6 +7027,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is handled by execute_portable_addr_cmp_mem_to_reg")
+        }
+        JitTraceOp::AddaMemToReg { .. } => {
+            unreachable!("AddaMemToReg is handled by execute_portable_adda_mem_to_reg")
         }
         JitTraceOp::AddRegToMem { .. } => {
             unreachable!("AddRegToMem is handled by execute_portable_add_reg_to_mem")
@@ -7357,6 +7567,35 @@ fn emit_jit_op(
                 }
             }
         }
+        JitTraceOp::BitImmReg {
+            op,
+            bit,
+            dst,
+            cycles,
+        } => {
+            let mask = iconst_u32(builder, 1u32 << bit);
+            let value = load_reg(builder, cpu, JitDirectReg::Data(dst));
+            let tested = builder.ins().band(value, mask);
+            let not_z = flag_from_nonzero(builder, tested, 1);
+            store_value_u32(builder, cpu, offset_of!(CpuCore, not_z_flag), not_z);
+            match op {
+                JitBitOp::Test => {}
+                JitBitOp::Change => {
+                    let result = builder.ins().bxor(value, mask);
+                    store_reg(builder, cpu, JitDirectReg::Data(dst), result);
+                }
+                JitBitOp::Clear => {
+                    let inverted = builder.ins().bxor_imm(mask, -1);
+                    let result = builder.ins().band(value, inverted);
+                    store_reg(builder, cpu, JitDirectReg::Data(dst), result);
+                }
+                JitBitOp::Set => {
+                    let result = builder.ins().bor(value, mask);
+                    store_reg(builder, cpu, JitDirectReg::Data(dst), result);
+                }
+            }
+            cycles_const(builder, cycles)
+        }
         JitTraceOp::Exg { opcode } => {
             let rx = ((opcode >> 9) & 7) as u8;
             let ry = (opcode & 7) as u8;
@@ -7485,6 +7724,9 @@ fn emit_jit_op(
         }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is emitted by emit_addr_cmp_mem_to_reg")
+        }
+        JitTraceOp::AddaMemToReg { .. } => {
+            unreachable!("AddaMemToReg is emitted by emit_adda_mem_to_reg")
         }
         JitTraceOp::AddRegToMem { .. } => {
             unreachable!("AddRegToMem is emitted by emit_add_reg_to_mem")
@@ -8308,6 +8550,49 @@ fn emit_addr_cmp_mem_to_reg(
     let dst_value = load_reg(builder, cpu, JitDirectReg::Addr(dst));
     let result = builder.ins().isub(dst_value, src_value);
     set_cmp_flags(builder, cpu, src_value, dst_value, result, Size::Long);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit ADDA.W/L `<ea>,An`: the checked window load, word sign-extension,
+/// and 32-bit add mirror `emit_addr_cmp_mem_to_reg`, but the result is
+/// written back to the address register and no condition code changes.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_adda_mem_to_reg(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::AddaMemToReg { size, src, dst } = trace.op else {
+        unreachable!("expected memory-to-address-register add trace")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let address = match src {
+        JitEa::Ind(reg) => load_reg(builder, cpu, JitDirectReg::Addr(reg)),
+        JitEa::Disp(reg, displacement) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            builder.ins().iadd_imm(base, displacement as i64)
+        }
+        _ => unreachable!("address add decoder admitted unsupported EA"),
+    };
+    let (off, _) = checked_window_off(builder, env, bail, address, size);
+    let src_value = window_load(builder, env, off, size);
+    let src_value = if size == Size::Word {
+        sign_extend_word(builder, src_value)
+    } else {
+        src_value
+    };
+    let dst_value = load_reg(builder, cpu, JitDirectReg::Addr(dst));
+    let result = builder.ins().iadd(dst_value, src_value);
+    store_reg(builder, cpu, JitDirectReg::Addr(dst), result);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -15048,6 +15333,350 @@ mod portable_tests {
         assert_eq!(actual.pc, 0x0100);
         assert_eq!(actual.a(3), 0xABCD_EF01);
         assert_eq!(actual.get_ccr(), 0x15);
+    }
+
+    #[test]
+    fn portable_adda_word_memory_sign_extends_writes_destination_and_preserves_ccr() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        mem[0x0210..0x0212].copy_from_slice(&0xFFFFu16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(1, 0x0200);
+        cpu.set_a(3, 0x0000_1000);
+        cpu.set_ccr(0x15);
+
+        let op = TraceBuildOp {
+            opcode: 0xD6E9,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AddaMemToReg {
+                size: Size::Word,
+                src: JitEa::Disp(1, 0x0010),
+                dst: 3,
+            },
+        };
+        assert_eq!(
+            execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0104)),
+            Some(16)
+        );
+        assert_eq!(
+            cpu.a(3),
+            0x0000_0FFF,
+            "word source is sign-extended before the 32-bit add"
+        );
+        assert_eq!(cpu.pc, 0x0104);
+        assert_eq!(cpu.get_ccr(), 0x15, "ADDA changes no condition code");
+    }
+
+    #[test]
+    fn adda_memory_sources_match_the_68000_interpreter_and_cycles() {
+        for (opcode, extension, address, expected_cycles, label) in [
+            (0xD6D1u16, None, 0x0200u32, 12, "ADDA.W (A1),A3"),
+            (0xD6E9, Some(0x0010), 0x0210, 16, "ADDA.W d16(A1),A3"),
+            (0xD7D1, None, 0x0200, 14, "ADDA.L (A1),A3"),
+            (0xD7E9, Some(0x0010), 0x0210, 18, "ADDA.L d16(A1),A3"),
+        ] {
+            let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+            bus.write_word(0x0100, opcode);
+            if let Some(extension) = extension {
+                bus.write_word(0x0102, extension);
+            }
+            bus.write_long(address, 0xFFFF_1234);
+
+            let mut interpreter = cpu();
+            interpreter.set_cpu_type(CpuType::M68000);
+            interpreter.set_a(1, 0x0200);
+            interpreter.set_a(3, 0x1234_5678);
+            interpreter.set_ccr(0x15);
+            let interpreter_cycles = match interpreter.step(&mut bus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+
+            let trace = decode_trace_op(&cpu(), &mut bus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: trace decode failed"));
+            let mut memory = vec![0u8; 0x1000];
+            memory[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+            if let Some(extension) = extension {
+                memory[0x0102..0x0104].copy_from_slice(&extension.to_be_bytes());
+            }
+            memory[address as usize..address as usize + 4]
+                .copy_from_slice(&0xFFFF_1234u32.to_be_bytes());
+            let mut portable = cpu();
+            portable.set_cpu_type(CpuType::M68000);
+            portable.set_a(1, 0x0200);
+            portable.set_a(3, 0x1234_5678);
+            portable.set_ccr(0x15);
+            attach_window(&mut portable, &mut memory);
+            let portable_cycles =
+                execute_portable_op(&mut portable, trace, CodeSpans::caller(0x0100, 0x0104))
+                    .unwrap_or_else(|| panic!("{label}: portable execution bailed"));
+
+            assert_eq!(
+                interpreter_cycles, expected_cycles,
+                "{label}: reference cycles"
+            );
+            assert_eq!(portable_cycles, interpreter_cycles, "{label}: trace cycles");
+            assert_eq!(portable.dar, interpreter.dar, "{label}: registers");
+            assert_eq!(portable.get_ccr(), interpreter.get_ccr(), "{label}: CCR");
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_adda_displacement_matches_portable_and_bails_atomically() {
+        let adda = TraceBuildOp {
+            opcode: 0xD7E9,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::AddaMemToReg {
+                size: Size::Long,
+                src: JitEa::Disp(1, 0x0010),
+                dst: 3,
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60FA,
+            extension: None,
+            extension2: None,
+            pc: 0x0104,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -6,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let ops = vec![adda, branch];
+
+        let mut expected = cpu();
+        let mut expected_mem = vec![0u8; 0x1000];
+        expected_mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        expected_mem[0x0210..0x0214].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        attach_window(&mut expected, &mut expected_mem);
+        expected.set_cpu_type(CpuType::M68040);
+        expected.set_a(1, 0x0200);
+        expected.set_a(3, 0x0000_0100);
+        expected.set_ccr(0x10);
+        let expected_packed =
+            execute_portable_trace(&mut expected, &ops, CodeSpans::caller(0x0100, 0x0106));
+
+        let mut actual = cpu();
+        let mut actual_mem = vec![0u8; 0x1000];
+        actual_mem[0x0102..0x0104].copy_from_slice(&0x0010u16.to_be_bytes());
+        actual_mem[0x0210..0x0214].copy_from_slice(&0x1234_5678u32.to_be_bytes());
+        attach_window(&mut actual, &mut actual_mem);
+        actual.set_cpu_type(CpuType::M68040);
+        actual.set_a(1, 0x0200);
+        actual.set_a(3, 0x0000_0100);
+        actual.set_ccr(0x10);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops, Some(0x0100))
+            .expect("ADDA loop should compile");
+        let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+
+        assert_eq!(actual_packed, expected_packed);
+        assert_eq!(expected.a(3), 0x1234_5778, "the destination was written");
+        assert_eq!(actual.a(3), expected.a(3));
+        assert_eq!(actual.get_ccr(), expected.get_ccr());
+        assert_eq!(actual.pc, expected.pc);
+
+        // Out-of-window source: nothing may commit.
+        actual.set_a(1, 0x00FF_FFF8);
+        actual.set_a(3, 0xABCD_EF01);
+        actual.set_ccr(0x15);
+        actual.pc = 0x0100;
+        let packed = unsafe { compiled.call_native(&mut actual, 1) };
+        assert_eq!(packed, 0);
+        assert_eq!(actual.pc, 0x0100);
+        assert_eq!(actual.a(3), 0xABCD_EF01);
+        assert_eq!(actual.get_ccr(), 0x15);
+    }
+
+    #[test]
+    fn bit_imm_reg_decodes_all_four_ops_and_charges_the_static_cycles() {
+        // BTST #2,D4 / BCHG #20,D1 / BCLR #20,D1 / BSET #0,D7, encoded in
+        // bus memory so the decoder reads the real extension words, routed
+        // through `decode_trace_op` to prove the router claims the forms.
+        let mut cpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (base, words) in [
+            (0x0100u32, [0x0804u16, 0x0002]), // BTST #2,D4
+            (0x0110, [0x0841, 0x0014]),       // BCHG #20,D1
+            (0x0120, [0x0881, 0x0014]),       // BCLR #20,D1
+            (0x0130, [0x08C7, 0x0000]),       // BSET #0,D7
+        ] {
+            bus.write_word(base, words[0]);
+            bus.write_word(base + 2, words[1]);
+        }
+
+        // 68040: flat post-020 charges.
+        cpu.set_cpu_type(CpuType::M68040);
+        let ops: Vec<TraceBuildOp> = [0x0100u32, 0x0110, 0x0120, 0x0130]
+            .iter()
+            .map(|&pc| decode_trace_op(&cpu, &mut bus, pc, CpuType::M68040).expect("form decodes"))
+            .collect();
+        let expect = [
+            (JitBitOp::Test, 2u8, 4u8, 6),
+            (JitBitOp::Change, 20, 1, 8),
+            (JitBitOp::Clear, 20, 1, 10),
+            (JitBitOp::Set, 0, 7, 8),
+        ];
+        for (decoded, &(op, bit, dst, cycles)) in ops.iter().zip(&expect) {
+            let JitTraceOp::BitImmReg {
+                op: d_op,
+                bit: d_bit,
+                dst: d_dst,
+                cycles: d_cycles,
+            } = decoded.op
+            else {
+                panic!("expected BitImmReg");
+            };
+            assert_eq!((d_op, d_bit, d_dst), (op, bit, dst));
+            assert_eq!(d_cycles, cycles, "68040 cycles for {op:?}");
+        }
+
+        // 68000: dynamic-form base + 4 for the extension fetch, and the
+        // modifying ops add 2 for an upper-half bit; BTST does not.
+        cpu.set_cpu_type(CpuType::M68000);
+        let cycles_68000: Vec<i32> = [0x0100u32, 0x0110, 0x0120, 0x0130]
+            .iter()
+            .map(|&pc| {
+                let decoded = decode_trace_op(&cpu, &mut bus, pc, CpuType::M68000)
+                    .expect("form decodes on the 68000");
+                let JitTraceOp::BitImmReg { cycles, .. } = decoded.op else {
+                    panic!("expected BitImmReg");
+                };
+                cycles
+            })
+            .collect();
+        assert_eq!(
+            cycles_68000,
+            vec![10, 12, 14, 10],
+            "BTST #2 / BCHG #20 / BCLR #20 / BSET #0 on the 68000"
+        );
+
+        // The memory-destination static forms are another decoder's job.
+        assert!(decode_bit_imm_reg_trace_op(&cpu, &mut bus, 0x0100, 0x0810).is_none());
+    }
+
+    #[test]
+    fn portable_bit_imm_reg_sets_only_z_and_writes_modifying_results() {
+        let mut cpu = cpu();
+        cpu.set_d(4, 0b0100);
+        cpu.set_ccr(0x1F);
+        let op = |op, bit, cycles| TraceBuildOp {
+            opcode: 0x0804,
+            extension: Some(bit as u16),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::BitImmReg {
+                op,
+                bit,
+                dst: 4,
+                cycles,
+            },
+        };
+        // BTST #2: bit set, Z clear, everything else preserved.
+        assert_eq!(
+            execute_portable_op(&mut cpu, op(JitBitOp::Test, 2, 10), CodeSpans::caller(0, 0)),
+            Some(10)
+        );
+        assert_eq!(cpu.get_ccr(), 0x1B, "only Z changes; X/N/V/C preserved");
+        assert_eq!(cpu.d(4), 0b0100);
+        // BCLR #2: Z reflects the old bit, the bit clears.
+        assert_eq!(
+            execute_portable_op(
+                &mut cpu,
+                op(JitBitOp::Clear, 2, 14),
+                CodeSpans::caller(0, 0)
+            ),
+            Some(14)
+        );
+        assert_eq!(cpu.d(4), 0);
+        // BSET #31: the high-mask edge writes bit 31 and Z was set.
+        assert_eq!(
+            execute_portable_op(&mut cpu, op(JitBitOp::Set, 31, 12), CodeSpans::caller(0, 0)),
+            Some(12)
+        );
+        assert_eq!(cpu.d(4), 0x8000_0000);
+        assert_eq!(cpu.get_ccr() & 0x04, 0x04, "Z was set by the cleared bit");
+        // BCHG #31 flips it back off; Z reflects the old set bit.
+        assert_eq!(
+            execute_portable_op(
+                &mut cpu,
+                op(JitBitOp::Change, 31, 12),
+                CodeSpans::caller(0, 0)
+            ),
+            Some(12)
+        );
+        assert_eq!(cpu.d(4), 0);
+        assert_eq!(cpu.get_ccr() & 0x04, 0, "the tested bit was set");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_bit_imm_reg_matches_portable_for_all_ops_and_bit_31() {
+        for (bit_op, bit) in [
+            (JitBitOp::Test, 2u8),
+            (JitBitOp::Change, 31),
+            (JitBitOp::Clear, 31),
+            (JitBitOp::Set, 15),
+        ] {
+            let bit_trace = TraceBuildOp {
+                opcode: 0x0804,
+                extension: Some(u16::from(bit)),
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::BitImmReg {
+                    op: bit_op,
+                    bit,
+                    dst: 4,
+                    cycles: 8,
+                },
+            };
+            let branch = TraceBuildOp {
+                opcode: 0x60FA,
+                extension: None,
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -6,
+                    length: 2,
+                    expected_taken: None,
+                },
+            };
+            let ops = vec![bit_trace, branch];
+
+            let run = |native: bool| {
+                let mut cpu = cpu();
+                cpu.set_cpu_type(CpuType::M68040);
+                cpu.set_d(4, 0x8000_0004);
+                cpu.set_ccr(0x11);
+                let packed = if native {
+                    let mut jit = TraceJit::new();
+                    let compiled = jit
+                        .compile_decoded_ops(
+                            &cpu,
+                            0x0100,
+                            CpuType::M68040,
+                            ops.clone(),
+                            Some(0x0100),
+                        )
+                        .expect("bit-op loop should compile");
+                    unsafe { compiled.call_native(&mut cpu, 1) }
+                } else {
+                    execute_portable_trace(&mut cpu, &ops, CodeSpans::caller(0x0100, 0x0106))
+                };
+                (packed, cpu.d(4), cpu.get_ccr(), cpu.pc)
+            };
+            assert_eq!(run(true), run(false), "{bit_op:?} #{bit},D4");
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
