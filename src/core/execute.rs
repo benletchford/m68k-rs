@@ -620,6 +620,18 @@ impl CpuCore {
         let mut retired: u32 = 0;
         let mut probe_on_entry = true;
 
+        // A recording that closed at an A-line on the previous batch named
+        // its expected continuation; if the host resumed exactly there, the
+        // continuation becomes a trace-head candidate (counting, then
+        // recording, like any backward-branch target). A host that resumed
+        // anywhere else silently drops the hint.
+        if let Some(expected) = self.pending_trap_resume.take()
+            && expected == self.pc
+        {
+            trace_jit::record_trace_target(self.pc, self.cpu_type);
+            probe_on_entry = true;
+        }
+
         loop {
             // The trace JIT's headroom guard compares against
             // `cycles_remaining`; keep it topped up so it can never gate a
@@ -715,10 +727,36 @@ impl CpuCore {
                 }
             };
             if let Some(exit) = exit {
-                // The caller may emulate a surfaced trap and resume at an
-                // unrelated guest PC. Never let an in-progress path recording
-                // cross that host-controlled execution boundary.
-                trace_jit::stop_recording(self, trace_jit::RecordingStop::TrapOrException);
+                // An A-line reached by falling through a recorded region is
+                // a trap-boundary terminal: the region compiles ending at
+                // the trap and the expected resume point (the word after
+                // the A-line) gains head candidacy on the next batch entry,
+                // so segments chain themselves down a trap-punctuated run
+                // (docs/trap-crossing-traces-design.md). Everything else --
+                // F-line, TRAP #n, exceptions, non-sequential arrival --
+                // keeps the previous behavior: the caller may resume at an
+                // unrelated guest PC, so the recording is discarded rather
+                // than allowed to cross a host-controlled boundary.
+                if matches!(exit, BatchExit::AlineTrap { .. }) {
+                    match trace_jit::finish_recording_at_trap(self) {
+                        // Chain quality gate: only a segment the compiler
+                        // accepted right up to this boundary earns a seeded
+                        // continuation; a rejected closure must not extend
+                        // the head chain past code that will never pay.
+                        trace_jit::TrapFinish::Compiled => {
+                            self.pending_trap_resume = Some(self.ppc.wrapping_add(2));
+                        }
+                        trace_jit::TrapFinish::Closed => {}
+                        trace_jit::TrapFinish::None => {
+                            trace_jit::stop_recording(
+                                self,
+                                trace_jit::RecordingStop::TrapOrException,
+                            );
+                        }
+                    }
+                } else {
+                    trace_jit::stop_recording(self, trace_jit::RecordingStop::TrapOrException);
+                }
                 return BatchResult {
                     instructions: retired,
                     exit,

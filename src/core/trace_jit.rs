@@ -48,6 +48,15 @@ const TRACE_MIN_SELF_LOOP_OPS: usize = 2;
 /// memory-ALU, and memory-heavy mixes.
 const TRACE_MIN_INDIRECT_JSR_OPS: usize = 7;
 const TRACE_HOT_THRESHOLD: u8 = 2;
+
+/// Hits a head must re-accumulate after its first trap-boundary closure was
+/// deferred (see `finish_recording_at_trap`): the value only needs to sit
+/// between how often one-shot startup code repeats (once or twice through
+/// boot) and how often a gameplay loop repeats (unbounded), with margin on
+/// both sides -- any small multiple of the base hot threshold satisfies
+/// that, so the deferral is expressed as one rather than as a tuned
+/// constant of its own.
+const TRACE_TRAP_SEGMENT_HOT_THRESHOLD: u8 = 8 * TRACE_HOT_THRESHOLD;
 /// How many compiled continuations one guest entry may chain through after
 /// guard exits. Bounds recursion; each level also shrinks the instruction
 /// budget by what the parent retired.
@@ -212,6 +221,12 @@ pub(crate) enum JitBitSource {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JitTraceOp {
+    /// Trap-boundary terminal: the recorded op is the A-line word itself
+    /// (so SMC validation covers it); executing it sets `pc` to the trap's
+    /// address, retires no guest instruction, charges no cycles, and ends
+    /// the trace. The batch loop then fetches the A-line and surfaces it
+    /// to the host exactly as an interpreted run would.
+    TrapExit,
     Nop,
     MoveReg {
         src: JitDirectReg,
@@ -582,6 +597,9 @@ enum RecordingEnd {
     /// The region closed on its own terms: a back edge, a recorded branch,
     /// or an operation limit.
     Region,
+    /// The region ran into an A-line trap; the `TrapExit` terminal has
+    /// already been appended and the region compiles ending there.
+    TrapBoundary,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -699,6 +717,10 @@ enum TraceSlot {
         /// that ended at a qualifying call boundary so the head's next
         /// recording attempts to record through it.
         allow_call_through: bool,
+        /// A recording from this head closed at an A-line boundary and was
+        /// deferred instead of compiled; the head must re-reach
+        /// `TRACE_TRAP_SEGMENT_HOT_THRESHOLD` hits before recording again.
+        deferred_trap: bool,
     },
     Rejected {
         pc: u32,
@@ -1126,6 +1148,7 @@ impl TraceJit {
                     hits: 0,
                     adaptive_rerecords,
                     allow_call_through,
+                    deferred_trap: false,
                 };
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
@@ -1196,9 +1219,15 @@ impl TraceJit {
                 hits,
                 adaptive_rerecords,
                 allow_call_through,
+                deferred_trap,
             } if *counted_pc == pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
-                if *hits < TRACE_HOT_THRESHOLD {
+                let threshold = if *deferred_trap {
+                    TRACE_TRAP_SEGMENT_HOT_THRESHOLD
+                } else {
+                    TRACE_HOT_THRESHOLD
+                };
+                if *hits < threshold {
                     return None;
                 }
                 self.recording = Some(TraceRecording {
@@ -1384,6 +1413,7 @@ impl TraceJit {
                         hits: 1,
                         adaptive_rerecords: 0,
                         allow_call_through: self.has_call_permission(pc),
+                        deferred_trap: false,
                     };
                     TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
                 }
@@ -1401,6 +1431,7 @@ impl TraceJit {
                     hits: 1,
                     adaptive_rerecords: 0,
                     allow_call_through: self.has_call_permission(pc),
+                    deferred_trap: false,
                 };
                 TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
             }
@@ -1442,9 +1473,15 @@ impl TraceJit {
                 hits,
                 adaptive_rerecords,
                 allow_call_through,
+                deferred_trap,
             } if *counted_pc == exit_pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
-                if entry_watched || *hits < TRACE_HOT_THRESHOLD || self.recording.is_some() {
+                let threshold = if *deferred_trap {
+                    TRACE_TRAP_SEGMENT_HOT_THRESHOLD
+                } else {
+                    TRACE_HOT_THRESHOLD
+                };
+                if entry_watched || *hits < threshold || self.recording.is_some() {
                     return ExitSeed::None;
                 }
                 let adaptive_rerecords = *adaptive_rerecords;
@@ -1480,6 +1517,7 @@ impl TraceJit {
                     hits: 1,
                     adaptive_rerecords: 0,
                     allow_call_through: permission,
+                    deferred_trap: false,
                 };
                 ExitSeed::None
             }
@@ -1547,6 +1585,94 @@ impl TraceJit {
     #[cfg_attr(not(feature = "trace-profile"), allow(unused_variables))]
     fn finish_recording(&mut self, cpu: &mut CpuCore, exit_pc: u32, end: RecordingEnd) {
         self.finish_recording_with_retry(cpu, exit_pc, end, false);
+    }
+
+    /// Close the current recording at the A-line whose word is in `cpu.ir`
+    /// at `cpu.ppc`, appending the `TrapExit` terminal, when the trap is
+    /// the region's sequential continuation. Returns false (leaving the
+    /// recording for the ordinary discard path) when there is no recording,
+    /// nothing was recorded yet, or execution arrived at the trap by a jump
+    /// rather than by falling through from the recorded tail.
+    fn finish_recording_at_trap(&mut self, cpu: &mut CpuCore) -> TrapFinish {
+        let trap_pc = cpu.ppc;
+        let opcode = cpu.ir as u16;
+        let Some(recording) = self.recording.as_ref() else {
+            cpu.trace_recording = false;
+            return TrapFinish::None;
+        };
+        let sequential = recording
+            .ops
+            .last()
+            .is_some_and(|op| op.pc.wrapping_add(op.length() as u32) == trap_pc);
+        if !sequential || opcode & 0xF000 != 0xA000 {
+            return TrapFinish::None;
+        }
+        let start_pc = recording.start_pc;
+        let cpu_type = recording.cpu_type;
+        let adaptive_rerecords = recording.adaptive_rerecords;
+        let allow_call_through = recording.allow_call_through;
+        // Deferred compilation: most trap-terminal regions in boot-like
+        // phases close once or twice and never repay a compile (measured
+        // over a profiled headless boot: +31.6K native calls bought
+        // +0.27M retired). Length cannot separate those from the
+        // trap-punctuated gameplay loops this terminal exists for --
+        // repetition can. The first closure therefore compiles nothing:
+        // it re-arms the head to count with the raised trap-segment
+        // threshold, and only a head that comes back that hot records
+        // again and compiles here.
+        let idx = trace_cache_index(start_pc);
+        let proven = matches!(
+            &self.slots[idx],
+            TraceSlot::Counting {
+                pc,
+                cpu_type: slot_type,
+                deferred_trap: true,
+                ..
+            } if *pc == start_pc && *slot_type == cpu_type
+        );
+        if !proven {
+            self.recording = None;
+            cpu.trace_recording = false;
+            self.slots[idx] = TraceSlot::Counting {
+                pc: start_pc,
+                cpu_type,
+                hits: 0,
+                adaptive_rerecords,
+                allow_call_through,
+                deferred_trap: true,
+            };
+            return TrapFinish::Closed;
+        }
+        let Some(recording) = self.recording.as_mut() else {
+            unreachable!("recording checked above");
+        };
+        recording.ops.push(TraceBuildOp {
+            opcode,
+            extension: None,
+            extension2: None,
+            pc: trap_pc,
+            op: JitTraceOp::TrapExit,
+        });
+        self.finish_recording(cpu, trap_pc, RecordingEnd::TrapBoundary);
+        // Seed the continuation only when a trace now really ends at this
+        // trap. A closure that rejected (or salvaged back to an interior
+        // branch) yields no compiled segment reaching the boundary, and
+        // seeding past it would extend head chains through code the
+        // compiler has already refused -- planting probe candidates that
+        // alias-thrash the direct-mapped slot array without ever paying.
+        let compiled_to_trap = matches!(
+            &self.slots[trace_cache_index(start_pc)],
+            TraceSlot::Compiled(t) if t.pc == start_pc
+                && t.cpu_type == cpu_type
+                && t.ops.last().is_some_and(
+                    |op| matches!(op.op, JitTraceOp::TrapExit) && op.pc == trap_pc,
+                )
+        );
+        if compiled_to_trap {
+            TrapFinish::Compiled
+        } else {
+            TrapFinish::Closed
+        }
     }
 
     /// `call_retry_pending` marks the one case where a rescued prefix is
@@ -1882,6 +2008,7 @@ impl TraceJit {
                         hits: 0,
                         adaptive_rerecords: 0,
                         allow_call_through: true,
+                        deferred_trap: false,
                     };
                     // The reject pushed the head into the probe-skip
                     // filter; clear it so the retry can be probed.
@@ -2014,7 +2141,10 @@ impl TraceJit {
         // Short checked memory ALU regions do not amortize trace validation
         // and the native/Rust boundary. Keep those on the decoded-memory path
         // unless the measured indirect-call length threshold above provides
-        // enough independent work to cover the fixed cost.
+        // enough independent work to cover the fixed cost. Trap-boundary
+        // segments get NO exemption here: a TrapExit ending adds trap
+        // dispatch and re-entry on top of the fixed costs, so the
+        // amortisation economics only tighten.
         if !self_loop
             && !ends_in_indirect_jsr
             && ops.iter().any(|op| {
@@ -2260,6 +2390,23 @@ impl TraceJit {
                     cycles_before: cycles_value,
                 };
                 let op_cycles = match op.op {
+                    JitTraceOp::TrapExit => {
+                        // Trap boundary: unconditionally take a bail exit --
+                        // `pc` lands on the A-line, retired counts only the
+                        // ops before it. The continuation block is dead
+                        // (TrapExit is always the final op) but keeps the
+                        // emit loop's shape uniform.
+                        let bail = builder.create_block();
+                        bails.push(BailReq {
+                            block: bail,
+                            pc: op.pc,
+                            at: bail_at,
+                        });
+                        builder.ins().jump(bail, &[]);
+                        let cont = builder.create_block();
+                        builder.switch_to_block(cont);
+                        builder.ins().iconst(types::I32, 0)
+                    }
                     JitTraceOp::Branch {
                         condition,
                         displacement,
@@ -2602,6 +2749,9 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
     let mut mem_written_flags: u8 = 0;
     for op in body {
         match op.op {
+            // A trap boundary never appears inside a self-loop body; if it
+            // somehow did, the loop is not a pure poll.
+            JitTraceOp::TrapExit => return false,
             // No-ops mutate nothing.
             JitTraceOp::Nop => {}
             // Interior branches make the recorded path non-unique for
@@ -2798,6 +2948,34 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
     })
 }
 
+/// Finish an in-progress recording at an A-line trap: the trap word itself
+/// becomes the region's `TrapExit` terminal and the region compiles ending
+/// there (docs/trap-crossing-traces-design.md). Returns whether a recording
+/// was closed this way; the caller falls back to the ordinary discard
+/// otherwise. `cpu.ppc` must be the A-line's address and `cpu.ir` its word,
+/// as the batch loop's miss contract guarantees.
+pub(crate) fn finish_recording_at_trap(cpu: &mut CpuCore) -> TrapFinish {
+    if !cpu.trace_recording {
+        return TrapFinish::None;
+    }
+    with_trace_jit(|jit| jit.finish_recording_at_trap(cpu))
+}
+
+/// How a recording responded to an A-line at its sequential continuation.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum TrapFinish {
+    /// No recording, nothing recorded, or non-sequential arrival: the
+    /// caller applies the ordinary discard path.
+    None,
+    /// The recording closed at the trap but no compiled segment reaches
+    /// the boundary (rejected, or salvaged back to an interior branch).
+    Closed,
+    /// A compiled segment now ends exactly at this trap; the boundary
+    /// has proven worth crossing, so the caller may seed the post-trap
+    /// continuation as a head candidate.
+    Compiled,
+}
+
 pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
     with_trace_jit(|jit| jit.record_trace_target(pc, cpu_type));
 }
@@ -2874,6 +3052,8 @@ fn push_probe_skip(cpu: &mut CpuCore, pc: u32) {
 impl JitTraceOp {
     fn max_cycles(self) -> i32 {
         match self {
+            // The A-line itself is not executed by the trace.
+            Self::TrapExit => 0,
             Self::Nop => 4,
             Self::MoveReg { .. } => 4,
             Self::Moveq { .. } => 4,
@@ -3102,7 +3282,7 @@ impl JitTraceOp {
     fn ends_trace(self) -> bool {
         matches!(
             self,
-            Self::Branch { .. } | Self::Dbcc { .. } | Self::IndirectJsr { .. }
+            Self::Branch { .. } | Self::Dbcc { .. } | Self::IndirectJsr { .. } | Self::TrapExit
         )
     }
 
@@ -4329,6 +4509,11 @@ fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSp
 /// from this op was committed.
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) -> Option<i32> {
+    if matches!(op.op, JitTraceOp::TrapExit) {
+        // Trap boundary: exit with `pc` on the A-line and nothing retired
+        // for this op -- the bail convention already does exactly that.
+        return None;
+    }
     if let JitTraceOp::MoveMem { size, src, dst } = op.op {
         return execute_portable_move_mem(cpu, size, src, dst, spans);
     }
@@ -5265,6 +5450,9 @@ fn execute_portable_move_mem(
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
     match op.op {
+        JitTraceOp::TrapExit => {
+            unreachable!("TrapExit bails in execute_portable_op before reaching the register path")
+        }
         JitTraceOp::Nop => 4,
         JitTraceOp::Moveq { reg, data } => {
             cpu.dar[reg as usize] = data;
@@ -5850,6 +6038,9 @@ fn emit_jit_op(
 ) -> Value {
     let trace_pc = op.pc;
     match op.op {
+        JitTraceOp::TrapExit => {
+            unreachable!("TrapExit is emitted as an unconditional bail in the main emit loop")
+        }
         JitTraceOp::Nop => cycles_const(builder, 4),
         JitTraceOp::MoveImmReg { reg, size, value } => {
             let imm = iconst_u32(builder, value);
@@ -15622,6 +15813,234 @@ mod portable_tests {
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    /// The stage-1 trap-crossing shape (docs/trap-crossing-traces-design.md):
+    /// a DBRA loop whose body is punctuated by two A-lines. Segment heads
+    /// must chain themselves down the run -- the loop head compiles ending
+    /// at trap 1, the seeded post-trap heads compile ending at trap 2 and at
+    /// the closing DBRA -- and executing the segments must land `pc` on each
+    /// A-line with only the real instructions retired.
+    #[test]
+    fn trap_punctuated_loop_compiles_and_executes_as_chained_segments() {
+        const A: u32 = 0x0100;
+        const TRAP1: u32 = 0x0106;
+        const CONT: u32 = 0x0108;
+        const TRAP2: u32 = 0x010E;
+        const TAIL: u32 = 0x0110;
+        let words = [
+            0x5282, // head: ADDQ.L #1,D2
+            0x5283, // ADDQ.L #1,D3
+            0x5284, // ADDQ.L #1,D4
+            0xA123, // trap 1
+            0x5285, // cont: ADDQ.L #1,D5
+            0x5286, // ADDQ.L #1,D6
+            0x5287, // ADDQ.L #1,D7
+            0xA124, // trap 2
+            0x4A41, // tail: TST.W D1
+            0x5281, // ADDQ.L #1,D1
+            0x51C8, 0xFFEA, // DBRA D0, head
+            0xA000, // sentinel
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in words.iter().enumerate() {
+            bus.write_word_at(A + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = A;
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 400);
+
+        // Drive the loop the way a host does: emulate every A-line as a
+        // no-op (pc has already advanced past the word) and stop at the
+        // sentinel.
+        let mut batches = 0;
+        loop {
+            let result = cpu.run_batch(&mut bus, 65_536, &[]);
+            match result.exit {
+                crate::BatchExit::AlineTrap { opcode: 0xA000 } => break,
+                crate::BatchExit::AlineTrap { .. } => {}
+                crate::BatchExit::BudgetExhausted => {}
+                other => panic!("unexpected exit {other:?}"),
+            }
+            batches += 1;
+            assert!(batches < 100_000, "loop diverged");
+        }
+        // 401 iterations, three counters each.
+        assert_eq!(cpu.d(2), 401);
+        assert_eq!(cpu.d(5), 401);
+        assert_eq!(cpu.d(1), 401);
+
+        // All three segments compiled, each ending at its boundary.
+        for (head, terminal, kind) in [
+            (A, Some(TRAP1), "loop head -> trap 1"),
+            (CONT, Some(TRAP2), "post-trap-1 -> trap 2"),
+            (TAIL, None, "post-trap-2 -> DBRA"),
+        ] {
+            with_trace_jit(|jit| match &jit.slots[trace_cache_index(head)] {
+                TraceSlot::Compiled(trace) => {
+                    assert_eq!(trace.pc, head, "{kind}: compiled at its head");
+                    let last = trace.ops.last().expect("ops");
+                    match terminal {
+                        Some(trap_pc) => {
+                            assert_eq!(
+                                last.op,
+                                JitTraceOp::TrapExit,
+                                "{kind}: must end in the trap terminal"
+                            );
+                            assert_eq!(last.pc, trap_pc, "{kind}: terminal at the A-line");
+                        }
+                        None => assert!(
+                            matches!(last.op, JitTraceOp::Dbcc { .. }),
+                            "{kind}: closes on the real branch"
+                        ),
+                    }
+                }
+                _ => panic!("{kind}: expected a compiled trace"),
+            });
+        }
+
+        // Executing the first segment retires exactly its three real ops
+        // and parks `pc` on the A-line, ready for host dispatch.
+        cpu.pc = A;
+        let before = (cpu.d(2), cpu.d(3), cpu.d(4));
+        let (result, retired) =
+            try_execute_trace(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[])
+                .expect("compiled segment executes");
+        assert!(matches!(result, CachedRunResult::Ran));
+        assert_eq!(retired, 3, "three real ops, the A-line not counted");
+        assert_eq!(cpu.pc, TRAP1, "pc parked on the trap for host dispatch");
+        assert_eq!(
+            (cpu.d(2), cpu.d(3), cpu.d(4)),
+            (before.0 + 1, before.1 + 1, before.2 + 1)
+        );
+
+        // Rewriting the trap word is self-modifying code over the recorded
+        // region: the segment must refuse to run stale semantics.
+        bus.write_word_at(TRAP1, 0xA125);
+        cpu.pc = A;
+        let after_smc = try_execute_trace(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[]);
+        match after_smc {
+            None => {}
+            Some((CachedRunResult::Miss(opcode), 0)) => assert_eq!(opcode, 0x5282),
+            Some((CachedRunResult::Miss(_), _)) => {}
+            Some((CachedRunResult::Ran, _)) => {
+                panic!("a rewritten trap word must invalidate the segment")
+            }
+        }
+    }
+
+    /// finish_recording_at_trap refuses non-sequential arrival and non-A-line
+    /// words: the recording is left for the ordinary discard path.
+    #[test]
+    fn trap_boundary_finish_requires_sequential_aline() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        with_trace_jit(|jit| {
+            jit.recording = Some(TraceRecording {
+                start_pc: 0x0100,
+                cpu_type: CpuType::M68040,
+                ops: vec![TraceBuildOp {
+                    opcode: 0x5282,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0100,
+                    op: JitTraceOp::AddqSubqReg {
+                        reg: 2,
+                        data: 1,
+                        size: Size::Long,
+                        is_sub: false,
+                    },
+                }],
+                allow_call_through: false,
+                pending_return: None,
+                adaptive_rerecords: 0,
+            });
+        });
+        cpu.trace_recording = true;
+        // Non-sequential: the A-line is not at 0x0102.
+        cpu.ppc = 0x0200;
+        cpu.ir = 0xA123;
+        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::None);
+        // Sequential but not an A-line word.
+        cpu.ppc = 0x0102;
+        cpu.ir = 0x4E71;
+        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::None);
+        // The recording is still open for the ordinary paths.
+        with_trace_jit(|jit| assert!(jit.recording.is_some()));
+        stop_recording(&mut cpu, RecordingStop::TrapOrException);
+        with_trace_jit(|jit| assert!(jit.recording.is_none()));
+    }
+
+    /// The first sequential trap-boundary closure at a head compiles
+    /// nothing: it is deferred, re-arming the head to count with the
+    /// raised trap-segment threshold. Only a head that comes back that
+    /// hot compiles at its second closure.
+    #[test]
+    fn trap_boundary_first_closure_defers_and_rearms_the_head() {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        let make_recording = || TraceRecording {
+            start_pc: 0x0100,
+            cpu_type: CpuType::M68040,
+            ops: vec![TraceBuildOp {
+                opcode: 0x5282,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 2,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            }],
+            allow_call_through: false,
+            pending_return: None,
+            adaptive_rerecords: 0,
+        };
+        with_trace_jit(|jit| {
+            jit.slots[trace_cache_index(0x0100)] = TraceSlot::Empty;
+            jit.recording = Some(make_recording());
+        });
+        cpu.trace_recording = true;
+        cpu.ppc = 0x0102;
+        cpu.ir = 0xA123;
+        // First closure: deferred, not compiled.
+        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::Closed);
+        assert!(!cpu.trace_recording);
+        with_trace_jit(|jit| {
+            assert!(jit.recording.is_none());
+            assert!(matches!(
+                &jit.slots[trace_cache_index(0x0100)],
+                TraceSlot::Counting {
+                    pc: 0x0100,
+                    hits: 0,
+                    deferred_trap: true,
+                    ..
+                }
+            ));
+            // The head must now re-reach the raised threshold before the
+            // probe path records again.
+            jit.recording = Some(make_recording());
+        });
+        cpu.trace_recording = true;
+        cpu.ppc = 0x0102;
+        cpu.ir = 0xA123;
+        // Second closure at the now-deferred head: single-op region, so the
+        // compile gate rejects it -- but it must NOT defer again (Closed
+        // comes from the too-short rejection, and the slot moves off
+        // Counting instead of re-arming).
+        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::Closed);
+        with_trace_jit(|jit| {
+            assert!(jit.recording.is_none());
+            assert!(matches!(
+                &jit.slots[trace_cache_index(0x0100)],
+                TraceSlot::Rejected { pc: 0x0100, .. }
+            ));
+        });
+    }
+
     #[test]
     fn blocked_recording_salvages_the_prefix_through_the_last_branch() {
         // Nine admissible ops (the last a recorded interior branch), then
@@ -16020,6 +16439,7 @@ mod portable_tests {
                 TraceSlot::Counting {
                     pc,
                     allow_call_through: true,
+                    deferred_trap: false,
                     ..
                 } if *pc == HEAD
             ),
@@ -16032,6 +16452,7 @@ mod portable_tests {
             TraceSlot::Counting {
                 pc,
                 allow_call_through: false,
+                    deferred_trap: false,
                 ..
             } if *pc == COLLIDER
         ));

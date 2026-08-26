@@ -367,6 +367,11 @@ pub struct CpuCore {
     // trace, so eviction can't wedge them.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_record_skip: [u32; 4],
+    /// Expected resume PC after an A-line that closed a trap-boundary
+    /// recording; consumed at the next batch entry to seed the
+    /// continuation segment's head candidacy. Transient host-side state.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) pending_trap_resume: Option<u32>,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) trace_probe_skip: [u32; 4],
     #[cfg_attr(feature = "serde", serde(skip))]
@@ -526,6 +531,7 @@ impl CpuCore {
             fm_base: 0,
             fm_len: 0,
             trace_record_skip: [super::trace_jit::TRACE_PC_NONE; 4],
+            pending_trap_resume: None,
             trace_probe_skip: [super::trace_jit::TRACE_PC_NONE; 4],
             trace_record_skip_at: 0,
             trace_probe_skip_at: 0,
