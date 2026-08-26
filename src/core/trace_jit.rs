@@ -2555,19 +2555,27 @@ impl TraceJit {
 
         // Short checked memory ALU regions do not amortize trace validation
         // and the native/Rust boundary. Keep those on the decoded-memory path
-        // unless the measured indirect-call length threshold above provides
-        // enough independent work to cover the fixed cost. Trap-boundary
-        // segments get NO exemption here: a TrapExit ending adds trap
-        // dispatch and re-entry on top of the fixed costs, so the
-        // amortisation economics only tighten.
+        // unless the region carries enough independent work to cover the
+        // fixed cost. The length bound reuses the measured indirect-call
+        // threshold (seven-op trials won at least 7.2% across register,
+        // memory-ALU, and memory-heavy mixes, and an indirect call pays
+        // MORE per entry than a plain linear trace, so the bound is
+        // conservative here). The rejection used to be presence-based with
+        // no length test; once call-through recordings began spanning
+        // whole subroutines, a single memory compare deep inside a long
+        // recording rejected regions the gate's economics never measured.
+        // Trap-boundary segments get no exemption: a TrapExit adds trap
+        // dispatch and re-entry on top of the fixed costs.
         if !self_loop
             && !ends_in_indirect_jsr
+            && ops.len() < TRACE_MIN_INDIRECT_JSR_OPS
             && ops.iter().any(|op| {
                 matches!(
                     op.op,
                     JitTraceOp::AluMemToReg { .. }
                         | JitTraceOp::CmpiWordMem { .. }
                         | JitTraceOp::AddrCmpMemToReg { .. }
+                        | JitTraceOp::AddaMemToReg { .. }
                 )
             })
         {
@@ -18707,6 +18715,103 @@ mod portable_tests {
             .expect("a near-branching callee compiles");
         assert_eq!(near.callee_start, 0x0110);
         assert_eq!(near.callee_end, 0x0134 + 4);
+    }
+
+    /// The memory-ALU amortization refusal is a SHORT-segment rule: a
+    /// non-loop region below the measured length bound rejects, and the
+    /// same shape with enough independent work compiles. Both the
+    /// read-only compare family and the mutating ADDA admission are
+    /// gated identically.
+    #[test]
+    fn linear_memory_alu_gate_rejects_only_short_regions() {
+        let mem_op = |op: JitTraceOp, opcode: u16| TraceBuildOp {
+            opcode,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op,
+        };
+        let build = |first: TraceBuildOp, fillers: usize| {
+            let mut ops = vec![first];
+            for i in 0..fillers {
+                ops.push(TraceBuildOp {
+                    opcode: 0x7000,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0102 + 2 * i as u32,
+                    op: JitTraceOp::Moveq {
+                        reg: (i % 4) as u8,
+                        data: i as u32,
+                    },
+                });
+            }
+            let last_pc = 0x0102 + 2 * fillers as u32;
+            ops.push(TraceBuildOp {
+                opcode: 0x6010,
+                extension: None,
+                extension2: None,
+                pc: last_pc,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: 0x10,
+                    length: 2,
+                    expected_taken: None,
+                },
+            });
+            ops
+        };
+        let cmp = || {
+            mem_op(
+                JitTraceOp::AluMemToReg {
+                    op: JitBinaryOp::Cmp,
+                    size: Size::Word,
+                    src: JitEa::Ind(1),
+                    dst: 0,
+                },
+                0xB051,
+            )
+        };
+        let adda = || {
+            mem_op(
+                JitTraceOp::AddaMemToReg {
+                    size: Size::Word,
+                    src: JitEa::Ind(1),
+                    dst: 3,
+                },
+                0xD6D1,
+            )
+        };
+
+        let mut mem = vec![0u8; 0x1000];
+        let mut c = cpu();
+        c.set_cpu_type(CpuType::M68040);
+        c.set_a(1, 0x0200);
+        attach_window(&mut c, &mut mem);
+        let mut jit = TraceJit::new();
+
+        // Below the bound (op + 4 fillers + branch = 6 < 7): both families
+        // reject with the amortization reason.
+        for short_first in [cmp(), adda()] {
+            let short = jit.compile_decoded_ops_reason(
+                &c,
+                0x0100,
+                CpuType::M68040,
+                build(short_first, 4),
+                None,
+            );
+            assert!(
+                matches!(short, Err(RegionRejectReason::LinearMemoryAlu)),
+                "a short non-loop memory-ALU region must reject: {:?}",
+                short.as_ref().err()
+            );
+        }
+
+        // At the bound (op + 5 fillers + branch = 7): the same shapes
+        // carry enough independent work and compile.
+        for long_first in [cmp(), adda()] {
+            jit.compile_decoded_ops_reason(&c, 0x0100, CpuType::M68040, build(long_first, 5), None)
+                .expect("a bound-length memory-ALU region compiles");
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
