@@ -1614,10 +1614,13 @@ mod tests {
         let mut bus = LinearMemoryBus::new(0x1_0000);
         let words = [
             0x4600, // NOT.B D0: alternates Z every iteration
-            0x6602, // BNE.S skip
-            0x4E71, // opposite-path NOP
+            // Skips 5 ops (> MAX_SKIP_OPS) so the alternating branch stays
+            // a guarded terminal rather than being if-converted: this test
+            // is about guard-exit accounting, not inlining.
+            0x660A, // BNE.S skip
+            0x4E71, 0x4E71, 0x4E71, 0x4E71, 0x4E71, // opposite-path NOPs
             0x5281, // skip: ADDQ.L #1,D1
-            0x60F6, // BRA.S head
+            0x60EE, // BRA.S head
         ];
         for (index, word) in words.iter().enumerate() {
             bus.write_word(HEAD + index as u32 * 2, *word);
@@ -1637,7 +1640,9 @@ mod tests {
             .expect("alternating loop head was profiled");
         assert_eq!(row.recording_attempts, 1);
         assert_eq!(row.adaptive_rerecords, 0);
-        assert_eq!(row.compiled_ops, 5);
+        // NOT + BNE + the five skipped NOPs + ADDQ + BRA: the recorded
+        // path is the not-taken one, so the whole skip is inline.
+        assert_eq!(row.compiled_ops, 9);
         assert!(row.guarded_branch_exits > 1_000);
     }
 
@@ -1648,14 +1653,16 @@ mod tests {
         let mut bus = LinearMemoryBus::new(0x1_0000);
         let words = [
             0x5340, // SUBQ.W #1,D0
-            0x6602, // BNE.S common (taken about 99% of entries)
+            // Skips 5 ops (> MAX_SKIP_OPS) so the rare path stays a
+            // guarded branch terminal rather than being if-converted.
+            0x660A, // BNE.S common (taken about 99% of entries)
             0x7063, // rare: MOVEQ #99,D0
+            0x4E71, 0x4E71, 0x4E71, 0x4E71, // rare-path padding
             0x5281, // common: ADDQ.L #1,D1
             0x51CF, 0x0004, // DBF D7,outer
             0x4E71, // unreachable padding
-            0x4E71, // unreachable padding
             0x7E01, // outer: MOVEQ #1,D7
-            0x60EC, // BRA.S head
+            0x60E6, // BRA.S head
         ];
         for (index, word) in words.iter().enumerate() {
             bus.write_word(HEAD + index as u32 * 2, *word);
