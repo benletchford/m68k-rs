@@ -31,7 +31,11 @@ use std::fmt;
 use std::mem::{offset_of, size_of, transmute};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const TRACE_CACHE_SIZE: usize = 4096;
+// Guest code in large applications commonly places unrelated hot loops one
+// 8 KiB region apart. A 4K-entry direct-mapped cache aliases those heads
+// because its byte-address period is only 0x2000; four times as many entries
+// keeps the lookup branchless while moving the collision period to 0x8000.
+const TRACE_CACHE_SIZE: usize = 16_384;
 pub(crate) const TRACE_MAX_OPS: usize = 128;
 pub(crate) const TRACE_MIN_OPS: usize = 3;
 
@@ -86,6 +90,28 @@ const NO_TERMINAL_STRIKE_LIMIT: u8 = 3;
 
 /// Sentinel for `CpuCore::trace_record_skip` / `trace_probe_skip`: no PC.
 pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
+
+/// Trace-return completion status in the otherwise-unused sign bit of the
+/// cycle word. Trace execution is bounded by `CpuCore::cycles_remaining`
+/// (`i32`), so cycles never need this bit. The upper 32 retirement bits stay
+/// fully available for data-dependent retirement such as `CondSkip`.
+const TRACE_RETURN_COMPLETE: u64 = 1 << 31;
+const TRACE_RETURN_CYCLES_MASK: u32 = i32::MAX as u32;
+
+#[inline]
+fn trace_return_complete(packed: u64) -> bool {
+    packed & TRACE_RETURN_COMPLETE != 0
+}
+
+#[inline]
+fn trace_return_cycles(packed: u64) -> u32 {
+    packed as u32 & TRACE_RETURN_CYCLES_MASK
+}
+
+#[inline]
+fn trace_return_retired(packed: u64) -> u32 {
+    (packed >> 32) as u32
+}
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 /// Original one-pass compiled trace entry point.
@@ -147,6 +173,20 @@ pub(crate) enum JitEa {
         scale: u8,
         displacement: i8,
     },
+    /// Brief (d8,PC,Xn): the PC-relative base and displacement collapse
+    /// to a constant when the trace is recorded (the pc is the trace's
+    /// own code), leaving a constant-base indexed read. Read-only by
+    /// construction: PC-relative modes are not legal destinations.
+    PcIndex {
+        base: u32,
+        index: JitDirectReg,
+        index_long: bool,
+        scale: u8,
+    },
+    /// (d16,PC): the extension-word PC and signed displacement collapse
+    /// to a constant address at record time. Kept distinct from absolute
+    /// addressing because the 68000 effective-address cycle charge differs.
+    PcDisp(u32),
     /// Absolute-short memory address, sign-extended when the trace is
     /// recorded so execution does not read the instruction stream.
     AbsWord(u32),
@@ -163,6 +203,8 @@ impl JitEa {
                 | Self::PreDec(_)
                 | Self::Disp(_, _)
                 | Self::Index { .. }
+                | Self::PcIndex { .. }
+                | Self::PcDisp(_)
                 | Self::AbsWord(_)
                 | Self::AbsLong(_)
         )
@@ -402,6 +444,18 @@ pub(crate) enum JitTraceOp {
         /// means this branch ends the trace; `Some` emits a guarded side
         /// exit and continues along the recorded path on a match.
         expected_taken: Option<bool>,
+    },
+    /// `JMP (d8,PC,Xn)` -- an N-way jump-table dispatch. The base (pc +
+    /// 2 + d8) folds to a constant at record time; the recorded taken
+    /// target guards the trace: a mismatch commits the jump (pc = the
+    /// computed target) and side-exits, where exit seeding compiles the
+    /// other dispatch cases as continuations that link back.
+    PcIndexJmp {
+        base: u32,
+        index: JitDirectReg,
+        index_long: bool,
+        scale: u8,
+        expected_target: Option<u32>,
     },
     Dbcc {
         condition: u8,
@@ -650,15 +704,27 @@ impl TraceBuildOp {
     }
 }
 
+/// One contiguous guest-code range inside the execution-ordered `code`
+/// snapshot. A trace can jump between several ranges (for example a computed
+/// dispatch or an inlined call); validating each range with a slice compare
+/// avoids re-entering the bus once per recorded instruction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TraceCodeSegment {
+    start: u32,
+    code_offset: u32,
+    len: u32,
+}
+
 struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
     ops: Vec<TraceBuildOp>,
-    /// The exact instruction bytes the trace was compiled from (ops are
-    /// in execution order. Contiguous traces can validate this with one
-    /// compare; recorded multi-block paths validate each instruction.
+    /// The exact instruction bytes the trace was compiled from, in execution
+    /// order. `code_segments` maps its contiguous slices back to guest
+    /// addresses so multi-block traces can use the same fast validation as a
+    /// linear trace.
     code: Vec<u8>,
-    contiguous_code: bool,
+    code_segments: Vec<TraceCodeSegment>,
     max_cycles: i32,
     /// The final branch's taken-target is the trace head, so the trace is
     /// a whole loop iteration and can be re-run (budget permitting)
@@ -689,10 +755,10 @@ struct CompiledTrace {
     /// between them is deliberately unguarded.
     callee_start: u32,
     callee_end: u32,
-    /// Bit `n` is set when operation `n` is a recorded branch guard. Trace
-    /// entry can reject guard-free partial returns after one zero check, and
-    /// guarded traces inspect only the guarded operations instead of walking
-    /// up to 128 recorded operations.
+    /// Bit `n` is set when operation `n` has a recorded control-flow guard.
+    /// Trace entry checks this before inspecting `ops`, so the common
+    /// guard-free return is constant-time; guarded traces visit only their
+    /// guarded operations instead of scanning the complete recorded path.
     guarded_ops: u128,
     /// A recorded interior branch is a path prediction eligible for adaptive
     /// rerecording. Cleared after the one allowed rerecord so completed traces
@@ -708,17 +774,22 @@ struct CompiledTrace {
 impl CompiledTrace {
     #[cfg(all(feature = "jit", not(target_family = "wasm"), test))]
     unsafe fn call_native(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
-        match self.func {
+        let packed = match self.func {
             NativeTraceFn::Once(func) => unsafe { func(cpu) },
             NativeTraceFn::Loop(func) => unsafe { func(cpu, max_iters) },
-        }
+        };
+        // Direct executor tests assert the architectural cycles/retirement
+        // payload; completion is internal call-driver metadata.
+        packed & !TRACE_RETURN_COMPLETE
     }
 
     fn is_guarded_branch_exit(&self, cpu: &CpuCore) -> bool {
-        // `ops_done` cannot identify an op once a preceding CondSkip makes the
-        // retired count data-dependent. Native and portable guarded branches
-        // both leave the branch address in ppc and one of its two successors
-        // in pc, so identify the exit from that architectural state instead.
+        // A side exit can retire the trace's full numeric op count when the
+        // guarded control-flow op is last, and future data-dependent ops can
+        // make a retired count differ from a static trace index. Both native
+        // and portable guards leave the exiting instruction in PPC and the
+        // architecturally committed successor in PC, so classify from that
+        // state instead.
         let mut guarded_ops = self.guarded_ops;
         while guarded_ops != 0 {
             let index = guarded_ops.trailing_zeros() as usize;
@@ -727,22 +798,28 @@ impl CompiledTrace {
             if cpu.ppc != op.pc {
                 continue;
             }
-            let JitTraceOp::Branch {
-                displacement,
-                length,
-                expected_taken: Some(expected_taken),
-                ..
-            } = op.op
-            else {
-                unreachable!("guarded_ops contains only guarded branches")
+            return match op.op {
+                JitTraceOp::Branch {
+                    displacement,
+                    length,
+                    expected_taken: Some(expected_taken),
+                    ..
+                } => {
+                    let target = (op.pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32;
+                    let fallthrough = op.pc.wrapping_add(length as u32);
+                    if target == fallthrough {
+                        cpu.pc == target
+                    } else {
+                        (cpu.pc == target && !expected_taken)
+                            || (cpu.pc == fallthrough && expected_taken)
+                    }
+                }
+                JitTraceOp::PcIndexJmp {
+                    expected_target: Some(expected),
+                    ..
+                } => cpu.pc != expected,
+                _ => unreachable!("guarded_ops contains only guarded control flow"),
             };
-            let target = (op.pc.wrapping_add(2) as i32).wrapping_add(displacement) as u32;
-            let fallthrough = op.pc.wrapping_add(length as u32);
-            if target == fallthrough {
-                return cpu.pc == target;
-            }
-            return (cpu.pc == target && !expected_taken)
-                || (cpu.pc == fallthrough && expected_taken);
         }
         false
     }
@@ -756,6 +833,9 @@ fn guarded_op_mask(ops: &[TraceBuildOp]) -> u128 {
             op.op,
             JitTraceOp::Branch {
                 expected_taken: Some(_),
+                ..
+            } | JitTraceOp::PcIndexJmp {
+                expected_target: Some(_),
                 ..
             }
         ) {
@@ -782,6 +862,13 @@ struct TraceRecording {
     /// recorded from the fall-through, the recorder skips re-recording the
     /// executed block ops until control reaches this pc (the branch target).
     skip_record_until: Option<u32>,
+    /// Whether this recording was seeded from a guard exit rather than a
+    /// backward branch. Only exit-seeded recordings may finish early by
+    /// LINKING at another compiled head: truncating a backward-branch loop
+    /// recording at an interior compiled head replaces the whole loop with
+    /// a stub (measured: whole-application trace coverage fell 14 points
+    /// on one workload when loop recordings were allowed to link-finish).
+    from_exit_seed: bool,
 }
 
 enum TraceSlot {
@@ -816,6 +903,11 @@ pub(crate) struct TraceJit {
     next_func: u32,
     slots: Vec<TraceSlot>,
     recording: Option<TraceRecording>,
+    /// A guarded exit already counted candidacy at this exact target. The
+    /// decoded loop probes again immediately after any trace returns; carry
+    /// the provenance across that probe so it neither double-counts the hit
+    /// nor starts the resulting recording as an ordinary loop candidate.
+    pending_exit_seed: Option<(u32, CpuType)>,
     /// Heads that have earned call-through permission: a recording here
     /// blocked at a recordable call, so future candidacy at the same pc
     /// starts with permission instead of re-earning it through a doomed
@@ -885,6 +977,7 @@ impl TraceJit {
             next_func: 0,
             slots: (0..TRACE_CACHE_SIZE).map(|_| TraceSlot::Empty).collect(),
             recording: None,
+            pending_exit_seed: None,
             earned_call_permission: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
             structurally_rejected: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
             compiled_before: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
@@ -969,25 +1062,31 @@ impl TraceJit {
                 return None;
             }
 
-            // Fast validation: when a fastmem window covers the whole
-            // trace, one slice compare against the live instruction bytes
-            // replaces per-op bus reads. (SMC through the window is still
-            // caught: we compare the actual RAM.)
+            // Fast validation: when the fastmem window covers every
+            // contiguous code segment, compare the live instruction bytes
+            // directly. This is one compare for a linear trace and a small
+            // handful for a recorded multi-block path, instead of a virtual
+            // bus read for every op. SMC is still caught because these are
+            // comparisons against the actual RAM; a mismatch falls through
+            // to the per-op path below to locate the architecturally first
+            // changed instruction.
             let mut validated = false;
-            if trace.contiguous_code && cpu.fm_len != 0 {
-                let n = trace.code.len() as u32;
-                let off = cpu.address(pc).wrapping_sub(cpu.fm_base);
-                if n <= cpu.fm_len && off <= cpu.fm_len - n {
+            if cpu.fm_len != 0 {
+                validated = trace.code_segments.iter().all(|segment| {
+                    let off = segment.start.wrapping_sub(cpu.fm_base);
+                    if segment.len > cpu.fm_len || off > cpu.fm_len - segment.len {
+                        return false;
+                    }
+                    let expected = &trace.code[segment.code_offset as usize
+                        ..(segment.code_offset + segment.len) as usize];
                     let live = unsafe {
                         std::slice::from_raw_parts(
                             (cpu.fm_ptr as *const u8).add(off as usize),
-                            n as usize,
+                            segment.len as usize,
                         )
                     };
-                    if live == trace.code.as_slice() {
-                        validated = true;
-                    }
-                }
+                    live == expected
+                });
             }
 
             let mut miss = None;
@@ -1081,14 +1180,27 @@ impl TraceJit {
                 let NativeTraceFn::Loop(func) = trace.func else {
                     unreachable!("a batched trace must have a counted entry point")
                 };
+                // When a trace combines data-dependent CondSkip retirement
+                // with an adaptive guard, a packed retirement count cannot
+                // reveal how many whole iterations preceded a side exit.
+                // Run one iteration per call for that uncommon combination;
+                // ordinary CondSkip loops remain batched.
+                let dynamic_guard_retirement = trace.adaptive_branch
+                    && trace
+                        .ops
+                        .iter()
+                        .any(|op| matches!(op.op, JitTraceOp::CondSkip { .. }));
                 loop {
-                    let call_max_iters = max_iters - full_iters;
+                    let call_max_iters = if dynamic_guard_retirement {
+                        1
+                    } else {
+                        max_iters - full_iters
+                    };
                     let packed = unsafe { func(cpu as *mut CpuCore, call_max_iters) };
-                    cycles_total += (packed as u32) as i64;
-                    let ops_done = (packed >> 32) as u32;
-                    let completed = ops_done / ops_len;
-                    let partial_call = completed < call_max_iters;
-                    let guarded_branch_exit = partial_call && trace.is_guarded_branch_exit(cpu);
+                    cycles_total += i64::from(trace_return_cycles(packed));
+                    let ops_done = trace_return_retired(packed);
+                    let complete = trace_return_complete(packed);
+                    let guarded_branch_exit = !complete && trace.is_guarded_branch_exit(cpu);
                     #[cfg(feature = "trace-profile")]
                     super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                     #[cfg(feature = "trace-profile")]
@@ -1096,10 +1208,24 @@ impl TraceJit {
                         super::trace_profile::note_guarded_branch_exit(pc, cpu_type);
                     }
                     retired += ops_done;
-                    full_iters += completed;
-                    if partial_call {
+                    if !complete {
+                        if !dynamic_guard_retirement {
+                            let numeric_completed = ops_done / ops_len;
+                            let remainder = ops_done % ops_len;
+                            // A last-op guard contributes one whole numeric
+                            // trace length but is still a side exit.
+                            let side_exit_at_last =
+                                guarded_branch_exit && remainder == 0 && ops_done != 0;
+                            full_iters +=
+                                numeric_completed.saturating_sub(u32::from(side_exit_at_last));
+                        }
                         break (guarded_branch_exit, true);
                     }
+                    // A counted body returns complete only after exhausting
+                    // the request or after a complete final iteration leaves
+                    // the self-loop. Once PC leaves the head, one completed
+                    // entry is sufficient for adaptive-policy accounting.
+                    full_iters += if cpu.pc == pc { call_max_iters } else { 1 };
                     if full_iters >= max_iters || cpu.pc != pc {
                         break (false, false);
                     }
@@ -1114,10 +1240,10 @@ impl TraceJit {
                 };
                 loop {
                     let packed = unsafe { func(cpu as *mut CpuCore) };
-                    cycles_total += (packed as u32) as i64;
-                    let ops_done = (packed >> 32) as u32;
-                    let partial_call = ops_done < ops_len;
-                    let guarded_branch_exit = partial_call && trace.is_guarded_branch_exit(cpu);
+                    cycles_total += i64::from(trace_return_cycles(packed));
+                    let ops_done = trace_return_retired(packed);
+                    let complete = trace_return_complete(packed);
+                    let guarded_branch_exit = !complete && trace.is_guarded_branch_exit(cpu);
                     #[cfg(feature = "trace-profile")]
                     super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                     #[cfg(feature = "trace-profile")]
@@ -1125,7 +1251,7 @@ impl TraceJit {
                         super::trace_profile::note_guarded_branch_exit(pc, cpu_type);
                     }
                     retired += ops_done;
-                    if partial_call {
+                    if !complete {
                         break (guarded_branch_exit, true);
                     }
                     full_iters += 1;
@@ -1136,7 +1262,7 @@ impl TraceJit {
             };
             #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
             let (guarded_branch_exit, partial_call_this_entry) = loop {
-                let packed = execute_portable_trace(
+                let packed = execute_portable_trace_raw(
                     cpu,
                     &trace.ops,
                     CodeSpans {
@@ -1146,10 +1272,10 @@ impl TraceJit {
                         callee_end: trace.callee_end,
                     },
                 );
-                cycles_total += (packed as u32) as i64;
-                let ops_done = (packed >> 32) as u32;
-                let partial_call = ops_done < ops_len;
-                let guarded_branch_exit = partial_call && trace.is_guarded_branch_exit(cpu);
+                cycles_total += i64::from(trace_return_cycles(packed));
+                let ops_done = trace_return_retired(packed);
+                let complete = trace_return_complete(packed);
+                let guarded_branch_exit = !complete && trace.is_guarded_branch_exit(cpu);
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                 #[cfg(feature = "trace-profile")]
@@ -1157,7 +1283,7 @@ impl TraceJit {
                     super::trace_profile::note_guarded_branch_exit(pc, cpu_type);
                 }
                 retired += ops_done;
-                if partial_call {
+                if !complete {
                     break (guarded_branch_exit, true);
                 }
                 full_iters += 1;
@@ -1227,7 +1353,22 @@ impl TraceJit {
             // pc is an access the trace could not execute, so seeding it
             // would probe and compile a continuation that starts on the
             // very op that just bailed.
-            if guarded_branch_exit && !single_iter && chain_budget > 0 && cpu.pc != pc {
+            // A clean completion that exits exactly onto another compiled
+            // head (a LINK-EXIT trace's tail) chains the same way a guarded
+            // branch exit does: entering the neighbour now instead of
+            // interpreting until the next backward-branch probe.
+            let clean_link_exit = !guarded_branch_exit
+                && !partial_call_this_entry
+                && self.compiled_head_at(cpu.pc, cpu_type);
+            #[cfg(feature = "trace-profile")]
+            if clean_link_exit {
+                super::trace_profile::note_link_exit(pc, cpu_type);
+            }
+            if (guarded_branch_exit || clean_link_exit)
+                && !single_iter
+                && chain_budget > 0
+                && cpu.pc != pc
+            {
                 // A watched exit target still counts candidacy hits, but
                 // neither chains nor starts a recording: a chained entry
                 // is not observed by the runner (watches fire before an
@@ -1274,6 +1415,10 @@ impl TraceJit {
             return Some((CachedRunResult::Ran, retired));
         }
 
+        let from_exit_seed = self.pending_exit_seed == Some((pc, cpu_type));
+        if from_exit_seed {
+            self.pending_exit_seed = None;
+        }
         match &mut self.slots[idx] {
             TraceSlot::Counting {
                 pc: counted_pc,
@@ -1283,7 +1428,9 @@ impl TraceJit {
                 allow_call_through,
                 deferred_trap,
             } if *counted_pc == pc && *counted_type == cpu_type => {
-                *hits = hits.saturating_add(1);
+                if !from_exit_seed {
+                    *hits = hits.saturating_add(1);
+                }
                 let threshold = if *deferred_trap {
                     TRACE_TRAP_SEGMENT_HOT_THRESHOLD
                 } else {
@@ -1300,6 +1447,7 @@ impl TraceJit {
                     allow_call_through: *allow_call_through,
                     pending_return: None,
                     skip_record_until: None,
+                    from_exit_seed,
                 });
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_recording(pc, cpu_type);
@@ -1369,6 +1517,15 @@ impl TraceJit {
             ways[1] = ways[0];
             ways[0] = pc;
         }
+    }
+
+    /// Whether a compiled trace for `cpu_type` is installed with its head
+    /// at exactly `pc` -- the target a link-exit region may end on.
+    fn compiled_head_at(&self, pc: u32, cpu_type: CpuType) -> bool {
+        matches!(
+            &self.slots[trace_cache_index(pc)],
+            TraceSlot::Compiled(trace) if trace.pc == pc && trace.cpu_type == cpu_type
+        )
     }
 
     fn has_compiled_before(&self, pc: u32) -> bool {
@@ -1545,6 +1702,9 @@ impl TraceJit {
                     TRACE_HOT_THRESHOLD
                 };
                 if entry_watched || *hits < threshold || self.recording.is_some() {
+                    if !entry_watched && self.recording.is_none() {
+                        self.pending_exit_seed = Some((exit_pc, cpu_type));
+                    }
                     return ExitSeed::None;
                 }
                 let adaptive_rerecords = *adaptive_rerecords;
@@ -1562,6 +1722,7 @@ impl TraceJit {
                     allow_call_through,
                     pending_return: None,
                     skip_record_until: None,
+                    from_exit_seed: true,
                 });
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_recording(exit_pc, cpu_type);
@@ -1583,6 +1744,7 @@ impl TraceJit {
                     allow_call_through: permission,
                     deferred_trap: false,
                 };
+                self.pending_exit_seed = Some((exit_pc, cpu_type));
                 ExitSeed::None
             }
         }
@@ -2221,6 +2383,14 @@ impl TraceJit {
                     *expected_taken = Some(taken);
                 }
             }
+            // A computed jump records its taken target and the recording
+            // follows it (like a taken Branch); execution guards on the
+            // recorded target and side-exits on any other dispatch case.
+            JitTraceOp::PcIndexJmp {
+                expected_target, ..
+            } => {
+                *expected_target = Some(next_pc);
+            }
             // DBcc remains a natural region boundary for now. Its data-
             // dependent counter update is already compiled efficiently.
             JitTraceOp::Dbcc { .. } => {
@@ -2241,14 +2411,32 @@ impl TraceJit {
         }
 
         let recording = self.recording.as_mut().unwrap();
+        let recording_cpu_type = recording.cpu_type;
         recording.ops.push(op);
+        let recorded_len = recording.ops.len();
         if next_pc == start_pc {
             self.finish_recording(cpu, next_pc, RecordingEnd::Region);
             return;
         }
 
+        // Link exit: the recorded path reached another compiled trace's
+        // head. Finish here -- the region compiles with its exit chaining
+        // into that trace -- instead of recording on through code the
+        // neighbour already covers and tripping the repeated-pc guard
+        // into a rejection. Too-short regions keep recording: ending them
+        // here would reject TooShort, and durably.
+        let from_exit_seed = self.recording.as_ref().unwrap().from_exit_seed;
+        if from_exit_seed
+            && recorded_len >= TRACE_MIN_OPS
+            && self.compiled_head_at(next_pc, recording_cpu_type)
+        {
+            self.finish_recording(cpu, next_pc, RecordingEnd::Region);
+            return;
+        }
+
+        let recording = self.recording.as_ref().unwrap();
         let repeated = recording.ops.iter().any(|op| op.pc == next_pc);
-        if recording.ops.len() >= TRACE_MAX_OPS || repeated {
+        if recorded_len >= TRACE_MAX_OPS || repeated {
             self.finish_recording(cpu, next_pc, RecordingEnd::Region);
         }
     }
@@ -2282,7 +2470,19 @@ impl TraceJit {
         recorded_exit_pc: Option<u32>,
     ) -> Result<CompiledTrace, RegionRejectReason> {
         if !ops.last().is_some_and(|op| op.op.ends_trace()) {
-            return Err(RegionRejectReason::NoTraceTerminal);
+            // A region whose recorded exit lands exactly on another
+            // compiled trace's head ends by LINKING into that trace: the
+            // non-branch tail is a valid terminal (the runtime probes and
+            // chains at the exit pc), so only a tail that reaches neither
+            // a terminal nor a link target rejects. This is what lets the
+            // guard-exit side paths of a hot loop compile: their natural
+            // shape rejoins the loop at its head rather than closing a
+            // backward branch of their own.
+            let links_to_compiled_head = recorded_exit_pc
+                .is_some_and(|exit| exit != start_pc && self.compiled_head_at(exit, cpu_type));
+            if !links_to_compiled_head {
+                return Err(RegionRejectReason::NoTraceTerminal);
+            }
         }
 
         let self_loop = recorded_exit_pc == Some(start_pc)
@@ -2299,13 +2499,11 @@ impl TraceJit {
         }
 
         let max_cycles = ops.iter().map(|op| op.op.max_cycles()).sum();
-        let contiguous_code = ops.first().is_some_and(|op| op.pc == start_pc)
-            && ops
-                .windows(2)
-                .all(|pair| pair[0].pc.wrapping_add(pair[0].length() as u32) == pair[1].pc);
-
         let mut code = Vec::with_capacity(ops.len() * 4);
+        let mut code_segments: Vec<TraceCodeSegment> = Vec::new();
         for op in &ops {
+            let start = cpu.address(op.pc);
+            let code_offset = code.len() as u32;
             code.extend_from_slice(&op.opcode.to_be_bytes());
             if let Some(extension) = op.extension {
                 code.extend_from_slice(&extension.to_be_bytes());
@@ -2313,15 +2511,19 @@ impl TraceJit {
             if let Some(extension) = op.extension2 {
                 code.extend_from_slice(&extension.to_be_bytes());
             }
-        }
-        if contiguous_code {
-            debug_assert_eq!(
-                code.len() as u32,
-                ops.last()
-                    .map(|op| op.pc.wrapping_add(op.length() as u32))
-                    .unwrap_or(start_pc)
-                    .wrapping_sub(start_pc)
-            );
+            debug_assert_eq!(code.len() as u32 - code_offset, u32::from(op.length()));
+            if let Some(segment) = code_segments.last_mut()
+                && segment.start.checked_add(segment.len) == Some(start)
+            {
+                debug_assert_eq!(segment.code_offset + segment.len, code_offset);
+                segment.len += u32::from(op.length());
+            } else {
+                code_segments.push(TraceCodeSegment {
+                    start,
+                    code_offset,
+                    len: u32::from(op.length()),
+                });
+            }
         }
 
         let ends_in_indirect_jsr = ops
@@ -2452,7 +2654,7 @@ impl TraceJit {
             cpu_type,
             ops: &ops,
             code,
-            contiguous_code,
+            code_segments,
             max_cycles,
             self_loop,
             needs_window,
@@ -2473,7 +2675,7 @@ impl TraceJit {
             cpu_type,
             ops,
             code,
-            contiguous_code,
+            code_segments,
             max_cycles,
             callee_start,
             callee_end,
@@ -2709,6 +2911,25 @@ impl TraceJit {
                         bail_at.ops_before,
                         1,
                     ),
+                    JitTraceOp::PcIndexJmp {
+                        base,
+                        index: jmp_index,
+                        index_long,
+                        scale,
+                        expected_target: Some(expected_target),
+                    } => emit_guarded_pc_index_jmp(
+                        &mut builder,
+                        cpu_ptr,
+                        op.pc,
+                        base,
+                        jmp_index,
+                        index_long,
+                        scale,
+                        expected_target,
+                        cycles_value,
+                        bail_at.ops_before,
+                        1,
+                    ),
                     JitTraceOp::MoveMem { size, src, dst } => {
                         let env = mem_env.as_ref().expect("MoveMem implies a window env");
                         emit_move_mem(
@@ -2842,6 +3063,17 @@ impl TraceJit {
                     offset_of!(CpuCore, ir),
                     last.opcode as u32,
                 );
+                if !last.op.ends_trace() {
+                    // Link-exit tail: no branch materialized the pc; the
+                    // trace exits at the next sequential instruction (the
+                    // linked head).
+                    store_u32(
+                        &mut builder,
+                        cpu_ptr,
+                        offset_of!(CpuCore, pc),
+                        last.pc.wrapping_add(u32::from(last.length())),
+                    );
+                }
             }
 
             let retired_value = if let Some(rv) = dyn_retired {
@@ -2879,6 +3111,10 @@ impl TraceJit {
                 builder.ins().iconst(types::I64, (ops.len() as i64) << 32)
             };
             let packed = builder.ins().bor(cycles64, retired64);
+            let complete = builder
+                .ins()
+                .iconst(types::I64, TRACE_RETURN_COMPLETE as i64);
+            let packed = builder.ins().bor(packed, complete);
             builder.ins().return_(&[packed]);
 
             // Bail exits: set PC to the un-executed op, return the ops and
@@ -2920,7 +3156,7 @@ impl TraceJit {
             cpu_type,
             ops: ops.to_vec(),
             code,
-            contiguous_code,
+            code_segments,
             max_cycles,
             self_loop,
             native_loop,
@@ -2948,7 +3184,7 @@ impl TraceJit {
             callee_start: params.callee_start,
             callee_end: params.callee_end,
             code: params.code,
-            contiguous_code: params.contiguous_code,
+            code_segments: params.code_segments,
             max_cycles: params.max_cycles,
             self_loop: params.self_loop,
             needs_window: params.needs_window,
@@ -2969,7 +3205,7 @@ struct CompileParams<'a> {
     cpu_type: CpuType,
     ops: &'a [TraceBuildOp],
     code: Vec<u8>,
-    contiguous_code: bool,
+    code_segments: Vec<TraceCodeSegment>,
     max_cycles: i32,
     self_loop: bool,
     needs_window: bool,
@@ -3036,8 +3272,9 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             JitTraceOp::Nop => {}
             // Interior branches make the recorded path non-unique for
             // this head; per-head wait accounting would then erase
-            // opportunity data belonging to other shapes.
-            JitTraceOp::Branch { .. } => return false,
+            // opportunity data belonging to other shapes. A guarded
+            // computed jump is an interior N-way branch: same rule.
+            JitTraceOp::Branch { .. } | JitTraceOp::PcIndexJmp { .. } => return false,
             // Memory-reading compares and tests write NZVC only; the
             // polled value is the only input that can change.
             JitTraceOp::TstMem { .. }
@@ -3345,6 +3582,8 @@ impl JitTraceOp {
                 }
             }
             Self::Nop => 4,
+            // JMP (d8,PC,Xn) (M68000UM table 8-, indexed jump).
+            Self::PcIndexJmp { .. } => 14,
             Self::MoveReg { .. } => 4,
             Self::Moveq { .. } => 4,
             // MC68000: 8(2/0) for the word form, 12(3/0) for the long.
@@ -3417,6 +3656,14 @@ impl JitTraceOp {
                 let long = size == Size::Long;
                 let src_c = match src {
                     JitEa::Data(_) | JitEa::Addr(_) => 0,
+                    // (d8,PC,Xn) costs what (d8,An,Xn) costs (M68000UM).
+                    JitEa::PcIndex { .. } => {
+                        if long {
+                            14
+                        } else {
+                            10
+                        }
+                    }
                     JitEa::Ind(_) | JitEa::PostInc(_) => {
                         if long {
                             8
@@ -3431,7 +3678,7 @@ impl JitTraceOp {
                             6
                         }
                     }
-                    JitEa::Disp(_, _) => {
+                    JitEa::Disp(_, _) | JitEa::PcDisp(_) => {
                         if long {
                             12
                         } else {
@@ -3575,7 +3822,14 @@ impl JitTraceOp {
     fn ends_trace(self) -> bool {
         matches!(
             self,
-            Self::Branch { .. } | Self::Dbcc { .. } | Self::IndirectJsr { .. } | Self::TrapExit
+            Self::Branch { .. }
+                | Self::Dbcc { .. }
+                | Self::IndirectJsr { .. }
+                | Self::PcIndexJmp {
+                    expected_target: Some(_),
+                    ..
+                }
+                | Self::TrapExit
         )
     }
 
@@ -3719,6 +3973,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_pc_index_jmp_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
 
@@ -4603,19 +4860,22 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     };
     let src_mode = (opcode >> 3) & 7;
     let dst_mode = (opcode >> 6) & 7;
-    let mut extensions = [0u16; 2];
-    let mut extension_count = 0usize;
+    let extensions = std::cell::Cell::new([0u16; 2]);
+    let extension_count = std::cell::Cell::new(0usize);
     let mut read_ext = || -> Option<u16> {
-        if extension_count == extensions.len() {
+        let count = extension_count.get();
+        if count == 2 {
             return None;
         }
-        let address = pc.wrapping_add(2 + 2 * extension_count as u32);
+        let address = pc.wrapping_add(2 + 2 * count as u32);
         let value = bus.try_read_word(cpu.address(address)).ok()?;
-        extensions[extension_count] = value;
-        extension_count += 1;
+        let mut stored = extensions.get();
+        stored[count] = value;
+        extensions.set(stored);
+        extension_count.set(count + 1);
         Some(value)
     };
-    let mut decode_ea = |mode: u16, reg: u16| -> Option<JitEa> {
+    let mut decode_ea = |mode: u16, reg: u16, is_src: bool| -> Option<JitEa> {
         match (mode, reg) {
             (5 | 6, _) => decode_jit_ea(mode, reg, read_ext()?, cpu.cpu_type),
             (7, 0) => Some(JitEa::AbsWord(read_ext()? as i16 as i32 as u32)),
@@ -4624,11 +4884,45 @@ fn decode_move_mem_trace_op<B: AddressBus>(
                 let low = read_ext()?;
                 Some(JitEa::AbsLong((u32::from(high) << 16) | u32::from(low)))
             }
+            // PC-relative modes are legal sources only. Their base is the
+            // extension word's own address, a record-time constant.
+            (7, 2) if is_src => {
+                let ext_pc = pc.wrapping_add(2 + 2 * extension_count.get() as u32);
+                let displacement = read_ext()? as i16;
+                Some(JitEa::PcDisp(
+                    ext_pc.wrapping_add(displacement as i32 as u32),
+                ))
+            }
+            (7, 3) if is_src => {
+                let ext_pc = pc.wrapping_add(2 + 2 * extension_count.get() as u32);
+                let extension = read_ext()?;
+                // Full-format extension words are not admitted (same rule
+                // as the (d8,An,Xn) decoder).
+                if !is_pre_68020(cpu.cpu_type) && (extension & 0x0100) != 0 {
+                    return None;
+                }
+                let index_num = ((extension >> 12) & 7) as u8;
+                let index = if (extension & 0x8000) != 0 {
+                    JitDirectReg::Addr(index_num)
+                } else {
+                    JitDirectReg::Data(index_num)
+                };
+                Some(JitEa::PcIndex {
+                    base: ext_pc.wrapping_add((extension as u8 as i8) as i32 as u32),
+                    index,
+                    index_long: (extension & 0x0800) != 0,
+                    scale: if is_pre_68020(cpu.cpu_type) {
+                        0
+                    } else {
+                        ((extension >> 9) & 3) as u8
+                    },
+                })
+            }
             _ => decode_jit_ea(mode, reg, 0, cpu.cpu_type),
         }
     };
-    let src = decode_ea(src_mode, opcode & 7)?;
-    let dst = decode_ea(dst_mode, (opcode >> 9) & 7)?;
+    let src = decode_ea(src_mode, opcode & 7, true)?;
+    let dst = decode_ea(dst_mode, (opcode >> 9) & 7, false)?;
     // Indexed destinations were gated until "a profile demonstrates that
     // their extra emitter paths pay". Three profiled heads across two
     // workloads now terminate on indexed-destination stores (MOVE.W 3180
@@ -4643,10 +4937,53 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     }
     Some(TraceBuildOp {
         opcode,
-        extension: (extension_count >= 1).then_some(extensions[0]),
-        extension2: (extension_count >= 2).then_some(extensions[1]),
+        extension: (extension_count.get() >= 1).then_some(extensions.get()[0]),
+        extension2: (extension_count.get() >= 2).then_some(extensions.get()[1]),
         pc,
         op: JitTraceOp::MoveMem { size, src, dst },
+    })
+}
+
+/// Decode `JMP (d8,PC,Xn)` -- the jump-table dispatch of a bytecode
+/// interpreter. The recorded taken target is filled in by the recorder
+/// (like a Branch's expected direction); execution guards on it.
+fn decode_pc_index_jmp_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    if opcode != 0x4EFB {
+        return None;
+    }
+    let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    if !is_pre_68020(cpu.cpu_type) && (extension & 0x0100) != 0 {
+        return None;
+    }
+    let index_num = ((extension >> 12) & 7) as u8;
+    let index = if (extension & 0x8000) != 0 {
+        JitDirectReg::Addr(index_num)
+    } else {
+        JitDirectReg::Data(index_num)
+    };
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(extension),
+        extension2: None,
+        pc,
+        op: JitTraceOp::PcIndexJmp {
+            base: pc
+                .wrapping_add(2)
+                .wrapping_add((extension as u8 as i8) as i32 as u32),
+            index,
+            index_long: (extension & 0x0800) != 0,
+            scale: if is_pre_68020(cpu.cpu_type) {
+                0
+            } else {
+                ((extension >> 9) & 3) as u8
+            },
+            expected_target: None,
+        },
     })
 }
 
@@ -4851,7 +5188,7 @@ impl CodeSpans {
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
-fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSpans) -> u64 {
+fn execute_portable_trace_raw(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSpans) -> u64 {
     let mut cycles: i32 = 0;
     // Guest instructions retired -- tracked explicitly (not the trace op
     // index) because a `CondSkip` block executes a data-dependent count.
@@ -4899,6 +5236,19 @@ fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSp
                         return ((retired as u64) << 32) | cycles as u32 as u64;
                     }
                 }
+                if let JitTraceOp::PcIndexJmp {
+                    expected_target: Some(expected),
+                    ..
+                } = op.op
+                {
+                    // The jump committed (pc = computed target); any
+                    // other dispatch case than the recorded one exits.
+                    if cpu.pc != expected {
+                        cpu.ppc = op.pc;
+                        cpu.ir = op.opcode as u32;
+                        return ((retired as u64) << 32) | cycles as u32 as u64;
+                    }
+                }
             }
             None => {
                 cpu.pc = op.pc;
@@ -4910,8 +5260,21 @@ fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSp
     if let Some(last) = ops.last() {
         cpu.ppc = last.pc;
         cpu.ir = last.opcode as u32;
+        if !last.op.ends_trace() {
+            // Link-exit tail: a plain op does not materialize the pc the
+            // way branch terminals do; the trace exits at the next
+            // sequential instruction (the linked head).
+            cpu.pc = last.pc.wrapping_add(u32::from(last.length()));
+        }
     }
-    ((retired as u64) << 32) | cycles as u32 as u64
+    ((retired as u64) << 32) | cycles as u32 as u64 | TRACE_RETURN_COMPLETE
+}
+
+/// Architectural payload used by direct parity tests. Completion is call-
+/// driver metadata, not part of their cycles/count contract.
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSpans) -> u64 {
+    execute_portable_trace_raw(cpu, ops, spans) & !TRACE_RETURN_COMPLETE
 }
 
 /// Execute one trace op; `None` means a mem-op check failed and nothing
@@ -5750,7 +6113,27 @@ fn execute_portable_move_mem(
                 .wrapping_add(displacement as i32 as u32);
             read(cpu, locate(cpu, a)?)
         }
-        JitEa::AbsWord(address) | JitEa::AbsLong(address) => read(cpu, locate(cpu, address)?),
+        JitEa::PcIndex {
+            base,
+            index,
+            index_long,
+            scale,
+        } => {
+            let raw_index = match index {
+                JitDirectReg::Data(r) => cpu.dar[r as usize],
+                JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+            };
+            let index = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            let a = base.wrapping_add(index.wrapping_shl(scale as u32));
+            read(cpu, locate(cpu, a)?)
+        }
+        JitEa::PcDisp(address) | JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
+            read(cpu, locate(cpu, address)?)
+        }
     };
 
     let dst_base = |cpu: &CpuCore, r: u8| match staged {
@@ -5759,6 +6142,10 @@ fn execute_portable_move_mem(
     };
 
     match dst {
+        // PC-relative modes are never decoded as destinations.
+        JitEa::PcDisp(_) | JitEa::PcIndex { .. } => {
+            unreachable!("PC-relative EA as a MoveMem destination")
+        }
         JitEa::Data(r) => {
             if let Some((idx, v)) = staged {
                 cpu.dar[idx] = v;
@@ -5870,6 +6257,29 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             unreachable!("CondSkip is handled in execute_portable_trace, not the register path")
         }
         JitTraceOp::Nop => 4,
+        JitTraceOp::PcIndexJmp {
+            base,
+            index,
+            index_long,
+            scale,
+            ..
+        } => {
+            // The jump commits architecturally regardless of the guard:
+            // pc = base + scaled index. The guard comparison itself is
+            // handled by the trace executor (mirroring Branch).
+            let raw_index = match index {
+                JitDirectReg::Data(r) => cpu.dar[r as usize],
+                JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+            };
+            let idx = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            cpu.pc = base.wrapping_add(idx.wrapping_shl(scale as u32));
+            cpu.change_of_flow = true;
+            14
+        }
         JitTraceOp::Moveq { reg, data } => {
             cpu.dar[reg as usize] = data;
             cpu.n_flag = if (data as i32) < 0 { NFLAG_SET } else { 0 };
@@ -6467,6 +6877,11 @@ fn emit_jit_op(
         }
         JitTraceOp::CondSkip { .. } => {
             unreachable!("CondSkip is emitted by the main compile_ops loop, not emit_jit_op")
+        }
+        // Guarded computed jumps are emitted by the main loop (they need
+        // the exit plumbing); an unguarded one never compiles.
+        JitTraceOp::PcIndexJmp { .. } => {
+            unreachable!("PcIndexJmp reaches emit_jit_op")
         }
         JitTraceOp::Nop => cycles_const(builder, 4),
         JitTraceOp::MoveImmReg { reg, size, value } => {
@@ -8490,7 +8905,7 @@ fn emit_move_mem(
             let (off, _) = checked_window_off(builder, env, bail, a, size);
             window_load(builder, env, off, size)
         }
-        JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
+        JitEa::PcDisp(address) | JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
             let address = iconst_u32(builder, address);
             let (off, _) = checked_window_off(builder, env, bail, address, size);
             window_load(builder, env, off, size)
@@ -8540,6 +8955,31 @@ fn emit_move_mem(
             let (off, _) = checked_window_off(builder, env, bail, a, size);
             window_load(builder, env, off, size)
         }
+        JitEa::PcIndex {
+            base,
+            index,
+            index_long,
+            scale,
+        } => {
+            // Constant base (pc-relative, folded at record time) plus a
+            // live scaled index register.
+            let base = iconst_u32(builder, base);
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let a = builder.ins().iadd(base, index);
+            let (off, _) = checked_window_off(builder, env, bail, a, size);
+            window_load(builder, env, off, size)
+        }
     };
 
     // A destination base register must observe a same-register source
@@ -8555,6 +8995,11 @@ fn emit_move_mem(
     };
 
     match op.dst {
+        // PC-relative modes are never decoded as destinations
+        // (decode_move_mem_trace_op gates them to sources).
+        JitEa::PcDisp(_) | JitEa::PcIndex { .. } => {
+            unreachable!("PC-relative EA as a MoveMem destination")
+        }
         JitEa::Data(r) => {
             commit_staged(builder);
             write_data_reg_sized(builder, cpu, r, size, value);
@@ -9134,6 +9579,77 @@ fn emit_guarded_branch(
 
     builder.switch_to_block(side_exit);
     store_u32(builder, cpu, offset_of!(CpuCore, ppc), trace_pc);
+    let total_cycles = builder.ins().iadd(cycles_before, op_cycles);
+    let cycles64 = builder.ins().uextend(types::I64, total_cycles);
+    let retired = match retired_before_iter {
+        RetiredBefore::Constant(retired) => builder
+            .ins()
+            .iconst(types::I64, i64::from(retired + ops_done) << 32),
+        RetiredBefore::Dynamic(retired) => {
+            let retired = builder.ins().iadd_imm(retired, i64::from(ops_done));
+            let retired = builder.ins().uextend(types::I64, retired);
+            builder.ins().ishl_imm(retired, 32)
+        }
+    };
+    let packed = builder.ins().bor(cycles64, retired);
+    builder.ins().return_(&[packed]);
+
+    builder.switch_to_block(continue_block);
+    op_cycles
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+#[allow(clippy::too_many_arguments)]
+fn emit_guarded_pc_index_jmp(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace_pc: u32,
+    base: u32,
+    index: JitDirectReg,
+    index_long: bool,
+    scale: u8,
+    expected_target: u32,
+    cycles_before: Value,
+    retired_before_iter: RetiredBefore,
+    ops_done: u32,
+) -> Value {
+    // The jump commits architecturally on every dispatch case:
+    // pc = base + scaled index.
+    let base_v = iconst_u32(builder, base);
+    let raw_index = load_reg(builder, cpu, index);
+    let idx = if index_long {
+        raw_index
+    } else {
+        let word = builder.ins().ireduce(types::I16, raw_index);
+        builder.ins().sextend(types::I32, word)
+    };
+    let idx = if scale == 0 {
+        idx
+    } else {
+        builder.ins().ishl_imm(idx, i64::from(scale))
+    };
+    let target = builder.ins().iadd(base_v, idx);
+    store_pc_value(builder, cpu, target);
+    let true_change = builder.ins().iconst(types::I8, 1);
+    store_value(
+        builder,
+        cpu,
+        offset_of!(CpuCore, change_of_flow),
+        true_change,
+    );
+
+    let op_cycles = cycles_const(builder, 14);
+    let expected = iconst_u32(builder, expected_target);
+    let matches = builder.ins().icmp(IntCC::Equal, target, expected);
+    let continue_block = builder.create_block();
+    let side_exit = builder.create_block();
+    builder
+        .ins()
+        .brif(matches, continue_block, &[], side_exit, &[]);
+
+    builder.switch_to_block(side_exit);
+    store_u32(builder, cpu, offset_of!(CpuCore, ppc), trace_pc);
+    store_u32(builder, cpu, offset_of!(CpuCore, ir), 0x4EFB);
     let total_cycles = builder.ins().iadd(cycles_before, op_cycles);
     let cycles64 = builder.ins().uextend(types::I64, total_cycles);
     let retired = match retired_before_iter {
@@ -9825,6 +10341,7 @@ mod portable_tests {
                 allow_call_through: false,
                 pending_return: None,
                 skip_record_until: None,
+                from_exit_seed: false,
             });
         });
         cpu.trace_recording = true;
@@ -10874,6 +11391,7 @@ mod portable_tests {
                 allow_call_through: false,
                 pending_return: None,
                 skip_record_until: None,
+                from_exit_seed: false,
             });
             cpu.set_cpu_type(CpuType::M68040);
             cpu.trace_recording = true;
@@ -12555,6 +13073,107 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
+    fn fast_validation_checks_every_discontiguous_code_segment_before_execution() {
+        const HEAD: u32 = 0x0100;
+        const SIDE: u32 = 0x0200;
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x5280,
+                extension: None,
+                extension2: None,
+                pc: HEAD,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 0,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x5281,
+                extension: None,
+                extension2: None,
+                pc: SIDE,
+                op: JitTraceOp::AddqSubqReg {
+                    reg: 1,
+                    data: 1,
+                    size: Size::Long,
+                    is_sub: false,
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x6000,
+                extension: None,
+                extension2: None,
+                pc: SIDE + 2,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: HEAD as i32 - (SIDE + 4) as i32,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let mut mem = vec![0u8; 0x1000];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for op in &ops {
+            let bytes = op.opcode.to_be_bytes();
+            mem[op.pc as usize..op.pc as usize + 2].copy_from_slice(&bytes);
+            bus.write_word(op.pc, op.opcode);
+        }
+        let mut actual = cpu();
+        actual.pc = HEAD;
+        actual.cycles_remaining = 1_000;
+        attach_window(&mut actual, &mut mem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&actual, HEAD, CpuType::M68000, ops, Some(HEAD))
+            .expect("two-segment trace compiles");
+        assert_eq!(
+            compiled.code_segments,
+            [
+                TraceCodeSegment {
+                    start: HEAD,
+                    code_offset: 0,
+                    len: 2,
+                },
+                TraceCodeSegment {
+                    start: SIDE,
+                    code_offset: 2,
+                    len: 4,
+                },
+            ]
+        );
+        jit.slots[trace_cache_index(HEAD)] = TraceSlot::Compiled(compiled);
+
+        // Change only the second segment. The aggregate fast check must
+        // notice it, then the exact fallback must invalidate before the
+        // valid first op can commit.
+        mem[SIDE as usize..SIDE as usize + 2].copy_from_slice(&0x4E71u16.to_be_bytes());
+        bus.write_word(SIDE, 0x4E71);
+        let result = jit.try_execute(
+            &mut actual,
+            &mut bus,
+            CpuType::M68000,
+            3,
+            false,
+            &[],
+            TRACE_EXIT_CHAIN_BUDGET,
+        );
+        assert!(
+            result.is_none(),
+            "a mid-trace SMC miss restarts at the head"
+        );
+        assert_eq!(actual.pc, HEAD);
+        assert_eq!((actual.d(0), actual.d(1)), (0, 0));
+        assert!(matches!(
+            jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Empty
+        ));
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
     fn short_blocked_recordings_still_reject() {
         // A five-op prefix whose last terminal sits at op four: below
         // SALVAGE_MIN_OPS the head must reject exactly as before. (The
@@ -12877,11 +13496,13 @@ mod portable_tests {
         );
         for row in &chaining {
             assert!(
-                row.chained_calls <= row.guarded_branch_exits,
-                "every chain hangs off a guard exit ({:08X}: {} chains, {} exits)",
+                row.chained_calls <= row.guarded_branch_exits + row.link_exits,
+                "every chain hangs off an exit ({:08X}: {} chains, {} guard \
+                 exits, {} link exits)",
                 row.start_pc,
                 row.chained_calls,
-                row.guarded_branch_exits
+                row.guarded_branch_exits,
+                row.link_exits
             );
             assert!(
                 row.chained_retired > 0,
@@ -16098,7 +16719,10 @@ mod portable_tests {
         // reports in the wait section, and wait-attributed volume cannot
         // inflate projected dispatches.
         super::super::trace_profile::reset();
-        let mut bus = super::super::memory::LinearMemoryBus::new(0x4000);
+        const HEAD: u32 = 0x0100;
+        const COLLIDER: u32 = HEAD + (TRACE_CACHE_SIZE as u32) * 2;
+        assert_eq!(trace_cache_index(HEAD), trace_cache_index(COLLIDER));
+        let mut bus = super::super::memory::LinearMemoryBus::new(COLLIDER as usize + 0x1000);
         bus.write_word(0x0100, 0xB26D); // CMP.W (-0x10,A5),D1
         bus.write_word(0x0102, 0xFFF0);
         bus.write_word(0x0104, 0x67FA); // BEQ.S head
@@ -16106,8 +16730,8 @@ mod portable_tests {
         bus.write_word(0x0108, 0x0800);
         bus.write_word(0x010A, 0x60F4); // BRA.S head
         bus.write_word(0x0300, 0x1234); // the polled word
-        bus.write_word(0x2100, 0x5282); // ADDQ.L #1,D2
-        bus.write_word(0x2102, 0x60FC); // BRA.S 0x2100
+        bus.write_word(COLLIDER, 0x5282); // ADDQ.L #1,D2
+        bus.write_word(COLLIDER + 2, 0x60FC); // BRA.S COLLIDER
 
         let mut cpu = cpu();
         cpu.set_cpu_type(CpuType::M68040);
@@ -16132,7 +16756,7 @@ mod portable_tests {
         );
 
         // Phase 2: evict the direct-mapped slot with the colliding head.
-        cpu.pc = 0x2100;
+        cpu.pc = COLLIDER;
         cpu.run_batch(&mut bus, 200, &[]);
 
         // Phase 3: equal compare -- the taken loop classifies as a wait.
@@ -16188,14 +16812,17 @@ mod portable_tests {
     fn wait_then_eviction_then_fall_through_restores_the_blocker() {
         // The wait bit must reflect the most recent completed recording,
         // not the first. Sequence: classify a genuine wait; evict its
-        // direct-mapped slot with a colliding head (0x0100 and 0x2100 both
-        // map to slot 0x80); revisit with the compare unequal so the back
-        // edge falls through into an unsupported operation. The second
+        // direct-mapped slot with a head one cache period away; revisit with
+        // the compare unequal so the back edge falls through into an
+        // unsupported operation. The second
         // recording finds a real blocker, and the head must return to the
         // opportunity ranking rather than staying hidden in the wait
         // section by the stale classification.
         super::super::trace_profile::reset();
-        let mut bus = super::super::memory::LinearMemoryBus::new(0x4000);
+        const HEAD: u32 = 0x0100;
+        const COLLIDER: u32 = HEAD + (TRACE_CACHE_SIZE as u32) * 2;
+        assert_eq!(trace_cache_index(HEAD), trace_cache_index(COLLIDER));
+        let mut bus = super::super::memory::LinearMemoryBus::new(COLLIDER as usize + 0x1000);
         // Wait/fall-through head at 0x0100.
         bus.write_word(0x0100, 0xB26D); // CMP.W (-0x10,A5),D1
         bus.write_word(0x0102, 0xFFF0);
@@ -16204,9 +16831,9 @@ mod portable_tests {
         bus.write_word(0x0108, 0x0800);
         bus.write_word(0x010A, 0x60F4); // BRA.S head
         bus.write_word(0x0300, 0x1234); // the polled word
-        // Colliding loop head at 0x2100.
-        bus.write_word(0x2100, 0x5282); // ADDQ.L #1,D2
-        bus.write_word(0x2102, 0x60FC); // BRA.S 0x2100
+        // Colliding loop head one cache period after HEAD.
+        bus.write_word(COLLIDER, 0x5282); // ADDQ.L #1,D2
+        bus.write_word(COLLIDER + 2, 0x60FC); // BRA.S COLLIDER
 
         let mut cpu = cpu();
         cpu.set_cpu_type(CpuType::M68040);
@@ -16233,7 +16860,7 @@ mod portable_tests {
 
         // Phase 2: a backward branch to the colliding head evicts the
         // rejected slot for 0x0100.
-        cpu.pc = 0x2100;
+        cpu.pc = COLLIDER;
         cpu.run_batch(&mut bus, 200, &[]);
 
         // Phase 3: unequal compare -- the back edge falls through into the
@@ -16649,11 +17276,30 @@ mod portable_tests {
     #[test]
     fn exit_seeding_counts_promotes_and_respects_slot_owners() {
         let mut jit = TraceJit::new();
-        // First exit seeds a vacant slot; second promotes to recording.
+        // The first exit seeds a vacant slot. The decoded loop immediately
+        // probes the committed target again after the parent trace returns;
+        // that probe must neither count the same exit twice nor lose the
+        // exit-seeded provenance of the eventual recording.
         assert!(matches!(
             jit.note_trace_exit(0x0100, CpuType::M68040, false),
             ExitSeed::None
         ));
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.pc = 0x0100;
+        cpu.cycles_remaining = 1_000;
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        assert!(
+            jit.try_execute(&mut cpu, &mut bus, CpuType::M68040, 100, false, &[], 1)
+                .is_none()
+        );
+        assert!(jit.recording.is_none(), "the duplicate probe stays cold");
+        assert!(matches!(
+            &jit.slots[trace_cache_index(0x0100)],
+            TraceSlot::Counting { hits: 1, .. }
+        ));
+
+        // A genuinely second exit promotes to an exit-seeded recording.
         assert!(matches!(
             jit.note_trace_exit(0x0100, CpuType::M68040, false),
             ExitSeed::StartRecording
@@ -16662,6 +17308,10 @@ mod portable_tests {
             jit.recording.as_ref().map(|r| r.start_pc),
             Some(0x0100),
             "recording starts at the exit target"
+        );
+        assert!(
+            jit.recording.as_ref().is_some_and(|r| r.from_exit_seed),
+            "link-finish remains enabled for the side-path recording"
         );
         // While a recording is active, another hot exit defers rather than
         // stealing the recorder.
@@ -17029,6 +17679,7 @@ mod portable_tests {
                 allow_call_through: false,
                 pending_return: None,
                 skip_record_until: None,
+                from_exit_seed: false,
                 adaptive_rerecords: 0,
             });
         });
@@ -17073,6 +17724,7 @@ mod portable_tests {
             allow_call_through: false,
             pending_return: None,
             skip_record_until: None,
+            from_exit_seed: false,
             adaptive_rerecords: 0,
         };
         with_trace_jit(|jit| {
@@ -17593,6 +18245,396 @@ mod portable_tests {
                 displacement: 0,
             }
         ));
+    }
+
+    #[test]
+    fn move_from_pc_relative_source_decodes_to_constant_base() {
+        let dcpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        // 303B 0006 = MOVE.W (6,PC,D0.W),D0 -- the jump-table fetch shape.
+        // The PC base is the extension word's address (pc+2), so the
+        // record-time constant base is pc + 2 + 6.
+        bus.write_word(0x0100, 0x303B);
+        bus.write_word(0x0102, 0x0006);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.W (d8,PC,Xn),Dn should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::MoveMem {
+                size: Size::Word,
+                src: JitEa::PcIndex {
+                    base: 0x0108,
+                    index: JitDirectReg::Data(0),
+                    index_long: false,
+                    scale: 0,
+                },
+                dst: JitEa::Data(0),
+            }
+        ));
+        assert_eq!(trace.extension, Some(0x0006));
+
+        // 2A3A 0010 = MOVE.L (d16,PC),D5 -- collapses to a constant
+        // PC-displacement source at pc + 2 + 0x10. It stays distinct from
+        // absolute-long addressing because its 68000 cycle charge is lower.
+        bus.write_word(0x0100, 0x2A3A);
+        bus.write_word(0x0102, 0x0010);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("MOVE.L (d16,PC),Dn should decode");
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::MoveMem {
+                size: Size::Long,
+                src: JitEa::PcDisp(0x0112),
+                dst: JitEa::Data(5),
+            }
+        ));
+
+        // PC-relative destinations are illegal and must not decode: a
+        // synthetic word with dst mode 7/reg 2 stays rejected.
+        bus.write_word(0x0100, 0x35C0); // hypothetical MOVE.W D0,(d16,PC)
+        bus.write_word(0x0102, 0x0010);
+        assert!(
+            decode_move_mem_trace_op(&dcpu, &mut bus, 0x0100, 0x35C0).is_none(),
+            "PC-relative destination must not decode"
+        );
+    }
+
+    #[test]
+    fn pc_relative_move_sources_match_the_68000_interpreter_and_cycles() {
+        let cases = [
+            (
+                0x303Au16,
+                0x0010u16,
+                None,
+                0x0112u32,
+                vec![0x81, 0x23],
+                "MOVE.W (d16,PC),D0",
+            ),
+            (
+                0x203Au16,
+                0x0010u16,
+                None,
+                0x0112u32,
+                vec![0x12, 0x34, 0x56, 0x78],
+                "MOVE.L (d16,PC),D0",
+            ),
+            (
+                0x303Bu16,
+                0x1006u16,
+                Some((1u8, 4u32)),
+                0x010Cu32,
+                vec![0xA5, 0x5A],
+                "MOVE.W (d8,PC,D1.W),D0",
+            ),
+        ];
+
+        for (opcode, extension, index, address, bytes, label) in cases {
+            let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+            bus.write_word(0x0100, opcode);
+            bus.write_word(0x0102, extension);
+            bus.load(address, &bytes);
+
+            let mut interpreter = cpu();
+            interpreter.set_d(0, 0xCAFE_BABE);
+            interpreter.set_ccr(0x10);
+            if let Some((reg, value)) = index {
+                interpreter.set_d(reg as usize, value);
+            }
+            let interpreter_cycles = match interpreter.step(&mut bus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("{label}: interpreter step failed: {other:?}"),
+            };
+
+            let trace = decode_trace_op(&cpu(), &mut bus, 0x0100, CpuType::M68000)
+                .unwrap_or_else(|| panic!("{label}: trace decode failed"));
+            let mut mem = vec![0u8; 0x1000];
+            mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+            mem[0x0102..0x0104].copy_from_slice(&extension.to_be_bytes());
+            mem[address as usize..address as usize + bytes.len()].copy_from_slice(&bytes);
+            let mut portable = cpu();
+            portable.set_d(0, 0xCAFE_BABE);
+            portable.set_ccr(0x10);
+            if let Some((reg, value)) = index {
+                portable.set_d(reg as usize, value);
+            }
+            attach_window(&mut portable, &mut mem);
+            let portable_cycles =
+                execute_portable_op(&mut portable, trace, CodeSpans::caller(0x0100, 0x0104))
+                    .unwrap_or_else(|| panic!("{label}: portable execution bailed"));
+
+            assert_eq!(portable.dar, interpreter.dar, "{label}: registers");
+            assert_eq!(portable.get_ccr(), interpreter.get_ccr(), "{label}: CCR");
+            assert_eq!(
+                portable_cycles, interpreter_cycles,
+                "{label}: exact 68000 cycle charge"
+            );
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_pc_relative_move_sources_match_portable_results_and_cycles() {
+        let cases = [
+            (
+                JitEa::PcDisp(0x0120),
+                0x303Au16,
+                0x001Eu16,
+                0u32,
+                26u32,
+                "(d16,PC)",
+            ),
+            (
+                JitEa::PcIndex {
+                    base: 0x0120,
+                    index: JitDirectReg::Data(1),
+                    index_long: false,
+                    scale: 0,
+                },
+                0x303Bu16,
+                0x101Eu16,
+                4u32,
+                28u32,
+                "(d8,PC,D1.W)",
+            ),
+        ];
+
+        for (src, opcode, extension, d1, expected_cycles, label) in cases {
+            let ops = vec![
+                TraceBuildOp {
+                    opcode,
+                    extension: Some(extension),
+                    extension2: None,
+                    pc: 0x0100,
+                    op: JitTraceOp::MoveMem {
+                        size: Size::Word,
+                        src,
+                        dst: JitEa::Data(0),
+                    },
+                },
+                TraceBuildOp {
+                    opcode: 0x4E71,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0104,
+                    op: JitTraceOp::Nop,
+                },
+                TraceBuildOp {
+                    opcode: 0x60F8,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0106,
+                    op: JitTraceOp::Branch {
+                        condition: 0,
+                        displacement: -8,
+                        length: 2,
+                        expected_taken: None,
+                    },
+                },
+            ];
+            let seed_mem = |mem: &mut [u8]| {
+                mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                mem[0x0102..0x0104].copy_from_slice(&extension.to_be_bytes());
+                mem[0x0104..0x0106].copy_from_slice(&0x4E71u16.to_be_bytes());
+                mem[0x0106..0x0108].copy_from_slice(&0x60F8u16.to_be_bytes());
+                mem[0x0120..0x0122].copy_from_slice(&0x1234u16.to_be_bytes());
+                mem[0x0124..0x0126].copy_from_slice(&0xA55Au16.to_be_bytes());
+            };
+
+            let mut native_mem = vec![0u8; 0x1000];
+            seed_mem(&mut native_mem);
+            let mut native = cpu();
+            native.set_d(0, 0xCAFE_BABE);
+            native.set_d(1, d1);
+            native.set_ccr(0x10);
+            attach_window(&mut native, &mut native_mem);
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&native, 0x0100, CpuType::M68000, ops.clone(), Some(0x0100))
+                .unwrap_or_else(|| panic!("{label}: trace should compile"));
+            let native_packed = unsafe { compiled.call_native(&mut native, 1) };
+
+            let mut portable_mem = vec![0u8; 0x1000];
+            seed_mem(&mut portable_mem);
+            let mut portable = cpu();
+            portable.set_d(0, 0xCAFE_BABE);
+            portable.set_d(1, d1);
+            portable.set_ccr(0x10);
+            attach_window(&mut portable, &mut portable_mem);
+            let portable_packed =
+                execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x0108));
+
+            assert_eq!(native_packed, portable_packed, "{label}: packed result");
+            assert_eq!(native_packed as u32, expected_cycles, "{label}: cycles");
+            assert_eq!(native.dar, portable.dar, "{label}: registers");
+            assert_eq!(native.get_ccr(), portable.get_ccr(), "{label}: CCR");
+            assert_eq!(native.pc, 0x0100, "{label}: loop closes");
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn guarded_pc_index_jmp_matches_portable_and_seeds_a_last_op_exit() {
+        const START: u32 = 0x00FC;
+        const JMP_PC: u32 = 0x0100;
+        const EXPECTED: u32 = 0x010C;
+        const ALTERNATE: u32 = 0x010E;
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x4E71,
+                extension: None,
+                extension2: None,
+                pc: START,
+                op: JitTraceOp::Nop,
+            },
+            TraceBuildOp {
+                opcode: 0x4E71,
+                extension: None,
+                extension2: None,
+                pc: START + 2,
+                op: JitTraceOp::Nop,
+            },
+            TraceBuildOp {
+                opcode: 0x4EFB,
+                extension: Some(0x0006),
+                extension2: None,
+                pc: JMP_PC,
+                op: JitTraceOp::PcIndexJmp {
+                    base: 0x0108,
+                    index: JitDirectReg::Data(0),
+                    index_long: false,
+                    scale: 0,
+                    expected_target: Some(EXPECTED),
+                },
+            },
+        ];
+
+        // Independent interpreter reference for the computed jump itself.
+        let mut interpreter_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        interpreter_bus.write_word(JMP_PC, 0x4EFB);
+        interpreter_bus.write_word(JMP_PC + 2, 0x0006);
+        let mut interpreter = cpu();
+        interpreter.pc = JMP_PC;
+        interpreter.set_d(0, 6);
+        let interpreter_cycles = match interpreter.step(&mut interpreter_bus) {
+            super::super::types::StepResult::Ok { cycles } => cycles,
+            other => panic!("interpreter JMP failed: {other:?}"),
+        };
+        assert_eq!(interpreter_cycles, 14, "68000 indexed JMP timing");
+        assert_eq!(interpreter.pc, ALTERNATE, "the computed target commits");
+
+        let mut jit = TraceJit::new();
+        let seed = cpu();
+        assert_eq!(guarded_op_mask(&ops[..2]), 0, "plain ops need no scan");
+        assert_eq!(
+            guarded_op_mask(&ops),
+            1 << 2,
+            "only the computed jump is guarded"
+        );
+        let compiled = jit
+            .compile_decoded_ops(&seed, START, CpuType::M68000, ops.clone(), Some(EXPECTED))
+            .expect("the guarded computed-jump trace should compile");
+        assert_eq!(compiled.guarded_ops, 1 << 2);
+
+        for (index, expected_pc, expected_exit) in
+            [(4u32, EXPECTED, false), (6u32, ALTERNATE, true)]
+        {
+            let mut native = cpu();
+            native.pc = START;
+            native.ppc = 0xDEAD_BEEF;
+            native.ir = 0xA5A5;
+            native.set_d(0, index);
+            let native_packed = unsafe { compiled.call_native(&mut native, 1) };
+
+            let mut portable = cpu();
+            portable.pc = START;
+            portable.ppc = 0xDEAD_BEEF;
+            portable.ir = 0xA5A5;
+            portable.set_d(0, index);
+            let portable_packed =
+                execute_portable_trace(&mut portable, &ops, CodeSpans::caller(START, JMP_PC + 4));
+
+            assert_eq!(
+                native_packed, portable_packed,
+                "index={index}: packed result"
+            );
+            assert_eq!((native_packed >> 32) as u32, 3, "all three ops retire");
+            assert_eq!(native_packed as u32, 22, "two NOPs plus 14-cycle JMP");
+            assert_eq!(native.pc, expected_pc, "index={index}: committed PC");
+            assert_eq!(native.ppc, JMP_PC, "index={index}: PPC identifies JMP");
+            assert_eq!(native.ir, 0x4EFB, "index={index}: IR identifies JMP");
+            assert_eq!(native.change_of_flow, portable.change_of_flow);
+            assert_eq!(
+                compiled.is_guarded_branch_exit(&native),
+                expected_exit,
+                "index={index}: exit classification"
+            );
+        }
+
+        // The mismatch is at the last trace op, so its retired count equals
+        // the full trace length. try_execute must still recognize the guard
+        // exit and create an exit-seeded candidate at the committed target.
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(START, 0x4E71);
+        bus.write_word(START + 2, 0x4E71);
+        bus.write_word(JMP_PC, 0x4EFB);
+        bus.write_word(JMP_PC + 2, 0x0006);
+        jit.slots[trace_cache_index(START)] = TraceSlot::Compiled(compiled);
+        let mut actual = cpu();
+        actual.pc = START;
+        actual.cycles_remaining = 1_000;
+        actual.set_d(0, 6);
+        let result = jit.try_execute(
+            &mut actual,
+            &mut bus,
+            CpuType::M68000,
+            100,
+            false,
+            &[],
+            TRACE_EXIT_CHAIN_BUDGET,
+        );
+        assert!(matches!(result, Some((CachedRunResult::Ran, 3))));
+        assert_eq!(actual.pc, ALTERNATE);
+        assert!(matches!(
+            &jit.slots[trace_cache_index(ALTERNATE)],
+            TraceSlot::Counting { pc, hits: 1, .. } if *pc == ALTERNATE
+        ));
+    }
+
+    #[test]
+    fn portable_move_from_pc_index_reads_the_live_table() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        // Table of words at 0x0200; code at 0x0100 (unused by the
+        // portable executor beyond spans).
+        mem[0x200] = 0x12;
+        mem[0x201] = 0x34;
+        mem[0x202] = 0x56;
+        mem[0x203] = 0x78;
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_d(0, 4); // index selects the second table word
+        let op = TraceBuildOp {
+            opcode: 0x303B,
+            extension: Some(0x0006),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::MoveMem {
+                size: Size::Word,
+                src: JitEa::PcIndex {
+                    base: 0x01FE,
+                    index: JitDirectReg::Data(0),
+                    index_long: false,
+                    scale: 0,
+                },
+                dst: JitEa::Data(0),
+            },
+        };
+        let packed = execute_portable_trace(&mut cpu, &[op], CodeSpans::caller(0x0100, 0x0104));
+        assert_eq!((packed >> 32) as u32, 1, "the op must retire");
+        assert_eq!(
+            cpu.d(0) & 0xFFFF,
+            0x5678,
+            "base 0x1FE + D0.W(4) reads the table word at 0x202"
+        );
     }
 
     #[test]
@@ -18657,14 +19699,14 @@ mod durable_rejection_tests {
         cpu
     }
 
-    /// Two loop heads 8KB apart share a trace-cache slot
-    /// (`trace_cache_index` = (pc>>1)&0xFFF). HEAD_A's loop crosses a
+    /// Two loop heads one cache period apart share a trace-cache slot.
+    /// HEAD_A's loop crosses a
     /// trap-free stretch and then JUMPS AWAY through a computed JMP before
     /// any backward branch closes it, so every recording ends
     /// `no-trace-terminal`; HEAD_B is an ordinary tight loop whose
     /// candidacy overwrites A's `Rejected` slot each time it counts.
     const HEAD_A: u32 = 0x1000;
-    const HEAD_B: u32 = 0x1000 + 0x2000; // same (pc>>1)&0xFFF
+    const HEAD_B: u32 = HEAD_A + (TRACE_CACHE_SIZE as u32) * 2;
 
     fn build_bus() -> LinearMemoryBus {
         let mut bus = LinearMemoryBus::new(0x10000);
@@ -18935,6 +19977,251 @@ mod durable_rejection_tests {
         assert!(
             !with_trace_jit(|jit| jit.has_no_terminal_strikes(HEAD_C)),
             "a successful compile clears the head's no-terminal strikes"
+        );
+    }
+
+    /// Link exit: an exit-seeded recording that flows sequentially into
+    /// another compiled trace's head finishes there and compiles with that
+    /// head as its exit -- the shape of a guard-exit side path rejoining
+    /// its parent loop -- instead of recording on through the parent's
+    /// code. Exercises both halves: the recorder's early link-finish
+    /// (exit-seeded recordings only) and compile acceptance of the
+    /// non-branch link tail.
+    const PARENT: u32 = 0x2000;
+    const SIDE: u32 = 0x1FF8; // CondSkip side path falls into PARENT
+
+    #[test]
+    fn an_exit_seeded_recording_link_finishes_at_a_compiled_head() {
+        let mut bus = LinearMemoryBus::new(0x10000);
+        // SIDE:   NOP; BCS.S parent-tail; MOVEQ #99,D0; NOP
+        //         (the branch skips MOVEQ, then the tail falls into PARENT)
+        // PARENT: SUBQ.W #1,D7; BNE.S PARENT; JMP (A1)
+        for (i, w) in [0x4E71u16, 0x6502, 0x7063, 0x4E71, 0x5347, 0x66FC, 0x4ED1]
+            .iter()
+            .enumerate()
+        {
+            bus.load(SIDE + 2 * i as u32, &w.to_be_bytes());
+        }
+        let mut cpu = cpu_at(PARENT);
+        cpu.set_a(1, PARENT);
+
+        // Phase 1: make PARENT hot and compiled via its own back edge.
+        for _ in 0..20 {
+            cpu.set_d(7, 40);
+            cpu.pc = PARENT;
+            cpu.run_batch(&mut bus, 120, &[]);
+        }
+        assert!(
+            with_trace_jit(|jit| matches!(
+                &jit.slots[trace_cache_index(PARENT)],
+                TraceSlot::Compiled(trace) if trace.pc == PARENT
+            )),
+            "the parent loop must compile first"
+        );
+
+        // Phase 2: inject an exit-seeded recording at SIDE (what
+        // note_trace_exit's StartRecording arm creates) and run through
+        // the side ops. The recording must finish at PARENT after the 3
+        // side ops and compile them as a link-exit trace.
+        with_trace_jit(|jit| {
+            jit.recording = Some(TraceRecording {
+                start_pc: SIDE,
+                cpu_type: CpuType::M68000,
+                ops: Vec::with_capacity(TRACE_MAX_OPS),
+                adaptive_rerecords: 0,
+                allow_call_through: false,
+                pending_return: None,
+                skip_record_until: None,
+                from_exit_seed: true,
+            });
+        });
+        cpu.trace_recording = true;
+        cpu.c_flag = CFLAG_SET;
+        cpu.set_d(7, 4);
+        cpu.pc = SIDE;
+        cpu.run_batch(&mut bus, 8, &[]);
+
+        let (compiled, ops_len) = with_trace_jit(|jit| match &jit.slots[trace_cache_index(SIDE)] {
+            TraceSlot::Compiled(trace) if trace.pc == SIDE => (true, trace.ops.len()),
+            _ => (false, 0),
+        });
+        assert!(
+            compiled,
+            "an exit-seeded region flowing into a compiled head must \
+             compile as a link exit (durable={}, strikes={})",
+            with_trace_jit(|jit| jit.is_structurally_rejected(SIDE)),
+            with_trace_jit(|jit| jit.has_no_terminal_strikes(SIDE)),
+        );
+        assert_eq!(
+            ops_len, 4,
+            "the link-exit trace holds CondSkip, its skipped op, and the \
+             recorder must finish AT the parent's head, not record on \
+             through the parent's code)"
+        );
+
+        // Taken CondSkip retires only three of the four stored ops, but that
+        // is still a clean completion and must link-chain into PARENT.
+        cpu.set_d(0, 7);
+        cpu.set_d(7, 4);
+        cpu.c_flag = CFLAG_SET;
+        cpu.pc = SIDE;
+        cpu.run_batch(&mut bus, 8, &[]);
+        assert_eq!(cpu.d(0), 7, "the skipped MOVEQ did not execute");
+        let row = super::super::trace_profile::snapshot()
+            .rows
+            .into_iter()
+            .find(|row| row.start_pc == SIDE)
+            .expect("compiled side appears in profile");
+        assert!(
+            row.link_exits > 0,
+            "dynamic retirement is a clean link exit"
+        );
+        assert!(
+            row.chained_calls > 0,
+            "the completed side chains into PARENT"
+        );
+    }
+
+    /// The bytecode-dispatch composition: a loop that reads a byte,
+    /// fetches a jump-table offset through (d8,PC,Xn), and dispatches
+    /// through JMP (d8,PC,Xn). The head must compile THROUGH the guarded
+    /// computed jump; the alternate dispatch case guard-exits, gets
+    /// exit-seeded, and compiles its own continuation.
+    const DISPATCH: u32 = 0x2000;
+    const CASE1: u32 = 0x201E;
+
+    #[test]
+    fn a_bytecode_dispatch_loop_compiles_through_the_guarded_computed_jump() {
+        let mut bus = LinearMemoryBus::new(0x10000);
+        // head:  MOVE.B (A2)+,D5; MOVEQ #0,D0; MOVE.B D5,D0; ADD.W D0,D0
+        //        MOVE.W (6,PC,D0.W),D0   (table at 0x2010)
+        //        JMP (2,PC,D0.W)         (base 0x2010)
+        // table: dc.w case0-0x2010 (=0x0008), case1-0x2010 (=0x000E)
+        // case0: ADDQ.L #1,D1; ADDQ.L #1,D3; BRA.S head
+        // case1: ADDQ.L #1,D2; ADDQ.L #1,D4; BRA.S head
+        // Each case is exactly TRACE_MIN_OPS so the alternate case must
+        // link-finish at the already compiled dispatch head.
+        for (i, w) in [
+            0x1A1Au16, 0x7000, 0x1005, 0xD040, 0x303B, 0x0006, 0x4EFB, 0x0002, 0x0008, 0x000E,
+            0x4E71, 0x4E71, // table + padding
+            0x5281, 0x5283, 0x60E2, // case0 @ 0x2018
+            0x5282, 0x5284, 0x60DC, // case1 @ 0x201E
+        ]
+        .iter()
+        .enumerate()
+        {
+            bus.load(DISPATCH + 2 * i as u32, &w.to_be_bytes());
+        }
+        // Bytecode stream: alternating case 0 / case 1.
+        for i in 0..0x400u32 {
+            bus.load(0x3000 + i, &[(i & 1) as u8]);
+        }
+        let mut cpu = cpu_at(DISPATCH);
+        cpu.set_a(2, 0x3000);
+
+        cpu.run_batch(&mut bus, 4_000, &[]);
+
+        let (head_has_guarded_jmp, code_segments) =
+            with_trace_jit(|jit| match &jit.slots[trace_cache_index(DISPATCH)] {
+                TraceSlot::Compiled(trace) if trace.pc == DISPATCH => (
+                    trace.ops.iter().any(|op| {
+                        matches!(
+                            op.op,
+                            JitTraceOp::PcIndexJmp {
+                                expected_target: Some(_),
+                                ..
+                            }
+                        )
+                    }),
+                    trace
+                        .code_segments
+                        .iter()
+                        .map(|segment| (segment.start, segment.len))
+                        .collect::<Vec<_>>(),
+                ),
+                _ => (false, Vec::new()),
+            });
+        assert!(
+            head_has_guarded_jmp,
+            "the dispatch head must compile THROUGH the guarded computed jump"
+        );
+        assert_eq!(
+            code_segments.len(),
+            2,
+            "dispatcher prefix and recorded case are two fast-validation segments: {code_segments:?}"
+        );
+        assert_eq!(code_segments[0], (DISPATCH, 16));
+        assert!(matches!(code_segments[1], (0x2018 | 0x201E, 6)));
+        // Whichever case the recording did NOT capture as the expected
+        // path must be exit-seeded and compile as its own continuation.
+        const CASE0: u32 = 0x2018;
+        let compiled_case = with_trace_jit(|jit| {
+            [CASE0, CASE1]
+                .iter()
+                .find_map(|&case| match &jit.slots[trace_cache_index(case)] {
+                    TraceSlot::Compiled(trace) if trace.pc == case => {
+                        Some((case, trace.ops.len(), trace.ops.last().copied()))
+                    }
+                    _ => None,
+                })
+        });
+        if compiled_case.is_none() {
+            with_trace_jit(|jit| {
+                let slot = match &jit.slots[trace_cache_index(CASE1)] {
+                    TraceSlot::Empty => "Empty".to_string(),
+                    TraceSlot::Counting { pc, hits, .. } => format!("Counting({pc:X},h={hits})"),
+                    TraceSlot::Rejected { pc, .. } => format!("Rejected({pc:X})"),
+                    TraceSlot::Compiled(t) => format!("Compiled({:X})", t.pc),
+                };
+                eprintln!(
+                    "[DBG] case1 slot={slot} durable={} strikes={} attempts={}",
+                    jit.is_structurally_rejected(CASE1),
+                    jit.has_no_terminal_strikes(CASE1),
+                    attempts_for(CASE1)
+                );
+            });
+        }
+        assert!(
+            compiled_case.is_some(),
+            "an alternate dispatch case must be exit-seeded and compile"
+        );
+        let (compiled_case_pc, compiled_case_ops, last) = compiled_case.unwrap();
+        assert_eq!(
+            compiled_case_ops, TRACE_MIN_OPS,
+            "the alternate case must finish at the dispatch head instead of recording through it"
+        );
+        assert_eq!(
+            last.and_then(|op| op.op.taken_target(op.pc)),
+            Some(DISPATCH),
+            "the case continuation links back to the common dispatcher"
+        );
+        // Semantics: alternating bytecode increments D1 and D2 in lockstep.
+        assert!(
+            cpu.d(1) > 100,
+            "case 0 ran natively many times: {}",
+            cpu.d(1)
+        );
+        assert!(
+            cpu.d(1).abs_diff(cpu.d(2)) <= 1,
+            "the two dispatch cases alternate: D1={} D2={}",
+            cpu.d(1),
+            cpu.d(2)
+        );
+        assert_eq!(cpu.d(3), cpu.d(1), "case 0 executes all three case ops");
+        assert_eq!(cpu.d(4), cpu.d(2), "case 1 executes all three case ops");
+
+        let row = super::super::trace_profile::snapshot()
+            .rows
+            .into_iter()
+            .find(|row| row.start_pc == compiled_case_pc)
+            .expect("compiled case appears in the profile");
+        assert!(
+            row.link_exits > 0,
+            "the case completed onto the dispatch head"
+        );
+        assert!(
+            row.chained_calls > 0,
+            "the completed case entered the compiled dispatcher without interpretation"
         );
     }
 }
