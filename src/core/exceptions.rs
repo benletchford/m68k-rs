@@ -337,10 +337,23 @@ impl CpuCore {
                 self.push_32_raw(bus, self.ppc);
                 self.push_16_raw(bus, old_sr);
             }
+            _ if self.is_040() => {
+                // An odd instruction prefetch uses the six-word format-$2
+                // address-error frame (MC68040UM 8.2.2, 8.4.3), not the
+                // format-$7 access-error frame used for bus and ATC faults.
+                // The extra longword contains the referenced address with A0
+                // cleared, while the stacked PC identifies the instruction
+                // that caused the address error.
+                self.push_32_raw(bus, address & !1);
+                self.push_16_raw(bus, 0x2000 | ((vector::ADDRESS_ERROR as u16) << 2));
+                self.push_32_raw(bus, self.ppc);
+                self.push_16_raw(bus, old_sr);
+                let _ = status_word;
+            }
             _ => {
-                // TODO: 68020+ address error stack frames (format A/B/7 variants) are not yet
-                // implemented. Use a minimal 68010+ format-0-like frame to avoid totally losing
-                // control flow, but this is not architecturally accurate.
+                // TODO: 68020/68030/68060 address error stack frames are not
+                // yet implemented. Use a minimal format-0-like frame to avoid
+                // totally losing control flow, but this is not architecturally accurate.
                 self.push_16_raw(bus, (vector::ADDRESS_ERROR as u16) << 2);
                 self.push_32_raw(bus, self.ppc);
                 self.push_16_raw(bus, old_sr);
