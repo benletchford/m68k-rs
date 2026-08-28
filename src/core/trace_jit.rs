@@ -680,6 +680,10 @@ enum RegionRejectReason {
     TooShort,
     IndirectJsrTooShort,
     LinearMemoryAlu,
+    /// A guarded path mutates a function stack frame before a possible
+    /// prefix exit. Keep the region decoded so host batch boundaries cannot
+    /// expose partially replayed prologue memory effects.
+    GuardedStackFrame,
     AddressWrap,
     /// A recorded call's caller or callee segment exceeds
     /// `CALL_THROUGH_MAX_SPAN` in the complete shape. The admission-time
@@ -1831,6 +1835,7 @@ impl TraceJit {
             RegionRejectReason::TooShort => Public::TooShort,
             RegionRejectReason::IndirectJsrTooShort => Public::IndirectJsrTooShort,
             RegionRejectReason::LinearMemoryAlu => Public::LinearMemoryAlu,
+            RegionRejectReason::GuardedStackFrame => Public::Backend,
             RegionRejectReason::AddressWrap => Public::AddressWrap,
             RegionRejectReason::CallSpan => Public::CallSpan,
             RegionRejectReason::Backend => Public::Backend,
@@ -2564,6 +2569,22 @@ impl TraceJit {
         };
         if ops.len() < min_ops {
             return Err(RegionRejectReason::TooShort);
+        }
+
+        // A guarded multi-block path may side-exit after only a prefix of
+        // the recording. Keep function prologues that have already mutated
+        // the stack frame on the decoded path: their partial memory effects
+        // otherwise become dependent on the embedder's run_batch boundary.
+        let guarded = guarded_op_mask(&ops) != 0;
+        if guarded
+            && ops.iter().any(|op| {
+                matches!(
+                    op.op,
+                    JitTraceOp::Link { .. } | JitTraceOp::MovemLongPredec { .. }
+                )
+            })
+        {
+            return Err(RegionRejectReason::GuardedStackFrame);
         }
 
         let max_cycles = ops.iter().map(|op| op.op.max_cycles()).sum();
@@ -21206,6 +21227,103 @@ mod portable_tests {
             0
         );
         assert_eq!(p2.a(7), 0x0106);
+    }
+
+    #[test]
+    fn guarded_function_entry_stack_trace_stays_decoded() {
+        const START: u32 = 0x0100;
+        const ARG_PTR: u32 = 0x0800;
+        const STACK: u32 = 0x1800;
+        let words = [
+            (0x0100, 0x4E56),
+            (0x0102, 0xFFFC),
+            (0x0104, 0x48E7),
+            (0x0106, 0x1C38),
+            (0x0108, 0x266E),
+            (0x010A, 0x0008),
+            (0x010C, 0x262E),
+            (0x010E, 0x000C),
+            (0x0110, 0x0C83),
+            (0x0112, 0x0000),
+            (0x0114, 0x0080),
+            (0x0116, 0x6C00),
+            (0x0118, 0x00A0),
+            (0x01B8, 0x246B),
+            (0x01BA, 0x0408),
+            (0x01BC, 0x6004),
+            (0x01C2, 0x200A),
+            (0x01C4, 0x6708),
+        ];
+
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x3000);
+        for (at, word) in words {
+            bus.write_word(at, word);
+        }
+        bus.write_long(STACK + 4, ARG_PTR);
+        bus.write_long(STACK + 8, 0x0000_0418);
+        bus.write_long(ARG_PTR + 0x0408, 0x0000_088C);
+        let mut expected = cpu();
+        expected.set_cpu_type(CpuType::M68040);
+        expected.pc = START;
+        expected.set_a(6, 0x1FF0);
+        expected.set_a(7, STACK);
+        for _ in 0..10 {
+            assert!(matches!(
+                expected.step(&mut bus),
+                super::super::types::StepResult::Ok { .. }
+            ));
+        }
+
+        let mut mem = vec![0u8; 0x3000];
+        for (at, word) in words {
+            mem[at as usize..at as usize + 2].copy_from_slice(&word.to_be_bytes());
+        }
+        mem[(STACK + 4) as usize..(STACK + 8) as usize].copy_from_slice(&ARG_PTR.to_be_bytes());
+        mem[(STACK + 8) as usize..(STACK + 12) as usize]
+            .copy_from_slice(&0x0000_0418u32.to_be_bytes());
+        mem[(ARG_PTR + 0x0408) as usize..(ARG_PTR + 0x040C) as usize]
+            .copy_from_slice(&0x0000_088Cu32.to_be_bytes());
+        let mut actual = cpu();
+        actual.set_cpu_type(CpuType::M68040);
+        actual.pc = START;
+        actual.set_a(6, 0x1FF0);
+        actual.set_a(7, STACK);
+        attach_window(&mut actual, &mut mem);
+
+        let pcs = [
+            0x0100, 0x0104, 0x0108, 0x010C, 0x0110, 0x0116, 0x01B8, 0x01BC, 0x01C2, 0x01C4,
+        ];
+        let mut ops: Vec<_> = pcs
+            .into_iter()
+            .map(|pc| decode_trace_op(&actual, &mut bus, pc, CpuType::M68040).unwrap())
+            .collect();
+        let JitTraceOp::Branch { expected_taken, .. } = &mut ops[5].op else {
+            unreachable!()
+        };
+        *expected_taken = Some(true);
+        let mut jit = TraceJit::new();
+        assert!(matches!(
+            jit.compile_decoded_ops_reason(
+                &actual,
+                START,
+                CpuType::M68040,
+                ops.clone(),
+                Some(0x01CE),
+            ),
+            Err(RegionRejectReason::GuardedStackFrame)
+        ));
+        let packed = execute_portable_trace(&mut actual, &ops, CodeSpans::caller(START, 0x01C6));
+
+        assert_eq!(packed >> 32, 10);
+        assert_eq!(actual.dar, expected.dar);
+        assert_eq!(actual.get_ccr(), expected.get_ccr());
+        assert_eq!(actual.pc, expected.pc);
+        for at in (STACK - 36..STACK + 12).step_by(4) {
+            assert_eq!(
+                u32::from_be_bytes(mem[at as usize..at as usize + 4].try_into().unwrap()),
+                bus.read_long(at)
+            );
+        }
     }
 }
 
