@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.5...m68k-v0.11.6) (2026-08-28)
+
+
+### Bug Fixes
+
+* emit 68040 format-2 address-error frames ([#158](https://github.com/benletchford/m68k-rs/issues/158)) ([d0b53b5](https://github.com/benletchford/m68k-rs/commit/d0b53b5baf56630d1b64d67a42acf3e965fd3780))
+
 ## [0.11.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.4...m68k-v0.11.5) (2026-08-28)
 
 
