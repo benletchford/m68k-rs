@@ -126,6 +126,61 @@ fn test_odd_pc_fetch_triggers_address_error_on_68020() {
     );
 }
 
+#[test]
+fn odd_pc_fetch_pushes_68040_format_2_address_error_frame() {
+    for cpu_type in [CpuType::M68EC040, CpuType::M68LC040, CpuType::M68040] {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(cpu_type);
+        let mut bus = TestBus::new();
+
+        bus.write_long_at(0x00, 0x1000);
+        bus.write_long_at(0x04, 0x0100);
+        bus.write_long_at(0x0C, 0x0200);
+        bus.write_word_at(0x0200, 0x4E73); // RTE
+
+        cpu.reset(&mut bus);
+        cpu.pc = 0x0101;
+        cpu.set_sr(0x2700);
+
+        assert!(matches!(cpu.step(&mut bus), StepResult::Ok { .. }));
+        assert_eq!(cpu.pc, 0x0200, "{cpu_type:?}");
+        assert_eq!(
+            cpu.a(7),
+            0x1000 - 12,
+            "{cpu_type:?}: six-word format-$2 frame"
+        );
+
+        let frame = cpu.a(7);
+        assert_eq!(bus.read_word(frame), 0x2700, "{cpu_type:?}: stacked SR");
+        assert_eq!(
+            bus.read_long(frame + 2),
+            0x0101,
+            "{cpu_type:?}: faulting instruction PC"
+        );
+        assert_eq!(
+            bus.read_word(frame + 6),
+            0x200C,
+            "{cpu_type:?}: format and vector offset"
+        );
+        assert_eq!(
+            bus.read_long(frame + 8),
+            0x0100,
+            "{cpu_type:?}: referenced address with A0 cleared"
+        );
+
+        assert!(matches!(cpu.step(&mut bus), StepResult::Ok { .. }));
+        assert_eq!(
+            cpu.pc, 0x0101,
+            "{cpu_type:?}: RTE restores the faulting instruction PC"
+        );
+        assert_eq!(
+            cpu.a(7),
+            0x1000,
+            "{cpu_type:?}: RTE consumes the complete format-$2 frame"
+        );
+    }
+}
+
 // Ported from upstream m68k-rs (post-fork regression test): a register-only
 // instruction followed by an odd-PC opcode fetch must not restore a stale
 // data/address rollback snapshot when the fetch faults. Confirms the vendored
