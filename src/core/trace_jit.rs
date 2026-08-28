@@ -5937,10 +5937,15 @@ fn execute_portable_an_disp(
             op: JitUnaryOp::Tst,
             size,
             reg,
-            ..
+            displacement,
         } => DecodedMemOp::Tst {
             size,
-            ea: FastEa::AnDisp(reg),
+            ea: if trace.extension.is_some() {
+                FastEa::AnDisp(reg)
+            } else {
+                debug_assert_eq!(displacement, 0);
+                FastEa::AnInd(reg)
+            },
         },
         JitTraceOp::AnDispUnary {
             op: JitUnaryOp::Clr,
@@ -19588,6 +19593,43 @@ mod portable_tests {
                 displacement: 0,
             }
         ));
+    }
+
+    #[test]
+    fn portable_tst_from_register_indirect_reads_exact_address() {
+        for (opcode, size) in [
+            (0x4A12u16, Size::Byte),
+            (0x4A52, Size::Word),
+            (0x4A92, Size::Long),
+        ] {
+            let mut mem = vec![0u8; 0x1000];
+            mem[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+            // If the portable executor mistakes (A2) for d16(A2), this
+            // following word becomes a displacement and the nonzero value at
+            // A2+4 controls the flags instead of the zero value at A2.
+            mem[0x0102..0x0104].copy_from_slice(&0x0004u16.to_be_bytes());
+            mem[0x0204..0x0208].fill(0x80);
+
+            let mut cpu = cpu();
+            cpu.set_a(2, 0x0200);
+            cpu.set_ccr(0x10);
+            attach_window(&mut cpu, &mut mem);
+
+            let mut decode_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+            decode_bus.write_word(0x0100, opcode);
+            let trace = decode_trace_op(&cpu, &mut decode_bus, 0x0100, CpuType::M68040)
+                .expect("TST (A2) should decode for portable execution");
+            let packed =
+                execute_portable_trace(&mut cpu, &[trace], CodeSpans::caller(0x0100, 0x0102));
+
+            assert_eq!(packed >> 32, 1, "{size:?} TST should retire");
+            assert_eq!(
+                cpu.get_ccr(),
+                0x14,
+                "{size:?} TST should observe zero at A2"
+            );
+            assert_eq!(cpu.pc, 0x0102, "{size:?} TST should consume no extension");
+        }
     }
 
     #[test]
