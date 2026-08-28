@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.4...m68k-v0.11.5) (2026-08-28)
+
+
+### Bug Fixes
+
+* **trace:** keep guarded stack frame paths decoded ([#155](https://github.com/benletchford/m68k-rs/issues/155)) ([c7b2f4c](https://github.com/benletchford/m68k-rs/commit/c7b2f4c61a74f83894bc6e49987f1c15453fe88c))
+
 ## [0.11.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.3...m68k-v0.11.4) (2026-08-28)
 
 
