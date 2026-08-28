@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.2...m68k-v0.11.3) (2026-08-28)
+
+
+### Bug Fixes
+
+* preserve indirect TST in portable traces ([#150](https://github.com/benletchford/m68k-rs/issues/150)) ([68b4d00](https://github.com/benletchford/m68k-rs/commit/68b4d0021957a7471f0b62eaeb582ca3c81b8b4e))
+
 ## [0.11.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.1...m68k-v0.11.2) (2026-08-26)
 
 
