@@ -5340,14 +5340,13 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     let dst = (opcode & 7) as u8;
     let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
     let bit = (extension & 31) as u8;
-    // The interpreter's charges: the 68000 pays the extension fetch on top
-    // of the dynamic-form base (bitop_cycles), other pre-68020 CPUs charge
-    // the dynamic-form legacy cost, and 68020+ charge the flat post-020
-    // cost. The modifying ops add 2 clocks pre-68020 when the bit lives in
-    // the upper register half; BTST does not.
+    // Start with the handlers' raw charges: the 68000 pays the extension
+    // fetch on top of the dynamic-form base (bitop_cycles), while the other
+    // CPUs use the dynamic-form legacy cost. The modifying ops add 2 clocks
+    // pre-68020 when the bit lives in the upper register half; BTST does not.
     let m68000 = cpu.cpu_type == CpuType::M68000;
     let hi = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
-    let cycles = match op {
+    let raw_cycles = match op {
         JitBitOp::Test => {
             if m68000 {
                 10
@@ -5373,6 +5372,16 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
                 10
             }
         }
+    };
+    // Normal retirement finalizes those raw charges through the selected
+    // processor's timing model. Traces must store that same modeled value:
+    // the 68020 table makes register bit operations four clocks, the
+    // 68030/040 family uses the legacy scaler, and the 68060 pipeline issues
+    // these register operations in one clock.
+    let cycles = match cpu.cpu_type {
+        CpuType::M68EC020 | CpuType::M68020 => 4,
+        CpuType::M68060 => 1,
+        _ => cpu.scale_cycles_for_cpu_type(raw_cycles),
     };
     Some(TraceBuildOp {
         opcode,
@@ -15850,17 +15859,17 @@ mod portable_tests {
             bus.write_word(base + 2, words[1]);
         }
 
-        // 68040: flat post-020 charges.
+        // 68040: handler charges finalized through the model scaler.
         cpu.set_cpu_type(CpuType::M68040);
         let ops: Vec<TraceBuildOp> = [0x0100u32, 0x0110, 0x0120, 0x0130]
             .iter()
             .map(|&pc| decode_trace_op(&cpu, &mut bus, pc, CpuType::M68040).expect("form decodes"))
             .collect();
         let expect = [
-            (JitBitOp::Test, 2u8, 4u8, 6),
-            (JitBitOp::Change, 20, 1, 8),
-            (JitBitOp::Clear, 20, 1, 10),
-            (JitBitOp::Set, 0, 7, 8),
+            (JitBitOp::Test, 2u8, 4u8, 4),
+            (JitBitOp::Change, 20, 1, 5),
+            (JitBitOp::Clear, 20, 1, 7),
+            (JitBitOp::Set, 0, 7, 5),
         ];
         for (decoded, &(op, bit, dst, cycles)) in ops.iter().zip(&expect) {
             let JitTraceOp::BitImmReg {
@@ -15898,6 +15907,75 @@ mod portable_tests {
 
         // The memory-destination static forms are another decoder's job.
         assert!(decode_bit_imm_reg_trace_op(&cpu, &mut bus, 0x0100, 0x0810).is_none());
+    }
+
+    #[test]
+    fn bit_imm_reg_cycles_match_the_interpreter_across_cpu_models() {
+        for cpu_type in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68EC020,
+            CpuType::M68020,
+            CpuType::M68EC030,
+            CpuType::M68030,
+            CpuType::M68EC040,
+            CpuType::M68LC040,
+            CpuType::M68040,
+            CpuType::SCC68070,
+            CpuType::M68060,
+        ] {
+            for (opcode, label) in [
+                (0x0801u16, "BTST"),
+                (0x0841, "BCHG"),
+                (0x0881, "BCLR"),
+                (0x08C1, "BSET"),
+            ] {
+                let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+                bus.write_word(0x0100, opcode);
+                bus.write_word(0x0102, 20);
+
+                let mut interpreter = cpu();
+                interpreter.set_cpu_type(cpu_type);
+                interpreter.set_d(1, 0x0010_0001);
+                interpreter.set_ccr(0x1F);
+                let interpreter_cycles = match interpreter.step(&mut bus) {
+                    super::super::types::StepResult::Ok { cycles } => cycles,
+                    other => panic!("{cpu_type:?} {label}: interpreter step failed: {other:?}"),
+                };
+
+                let mut portable = cpu();
+                portable.set_cpu_type(cpu_type);
+                portable.set_d(1, 0x0010_0001);
+                portable.set_ccr(0x1F);
+                let trace = decode_trace_op(&portable, &mut bus, 0x0100, cpu_type)
+                    .unwrap_or_else(|| panic!("{cpu_type:?} {label}: trace decode failed"));
+                let mut memory = vec![0u8; 0x1000];
+                memory[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                memory[0x0102..0x0104].copy_from_slice(&20u16.to_be_bytes());
+                attach_window(&mut portable, &mut memory);
+                let packed = execute_portable_trace(
+                    &mut portable,
+                    &[trace],
+                    CodeSpans::caller(0x0100, 0x0104),
+                );
+                let trace_cycles = trace_return_cycles(packed) as i32;
+
+                assert_eq!(
+                    portable.dar, interpreter.dar,
+                    "{cpu_type:?} {label}: registers"
+                );
+                assert_eq!(
+                    portable.get_ccr(),
+                    interpreter.get_ccr(),
+                    "{cpu_type:?} {label}: CCR"
+                );
+                assert_eq!(portable.pc, interpreter.pc, "{cpu_type:?} {label}: PC");
+                assert_eq!(
+                    trace_cycles, interpreter_cycles,
+                    "{cpu_type:?} {label}: trace cycles"
+                );
+            }
+        }
     }
 
     #[test]
@@ -16012,6 +16090,80 @@ mod portable_tests {
                 (packed, cpu.d(4), cpu.get_ccr(), cpu.pc)
             };
             assert_eq!(run(true), run(false), "{bit_op:?} #{bit},D4");
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_bit_imm_reg_matches_portable_across_cpu_models() {
+        for cpu_type in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68EC020,
+            CpuType::M68020,
+            CpuType::M68EC030,
+            CpuType::M68030,
+            CpuType::M68EC040,
+            CpuType::M68LC040,
+            CpuType::M68040,
+            CpuType::SCC68070,
+            CpuType::M68060,
+        ] {
+            for (opcode, label) in [
+                (0x0801u16, "BTST"),
+                (0x0841, "BCHG"),
+                (0x0881, "BCLR"),
+                (0x08C1, "BSET"),
+            ] {
+                let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+                bus.write_word(0x0100, opcode);
+                bus.write_word(0x0102, 20);
+                bus.write_word(0x0104, 0x60FA); // BRA.S $0100
+
+                let mut native = cpu();
+                native.set_cpu_type(cpu_type);
+                native.set_d(1, 0x0010_0001);
+                native.set_ccr(0x1F);
+                let bit_trace = decode_trace_op(&native, &mut bus, 0x0100, cpu_type)
+                    .unwrap_or_else(|| panic!("{cpu_type:?} {label}: trace decode failed"));
+                let branch_trace = decode_trace_op(&native, &mut bus, 0x0104, cpu_type)
+                    .unwrap_or_else(|| panic!("{cpu_type:?} {label}: branch decode failed"));
+                let ops = vec![bit_trace, branch_trace];
+                let mut memory = vec![0u8; 0x1000];
+                memory[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                memory[0x0102..0x0104].copy_from_slice(&20u16.to_be_bytes());
+                memory[0x0104..0x0106].copy_from_slice(&0x60FAu16.to_be_bytes());
+                attach_window(&mut native, &mut memory);
+                let mut jit = TraceJit::new();
+                let compiled = jit
+                    .compile_decoded_ops(&native, 0x0100, cpu_type, ops.clone(), Some(0x0100))
+                    .unwrap_or_else(|| panic!("{cpu_type:?} {label}: trace compile failed"));
+                let native_packed = unsafe { compiled.call_native(&mut native, 1) };
+
+                let mut portable = cpu();
+                portable.set_cpu_type(cpu_type);
+                portable.set_d(1, 0x0010_0001);
+                portable.set_ccr(0x1F);
+                let mut portable_memory = vec![0u8; 0x1000];
+                portable_memory[0x0100..0x0102].copy_from_slice(&opcode.to_be_bytes());
+                portable_memory[0x0102..0x0104].copy_from_slice(&20u16.to_be_bytes());
+                portable_memory[0x0104..0x0106].copy_from_slice(&0x60FAu16.to_be_bytes());
+                attach_window(&mut portable, &mut portable_memory);
+                let portable_packed =
+                    execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x0106));
+
+                assert_eq!(
+                    native_packed, portable_packed,
+                    "{cpu_type:?} {label}: result"
+                );
+                assert_eq!(native.dar, portable.dar, "{cpu_type:?} {label}: registers");
+                assert_eq!(
+                    native.get_ccr(),
+                    portable.get_ccr(),
+                    "{cpu_type:?} {label}: CCR"
+                );
+                assert_eq!(native.pc, portable.pc, "{cpu_type:?} {label}: PC");
+            }
         }
     }
 
