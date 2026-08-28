@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.3...m68k-v0.11.4) (2026-08-28)
+
+
+### Bug Fixes
+
+* **m68k:** align immediate bit trace timing ([#152](https://github.com/benletchford/m68k-rs/issues/152)) ([6bc1272](https://github.com/benletchford/m68k-rs/commit/6bc127282da24e2d6947c5bf1d6a2eb2635194dc))
+
 ## [0.11.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.2...m68k-v0.11.3) (2026-08-28)
 
 
