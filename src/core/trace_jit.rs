@@ -5396,9 +5396,9 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     };
     // Normal retirement finalizes those raw charges through the selected
     // processor's timing model. Traces must store that same modeled value:
-    // the 68020 table makes register bit operations four clocks, the
-    // 68030/040 family uses the legacy scaler, and the 68060 pipeline issues
-    // these register operations in one clock.
+    // the 68020/030 tables make register bit operations four clocks, the
+    // 68040 and 68060 pipelines issue them in one clock, and the remaining
+    // models (SCC68070) keep the legacy scaler.
     let cycles = match cpu.cpu_type {
         CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030 => 4,
         CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => 1,

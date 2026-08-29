@@ -29,11 +29,12 @@
 //! loop is the one real code runs. `mulu.w` lands at 13+3 = 16 against the
 //! measured 14. Exception entries keep the legacy scaled costs unchanged.
 //!
-//! Residuals, deliberately on the slow side: no execute-stage overlap (a
-//! one-clock body would partially hide ahead of a longer instruction too);
-//! shifts and bit operations take the 060 class costs, which real 040
-//! silicon runs a clock or two slower in some forms; the write-back stage
-//! and store buffer are not modelled (writes bill at bus rate).
+//! Residuals -- simplifications, not uniformly conservative: there is no
+//! execute-stage overlap (pessimistic: a one-clock body would partially
+//! hide ahead of a longer instruction on silicon), while shifts and bit
+//! operations take the 060 class costs, which can be OPTIMISTIC where real
+//! 040 silicon runs those forms a clock or two slower; the write-back
+//! stage and store buffer are not modelled (writes bill at bus rate).
 
 use super::cpu::CpuCore;
 use super::timing_060::{F_BRANCH, F_DBCC, F_EA_INDEXED, F_UNCLASSIFIED, F_VARIABLE, info_060};
