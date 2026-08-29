@@ -478,10 +478,12 @@ impl Default for CpuCore {
 }
 
 impl CpuCore {
-    /// Legacy 68030/040 approximation from the handlers' corrected 68000
-    /// counts. The 68020/68EC020 is routed through its MC68020UM section-8
-    /// timing model before this function; the 68060 has a separate pipeline
-    /// engine. The 68000/68010 paths remain untouched.
+    /// Legacy scaling approximation from the handlers' corrected 68000
+    /// counts. The 020/030 route through the MC68020UM section-8 timing
+    /// model and the 040 and 060 through their pipeline engines before this
+    /// function; it remains the cost model for 040 exception entries, the
+    /// SCC68070, and the trace-JIT builders' baked fallbacks. The
+    /// 68000/68010 paths remain untouched.
     #[inline]
     pub(crate) fn scale_cycles_for_cpu_type(&self, cycles: i32) -> i32 {
         use crate::core::types::CpuType;

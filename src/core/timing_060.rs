@@ -743,13 +743,24 @@ impl CpuCore {
         cost
     }
 
-    /// Model-dispatching wrapper for the three step paths.
+    /// Model-dispatching wrapper for the three step paths. The 68030 runs
+    /// the MC68020UM section-8 tables: its integer core is the 020's, and
+    /// the real-hardware columns in Copperline's timing-test (a 25 MHz
+    /// 68030 CPU-slot board next to the real A1200's 020) measure the same
+    /// figures on the anchor rows -- taken `dbra` 6 clocks, `mulu.w` in
+    /// the mid-30s per loop -- where the legacy scaler billed the calls
+    /// ~1.7x high. The 68040 has its own single-issue pipeline model
+    /// (`timing_040.rs`).
     #[inline]
     pub(crate) fn finalize_cycles(&mut self, raw: i32, fetch_cached: bool) -> i32 {
         match self.cpu_type {
-            super::types::CpuType::M68EC020 | super::types::CpuType::M68020 => {
-                self.cycles_020(raw, fetch_cached)
-            }
+            super::types::CpuType::M68EC020
+            | super::types::CpuType::M68020
+            | super::types::CpuType::M68EC030
+            | super::types::CpuType::M68030 => self.cycles_020(raw, fetch_cached),
+            super::types::CpuType::M68EC040
+            | super::types::CpuType::M68LC040
+            | super::types::CpuType::M68040 => self.cycles_040(raw),
             super::types::CpuType::M68060 => self.cycles_060(raw, fetch_cached),
             _ => self.scale_cycles_for_cpu_type(raw),
         }

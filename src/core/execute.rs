@@ -867,8 +867,13 @@ impl CpuCore {
         let result = dispatch(self, bus, self.ir as u16);
         let fetch_cached = if matches!(
             self.cpu_type,
-            super::types::CpuType::M68EC020 | super::types::CpuType::M68020
+            super::types::CpuType::M68EC020
+                | super::types::CpuType::M68020
+                | super::types::CpuType::M68EC030
+                | super::types::CpuType::M68030
         ) {
+            // The 020/030 MC68020UM tables pick Cache Case only when every
+            // instruction-stream fetch hit the cache, not just the opcode.
             bus.instruction_fetches_were_cached()
         } else {
             opcode_fetch_cached
@@ -1019,8 +1024,13 @@ impl CpuCore {
         let result = dispatch_instruction(self, bus, self.ir as u16);
         let fetch_cached = if matches!(
             self.cpu_type,
-            super::types::CpuType::M68EC020 | super::types::CpuType::M68020
+            super::types::CpuType::M68EC020
+                | super::types::CpuType::M68020
+                | super::types::CpuType::M68EC030
+                | super::types::CpuType::M68030
         ) {
+            // The 020/030 MC68020UM tables pick Cache Case only when every
+            // instruction-stream fetch hit the cache, not just the opcode.
             bus.instruction_fetches_were_cached()
         } else {
             opcode_fetch_cached
