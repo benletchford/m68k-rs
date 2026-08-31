@@ -604,6 +604,15 @@ pub(crate) enum JitTraceOp {
         value: u32,
         dst: JitEa,
     },
+    /// `ANDI.B #imm,d8(An,Xn)` through checked fast memory. This is the
+    /// dominant unsupported trace terminal in the profiled SimCity 2000
+    /// workload. Both extension words are captured while recording; every
+    /// address and self-modification guard passes before the read-modify-
+    /// write or condition-code update commits.
+    AndImmByteMem {
+        immediate: u8,
+        dst: JitEa,
+    },
     /// CMPA.W/L through `(An)` or `d16(An)`. Unlike ordinary CMP, the
     /// destination is always the full address register and a word source is
     /// sign-extended before the 32-bit comparison.
@@ -2928,6 +2937,7 @@ impl TraceJit {
                     JitTraceOp::AluMemToReg { .. }
                         | JitTraceOp::CmpiWordMem { .. }
                         | JitTraceOp::CmpiByteAbs { .. }
+                        | JitTraceOp::AndImmByteMem { .. }
                         | JitTraceOp::AddrCmpMemToReg { .. }
                         | JitTraceOp::AddaMemToReg { .. }
                 )
@@ -2964,6 +2974,7 @@ impl TraceJit {
                     | JitTraceOp::TstMem { .. }
                     | JitTraceOp::ClrMem { .. }
                     | JitTraceOp::MoveImmMem { .. }
+                    | JitTraceOp::AndImmByteMem { .. }
                     | JitTraceOp::AddrCmpMemToReg { .. }
                     | JitTraceOp::AddaMemToReg { .. }
                     | JitTraceOp::AddRegToMem { .. }
@@ -3369,6 +3380,12 @@ impl TraceJit {
                         let env = mem_env.as_ref().expect("MoveImmMem implies a window env");
                         emit_move_imm_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
+                    JitTraceOp::AndImmByteMem { .. } => {
+                        let env = mem_env
+                            .as_ref()
+                            .expect("AndImmByteMem implies a window env");
+                        emit_and_imm_byte_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
+                    }
                     JitTraceOp::AddrCmpMemToReg { .. } => {
                         let env = mem_env
                             .as_ref()
@@ -3761,6 +3778,7 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::ClrMem { .. }
             | JitTraceOp::MoveImmReg { .. }
             | JitTraceOp::MoveImmMem { .. }
+            | JitTraceOp::AndImmByteMem { .. }
             | JitTraceOp::CallThrough { .. }
             | JitTraceOp::CallExit { .. }
             | JitTraceOp::RtsReturn { .. }
@@ -4221,6 +4239,9 @@ impl JitTraceOp {
                 (_, JitEa::Disp(_, _)) => 16,
                 _ => 12,
             },
+            // M68000 immediate ALU to memory: twelve-cycle byte/word base
+            // plus the ten-cycle brief-indexed destination read/EA cost.
+            Self::AndImmByteMem { .. } => 22,
             Self::AddrCmpMemToReg { .. } => 24,
             // MC68000 ADDA: word base 8, long-memory base 6, plus the
             // source EA fetch (4/8 for (An), 8/12 for d16(An)). Memory
@@ -4336,6 +4357,7 @@ fn is_if_convertible_block_op(op: &JitTraceOp) -> bool {
             | JitTraceOp::TstMem { .. }
             | JitTraceOp::ClrMem { .. }
             | JitTraceOp::MoveImmMem { .. }
+            | JitTraceOp::AndImmByteMem { .. }
             | JitTraceOp::AddrCmpMemToReg { .. }
             | JitTraceOp::AddRegToMem { .. }
             | JitTraceOp::MemAddqSubq { .. }
@@ -4391,6 +4413,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_binary_immediate_data_reg_trace_op(cpu, bus, pc, opcode, cpu_type) {
+        return Some(op);
+    }
+    if let Some(op) = decode_andi_byte_index_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_bit_imm_reg_trace_op(cpu, bus, pc, opcode) {
@@ -5397,6 +5422,39 @@ fn decode_move_imm_mem_trace_op<B: AddressBus>(
     })
 }
 
+/// Decode the measured `ANDI.B #imm,d8(An,Xn)` trace blocker. Keeping the
+/// admission deliberately byte/index-only matches the profiled form and
+/// avoids growing the native emitter for unmeasured sizes or destinations.
+fn decode_andi_byte_index_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let DecodedMemOp::AluImm {
+        op: BinaryOp::And,
+        size: Size::Byte,
+        dst: FastEa::AnIndex(base),
+    } = DecodedMemOp::decode(cpu_type, opcode)?
+    else {
+        return None;
+    };
+    let immediate_word = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    let brief = bus.try_read_word(cpu.address(pc.wrapping_add(4))).ok()?;
+    let dst = decode_jit_ea(6, u16::from(base), brief, cpu_type)?;
+    Some(TraceBuildOp {
+        opcode,
+        extension: Some(immediate_word),
+        extension2: Some(brief),
+        pc,
+        op: JitTraceOp::AndImmByteMem {
+            immediate: immediate_word as u8,
+            dst,
+        },
+    })
+}
+
 fn decode_move_mem_trace_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -5983,6 +6041,9 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     }
     if matches!(op.op, JitTraceOp::MoveImmMem { .. }) {
         return execute_portable_move_imm_mem(cpu, op, spans);
+    }
+    if matches!(op.op, JitTraceOp::AndImmByteMem { .. }) {
+        return execute_portable_and_imm_byte_mem(cpu, op, spans);
     }
     if matches!(op.op, JitTraceOp::AddrCmpMemToReg { .. }) {
         return execute_portable_addr_cmp_mem_to_reg(cpu, op);
@@ -6647,6 +6708,53 @@ fn execute_portable_move_imm_mem(
     }
     write(cpu, off, value);
     cpu.set_logic_flags(value, size);
+    Some(trace.op.max_cycles())
+}
+
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn execute_portable_and_imm_byte_mem(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    spans: CodeSpans,
+) -> Option<i32> {
+    let JitTraceOp::AndImmByteMem { immediate, dst } = trace.op else {
+        return None;
+    };
+    let JitEa::Index {
+        base,
+        index,
+        index_long,
+        scale,
+        displacement,
+    } = dst
+    else {
+        return None;
+    };
+    let base_value = cpu.dar[8 + base as usize];
+    let raw_index = match index {
+        JitDirectReg::Addr(reg) => cpu.dar[8 + reg as usize],
+        JitDirectReg::Data(reg) => cpu.dar[reg as usize],
+    };
+    let index_value = if index_long {
+        raw_index
+    } else {
+        raw_index as u16 as i16 as i32 as u32
+    };
+    let raw = base_value
+        .wrapping_add(index_value << scale)
+        .wrapping_add(displacement as i32 as u32);
+    if cpu.fm_len == 0 {
+        return None;
+    }
+    let masked = raw & cpu.address_mask;
+    let off = masked.wrapping_sub(cpu.fm_base);
+    if off >= cpu.fm_len || spans.store_hits_code(masked, 1) {
+        return None;
+    }
+    let ptr = unsafe { (cpu.fm_ptr as *mut u8).add(off as usize) };
+    let result = unsafe { *ptr } & immediate;
+    unsafe { *ptr = result };
+    cpu.set_logic_flags(u32::from(result), Size::Byte);
     Some(trace.op.max_cycles())
 }
 
@@ -7581,6 +7689,9 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::MoveImmMem { .. } => {
             unreachable!("MoveImmMem is handled by execute_portable_move_imm_mem")
         }
+        JitTraceOp::AndImmByteMem { .. } => {
+            unreachable!("AndImmByteMem is handled by execute_portable_and_imm_byte_mem")
+        }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is handled by execute_portable_addr_cmp_mem_to_reg")
         }
@@ -8287,6 +8398,9 @@ fn emit_jit_op(
         JitTraceOp::MoveImmMem { .. } => {
             unreachable!("MoveImmMem is emitted by emit_move_imm_mem")
         }
+        JitTraceOp::AndImmByteMem { .. } => {
+            unreachable!("AndImmByteMem is emitted by emit_and_imm_byte_mem")
+        }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             unreachable!("AddrCmpMemToReg is emitted by emit_addr_cmp_mem_to_reg")
         }
@@ -8925,6 +9039,63 @@ fn emit_move_imm_mem(
     let value = iconst_u32(builder, value);
     window_store(builder, env, off, size, value);
     set_logic_flags(builder, cpu, value, size);
+    cycles_const(builder, trace.op.max_cycles())
+}
+
+/// Emit `ANDI.B #imm,d8(An,Xn)`. The address passes the window and
+/// code-overlap guards before the read-modify-write and flag updates, so a
+/// bail leaves both memory and architectural state untouched.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_and_imm_byte_mem(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    trace: TraceBuildOp,
+    env: &MemEnv,
+    bails: &mut Vec<BailReq>,
+    at: BailAt,
+) -> Value {
+    let JitTraceOp::AndImmByteMem { immediate, dst } = trace.op else {
+        unreachable!("expected an indexed immediate AND trace")
+    };
+    let JitEa::Index {
+        base,
+        index,
+        index_long,
+        scale,
+        displacement,
+    } = dst
+    else {
+        unreachable!("ANDI.B decoder admitted an unsupported EA")
+    };
+    let bail = builder.create_block();
+    bails.push(BailReq {
+        block: bail,
+        pc: trace.pc,
+        at,
+    });
+
+    let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+    let raw_index = load_reg(builder, cpu, index);
+    let index = if index_long {
+        raw_index
+    } else {
+        let word = builder.ins().ireduce(types::I16, raw_index);
+        builder.ins().sextend(types::I32, word)
+    };
+    let index = if scale == 0 {
+        index
+    } else {
+        builder.ins().ishl_imm(index, i64::from(scale))
+    };
+    let address = builder.ins().iadd(base, index);
+    let address = builder.ins().iadd_imm(address, displacement as i64);
+    let (off, masked) = checked_window_off(builder, env, bail, address, Size::Byte);
+    guard_store_not_code(builder, env, bail, masked, Size::Byte);
+    let old = window_load(builder, env, off, Size::Byte);
+    let immediate = iconst_u32(builder, u32::from(immediate));
+    let result = builder.ins().band(old, immediate);
+    window_store(builder, env, off, Size::Byte, result);
+    set_logic_flags(builder, cpu, result, Size::Byte);
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -9836,6 +10007,9 @@ fn emit_block_op(
         }
         JitTraceOp::MoveImmMem { .. } => {
             emit_move_imm_mem(builder, cpu_ptr, *op, mem_env.expect("env"), bails, bail_at)
+        }
+        JitTraceOp::AndImmByteMem { .. } => {
+            emit_and_imm_byte_mem(builder, cpu_ptr, *op, mem_env.expect("env"), bails, bail_at)
         }
         JitTraceOp::AddrCmpMemToReg { .. } => {
             emit_addr_cmp_mem_to_reg(builder, cpu_ptr, *op, mem_env.expect("env"), bails, bail_at)
@@ -15609,6 +15783,166 @@ mod portable_tests {
             !matches!(t.map(|t| t.op), Some(JitTraceOp::MoveImmMem { .. })),
             "long immediate to an indexed destination must stay decoded"
         );
+    }
+
+    #[test]
+    fn andi_byte_index_decodes_the_profiled_trace_blocker() {
+        let mut dcpu = cpu();
+        dcpu.set_cpu_type(CpuType::M68040);
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        bus.write_word(0x0100, 0x0231); // ANDI.B #imm,(d8,A1,D3.W)
+        bus.write_word(0x0102, 0x00B7);
+        bus.write_word(0x0104, 0x3000);
+        let trace = decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040)
+            .expect("profiled ANDI.B indexed form should decode");
+        assert_eq!(
+            (trace.extension, trace.extension2),
+            (Some(0x00B7), Some(0x3000))
+        );
+        assert!(matches!(
+            trace.op,
+            JitTraceOp::AndImmByteMem {
+                immediate: 0xB7,
+                dst: JitEa::Index {
+                    base: 1,
+                    index: JitDirectReg::Data(3),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 0,
+                },
+            }
+        ));
+
+        // Full-format indexed extensions on 68020+ retain their existing
+        // fallback; the narrow trace op only handles the brief form.
+        bus.write_word(0x0104, 0x3100);
+        assert!(decode_trace_op(&dcpu, &mut bus, 0x0100, CpuType::M68040).is_none());
+    }
+
+    #[test]
+    fn andi_byte_index_matches_the_interpreter_with_exact_68000_cycles() {
+        let words = [0x0231u16, 0x00B7, 0x3000];
+        let setup = |cpu: &mut CpuCore| {
+            cpu.set_cpu_type(CpuType::M68000);
+            cpu.set_a(1, 0x0300);
+            cpu.set_d(3, 4);
+            cpu.set_ccr(0x10); // X is unaffected by ANDI.
+            cpu.pc = 0x0100;
+        };
+
+        let mut ibus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (index, word) in words.iter().enumerate() {
+            ibus.write_word(0x0100 + index as u32 * 2, *word);
+        }
+        ibus.write_byte(0x0304, 0xF3);
+        let mut icpu = cpu();
+        setup(&mut icpu);
+        let icycles = match icpu.step(&mut ibus) {
+            super::super::types::StepResult::Ok { cycles } => cycles,
+            other => panic!("interpreter step failed: {other:?}"),
+        };
+
+        let mut pmem = vec![0u8; 0x1000];
+        for (index, word) in words.iter().enumerate() {
+            pmem[0x0100 + index * 2..0x0102 + index * 2].copy_from_slice(&word.to_be_bytes());
+        }
+        pmem[0x0304] = 0xF3;
+        let mut pcpu = cpu();
+        setup(&mut pcpu);
+        attach_window(&mut pcpu, &mut pmem);
+        let trace = decode_trace_op(&pcpu, &mut ibus, 0x0100, CpuType::M68000)
+            .expect("ANDI.B indexed form should decode");
+        let pcycles = execute_portable_op(&mut pcpu, trace, CodeSpans::caller(0x0100, 0x0106))
+            .expect("portable trace op should execute");
+
+        assert_eq!(pcycles, icycles);
+        assert_eq!(icycles, 22);
+        assert_eq!(pmem[0x0304], 0xB3);
+        assert_eq!(pmem[0x0304], ibus.read_byte(0x0304));
+        assert_eq!(pcpu.dar, icpu.dar);
+        assert_eq!(pcpu.get_ccr(), icpu.get_ccr());
+        assert_ne!(pcpu.get_ccr() & 0x10, 0, "X preserved");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_andi_byte_index_matches_portable_and_bails_on_code_overlap() {
+        let andi = TraceBuildOp {
+            opcode: 0x0231,
+            extension: Some(0x00B7),
+            extension2: Some(0x3000),
+            pc: 0x0100,
+            op: JitTraceOp::AndImmByteMem {
+                immediate: 0xB7,
+                dst: JitEa::Index {
+                    base: 1,
+                    index: JitDirectReg::Data(3),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 0,
+                },
+            },
+        };
+        let branch = TraceBuildOp {
+            opcode: 0x60F8,
+            extension: None,
+            extension2: None,
+            pc: 0x0106,
+            op: JitTraceOp::Branch {
+                condition: 0,
+                displacement: -8,
+                length: 2,
+                expected_taken: None,
+            },
+        };
+        let ops = vec![andi, branch];
+        let prepare = |mem: &mut Vec<u8>| {
+            let mut cpu = cpu();
+            cpu.set_cpu_type(CpuType::M68040);
+            cpu.set_a(1, 0x0300);
+            cpu.set_d(3, 4);
+            cpu.set_ccr(0x10);
+            mem[0x0304] = 0xF3;
+            attach_window(&mut cpu, mem);
+            cpu
+        };
+
+        let mut pmem = vec![0u8; 0x1000];
+        let mut portable = prepare(&mut pmem);
+        let expected =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(0x0100, 0x0108));
+        let mut nmem = vec![0u8; 0x1000];
+        let mut native = prepare(&mut nmem);
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&native, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
+            .expect("ANDI.B loop should compile");
+        let actual = unsafe { compiled.call_native(&mut native, 1) };
+        assert_eq!(actual, expected, "cycles/retired");
+        assert_eq!(native.dar, portable.dar);
+        assert_eq!(native.get_ccr(), portable.get_ccr());
+        assert_eq!(nmem, pmem);
+        assert_eq!(nmem[0x0304], 0xB3);
+
+        // Aim the store into its own immediate word. Both executors must
+        // bail before touching memory or flags.
+        let overlap = |mem: &mut Vec<u8>| {
+            let mut cpu = prepare(mem);
+            cpu.set_a(1, 0x0102);
+            cpu.set_d(3, 0);
+            cpu
+        };
+        let mut pbail_mem = vec![0u8; 0x1000];
+        let mut pbail = overlap(&mut pbail_mem);
+        let packed = execute_portable_trace(&mut pbail, &ops, CodeSpans::caller(0x0100, 0x0108));
+        assert_eq!(packed, 0);
+        assert_eq!(pbail.get_ccr(), 0x10);
+        let mut nbail_mem = vec![0u8; 0x1000];
+        let mut nbail = overlap(&mut nbail_mem);
+        let packed = unsafe { compiled.call_native(&mut nbail, 1) };
+        assert_eq!(packed, 0);
+        assert_eq!(nbail.get_ccr(), 0x10);
+        assert_eq!(nbail_mem, pbail_mem);
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
