@@ -17000,8 +17000,8 @@ mod portable_tests {
         };
         assert!(jit.linear_compilation_deferred(HEAD));
 
-        // Reinstall the head and prove that both exit-seeded admission and
-        // the second completed recording honor the raised threshold.
+        // Reinstall the head and prove that ordinary independent entries
+        // and the second completed recording honor the raised threshold.
         jit.slots[trace_cache_index(HEAD)] = TraceSlot::Counting {
             pc: HEAD,
             cpu_type: CpuType::M68000,
@@ -17011,17 +17011,37 @@ mod portable_tests {
             deferred_trap: false,
             deferred_linear: true,
         };
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        cpu.pc = HEAD;
+        cpu.cycles_remaining = 1_000_000;
         for _ in 1..TRACE_LINEAR_HOT_THRESHOLD {
-            assert!(matches!(
-                jit.note_trace_exit(HEAD, CpuType::M68000, false),
-                ExitSeed::None
-            ));
+            assert!(
+                jit.try_execute(
+                    &mut cpu,
+                    &mut bus,
+                    CpuType::M68000,
+                    100,
+                    false,
+                    &[],
+                    TRACE_EXIT_CHAIN_BUDGET,
+                )
+                .is_none()
+            );
             assert!(jit.recording.is_none());
         }
-        assert!(matches!(
-            jit.note_trace_exit(HEAD, CpuType::M68000, false),
-            ExitSeed::StartRecording
-        ));
+        assert!(
+            jit.try_execute(
+                &mut cpu,
+                &mut bus,
+                CpuType::M68000,
+                100,
+                false,
+                &[],
+                TRACE_EXIT_CHAIN_BUDGET,
+            )
+            .is_none()
+        );
+        assert!(jit.recording.is_some());
 
         jit.recording = Some(make_recording());
         jit.finish_recording(&mut cpu, 0x0456, RecordingEnd::Region);
