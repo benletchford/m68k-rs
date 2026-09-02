@@ -123,6 +123,22 @@ pub(crate) enum DecodedMemOp {
     MovemWordPostInc {
         base: u8,
     },
+    BitImmDataReg {
+        op: BitOp,
+        reg: u8,
+    },
+    Link {
+        reg: u8,
+    },
+    Unlk {
+        reg: u8,
+    },
+    MovemLongPreDec {
+        base: u8,
+    },
+    MovemLongPostInc {
+        base: u8,
+    },
     /// ADD/SUB/AND/OR/CMP `<ea>,Dn`
     AluToReg {
         op: BinaryOp,
@@ -287,6 +303,19 @@ fn decode_group_0(opcode: u16) -> Option<DecodedMemOp> {
 
     // Static bit ops: 0000 1000 xxmm mrrr (#imm form).
     if (opcode & 0xFF00) == 0x0800 {
+        if (opcode >> 3) & 7 == 0 {
+            let op = match (opcode >> 6) & 3 {
+                0 => BitOp::Test,
+                1 => BitOp::Change,
+                2 => BitOp::Clear,
+                3 => BitOp::Set,
+                _ => unreachable!(),
+            };
+            return Some(DecodedMemOp::BitImmDataReg {
+                op,
+                reg: (opcode & 7) as u8,
+            });
+        }
         let ea = FastEa::decode((opcode >> 3) & 7, opcode & 7)?;
         if !ea.is_memory() || !ea.is_data_alterable() {
             return None;
@@ -332,6 +361,26 @@ fn decode_group_4(cpu_type: CpuType, opcode: u16) -> Option<DecodedMemOp> {
 
     if (opcode & 0xFFF8) == 0x4C98 {
         return Some(DecodedMemOp::MovemWordPostInc {
+            base: (opcode & 7) as u8,
+        });
+    }
+    if (opcode & 0xFFF8) == 0x4E50 && (opcode & 7) != 7 {
+        return Some(DecodedMemOp::Link {
+            reg: (opcode & 7) as u8,
+        });
+    }
+    if (opcode & 0xFFF8) == 0x4E58 && (opcode & 7) != 7 {
+        return Some(DecodedMemOp::Unlk {
+            reg: (opcode & 7) as u8,
+        });
+    }
+    if (opcode & 0xFFF8) == 0x48E0 {
+        return Some(DecodedMemOp::MovemLongPreDec {
+            base: (opcode & 7) as u8,
+        });
+    }
+    if (opcode & 0xFFF8) == 0x4CD8 {
+        return Some(DecodedMemOp::MovemLongPostInc {
             base: (opcode & 7) as u8,
         });
     }
@@ -815,6 +864,140 @@ fn fast_movem_word_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
         }
         cpu.dar[reg] = win.read(off, Size::Word) as u16 as i16 as i32 as u32;
         off += 2;
+    }
+    cpu.dar[8 + base as usize] = raw.wrapping_add(bytes);
+    cpu.pc = cpu.pc.wrapping_add(2);
+    true
+}
+
+/// BTST/BCHG/BCLR/BSET `#imm, Dn` — long-width register bit ops. Only Z is
+/// affected (from the pre-modification value), matching the slow path.
+fn fast_bit_imm_dreg(cpu: &mut CpuCore, win: Win, op: BitOp, reg: u8) -> bool {
+    let Some(ext_off) = win.off(cpu.address(cpu.pc), 2) else {
+        return false;
+    };
+    let bit = win.read(ext_off, Size::Word) & 31;
+    let mask = 1u32 << bit;
+    let reg = reg as usize;
+    let value = cpu.dar[reg];
+    cpu.not_z_flag = u32::from(value & mask != 0);
+    match op {
+        BitOp::Test => {}
+        BitOp::Set => cpu.dar[reg] = value | mask,
+        BitOp::Clear => cpu.dar[reg] = value & !mask,
+        BitOp::Change => cpu.dar[reg] = value ^ mask,
+    }
+    cpu.pc = cpu.pc.wrapping_add(2);
+    true
+}
+
+/// LINK An,#disp (word form). `LINK A7` has version-dependent semantics and
+/// bails to the slow path.
+fn fast_link(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
+    if reg == 7 {
+        return false;
+    }
+    let Some(ext_off) = win.off(cpu.address(cpu.pc), 2) else {
+        return false;
+    };
+    let sp = cpu.dar[15].wrapping_sub(4);
+    if cpu.is_pre_68020 && (sp & 1) != 0 {
+        return false;
+    }
+    let Some(off) = win.off(cpu.address(sp), 4) else {
+        return false;
+    };
+    let disp = win.read(ext_off, Size::Word) as u16 as i16 as i32;
+    win.write(off, Size::Long, cpu.dar[8 + reg as usize]);
+    cpu.dar[8 + reg as usize] = sp;
+    cpu.dar[15] = (sp as i32).wrapping_add(disp) as u32;
+    cpu.pc = cpu.pc.wrapping_add(2);
+    true
+}
+
+/// UNLK An. `UNLK A7` bails to the slow path.
+fn fast_unlk(cpu: &mut CpuCore, win: Win, reg: u8) -> bool {
+    if reg == 7 {
+        return false;
+    }
+    let sp = cpu.dar[8 + reg as usize];
+    if cpu.is_pre_68020 && (sp & 1) != 0 {
+        return false;
+    }
+    let Some(off) = win.off(cpu.address(sp), 4) else {
+        return false;
+    };
+    cpu.dar[8 + reg as usize] = win.read(off, Size::Long);
+    cpu.dar[15] = sp.wrapping_add(4);
+    // UNLK has no extension word: the decoded loop already advanced the PC
+    // past the opcode, so there is nothing further to consume.
+    true
+}
+
+/// MOVEM.L list,-(An). Predecrement mask order: bit 0 = A7 … bit 15 = D0.
+/// Bails when the base register is in the list (version-dependent stored
+/// value) or anything misses the window.
+fn fast_movem_long_predec(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
+    let Some(mask_off) = win.off(cpu.address(cpu.pc), 2) else {
+        return false;
+    };
+    let mask = win.read(mask_off, Size::Word) as u16;
+    if mask == 0 || (mask & (1 << (7 - base))) != 0 {
+        return false;
+    }
+    let bytes = mask.count_ones() * 4;
+    let raw = cpu.dar[8 + base as usize];
+    if cpu.is_pre_68020 && (raw & 1) != 0 {
+        return false;
+    }
+    let start = raw.wrapping_sub(bytes);
+    if bytes > win.len {
+        return false;
+    }
+    let Some(mut off) = win.off(cpu.address(start), bytes) else {
+        return false;
+    };
+    // Ascending memory order for predec is D0..D7, A0..A6 (mask bit 15-r for
+    // register index r).
+    for r in 0..16 {
+        if (mask & (1 << (15 - r))) == 0 {
+            continue;
+        }
+        win.write(off, Size::Long, cpu.dar[r]);
+        off += 4;
+    }
+    cpu.dar[8 + base as usize] = start;
+    cpu.pc = cpu.pc.wrapping_add(2);
+    true
+}
+
+/// MOVEM.L (An)+,list. Postincrement mask order: bit 0 = D0 … bit 15 = A7.
+/// Bails when the base register is in the list.
+fn fast_movem_long_postinc(cpu: &mut CpuCore, win: Win, base: u8) -> bool {
+    let Some(mask_off) = win.off(cpu.address(cpu.pc), 2) else {
+        return false;
+    };
+    let mask = win.read(mask_off, Size::Word) as u16;
+    if mask == 0 || (mask & (1 << (8 + base))) != 0 {
+        return false;
+    }
+    let bytes = mask.count_ones() * 4;
+    let raw = cpu.dar[8 + base as usize];
+    if cpu.is_pre_68020 && (raw & 1) != 0 {
+        return false;
+    }
+    if bytes > win.len {
+        return false;
+    }
+    let Some(mut off) = win.off(cpu.address(raw), bytes) else {
+        return false;
+    };
+    for r in 0..16 {
+        if (mask & (1 << r)) == 0 {
+            continue;
+        }
+        cpu.dar[r] = win.read(off, Size::Long);
+        off += 4;
     }
     cpu.dar[8 + base as usize] = raw.wrapping_add(bytes);
     cpu.pc = cpu.pc.wrapping_add(2);
@@ -1352,6 +1535,21 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     if let DecodedMemOp::MovemWordPostInc { base } = op {
         return fast_movem_word_postinc(cpu, win, base);
     }
+    if let DecodedMemOp::BitImmDataReg { op, reg } = op {
+        return fast_bit_imm_dreg(cpu, win, op, reg);
+    }
+    if let DecodedMemOp::Link { reg } = op {
+        return fast_link(cpu, win, reg);
+    }
+    if let DecodedMemOp::Unlk { reg } = op {
+        return fast_unlk(cpu, win, reg);
+    }
+    if let DecodedMemOp::MovemLongPreDec { base } = op {
+        return fast_movem_long_predec(cpu, win, base);
+    }
+    if let DecodedMemOp::MovemLongPostInc { base } = op {
+        return fast_movem_long_postinc(cpu, win, base);
+    }
 
     if let Some(handled) = fast_an_disp(cpu, win, op) {
         return handled;
@@ -1380,6 +1578,11 @@ pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
     }
 
     match op {
+        DecodedMemOp::BitImmDataReg { .. }
+        | DecodedMemOp::Link { .. }
+        | DecodedMemOp::Unlk { .. }
+        | DecodedMemOp::MovemLongPreDec { .. }
+        | DecodedMemOp::MovemLongPostInc { .. } => false,
         DecodedMemOp::Move { size, src, dst } => {
             let Some(src_loc) = resolve(cpu, win, src, size, &mut ctx) else {
                 return false;
@@ -1795,6 +1998,114 @@ mod tests {
         cpu.pc = 0x100;
         cpu.set_a(5, 0x400);
         cpu
+    }
+
+    #[test]
+    fn fast_btst_imm_dreg_sets_only_z_and_bchg_modifies() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x100..0x102].copy_from_slice(&5u16.to_be_bytes());
+        let mut cpu = cpu_with_window(&mut mem);
+        cpu.dar[3] = 0x20;
+        cpu.set_ccr(0x1F);
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::BitImmDataReg {
+                op: BitOp::Test,
+                reg: 3
+            }
+        ));
+        assert_eq!(cpu.pc, 0x102);
+        assert_ne!(cpu.not_z_flag, 0, "bit 5 of $20 is set -> Z clear");
+        assert_eq!(cpu.dar[3], 0x20);
+        assert_eq!(cpu.get_ccr() & 0x1B, 0x1B, "X/N/V/C untouched");
+        cpu.pc = 0x100;
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::BitImmDataReg {
+                op: BitOp::Change,
+                reg: 3
+            }
+        ));
+        assert_eq!(cpu.dar[3], 0, "BCHG #5 cleared the only set bit");
+        assert_ne!(cpu.not_z_flag, 0, "Z reflects the pre-change value");
+    }
+
+    #[test]
+    fn fast_link_unlk_roundtrip_builds_and_tears_down_the_frame() {
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x100..0x102].copy_from_slice(&(-8i16 as u16).to_be_bytes());
+        let mut cpu = cpu_with_window(&mut mem);
+        cpu.dar[15] = 0x800;
+        cpu.dar[8 + 6] = 0xDEAD_BEEF;
+        assert!(execute_mem_op(&mut cpu, DecodedMemOp::Link { reg: 6 }));
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.dar[8 + 6], 0x7FC, "A6 = decremented SP");
+        assert_eq!(cpu.dar[15], 0x7FC - 8, "SP moved by the displacement");
+        assert_eq!(
+            u32::from_be_bytes(mem[0x7FC..0x800].try_into().unwrap()),
+            0xDEAD_BEEF,
+            "old A6 saved on the stack"
+        );
+        cpu.pc = 0x200;
+        assert!(execute_mem_op(&mut cpu, DecodedMemOp::Unlk { reg: 6 }));
+        assert_eq!(cpu.pc, 0x200, "UNLK consumes no extension word");
+        assert_eq!(cpu.dar[8 + 6], 0xDEAD_BEEF, "A6 restored");
+        assert_eq!(cpu.dar[15], 0x800, "SP restored past the saved slot");
+        assert!(
+            !execute_mem_op(&mut cpu, DecodedMemOp::Link { reg: 7 }),
+            "LINK A7 bails to the slow path"
+        );
+    }
+
+    #[test]
+    fn fast_movem_long_predec_postinc_roundtrip_and_base_in_mask_bails() {
+        let mut mem = vec![0u8; 0x1000];
+        // push mask at pc: D2,D4,A2 -> predec mask bits (15-r): D2=bit13, D4=bit11, A2=bit5
+        mem[0x100..0x102].copy_from_slice(&0x2820u16.to_be_bytes());
+        // pop mask at 0x200: postinc bits: D2=bit2, D4=bit4, A2=bit10
+        mem[0x200..0x202].copy_from_slice(&0x0414u16.to_be_bytes());
+        let mut cpu = cpu_with_window(&mut mem);
+        cpu.dar[15] = 0x800;
+        cpu.dar[2] = 0x1111_2222;
+        cpu.dar[4] = 0x3333_4444;
+        cpu.dar[8 + 2] = 0x5555_6666;
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::MovemLongPreDec { base: 7 }
+        ));
+        assert_eq!(cpu.pc, 0x102);
+        assert_eq!(cpu.dar[15], 0x800 - 12);
+        cpu.dar[2] = 0;
+        cpu.dar[4] = 0;
+        cpu.dar[8 + 2] = 0;
+        cpu.dar[15] = 0x800 - 12;
+        cpu.pc = 0x200;
+        assert!(execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::MovemLongPostInc { base: 7 }
+        ));
+        assert_eq!(cpu.pc, 0x202);
+        assert_eq!(cpu.dar[15], 0x800, "SP restored");
+        assert_eq!(cpu.dar[2], 0x1111_2222);
+        assert_eq!(cpu.dar[4], 0x3333_4444);
+        assert_eq!(cpu.dar[8 + 2], 0x5555_6666);
+        // base register inside the list bails (A7 postinc bit 15)
+        mem_set(&mut cpu, 0x202, 0x8000);
+        cpu.pc = 0x202;
+        assert!(!execute_mem_op(
+            &mut cpu,
+            DecodedMemOp::MovemLongPostInc { base: 7 }
+        ));
+        assert_eq!(cpu.pc, 0x202, "bail leaves the PC untouched");
+    }
+
+    fn mem_set(cpu: &mut CpuCore, addr: u32, word: u16) {
+        unsafe {
+            let p = (cpu.fm_ptr as *mut u8).add(addr as usize);
+            let b = word.to_be_bytes();
+            *p = b[0];
+            *p.add(1) = b[1];
+        }
     }
 
     #[test]
