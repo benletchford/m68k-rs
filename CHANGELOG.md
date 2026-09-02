@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.6...m68k-v0.12.0) (2026-09-02)
+
+
+### Features
+
+* real-hardware timing models for the 68030 and 68040 ([#160](https://github.com/benletchford/m68k-rs/issues/160)) ([51aab10](https://github.com/benletchford/m68k-rs/commit/51aab10d84c87c05d88039ec238dee986e244644))
+
 ## [0.11.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.5...m68k-v0.11.6) (2026-08-28)
 
 
