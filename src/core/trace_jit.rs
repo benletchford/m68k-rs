@@ -1782,12 +1782,16 @@ impl TraceJit {
         entry_watched: bool,
     ) -> ExitSeed {
         let idx = trace_cache_index(exit_pc);
+        // Reaching this head from an already-compiled trace is stronger
+        // reuse evidence than an earlier independent linear observation.
+        // Let the connector use the eager threshold even if it was first
+        // discovered and deferred through a backward-edge probe.
+        self.clear_linear_deferral(exit_pc);
         // Read the durable grant before borrowing the slot mutably: a
         // candidate created here must carry the permission its head
         // already earned.
         let permission = self.has_call_permission(exit_pc);
         let structurally_rejected = self.is_structurally_rejected(exit_pc);
-        let linear_history = &self.deferred_linear;
         match &mut self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
@@ -1810,6 +1814,7 @@ impl TraceJit {
                 deferred_trap,
                 deferred_linear,
             } if *counted_pc == exit_pc && *counted_type == cpu_type => {
+                *deferred_linear = false;
                 *hits = hits.saturating_add(1);
                 let threshold = if *deferred_trap {
                     TRACE_TRAP_SEGMENT_HOT_THRESHOLD
@@ -1853,8 +1858,6 @@ impl TraceJit {
                 if structurally_rejected {
                     return ExitSeed::None;
                 }
-                let ways = &linear_history[idx];
-                let linear_deferred = ways[0] == exit_pc || ways[1] == exit_pc;
                 *slot = TraceSlot::Counting {
                     pc: exit_pc,
                     cpu_type,
@@ -1862,7 +1865,7 @@ impl TraceJit {
                     adaptive_rerecords: 0,
                     allow_call_through: permission,
                     deferred_trap: false,
-                    deferred_linear: linear_deferred,
+                    deferred_linear: false,
                 };
                 self.pending_exit_seed = Some((exit_pc, cpu_type));
                 ExitSeed::None
@@ -17052,6 +17055,45 @@ mod portable_tests {
             &jit.slots[trace_cache_index(HEAD)],
             TraceSlot::Compiled(trace) if trace.pc == HEAD
         ));
+    }
+
+    #[test]
+    fn exit_seed_overrides_prior_independent_linear_deferral() {
+        const HEAD: u32 = 0x0100;
+        let mut jit = TraceJit::new();
+        jit.defer_linear_compilation(HEAD);
+        jit.slots[trace_cache_index(HEAD)] = TraceSlot::Counting {
+            pc: HEAD,
+            cpu_type: CpuType::M68000,
+            hits: 0,
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            deferred_trap: false,
+            deferred_linear: true,
+        };
+
+        assert!(matches!(
+            jit.note_trace_exit(HEAD, CpuType::M68000, false),
+            ExitSeed::None
+        ));
+        assert!(!jit.linear_compilation_deferred(HEAD));
+        assert!(matches!(
+            &jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Counting {
+                hits: 1,
+                deferred_linear: false,
+                ..
+            }
+        ));
+        assert!(matches!(
+            jit.note_trace_exit(HEAD, CpuType::M68000, false),
+            ExitSeed::StartRecording
+        ));
+        assert!(
+            jit.recording
+                .as_ref()
+                .is_some_and(|recording| recording.from_exit_seed)
+        );
     }
 
     #[test]
