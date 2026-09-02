@@ -682,7 +682,9 @@ enum RegionRejectReason {
     LinearMemoryAlu,
     /// A guarded path mutates a function stack frame before a possible
     /// prefix exit. Keep the region decoded so host batch boundaries cannot
-    /// expose partially replayed prologue memory effects.
+    /// expose partially replayed prologue memory effects. Portable-executor
+    /// configurations only; native traces execute prefixes directly.
+    #[cfg_attr(all(feature = "jit", not(target_family = "wasm")), allow(dead_code))]
     GuardedStackFrame,
     AddressWrap,
     /// A recorded call's caller or callee segment exceeds
@@ -2575,16 +2577,25 @@ impl TraceJit {
         // the recording. Keep function prologues that have already mutated
         // the stack frame on the decoded path: their partial memory effects
         // otherwise become dependent on the embedder's run_batch boundary.
-        let guarded = guarded_op_mask(&ops) != 0;
-        if guarded
-            && ops.iter().any(|op| {
-                matches!(
-                    op.op,
-                    JitTraceOp::Link { .. } | JitTraceOp::MovemLongPredec { .. }
-                )
-            })
+        //
+        // Only the portable executor replays a trace's ops at host batch
+        // boundaries; a native trace executes its ops directly and side-
+        // exits with exact architectural and memory state, so the gate is
+        // scoped to the configurations whose compiled traces run portably.
+        // Natively compiled prologues stay admitted.
+        #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         {
-            return Err(RegionRejectReason::GuardedStackFrame);
+            let guarded = guarded_op_mask(&ops) != 0;
+            if guarded
+                && ops.iter().any(|op| {
+                    matches!(
+                        op.op,
+                        JitTraceOp::Link { .. } | JitTraceOp::MovemLongPredec { .. }
+                    )
+                })
+            {
+                return Err(RegionRejectReason::GuardedStackFrame);
+            }
         }
 
         let max_cycles = ops.iter().map(|op| op.op.max_cycles()).sum();
@@ -21304,6 +21315,7 @@ mod portable_tests {
         };
         *expected_taken = Some(true);
         let mut jit = TraceJit::new();
+        #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         assert!(matches!(
             jit.compile_decoded_ops_reason(
                 &actual,
@@ -21314,6 +21326,18 @@ mod portable_tests {
             ),
             Err(RegionRejectReason::GuardedStackFrame)
         ));
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        assert!(
+            jit.compile_decoded_ops_reason(
+                &actual,
+                START,
+                CpuType::M68040,
+                ops.clone(),
+                Some(0x01CE),
+            )
+            .is_ok(),
+            "a native build compiles the guarded prologue"
+        );
         let packed = execute_portable_trace(&mut actual, &ops, CodeSpans::caller(START, 0x01C6));
 
         assert_eq!(packed >> 32, 10);
