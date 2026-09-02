@@ -1015,7 +1015,7 @@ mod tests {
     }
 
     #[test]
-    fn model_dispatch_uses_tables_only_for_the_020_family() {
+    fn model_dispatch_routes_the_020_and_030_through_the_tables() {
         use crate::core::types::CpuType;
 
         let mut cpu = CpuCore::new();
@@ -1024,7 +1024,12 @@ mod tests {
         assert_eq!(cpu.finalize_cycles(4, true), 2);
         cpu.set_cpu_type(CpuType::M68020);
         assert_eq!(cpu.finalize_cycles(4, false), 3);
+        // The 030 shares the 020 integer core and now runs the same
+        // tables (real-hardware calibration: Copperline accelprobe).
         cpu.set_cpu_type(CpuType::M68030);
-        assert_eq!(cpu.finalize_cycles(4, true), 3);
+        assert_eq!(cpu.finalize_cycles(4, true), 2);
+        // The 040 runs its own single-issue pipeline model.
+        cpu.set_cpu_type(CpuType::M68040);
+        assert_eq!(cpu.finalize_cycles(4, true), 1);
     }
 }

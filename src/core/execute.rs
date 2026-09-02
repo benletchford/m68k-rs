@@ -22,6 +22,16 @@ pub const RUN_MODE_NORMAL: u32 = 0;
 /// Bus/address-error recovery or reset processing is active.
 pub const RUN_MODE_BERR_AERR_RESET: u32 = 1;
 
+/// The 020 timing tables select their Cache Case only when every
+/// instruction-stream fetch for the retiring instruction hit the cache.
+#[inline]
+fn timing_uses_full_fetch_stream(cpu_type: CpuType) -> bool {
+    matches!(
+        cpu_type,
+        CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030
+    )
+}
+
 /// Decode the deliberately narrow register-only subset whose precise
 /// instruction completion is preserved by the boundary-hook dispatcher.
 #[inline]
@@ -144,10 +154,7 @@ impl CpuCore {
             // hit the icache before dispatch consumes more of the stream).
             let opcode_fetch_cached = bus.last_fetch_was_cached();
             let result = dispatch_instruction(self, bus, self.ir as u16);
-            let fetch_cached = if matches!(
-                self.cpu_type,
-                super::types::CpuType::M68EC020 | super::types::CpuType::M68020
-            ) {
+            let fetch_cached = if timing_uses_full_fetch_stream(self.cpu_type) {
                 bus.instruction_fetches_were_cached()
             } else {
                 opcode_fetch_cached
@@ -865,10 +872,7 @@ impl CpuCore {
 
         let opcode_fetch_cached = bus.last_fetch_was_cached();
         let result = dispatch(self, bus, self.ir as u16);
-        let fetch_cached = if matches!(
-            self.cpu_type,
-            super::types::CpuType::M68EC020 | super::types::CpuType::M68020
-        ) {
+        let fetch_cached = if timing_uses_full_fetch_stream(self.cpu_type) {
             bus.instruction_fetches_were_cached()
         } else {
             opcode_fetch_cached
@@ -1017,10 +1021,7 @@ impl CpuCore {
 
         let opcode_fetch_cached = bus.last_fetch_was_cached();
         let result = dispatch_instruction(self, bus, self.ir as u16);
-        let fetch_cached = if matches!(
-            self.cpu_type,
-            super::types::CpuType::M68EC020 | super::types::CpuType::M68020
-        ) {
+        let fetch_cached = if timing_uses_full_fetch_stream(self.cpu_type) {
             bus.instruction_fetches_were_cached()
         } else {
             opcode_fetch_cached
@@ -1344,6 +1345,26 @@ impl CpuCore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_fetch_stream_timing_covers_020_and_030_families() {
+        for cpu_type in [
+            CpuType::M68EC020,
+            CpuType::M68020,
+            CpuType::M68EC030,
+            CpuType::M68030,
+        ] {
+            assert!(timing_uses_full_fetch_stream(cpu_type));
+        }
+        for cpu_type in [
+            CpuType::M68000,
+            CpuType::M68010,
+            CpuType::M68040,
+            CpuType::M68060,
+        ] {
+            assert!(!timing_uses_full_fetch_stream(cpu_type));
+        }
+    }
 
     #[test]
     fn boundary_hook_clr_admission_is_exact() {

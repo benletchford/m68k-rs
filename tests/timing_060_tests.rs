@@ -160,10 +160,14 @@ fn flow_change_pays_refill_floor_on_68060() {
 
 #[test]
 fn other_models_keep_their_cycle_counts() {
-    // Regression guard: the 060 cost model must not disturb 000-040 paths.
+    // Regression guard: the 060 cost model must not disturb the other
+    // models' paths. The 68000 keeps its exact count, the 030 runs the
+    // MC68020UM tables (MOVEQ Cache Case = 2), and the 040 its
+    // single-issue pipeline model (one clock).
     for (cpu_type, moveq_expected) in [
         (CpuType::M68000, 4),
-        (CpuType::M68030, 3), // ((4*5+7)/8).max(2)
+        (CpuType::M68030, 2),
+        (CpuType::M68040, 1),
     ] {
         let (mut cpu, mut bus) = setup(cpu_type);
         bus.write_word_at(0x0200, 0x7000);

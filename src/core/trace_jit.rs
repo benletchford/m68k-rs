@@ -5396,12 +5396,12 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     };
     // Normal retirement finalizes those raw charges through the selected
     // processor's timing model. Traces must store that same modeled value:
-    // the 68020 table makes register bit operations four clocks, the
-    // 68030/040 family uses the legacy scaler, and the 68060 pipeline issues
-    // these register operations in one clock.
+    // the 68020/030 tables make register bit operations four clocks, the
+    // 68040 and 68060 pipelines issue them in one clock, and the remaining
+    // models (SCC68070) keep the legacy scaler.
     let cycles = match cpu.cpu_type {
-        CpuType::M68EC020 | CpuType::M68020 => 4,
-        CpuType::M68060 => 1,
+        CpuType::M68EC020 | CpuType::M68020 | CpuType::M68EC030 | CpuType::M68030 => 4,
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => 1,
         _ => cpu.scale_cycles_for_cpu_type(raw_cycles),
     };
     Some(TraceBuildOp {
@@ -15880,17 +15880,19 @@ mod portable_tests {
             bus.write_word(base + 2, words[1]);
         }
 
-        // 68040: handler charges finalized through the model scaler.
+        // 68040: register bit operations issue in one clock on the
+        // single-issue pipeline model (timing_040.rs), and the baked trace
+        // cycles mirror the interpreter.
         cpu.set_cpu_type(CpuType::M68040);
         let ops: Vec<TraceBuildOp> = [0x0100u32, 0x0110, 0x0120, 0x0130]
             .iter()
             .map(|&pc| decode_trace_op(&cpu, &mut bus, pc, CpuType::M68040).expect("form decodes"))
             .collect();
         let expect = [
-            (JitBitOp::Test, 2u8, 4u8, 4),
-            (JitBitOp::Change, 20, 1, 5),
-            (JitBitOp::Clear, 20, 1, 7),
-            (JitBitOp::Set, 0, 7, 5),
+            (JitBitOp::Test, 2u8, 4u8, 1),
+            (JitBitOp::Change, 20, 1, 1),
+            (JitBitOp::Clear, 20, 1, 1),
+            (JitBitOp::Set, 0, 7, 1),
         ];
         for (decoded, &(op, bit, dst, cycles)) in ops.iter().zip(&expect) {
             let JitTraceOp::BitImmReg {

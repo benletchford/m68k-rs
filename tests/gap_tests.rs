@@ -236,6 +236,17 @@ fn test_gap_dbf_instruction() {
     bus.mem[0x1005] = 0x71;
     bus.mem[0x1006] = 0x4E;
     bus.mem[0x1007] = 0x75;
+    // RTS return address on the stack -> a parking loop (BRA.S self), so
+    // completion is observable no matter how many instructions fit in one
+    // execute() budget (the 040 pipeline model runs this code ~3x cheaper
+    // than the old scaled approximation, so the old mid-flight PC
+    // checkpoints were budget-dependent).
+    bus.mem[0x8000] = 0x00;
+    bus.mem[0x8001] = 0x00;
+    bus.mem[0x8002] = 0x20;
+    bus.mem[0x8003] = 0x00;
+    bus.mem[0x2000] = 0x60;
+    bus.mem[0x2001] = 0xFE;
 
     // Initialize D0 to 3 (should loop 4 times: 3,2,1,0,-1 exit)
     cpu.set_d(0, 3);
@@ -245,7 +256,7 @@ fn test_gap_dbf_instruction() {
     // Execute enough cycles
     for _ in 0..20 {
         cpu.execute(&mut bus, 100);
-        if cpu.pc == 0x1006 || cpu.pc > 0x1010 {
+        if cpu.pc == 0x2000 || cpu.pc == 0x2002 {
             break;
         }
     }
