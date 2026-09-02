@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.12.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.12.0...m68k-v0.12.1) (2026-09-02)
+
+
+### Performance Improvements
+
+* **decode:** decoded fast paths for immediate register bit ops, LINK/UNLK, and MOVEM.L pre/post-increment ([#162](https://github.com/benletchford/m68k-rs/issues/162)) ([3afaafa](https://github.com/benletchford/m68k-rs/commit/3afaafa248a9b16278838d225bdf3afe47c6f0db))
+* **trace:** defer cold independent linear regions ([#163](https://github.com/benletchford/m68k-rs/issues/163)) ([aa8aef1](https://github.com/benletchford/m68k-rs/commit/aa8aef1f64c3258fab4996fc7f3dfe3697cf9786))
+* **trace:** scope the guarded stack-frame gate to portable execution ([#161](https://github.com/benletchford/m68k-rs/issues/161)) ([c73c4cd](https://github.com/benletchford/m68k-rs/commit/c73c4cd0bb2fa76f4e789a21a9282830d28665f6))
+
 ## [0.12.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.11.6...m68k-v0.12.0) (2026-09-02)
 
 
