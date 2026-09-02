@@ -1575,7 +1575,20 @@ impl TraceJit {
                 let entry_watched = watch_pcs
                     .iter()
                     .any(|&watched| cpu.address(watched) == cpu.address(cpu.pc));
-                match self.note_trace_exit(cpu.pc, cpu_type, entry_watched) {
+                // A clean link already performed this exact slot lookup;
+                // guarded and seeded exits need it once. Keep the compiled
+                // steady state in this caller so it does not pay an outlined
+                // admission-helper call merely to return `Chain`.
+                let exit_seed = if clean_link_exit || self.compiled_head_at(cpu.pc, cpu_type) {
+                    if entry_watched {
+                        ExitSeed::None
+                    } else {
+                        ExitSeed::Chain
+                    }
+                } else {
+                    self.note_trace_exit(cpu.pc, cpu_type, entry_watched)
+                };
+                match exit_seed {
                     ExitSeed::Chain => {
                         match self.try_execute(
                             cpu,
