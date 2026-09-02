@@ -480,11 +480,11 @@ pub(crate) enum JitTraceOp {
         reg: u8,
         displacement: i16,
     },
-    /// Terminal `JSR (An)`. The target is dynamic, and the return address
-    /// store is checked against the active fastmem window before any CPU
-    /// state is committed.
+    /// Terminal `JSR (An)` / `JSR d16(An)`. The target is dynamic, and the
+    /// return-address store is checked against the active fastmem window
+    /// before any CPU state is committed.
     IndirectJsr {
-        reg: u8,
+        target: JitEa,
     },
     /// A BSR recorded THROUGH: pushes the constant return address and
     /// falls through to the callee's ops, which follow inline in the
@@ -3377,9 +3377,17 @@ impl TraceJit {
                         let env = mem_env.as_ref().expect("AddRegToMem implies a window env");
                         emit_add_reg_to_mem(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
-                    JitTraceOp::IndirectJsr { reg } => {
+                    JitTraceOp::IndirectJsr { target } => {
                         let env = mem_env.as_ref().expect("IndirectJsr implies a window env");
-                        emit_indirect_jsr(&mut builder, cpu_ptr, *op, reg, env, &mut bails, bail_at)
+                        emit_indirect_jsr(
+                            &mut builder,
+                            cpu_ptr,
+                            *op,
+                            target,
+                            env,
+                            &mut bails,
+                            bail_at,
+                        )
                     }
                     JitTraceOp::MemAddqSubq { .. } => {
                         let env = mem_env.as_ref().expect("MemAddqSubq implies a window env");
@@ -4216,7 +4224,15 @@ impl JitTraceOp {
                 (_, JitEa::Disp(_, _)) => 16,
                 _ => 12,
             },
-            Self::IndirectJsr { .. } => 16,
+            Self::IndirectJsr {
+                target: JitEa::Ind(_),
+            } => 16,
+            // JSR d16(An) adds the displacement-extension fetch to the
+            // M68000's 16-cycle JSR (An) bound.
+            Self::IndirectJsr {
+                target: JitEa::Disp(_, _),
+            } => 18,
+            Self::IndirectJsr { .. } => unreachable!("JSR decoder admitted unsupported EA"),
             // These ops only execute in instruction-budgeted fastmem mode;
             // conservative cycle maxima preserve the trace headroom guard.
             Self::MemAddqSubq { .. } | Self::AnDispUnary { .. } | Self::AnDispBit { .. } => 24,
@@ -4347,7 +4363,7 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_branch_word_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
-    if let Some(op) = decode_indirect_jsr_trace_op(pc, opcode) {
+    if let Some(op) = decode_indirect_jsr_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
     if let Some(op) = decode_return_exit_trace_op(cpu, bus, pc, opcode, cpu_type) {
@@ -4768,18 +4784,29 @@ fn decode_movem_word_postinc_trace_op<B: AddressBus>(
     })
 }
 
-fn decode_indirect_jsr_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
-    if (opcode & 0xFFF8) != 0x4E90 {
-        return None;
-    }
+fn decode_indirect_jsr_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+) -> Option<TraceBuildOp> {
+    let (extension, target) = match opcode & 0xFFF8 {
+        0x4E90 => (None, JitEa::Ind((opcode & 7) as u8)),
+        0x4EA8 => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (
+                Some(extension),
+                JitEa::Disp((opcode & 7) as u8, extension as i16),
+            )
+        }
+        _ => return None,
+    };
     Some(TraceBuildOp {
         opcode,
-        extension: None,
+        extension,
         extension2: None,
         pc,
-        op: JitTraceOp::IndirectJsr {
-            reg: (opcode & 7) as u8,
-        },
+        op: JitTraceOp::IndirectJsr { target },
     })
 }
 
@@ -5947,8 +5974,8 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     ) {
         return execute_portable_an_disp(cpu, op, spans);
     }
-    if let JitTraceOp::IndirectJsr { reg } = op.op {
-        return execute_portable_indirect_jsr(cpu, op, reg);
+    if let JitTraceOp::IndirectJsr { target } = op.op {
+        return execute_portable_indirect_jsr(cpu, op, target);
     }
     Some(execute_portable_reg_op(cpu, op))
 }
@@ -6074,15 +6101,19 @@ fn execute_portable_movem_long_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
-fn execute_portable_indirect_jsr(cpu: &mut CpuCore, trace: TraceBuildOp, reg: u8) -> Option<i32> {
+fn execute_portable_indirect_jsr(
+    cpu: &mut CpuCore,
+    trace: TraceBuildOp,
+    target: JitEa,
+) -> Option<i32> {
     let old_pc = cpu.pc;
     cpu.pc = trace.pc.wrapping_add(2);
-    if super::mem_ops::execute_mem_op(
-        cpu,
-        DecodedMemOp::Jsr {
-            ea: FastEa::AnInd(reg),
-        },
-    ) {
+    let ea = match target {
+        JitEa::Ind(reg) => FastEa::AnInd(reg),
+        JitEa::Disp(reg, _) => FastEa::AnDisp(reg),
+        _ => unreachable!("JSR decoder admitted unsupported EA"),
+    };
+    if super::mem_ops::execute_mem_op(cpu, DecodedMemOp::Jsr { ea }) {
         Some(trace.op.max_cycles())
     } else {
         cpu.pc = old_pc;
@@ -9112,16 +9143,17 @@ fn emit_add_reg_to_mem(
     cycles_const(builder, trace.op.max_cycles())
 }
 
-/// Emit terminal `JSR (An)`. The stack write is checked before the stack
-/// pointer, flow state, or PC changes, so a miss can re-execute the call via
-/// full dispatch. A successful call ends this non-self-loop trace; writing
-/// into its code is therefore safe because any later entry revalidates it.
+/// Emit terminal `JSR (An)` / `JSR d16(An)`. The stack write is checked before
+/// the stack pointer, flow state, or PC changes, so a miss can re-execute the
+/// call via full dispatch. A successful call ends this non-self-loop trace;
+/// writing into its code is therefore safe because any later entry revalidates
+/// it.
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn emit_indirect_jsr(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
     trace: TraceBuildOp,
-    reg: u8,
+    target: JitEa,
     env: &MemEnv,
     bails: &mut Vec<BailReq>,
     at: BailAt,
@@ -9133,11 +9165,18 @@ fn emit_indirect_jsr(
         at,
     });
 
-    let target = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+    let target = match target {
+        JitEa::Ind(reg) => load_reg(builder, cpu, JitDirectReg::Addr(reg)),
+        JitEa::Disp(reg, displacement) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            builder.ins().iadd_imm(base, i64::from(displacement))
+        }
+        _ => unreachable!("JSR decoder admitted unsupported EA"),
+    };
     let old_sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
     let new_sp = builder.ins().iadd_imm(old_sp, -4);
     let (off, _) = checked_window_off(builder, env, bail, new_sp, Size::Long);
-    let return_pc = iconst_u32(builder, trace.pc.wrapping_add(2));
+    let return_pc = iconst_u32(builder, trace.pc.wrapping_add(trace.length() as u32));
     window_store(builder, env, off, Size::Long, return_pc);
 
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
@@ -11871,8 +11910,26 @@ mod portable_tests {
         let jsr = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
         assert_eq!(jsr.extension, None);
         assert_eq!(jsr.length(), 2);
-        assert!(matches!(jsr.op, JitTraceOp::IndirectJsr { reg: 0 }));
+        assert!(matches!(
+            jsr.op,
+            JitTraceOp::IndirectJsr {
+                target: JitEa::Ind(0)
+            }
+        ));
         assert!(jsr.op.ends_trace());
+
+        mem.write_word(0x0100, 0x4EAD); // JSR -$0010(A5)
+        mem.write_word(0x0102, 0xFFF0);
+        let jsr = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(jsr.extension, Some(0xFFF0));
+        assert_eq!(jsr.length(), 4);
+        assert_eq!(jsr.op.max_cycles(), 18);
+        assert!(matches!(
+            jsr.op,
+            JitTraceOp::IndirectJsr {
+                target: JitEa::Disp(5, -16)
+            }
+        ));
     }
 
     #[test]
@@ -11889,7 +11946,9 @@ mod portable_tests {
             extension: None,
             extension2: None,
             pc: 0x0100,
-            op: JitTraceOp::IndirectJsr { reg: 0 },
+            op: JitTraceOp::IndirectJsr {
+                target: JitEa::Ind(0),
+            },
         };
         assert_eq!(
             execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
@@ -11897,6 +11956,35 @@ mod portable_tests {
         );
         assert_eq!(cpu.a(7), 0x07FC);
         assert_eq!(&mem[0x07FC..0x0800], &0x0102u32.to_be_bytes());
+        assert_eq!(cpu.pc, 0x0340);
+        assert!(cpu.change_of_flow);
+    }
+
+    #[test]
+    fn portable_displacement_jsr_uses_extension_extent_and_live_base() {
+        let mut cpu = cpu();
+        let mut mem = vec![0u8; 0x1000];
+        mem[0x0102..0x0104].copy_from_slice(&0xFFF0u16.to_be_bytes());
+        attach_window(&mut cpu, &mut mem);
+        cpu.set_a(5, 0x0350);
+        cpu.set_a(7, 0x0800);
+        cpu.change_of_flow = false;
+
+        let op = TraceBuildOp {
+            opcode: 0x4EAD,
+            extension: Some(0xFFF0),
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::IndirectJsr {
+                target: JitEa::Disp(5, -16),
+            },
+        };
+        assert_eq!(
+            execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0104)),
+            Some(18)
+        );
+        assert_eq!(cpu.a(7), 0x07FC);
+        assert_eq!(&mem[0x07FC..0x0800], &0x0104u32.to_be_bytes());
         assert_eq!(cpu.pc, 0x0340);
         assert!(cpu.change_of_flow);
     }
@@ -11916,7 +12004,9 @@ mod portable_tests {
             extension: None,
             extension2: None,
             pc: 0x0100,
-            op: JitTraceOp::IndirectJsr { reg: 0 },
+            op: JitTraceOp::IndirectJsr {
+                target: JitEa::Ind(0),
+            },
         };
         assert_eq!(
             execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
@@ -17015,7 +17105,9 @@ mod portable_tests {
                 extension: None,
                 extension2: None,
                 pc: 0x0100 + (count - 1) as u32 * 2,
-                op: JitTraceOp::IndirectJsr { reg: 0 },
+                op: JitTraceOp::IndirectJsr {
+                    target: JitEa::Ind(0),
+                },
             });
             ops
         };
@@ -17102,7 +17194,9 @@ mod portable_tests {
                 extension: None,
                 extension2: None,
                 pc: 0x010E,
-                op: JitTraceOp::IndirectJsr { reg: 0 },
+                op: JitTraceOp::IndirectJsr {
+                    target: JitEa::Ind(0),
+                },
             },
         ];
         let mut compile_cpu = cpu();
@@ -17147,6 +17241,72 @@ mod portable_tests {
         assert_eq!(bail.d(7), 0xA5A5_8000, "prefix remains committed");
         assert_eq!(bail.a(7), 2, "call itself did not commit");
         assert_eq!(bail.pc, 0x010E, "retry the unexecuted call");
+        assert!(!bail.change_of_flow);
+        assert!(bail_mem[0x07FC..0x0800].iter().all(|&byte| byte == 0));
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_displacement_jsr_uses_live_base_and_captured_displacement() {
+        let mut ops = Vec::new();
+        for index in 0..TRACE_MIN_INDIRECT_JSR_OPS - 1 {
+            ops.push(TraceBuildOp {
+                opcode: 0x7001,
+                extension: None,
+                extension2: None,
+                pc: 0x0100 + index as u32 * 2,
+                op: JitTraceOp::Moveq { reg: 0, data: 1 },
+            });
+        }
+        let call_pc = 0x0100 + (TRACE_MIN_INDIRECT_JSR_OPS as u32 - 1) * 2;
+        ops.push(TraceBuildOp {
+            opcode: 0x4EAD,
+            extension: Some(0x0010),
+            extension2: None,
+            pc: call_pc,
+            op: JitTraceOp::IndirectJsr {
+                target: JitEa::Disp(5, 0x0010),
+            },
+        });
+
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&cpu(), 0x0100, CpuType::M68000, ops, Some(0x0350))
+            .expect("displacement JSR region should compile");
+
+        let prepare = |stack: u32| {
+            let mut cpu = cpu();
+            let mut mem = vec![0u8; 0x1000];
+            attach_window(&mut cpu, &mut mem);
+            cpu.set_a(5, 0x0340);
+            cpu.set_a(7, stack);
+            cpu.change_of_flow = false;
+            (cpu, mem)
+        };
+
+        let (mut success, success_mem) = prepare(0x0800);
+        let packed = unsafe { compiled.call_native(&mut success, 1) };
+        assert_eq!((packed >> 32) as u32, TRACE_MIN_INDIRECT_JSR_OPS as u32);
+        assert_eq!(packed as u32 as i32, 42);
+        assert_eq!(success.a(7), 0x07FC);
+        assert_eq!(
+            &success_mem[0x07FC..0x0800],
+            &call_pc.wrapping_add(4).to_be_bytes()
+        );
+        assert_eq!(success.pc, 0x0350);
+        assert_eq!(success.ppc, call_pc);
+        assert_eq!(success.ir, 0x4EAD);
+        assert!(success.change_of_flow);
+
+        let (mut bail, bail_mem) = prepare(2);
+        let packed = unsafe { compiled.call_native(&mut bail, 1) };
+        assert_eq!(
+            (packed >> 32) as u32,
+            (TRACE_MIN_INDIRECT_JSR_OPS - 1) as u32
+        );
+        assert_eq!(packed as u32 as i32, 24);
+        assert_eq!(bail.a(7), 2);
+        assert_eq!(bail.pc, call_pc);
         assert!(!bail.change_of_flow);
         assert!(bail_mem[0x07FC..0x0800].iter().all(|&byte| byte == 0));
     }
