@@ -396,10 +396,9 @@ pub(crate) enum JitTraceOp {
         dst: u8,
         cycles: i32,
     },
-    /// LEA `(xxx).W`/`(xxx).L,An`. The absolute address is sign-extended
-    /// (word form) or taken whole (long form) while recording, so
-    /// execution loads a constant into the address register -- no memory
-    /// access, no condition codes.
+    /// LEA `d16(PC)`/`(xxx).W`/`(xxx).L,An`. The final address is resolved
+    /// while recording, so execution loads a constant into the address
+    /// register -- no memory access, no condition codes.
     LeaAbs {
         address: u32,
         dst: u8,
@@ -5288,6 +5287,26 @@ fn decode_an_disp_trace_op<B: AddressBus>(
                     dst,
                     // MC68000 LEA (d8,An,Xn) is twelve cycles.
                     cycles: if is_pre_68020(cpu_type) { 12 } else { 4 },
+                },
+            )
+        }
+        DecodedMemOp::Lea {
+            reg: dst,
+            ea: FastEa::PcDisp,
+        } => {
+            let extension = read_ext(2, bus)?;
+            (
+                Some(extension),
+                None,
+                JitTraceOp::LeaAbs {
+                    // The 68k PC-relative base is the address of the
+                    // displacement extension word, not the next opcode.
+                    address: pc
+                        .wrapping_add(2)
+                        .wrapping_add(extension as i16 as i32 as u32),
+                    dst,
+                    // MC68000 LEA d16(PC) is eight cycles.
+                    cycles: if is_pre_68020(cpu_type) { 8 } else { 4 },
                 },
             )
         }
@@ -13216,7 +13235,7 @@ mod portable_tests {
     }
 
     #[test]
-    fn lea_abs_decode_and_native_execution_load_the_constant() {
+    fn lea_constant_forms_decode_and_portable_execution_load_the_constant() {
         let mut cpu = cpu();
         cpu.set_cpu_type(CpuType::M68040);
         cpu.set_a(1, 0xDEAD_BEEF);
@@ -13259,6 +13278,29 @@ mod portable_tests {
             }
         ));
         assert_eq!(word.length(), 4);
+
+        // LEA d16(PC),A1 = 43FA. The PC base is the address of the
+        // extension word ($0302), so -$0100 resolves to $0202.
+        cpu.set_cpu_type(CpuType::M68000);
+        bus.write_word_at(0x0300, 0x43FA);
+        bus.write_word_at(0x0302, 0xFF00);
+        let pc_relative = decode_trace_op(&cpu, &mut bus, 0x0300, CpuType::M68000)
+            .expect("LEA d16(PC) should decode");
+        assert!(matches!(
+            pc_relative.op,
+            JitTraceOp::LeaAbs {
+                address: 0x0202,
+                dst: 1,
+                cycles: 8,
+            }
+        ));
+        assert_eq!(pc_relative.length(), 4);
+        assert_eq!(
+            execute_portable_op(&mut cpu, pc_relative, CodeSpans::caller(0x0300, 0x0304)),
+            Some(8)
+        );
+        assert_eq!(cpu.dar[9], 0x0202);
+        assert_eq!(cpu.get_ccr(), 0x1F);
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
