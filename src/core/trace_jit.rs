@@ -462,18 +462,6 @@ pub(crate) enum JitTraceOp {
         /// exit and continues along the recorded path on a match.
         expected_taken: Option<bool>,
     },
-    /// `JMP (d8,PC,Xn)` -- an N-way jump-table dispatch. The base (pc +
-    /// 2 + d8) folds to a constant at record time; the recorded taken
-    /// target guards the trace: a mismatch commits the jump (pc = the
-    /// computed target) and side-exits, where exit seeding compiles the
-    /// other dispatch cases as continuations that link back.
-    PcIndexJmp {
-        base: u32,
-        index: JitDirectReg,
-        index_long: bool,
-        scale: u8,
-        expected_target: Option<u32>,
-    },
     Dbcc {
         condition: u8,
         reg: u8,
@@ -485,11 +473,13 @@ pub(crate) enum JitTraceOp {
     IndirectJsr {
         target: JitEa,
     },
-    /// Terminal `JMP (An)`. Unlike an indirect call, this only transfers
-    /// control: there is no stack access, so a short region can still
-    /// amortize trace entry and validation.
+    /// Guarded indirect `JMP` through `(An)`, `d16(An)`, brief
+    /// `d8(An,Xn)`, or brief `d8(PC,Xn)`. The recorder follows the observed
+    /// target; execution commits the live target and side-exits if it differs.
+    /// This spans stable dispatch edges without assuming that they are static.
     IndirectJmp {
-        reg: u8,
+        target: JitEa,
+        expected_target: Option<u32>,
     },
     /// A BSR recorded THROUGH: pushes the constant return address and
     /// falls through to the callee's ops, which follow inline in the
@@ -1010,7 +1000,7 @@ impl CompiledTrace {
                             || (cpu.pc == fallthrough && expected_taken)
                     }
                 }
-                JitTraceOp::PcIndexJmp {
+                JitTraceOp::IndirectJmp {
                     expected_target: Some(expected),
                     ..
                 } => cpu.pc != expected,
@@ -1030,7 +1020,7 @@ fn guarded_op_mask(ops: &[TraceBuildOp]) -> u128 {
             JitTraceOp::Branch {
                 expected_taken: Some(_),
                 ..
-            } | JitTraceOp::PcIndexJmp {
+            } | JitTraceOp::IndirectJmp {
                 expected_target: Some(_),
                 ..
             }
@@ -2728,7 +2718,7 @@ impl TraceJit {
             // A computed jump records its taken target and the recording
             // follows it (like a taken Branch); execution guards on the
             // recorded target and side-exits on any other dispatch case.
-            JitTraceOp::PcIndexJmp {
+            JitTraceOp::IndirectJmp {
                 expected_target, ..
             } => {
                 *expected_target = Some(next_pc);
@@ -2741,11 +2731,6 @@ impl TraceJit {
                 return;
             }
             JitTraceOp::IndirectJsr { .. } => {
-                self.recording.as_mut().unwrap().ops.push(op);
-                self.finish_recording(cpu, next_pc, RecordingEnd::Region);
-                return;
-            }
-            JitTraceOp::IndirectJmp { .. } => {
                 self.recording.as_mut().unwrap().ops.push(op);
                 self.finish_recording(cpu, next_pc, RecordingEnd::Region);
                 return;
@@ -3318,20 +3303,15 @@ impl TraceJit {
                         bail_at.ops_before,
                         1,
                     ),
-                    JitTraceOp::PcIndexJmp {
-                        base,
-                        index: jmp_index,
-                        index_long,
-                        scale,
+                    JitTraceOp::IndirectJmp {
+                        target,
                         expected_target: Some(expected_target),
-                    } => emit_guarded_pc_index_jmp(
+                    } => emit_guarded_indirect_jmp(
                         &mut builder,
                         cpu_ptr,
                         op.pc,
-                        base,
-                        jmp_index,
-                        index_long,
-                        scale,
+                        op.opcode,
+                        target,
                         expected_target,
                         cycles_value,
                         bail_at.ops_before,
@@ -3721,7 +3701,7 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             // this head; per-head wait accounting would then erase
             // opportunity data belonging to other shapes. A guarded
             // computed jump is an interior N-way branch: same rule.
-            JitTraceOp::Branch { .. } | JitTraceOp::PcIndexJmp { .. } => return false,
+            JitTraceOp::Branch { .. } | JitTraceOp::IndirectJmp { .. } => return false,
             // Memory-reading compares and tests write NZVC only; the
             // polled value is the only input that can change.
             JitTraceOp::TstMem { .. }
@@ -3770,7 +3750,6 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::Swap { .. }
             | JitTraceOp::Dbcc { .. }
             | JitTraceOp::IndirectJsr { .. }
-            | JitTraceOp::IndirectJmp { .. }
             | JitTraceOp::MoveMem { .. }
             | JitTraceOp::MovemWordPostInc { .. }
             | JitTraceOp::AluMemToReg { .. }
@@ -4036,8 +4015,6 @@ impl JitTraceOp {
                 }
             }
             Self::Nop => 4,
-            // JMP (d8,PC,Xn) (M68000UM table 8-, indexed jump).
-            Self::PcIndexJmp { .. } => 14,
             Self::MoveReg { .. } => 4,
             Self::Moveq { .. } => 4,
             // MC68000: 8(2/0) for the word form, 12(3/0) for the long.
@@ -4282,8 +4259,21 @@ impl JitTraceOp {
                 target: JitEa::Disp(_, _),
             } => 18,
             Self::IndirectJsr { .. } => unreachable!("JSR decoder admitted unsupported EA"),
-            // M68000UM control-address timing: JMP (An) is 8(2/0).
-            Self::IndirectJmp { .. } => 8,
+            // M68000UM control-address timing: JMP is eight cycles plus
+            // the effective-address calculation (0/2/6 for these modes).
+            Self::IndirectJmp {
+                target: JitEa::Ind(_),
+                ..
+            } => 8,
+            Self::IndirectJmp {
+                target: JitEa::Disp(_, _),
+                ..
+            } => 10,
+            Self::IndirectJmp {
+                target: JitEa::Index { .. } | JitEa::PcIndex { .. },
+                ..
+            } => 14,
+            Self::IndirectJmp { .. } => unreachable!("JMP decoder admitted unsupported EA"),
             // These ops only execute in instruction-budgeted fastmem mode;
             // conservative cycle maxima preserve the trace headroom guard.
             Self::MemAddqSubq { .. } | Self::AnDispUnary { .. } | Self::AnDispBit { .. } => 24,
@@ -4310,9 +4300,8 @@ impl JitTraceOp {
             Self::Branch { .. }
                 | Self::Dbcc { .. }
                 | Self::IndirectJsr { .. }
-                | Self::IndirectJmp { .. }
                 | Self::CallExit { .. }
-                | Self::PcIndexJmp {
+                | Self::IndirectJmp {
                     expected_target: Some(_),
                     ..
                 }
@@ -4420,7 +4409,7 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_indirect_jsr_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
-    if let Some(op) = decode_indirect_jmp_trace_op(pc, opcode) {
+    if let Some(op) = decode_indirect_jmp_trace_op(cpu, bus, pc, opcode, cpu_type) {
         return Some(op);
     }
     if let Some(op) = decode_return_exit_trace_op(cpu, bus, pc, opcode, cpu_type) {
@@ -4483,10 +4472,6 @@ fn decode_trace_op<B: AddressBus>(
     if let Some(op) = decode_move_mem_trace_op(cpu, bus, pc, opcode) {
         return Some(op);
     }
-    if let Some(op) = decode_pc_index_jmp_trace_op(cpu, bus, pc, opcode) {
-        return Some(op);
-    }
-
     let decoded = DecodedSimpleOp::decode(cpu_type, opcode)?;
     let op = decoded.to_jit_trace_op()?;
     Some(TraceBuildOp {
@@ -4907,17 +4892,66 @@ fn decode_indirect_jsr_trace_op<B: AddressBus>(
     })
 }
 
-fn decode_indirect_jmp_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
-    if (opcode & 0xFFF8) != 0x4ED0 {
-        return None;
-    }
+fn decode_indirect_jmp_trace_op<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    pc: u32,
+    opcode: u16,
+    cpu_type: CpuType,
+) -> Option<TraceBuildOp> {
+    let (extension, target) = match opcode & 0xFFF8 {
+        0x4ED0 => (None, JitEa::Ind((opcode & 7) as u8)),
+        0x4EE8 => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (
+                Some(extension),
+                JitEa::Disp((opcode & 7) as u8, extension as i16),
+            )
+        }
+        0x4EF0 => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            (
+                Some(extension),
+                decode_jit_ea(6, opcode & 7, extension, cpu_type)?,
+            )
+        }
+        _ if opcode == 0x4EFB => {
+            let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+            if !is_pre_68020(cpu_type) && (extension & 0x0100) != 0 {
+                return None;
+            }
+            let index_num = ((extension >> 12) & 7) as u8;
+            let index = if (extension & 0x8000) != 0 {
+                JitDirectReg::Addr(index_num)
+            } else {
+                JitDirectReg::Data(index_num)
+            };
+            (
+                Some(extension),
+                JitEa::PcIndex {
+                    base: pc
+                        .wrapping_add(2)
+                        .wrapping_add((extension as u8 as i8) as i32 as u32),
+                    index,
+                    index_long: (extension & 0x0800) != 0,
+                    scale: if is_pre_68020(cpu_type) {
+                        0
+                    } else {
+                        ((extension >> 9) & 3) as u8
+                    },
+                },
+            )
+        }
+        _ => return None,
+    };
     Some(TraceBuildOp {
         opcode,
-        extension: None,
+        extension,
         extension2: None,
         pc,
         op: JitTraceOp::IndirectJmp {
-            reg: (opcode & 7) as u8,
+            target,
+            expected_target: None,
         },
     })
 }
@@ -5605,49 +5639,6 @@ fn decode_move_mem_trace_op<B: AddressBus>(
     })
 }
 
-/// Decode `JMP (d8,PC,Xn)` -- the jump-table dispatch of a bytecode
-/// interpreter. The recorded taken target is filled in by the recorder
-/// (like a Branch's expected direction); execution guards on it.
-fn decode_pc_index_jmp_trace_op<B: AddressBus>(
-    cpu: &CpuCore,
-    bus: &mut B,
-    pc: u32,
-    opcode: u16,
-) -> Option<TraceBuildOp> {
-    if opcode != 0x4EFB {
-        return None;
-    }
-    let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
-    if !is_pre_68020(cpu.cpu_type) && (extension & 0x0100) != 0 {
-        return None;
-    }
-    let index_num = ((extension >> 12) & 7) as u8;
-    let index = if (extension & 0x8000) != 0 {
-        JitDirectReg::Addr(index_num)
-    } else {
-        JitDirectReg::Data(index_num)
-    };
-    Some(TraceBuildOp {
-        opcode,
-        extension: Some(extension),
-        extension2: None,
-        pc,
-        op: JitTraceOp::PcIndexJmp {
-            base: pc
-                .wrapping_add(2)
-                .wrapping_add((extension as u8 as i8) as i32 as u32),
-            index,
-            index_long: (extension & 0x0800) != 0,
-            scale: if is_pre_68020(cpu.cpu_type) {
-                0
-            } else {
-                ((extension >> 9) & 3) as u8
-            },
-            expected_target: None,
-        },
-    })
-}
-
 fn decode_add_reg_to_mem_trace_op<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -6017,7 +6008,7 @@ fn execute_portable_trace_raw(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: Co
                         return ((retired as u64) << 32) | cycles as u32 as u64;
                     }
                 }
-                if let JitTraceOp::PcIndexJmp {
+                if let JitTraceOp::IndirectJmp {
                     expected_target: Some(expected),
                     ..
                 } = op.op
@@ -7159,33 +7150,49 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             unreachable!("CondSkip is handled in execute_portable_trace, not the register path")
         }
         JitTraceOp::Nop => 4,
-        JitTraceOp::PcIndexJmp {
-            base,
-            index,
-            index_long,
-            scale,
-            ..
-        } => {
-            // The jump commits architecturally regardless of the guard:
-            // pc = base + scaled index. The guard comparison itself is
-            // handled by the trace executor (mirroring Branch).
-            let raw_index = match index {
-                JitDirectReg::Data(r) => cpu.dar[r as usize],
-                JitDirectReg::Addr(r) => cpu.dar[8 + r as usize],
+        JitTraceOp::IndirectJmp { target, .. } => {
+            // The jump commits architecturally regardless of the guard. The
+            // executor compares this live target with the recorded one.
+            cpu.pc = match target {
+                JitEa::Ind(reg) => cpu.a(reg as usize),
+                JitEa::Disp(reg, displacement) => {
+                    cpu.a(reg as usize).wrapping_add(displacement as i32 as u32)
+                }
+                JitEa::Index {
+                    base,
+                    index,
+                    index_long,
+                    scale,
+                    displacement,
+                } => {
+                    let raw_index = portable_read_reg(cpu, index, Size::Long);
+                    let index = if index_long {
+                        raw_index
+                    } else {
+                        raw_index as u16 as i16 as i32 as u32
+                    };
+                    cpu.a(base as usize)
+                        .wrapping_add(index.wrapping_shl(scale as u32))
+                        .wrapping_add(displacement as i32 as u32)
+                }
+                JitEa::PcIndex {
+                    base,
+                    index,
+                    index_long,
+                    scale,
+                } => {
+                    let raw_index = portable_read_reg(cpu, index, Size::Long);
+                    let index = if index_long {
+                        raw_index
+                    } else {
+                        raw_index as u16 as i16 as i32 as u32
+                    };
+                    base.wrapping_add(index.wrapping_shl(scale as u32))
+                }
+                _ => unreachable!("JMP decoder admitted unsupported EA"),
             };
-            let idx = if index_long {
-                raw_index
-            } else {
-                raw_index as u16 as i16 as i32 as u32
-            };
-            cpu.pc = base.wrapping_add(idx.wrapping_shl(scale as u32));
             cpu.change_of_flow = true;
-            14
-        }
-        JitTraceOp::IndirectJmp { reg } => {
-            cpu.pc = cpu.a(reg as usize);
-            cpu.change_of_flow = true;
-            8
+            op.op.max_cycles()
         }
         JitTraceOp::Moveq { reg, data } => {
             cpu.dar[reg as usize] = data;
@@ -7817,8 +7824,8 @@ fn emit_jit_op(
         }
         // Guarded computed jumps are emitted by the main loop (they need
         // the exit plumbing); an unguarded one never compiles.
-        JitTraceOp::PcIndexJmp { .. } => {
-            unreachable!("PcIndexJmp reaches emit_jit_op")
+        JitTraceOp::IndirectJmp { .. } => {
+            unreachable!("guarded IndirectJmp reaches emit_jit_op")
         }
         JitTraceOp::ReturnExit { .. } => {
             unreachable!("ReturnExit is routed to emit_return_exit by the main emit loop")
@@ -8490,12 +8497,6 @@ fn emit_jit_op(
         }
         JitTraceOp::IndirectJsr { .. } => {
             unreachable!("IndirectJsr is emitted by emit_indirect_jsr")
-        }
-        JitTraceOp::IndirectJmp { reg } => {
-            let target = load_reg(builder, cpu, JitDirectReg::Addr(reg));
-            store_bool(builder, cpu, offset_of!(CpuCore, change_of_flow), true);
-            store_value_u32(builder, cpu, offset_of!(CpuCore, pc), target);
-            cycles_const(builder, 8)
         }
         JitTraceOp::Branch {
             condition,
@@ -10822,35 +10823,72 @@ fn emit_guarded_branch(
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 #[allow(clippy::too_many_arguments)]
-fn emit_guarded_pc_index_jmp(
+fn emit_guarded_indirect_jmp(
     builder: &mut FunctionBuilder<'_>,
     cpu: Value,
     trace_pc: u32,
-    base: u32,
-    index: JitDirectReg,
-    index_long: bool,
-    scale: u8,
+    opcode: u16,
+    target_ea: JitEa,
     expected_target: u32,
     cycles_before: Value,
     retired_before_iter: RetiredBefore,
     ops_done: u32,
 ) -> Value {
-    // The jump commits architecturally on every dispatch case:
-    // pc = base + scaled index.
-    let base_v = iconst_u32(builder, base);
-    let raw_index = load_reg(builder, cpu, index);
-    let idx = if index_long {
-        raw_index
-    } else {
-        let word = builder.ins().ireduce(types::I16, raw_index);
-        builder.ins().sextend(types::I32, word)
+    // The jump commits architecturally on every dispatch case. Only the
+    // comparison with the recorded target controls whether the trace can
+    // continue along its recorded path.
+    let target = match target_ea {
+        JitEa::Ind(reg) => load_reg(builder, cpu, JitDirectReg::Addr(reg)),
+        JitEa::Disp(reg, displacement) => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            builder.ins().iadd_imm(base, displacement as i64)
+        }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let base = load_reg(builder, cpu, JitDirectReg::Addr(base));
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            let target = builder.ins().iadd(base, index);
+            builder.ins().iadd_imm(target, displacement as i64)
+        }
+        JitEa::PcIndex {
+            base,
+            index,
+            index_long,
+            scale,
+        } => {
+            let base = iconst_u32(builder, base);
+            let raw_index = load_reg(builder, cpu, index);
+            let index = if index_long {
+                raw_index
+            } else {
+                let word = builder.ins().ireduce(types::I16, raw_index);
+                builder.ins().sextend(types::I32, word)
+            };
+            let index = if scale == 0 {
+                index
+            } else {
+                builder.ins().ishl_imm(index, i64::from(scale))
+            };
+            builder.ins().iadd(base, index)
+        }
+        _ => unreachable!("JMP decoder admitted unsupported EA"),
     };
-    let idx = if scale == 0 {
-        idx
-    } else {
-        builder.ins().ishl_imm(idx, i64::from(scale))
-    };
-    let target = builder.ins().iadd(base_v, idx);
     store_pc_value(builder, cpu, target);
     let true_change = builder.ins().iconst(types::I8, 1);
     store_value(
@@ -10860,7 +10898,14 @@ fn emit_guarded_pc_index_jmp(
         true_change,
     );
 
-    let op_cycles = cycles_const(builder, 14);
+    let op_cycles = cycles_const(
+        builder,
+        JitTraceOp::IndirectJmp {
+            target: target_ea,
+            expected_target: None,
+        }
+        .max_cycles(),
+    );
     let expected = iconst_u32(builder, expected_target);
     let matches = builder.ins().icmp(IntCC::Equal, target, expected);
     let continue_block = builder.create_block();
@@ -10871,7 +10916,7 @@ fn emit_guarded_pc_index_jmp(
 
     builder.switch_to_block(side_exit);
     store_u32(builder, cpu, offset_of!(CpuCore, ppc), trace_pc);
-    store_u32(builder, cpu, offset_of!(CpuCore, ir), 0x4EFB);
+    store_u32(builder, cpu, offset_of!(CpuCore, ir), u32::from(opcode));
     let total_cycles = builder.ins().iadd(cycles_before, op_cycles);
     let cycles64 = builder.ins().uextend(types::I64, total_cycles);
     let retired = match retired_before_iter {
@@ -12293,8 +12338,75 @@ mod portable_tests {
         assert_eq!(jmp.extension, None);
         assert_eq!(jmp.length(), 2);
         assert_eq!(jmp.op.max_cycles(), 8);
-        assert!(matches!(jmp.op, JitTraceOp::IndirectJmp { reg: 1 }));
-        assert!(jmp.op.ends_trace());
+        assert!(matches!(
+            jmp.op,
+            JitTraceOp::IndirectJmp {
+                target: JitEa::Ind(1),
+                expected_target: None,
+            }
+        ));
+        assert!(
+            !jmp.op.ends_trace(),
+            "the recorder follows the observed target before installing its guard"
+        );
+
+        mem.write_word(0x0100, 0x4EEA); // JMP -$0010(A2)
+        mem.write_word(0x0102, 0xFFF0);
+        let jmp = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(jmp.extension, Some(0xFFF0));
+        assert_eq!(jmp.length(), 4);
+        assert_eq!(jmp.op.max_cycles(), 10);
+        assert!(matches!(
+            jmp.op,
+            JitTraceOp::IndirectJmp {
+                target: JitEa::Disp(2, -16),
+                expected_target: None,
+            }
+        ));
+
+        mem.write_word(0x0100, 0x4EF3); // JMP $06(A3,D4.L)
+        mem.write_word(0x0102, 0x4806);
+        let jmp = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(jmp.extension, Some(0x4806));
+        assert_eq!(jmp.length(), 4);
+        assert_eq!(jmp.op.max_cycles(), 14);
+        assert!(matches!(
+            jmp.op,
+            JitTraceOp::IndirectJmp {
+                target: JitEa::Index {
+                    base: 3,
+                    index: JitDirectReg::Data(4),
+                    index_long: true,
+                    scale: 0,
+                    displacement: 6,
+                },
+                expected_target: None,
+            }
+        ));
+
+        mem.write_word(0x0100, 0x4EFB); // JMP $06(PC,A1.W)
+        mem.write_word(0x0102, 0x9006);
+        let jmp = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(jmp.extension, Some(0x9006));
+        assert_eq!(jmp.op.max_cycles(), 14);
+        assert!(matches!(
+            jmp.op,
+            JitTraceOp::IndirectJmp {
+                target: JitEa::PcIndex {
+                    base: 0x0108,
+                    index: JitDirectReg::Addr(1),
+                    index_long: false,
+                    scale: 0,
+                },
+                expected_target: None,
+            }
+        ));
+
+        mem.write_word(0x0102, 0x0100); // 68020 full-format extension
+        assert!(
+            decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68020).is_none(),
+            "full-format indexed control EAs remain in the interpreter"
+        );
     }
 
     #[test]
@@ -12307,8 +12419,12 @@ mod portable_tests {
             extension: None,
             extension2: None,
             pc: 0x0100,
-            op: JitTraceOp::IndirectJmp { reg: 1 },
+            op: JitTraceOp::IndirectJmp {
+                target: JitEa::Ind(1),
+                expected_target: Some(0x0340),
+            },
         };
+        assert!(op.op.ends_trace(), "a recorded target makes JMP guarded");
 
         assert_eq!(
             execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
@@ -12316,6 +12432,130 @@ mod portable_tests {
         );
         assert_eq!(cpu.pc, 0x0340);
         assert!(cpu.change_of_flow);
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn guarded_indirect_jmp_address_modes_match_interpreter_and_portable() {
+        const JMP_PC: u32 = 0x0106;
+        const EXPECTED: u32 = 0x0350;
+        let cases = [
+            (0x4ED0, None, JitEa::Ind(0), 0x0350, 0, 8, true),
+            (
+                0x4EE8,
+                Some(0x0010),
+                JitEa::Disp(0, 0x0010),
+                0x0340,
+                0,
+                10,
+                true,
+            ),
+            (
+                0x4EF0,
+                Some(0x1006),
+                JitEa::Index {
+                    base: 0,
+                    index: JitDirectReg::Data(1),
+                    index_long: false,
+                    scale: 0,
+                    displacement: 6,
+                },
+                0x0300,
+                0x004A,
+                14,
+                false,
+            ),
+            (
+                0x4EFB,
+                Some(0x1006),
+                JitEa::PcIndex {
+                    base: JMP_PC + 8,
+                    index: JitDirectReg::Data(1),
+                    index_long: false,
+                    scale: 0,
+                },
+                0,
+                0x0242,
+                14,
+                false,
+            ),
+        ];
+
+        for (opcode, extension, target, a0, d1, jump_cycles, target_uses_a0) in cases {
+            let mut interpreter_bus = super::super::memory::LinearMemoryBus::new(0x1000);
+            interpreter_bus.write_word(JMP_PC, opcode);
+            if let Some(extension) = extension {
+                interpreter_bus.write_word(JMP_PC + 2, extension);
+            }
+            let mut interpreter = cpu();
+            interpreter.pc = JMP_PC;
+            interpreter.set_a(0, a0);
+            interpreter.set_d(1, d1);
+            let cycles = match interpreter.step(&mut interpreter_bus) {
+                super::super::types::StepResult::Ok { cycles } => cycles,
+                other => panic!("opcode {opcode:04X}: interpreter JMP failed: {other:?}"),
+            };
+            assert_eq!(cycles, jump_cycles, "opcode {opcode:04X}: timing");
+            assert_eq!(interpreter.pc, EXPECTED, "opcode {opcode:04X}: target");
+
+            let mut ops = Vec::new();
+            for index in 0..3 {
+                ops.push(TraceBuildOp {
+                    opcode: 0x4E71,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0100 + index * 2,
+                    op: JitTraceOp::Nop,
+                });
+            }
+            ops.push(TraceBuildOp {
+                opcode,
+                extension,
+                extension2: None,
+                pc: JMP_PC,
+                op: JitTraceOp::IndirectJmp {
+                    target,
+                    expected_target: Some(EXPECTED),
+                },
+            });
+
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&cpu(), 0x0100, CpuType::M68000, ops.clone(), Some(EXPECTED))
+                .unwrap_or_else(|| panic!("opcode {opcode:04X}: trace should compile"));
+            for delta in [0u32, 2] {
+                let mut native = cpu();
+                native.pc = 0x0100;
+                native.set_a(0, a0 + if target_uses_a0 { delta } else { 0 });
+                native.set_d(1, d1 + if target_uses_a0 { 0 } else { delta });
+                let native_packed = unsafe { compiled.call_native(&mut native, 1) };
+
+                let mut portable = cpu();
+                portable.pc = 0x0100;
+                portable.set_a(0, a0 + if target_uses_a0 { delta } else { 0 });
+                portable.set_d(1, d1 + if target_uses_a0 { 0 } else { delta });
+                let portable_packed = execute_portable_trace(
+                    &mut portable,
+                    &ops,
+                    CodeSpans::caller(0x0100, JMP_PC + 4),
+                );
+
+                assert_eq!(
+                    native_packed, portable_packed,
+                    "opcode {opcode:04X}, delta={delta}: packed result"
+                );
+                assert_eq!((native_packed >> 32) as u32, 4);
+                assert_eq!(native_packed as u32 as i32, 12 + jump_cycles);
+                assert_eq!(native.pc, EXPECTED + delta);
+                assert_eq!(native.ppc, JMP_PC);
+                assert_eq!(native.ir, u32::from(opcode));
+                assert_eq!(
+                    compiled.is_guarded_branch_exit(&native),
+                    delta != 0,
+                    "opcode {opcode:04X}, delta={delta}: guard classification"
+                );
+            }
+        }
     }
 
     #[test]
@@ -18037,7 +18277,10 @@ mod portable_tests {
                 extension: None,
                 extension2: None,
                 pc: 0x0106,
-                op: JitTraceOp::IndirectJmp { reg: 5 },
+                op: JitTraceOp::IndirectJmp {
+                    target: JitEa::Ind(5),
+                    expected_target: Some(0x0350),
+                },
             },
         ];
         let mut jit = TraceJit::new();
@@ -21663,11 +21906,13 @@ mod portable_tests {
                 extension: Some(0x0006),
                 extension2: None,
                 pc: JMP_PC,
-                op: JitTraceOp::PcIndexJmp {
-                    base: 0x0108,
-                    index: JitDirectReg::Data(0),
-                    index_long: false,
-                    scale: 0,
+                op: JitTraceOp::IndirectJmp {
+                    target: JitEa::PcIndex {
+                        base: 0x0108,
+                        index: JitDirectReg::Data(0),
+                        index_long: false,
+                        scale: 0,
+                    },
                     expected_target: Some(EXPECTED),
                 },
             },
@@ -22976,7 +23221,8 @@ mod durable_rejection_tests {
 
     /// Two loop heads one cache period apart share a trace-cache slot.
     /// HEAD_A's loop crosses a
-    /// trap-free stretch and then JUMPS AWAY through a computed JMP before
+    /// trap-free stretch and then JUMPS AWAY through an unsupported
+    /// absolute-long JMP before
     /// any backward branch closes it, so every recording ends
     /// `no-trace-terminal`; HEAD_B is an ordinary tight loop whose
     /// candidacy overwrites A's `Rejected` slot each time it counts.
@@ -22986,15 +23232,34 @@ mod durable_rejection_tests {
     fn build_bus() -> LinearMemoryBus {
         let mut bus = LinearMemoryBus::new(0x10000);
         // HEAD_A: ADDQ.L #1,D0; ADDQ.L #1,D1; ADDQ.L #1,D2; ADDQ.L #1,D3;
-        //         JMP (A0)                 -- A0 = HEAD_B (structural dead end)
-        for (i, w) in [0x5280u16, 0x5281, 0x5282, 0x5283, 0x4ED0]
-            .iter()
-            .enumerate()
+        //         JMP (HEAD_B).L           -- structural dead end
+        // Absolute-long JMP deliberately remains outside this experiment's
+        // guarded dynamic-EA family, so it preserves the no-terminal fixture.
+        for (i, w) in [
+            0x5280u16,
+            0x5281,
+            0x5282,
+            0x5283,
+            0x4EF9,
+            (HEAD_B >> 16) as u16,
+            HEAD_B as u16,
+        ]
+        .iter()
+        .enumerate()
         {
             bus.load(HEAD_A + 2 * i as u32, &w.to_be_bytes());
         }
-        // HEAD_B: SUBQ.W #1,D7; BNE.S HEAD_B ; then JMP (A1) -- A1 = HEAD_A
-        for (i, w) in [0x5347u16, 0x66FC, 0x4ED1].iter().enumerate() {
+        // HEAD_B: SUBQ.W #1,D7; BNE.S HEAD_B ; then JMP (HEAD_A).L
+        for (i, w) in [
+            0x5347u16,
+            0x66FC,
+            0x4EF9,
+            (HEAD_A >> 16) as u16,
+            HEAD_A as u16,
+        ]
+        .iter()
+        .enumerate()
+        {
             bus.load(HEAD_B + 2 * i as u32, &w.to_be_bytes());
         }
         bus
@@ -23004,8 +23269,6 @@ mod durable_rejection_tests {
     fn structural_rejection_survives_slot_eviction() {
         let mut bus = build_bus();
         let mut cpu = cpu_at(HEAD_A);
-        cpu.set_a(0, HEAD_B);
-        cpu.set_a(1, HEAD_A);
         // HEAD_A is only ever entered by the JMP from HEAD_B's exit; give it
         // backward-branch hits by making HEAD_B's fallthrough jump back.
         // Each outer round: A's 4 ops, then B spins D7 iterations, then back.
@@ -23101,8 +23364,6 @@ mod durable_rejection_tests {
         // `compiled_before` gate this assertion fails (HEAD_A is frozen).
         let mut bus = build_bus();
         let mut cpu = cpu_at(HEAD_A);
-        cpu.set_a(0, HEAD_B);
-        cpu.set_a(1, HEAD_A);
         with_trace_jit(|jit| jit.remember_compiled(HEAD_A));
 
         for _ in 0..40 {
@@ -23402,7 +23663,7 @@ mod durable_rejection_tests {
                     trace.ops.iter().any(|op| {
                         matches!(
                             op.op,
-                            JitTraceOp::PcIndexJmp {
+                            JitTraceOp::IndirectJmp {
                                 expected_target: Some(_),
                                 ..
                             }
