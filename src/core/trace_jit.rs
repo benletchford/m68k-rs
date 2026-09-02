@@ -52,6 +52,12 @@ const TRACE_MIN_SELF_LOOP_OPS: usize = 2;
 /// memory-ALU, and memory-heavy mixes.
 const TRACE_MIN_INDIRECT_JSR_OPS: usize = 7;
 const TRACE_HOT_THRESHOLD: u8 = 2;
+/// A non-self-loop region must demonstrate this many entries before native
+/// compilation. Its first recording is still taken at `TRACE_HOT_THRESHOLD`
+/// so true loops can compile with minimum latency; only the observed one-pass
+/// shape is deferred. This avoids paying the compiler and cache-displacement
+/// costs for startup and traversal paths that execute only a handful of times.
+const TRACE_LINEAR_HOT_THRESHOLD: u8 = 64 * TRACE_HOT_THRESHOLD;
 
 /// Hits a head must re-accumulate after its first trap-boundary closure was
 /// deferred (see `finish_recording_at_trap`): the value only needs to sit
@@ -927,6 +933,10 @@ enum TraceSlot {
         /// deferred instead of compiled; the head must re-reach
         /// `TRACE_TRAP_SEGMENT_HOT_THRESHOLD` hits before recording again.
         deferred_trap: bool,
+        /// The first completed recording was non-self-looping, so this head
+        /// uses the second-stage linear admission threshold. Mirrored into
+        /// the slot so ordinary JIT misses never consult the durable table.
+        deferred_linear: bool,
     },
     Rejected {
         pc: u32,
@@ -985,6 +995,10 @@ pub(crate) struct TraceJit {
     /// observations with no compile in between. A successful compile
     /// clears the count; SMC under the head clears it with the verdict.
     no_terminal_strikes: Vec<[(u32, u8); 2]>,
+    /// Heads whose first hot recording proved to be a non-self-loop region.
+    /// Keep the shape verdict across direct-mapped slot eviction so alias
+    /// churn cannot repeatedly reset the head to the eager threshold.
+    deferred_linear: Vec<[u32; 2]>,
 }
 
 impl fmt::Debug for TraceJit {
@@ -1023,6 +1037,7 @@ impl TraceJit {
             structurally_rejected: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
             compiled_before: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
             no_terminal_strikes: vec![[(u32::MAX, 0); 2]; TRACE_CACHE_SIZE],
+            deferred_linear: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
         }
     }
 
@@ -1175,6 +1190,7 @@ impl TraceJit {
                 // Code changed under this head, so any structural verdict
                 // about the old bytes is void too.
                 self.forget_structural_rejection(pc);
+                self.clear_linear_deferral(pc);
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
                 if index > 0 {
@@ -1389,6 +1405,7 @@ impl TraceJit {
                     adaptive_rerecords,
                     allow_call_through,
                     deferred_trap: false,
+                    deferred_linear: false,
                 };
                 cpu.trace_record_skip = [TRACE_PC_NONE; 4];
                 cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
@@ -1484,12 +1501,15 @@ impl TraceJit {
                 adaptive_rerecords,
                 allow_call_through,
                 deferred_trap,
+                deferred_linear,
             } if *counted_pc == pc && *counted_type == cpu_type => {
                 if !from_exit_seed {
                     *hits = hits.saturating_add(1);
                 }
                 let threshold = if *deferred_trap {
                     TRACE_TRAP_SEGMENT_HOT_THRESHOLD
+                } else if *deferred_linear {
+                    TRACE_LINEAR_HOT_THRESHOLD
                 } else {
                     TRACE_HOT_THRESHOLD
                 };
@@ -1544,6 +1564,35 @@ impl TraceJit {
     fn has_call_permission(&self, pc: u32) -> bool {
         let ways = &self.earned_call_permission[trace_cache_index(pc)];
         ways[0] == pc || ways[1] == pc
+    }
+
+    fn defer_linear_compilation(&mut self, pc: u32) {
+        let ways = &mut self.deferred_linear[trace_cache_index(pc)];
+        if ways[0] == pc || ways[1] == pc {
+            return;
+        }
+        if ways[0] == u32::MAX {
+            ways[0] = pc;
+        } else if ways[1] == u32::MAX {
+            ways[1] = pc;
+        } else {
+            ways[1] = ways[0];
+            ways[0] = pc;
+        }
+    }
+
+    fn linear_compilation_deferred(&self, pc: u32) -> bool {
+        let ways = &self.deferred_linear[trace_cache_index(pc)];
+        ways[0] == pc || ways[1] == pc
+    }
+
+    fn clear_linear_deferral(&mut self, pc: u32) {
+        let ways = &mut self.deferred_linear[trace_cache_index(pc)];
+        for way in ways {
+            if *way == pc {
+                *way = u32::MAX;
+            }
+        }
     }
 
     fn remember_structural_rejection(&mut self, pc: u32) {
@@ -1652,6 +1701,7 @@ impl TraceJit {
         }
 
         let idx = trace_cache_index(pc);
+        let linear_history = &self.deferred_linear;
         match &self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
@@ -1684,6 +1734,8 @@ impl TraceJit {
                 if !self.is_structurally_rejected(pc)
                     && (self.has_compiled_before(pc) || self.has_no_terminal_strikes(pc))
                 {
+                    let ways = &linear_history[idx];
+                    let deferred_linear = ways[0] == pc || ways[1] == pc;
                     self.slots[idx] = TraceSlot::Counting {
                         pc,
                         cpu_type,
@@ -1691,6 +1743,7 @@ impl TraceJit {
                         adaptive_rerecords: 0,
                         allow_call_through: self.has_call_permission(pc),
                         deferred_trap: false,
+                        deferred_linear,
                     };
                     TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
                 }
@@ -1702,6 +1755,8 @@ impl TraceJit {
                     // the same uncompilable region.
                     return;
                 }
+                let ways = &linear_history[idx];
+                let deferred_linear = ways[0] == pc || ways[1] == pc;
                 self.slots[idx] = TraceSlot::Counting {
                     pc,
                     cpu_type,
@@ -1709,6 +1764,7 @@ impl TraceJit {
                     adaptive_rerecords: 0,
                     allow_call_through: self.has_call_permission(pc),
                     deferred_trap: false,
+                    deferred_linear,
                 };
                 TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
             }
@@ -1731,6 +1787,7 @@ impl TraceJit {
         // already earned.
         let permission = self.has_call_permission(exit_pc);
         let structurally_rejected = self.is_structurally_rejected(exit_pc);
+        let linear_history = &self.deferred_linear;
         match &mut self.slots[idx] {
             TraceSlot::Compiled(CompiledTrace {
                 pc: compiled_pc,
@@ -1751,10 +1808,13 @@ impl TraceJit {
                 adaptive_rerecords,
                 allow_call_through,
                 deferred_trap,
+                deferred_linear,
             } if *counted_pc == exit_pc && *counted_type == cpu_type => {
                 *hits = hits.saturating_add(1);
                 let threshold = if *deferred_trap {
                     TRACE_TRAP_SEGMENT_HOT_THRESHOLD
+                } else if *deferred_linear {
+                    TRACE_LINEAR_HOT_THRESHOLD
                 } else {
                     TRACE_HOT_THRESHOLD
                 };
@@ -1793,6 +1853,8 @@ impl TraceJit {
                 if structurally_rejected {
                     return ExitSeed::None;
                 }
+                let ways = &linear_history[idx];
+                let linear_deferred = ways[0] == exit_pc || ways[1] == exit_pc;
                 *slot = TraceSlot::Counting {
                     pc: exit_pc,
                     cpu_type,
@@ -1800,6 +1862,7 @@ impl TraceJit {
                     adaptive_rerecords: 0,
                     allow_call_through: permission,
                     deferred_trap: false,
+                    deferred_linear: linear_deferred,
                 };
                 self.pending_exit_seed = Some((exit_pc, cpu_type));
                 ExitSeed::None
@@ -1924,6 +1987,7 @@ impl TraceJit {
                 adaptive_rerecords,
                 allow_call_through,
                 deferred_trap: true,
+                deferred_linear: false,
             };
             return TrapFinish::Closed;
         }
@@ -2036,6 +2100,43 @@ impl TraceJit {
             };
             return;
         }
+
+        let self_loop = exit_pc == start_pc
+            || recording
+                .ops
+                .last()
+                .is_some_and(|op| op.op.taken_target(op.pc) == Some(start_pc));
+        let has_terminal = recording.ops.last().is_some_and(|op| op.op.ends_trace());
+        // Only a path that closed on its own terms (or a deliberately
+        // salvaged prefix ending at a blocker) proves a reusable linear
+        // shape. A host boundary or non-sequential trap merely interrupted
+        // recording; treating its earlier guarded branch as the terminal
+        // would defer an incomplete observation and hide the real stop.
+        if matches!(end, RecordingEnd::Region | RecordingEnd::Blocker)
+            && has_terminal
+            && !self_loop
+            // A guard-exit continuation is already backed by a hot compiled
+            // parent that can chain to it. Deferring that connector breaks
+            // the native trace graph into shorter calls, so reserve the
+            // raised threshold for independently discovered linear heads.
+            && !recording.from_exit_seed
+            && TRACE_LINEAR_HOT_THRESHOLD > TRACE_HOT_THRESHOLD
+            && !self.linear_compilation_deferred(start_pc)
+        {
+            self.defer_linear_compilation(start_pc);
+            self.slots[idx] = TraceSlot::Counting {
+                pc: start_pc,
+                cpu_type,
+                hits: 0,
+                adaptive_rerecords,
+                allow_call_through: recording.allow_call_through,
+                deferred_trap: false,
+                deferred_linear: true,
+            };
+            return;
+        }
+        self.clear_linear_deferral(start_pc);
+
         let outcome =
             self.compile_decoded_ops_reason(cpu, start_pc, cpu_type, recording.ops, Some(exit_pc));
         #[cfg(feature = "trace-profile")]
@@ -2405,6 +2506,7 @@ impl TraceJit {
                         adaptive_rerecords: 0,
                         allow_call_through: true,
                         deferred_trap: false,
+                        deferred_linear: false,
                     };
                     // The reject pushed the head into the probe-skip
                     // filter; clear it so the retry can be probed.
@@ -14391,6 +14493,24 @@ mod portable_tests {
         // Phase 1: 30 instructions of taken-spine iterations.
         step_n(&mut cpu_a, &mut bus_a, 30);
         batch_n(&mut cpu_b, &mut bus_b, 30);
+        let cont_pc = CODE_BASE + 4;
+        // This test concerns validation of an already-admitted continuation,
+        // not its profitability policy; place the candidate one hit before
+        // its second-stage threshold so phase 2 still exercises recording,
+        // compilation, chaining, and validation without spending the test's
+        // deliberately short adaptive-rerecording window on admission.
+        with_trace_jit(|jit| {
+            jit.defer_linear_compilation(cont_pc);
+            jit.slots[trace_cache_index(cont_pc)] = TraceSlot::Counting {
+                pc: cont_pc,
+                cpu_type: CpuType::M68040,
+                hits: TRACE_LINEAR_HOT_THRESHOLD - 1,
+                adaptive_rerecords: 0,
+                allow_call_through: false,
+                deferred_trap: false,
+                deferred_linear: true,
+            };
+        });
         // Phase 2: flip the predicate in both twins; 30 instructions of
         // guard exits, seeding, and chaining.
         cpu_a.set_d(1, 9);
@@ -14399,7 +14519,6 @@ mod portable_tests {
         batch_n(&mut cpu_b, &mut bus_b, 30);
         // The continuation must exist as its own compiled trace for phase 3
         // to test anything.
-        let cont_pc = CODE_BASE + 4;
         let cont_compiled = with_trace_jit(|jit| {
             matches!(
                 &jit.slots[trace_cache_index(cont_pc)],
@@ -16833,6 +16952,161 @@ mod portable_tests {
     }
 
     #[test]
+    fn linear_trace_first_closure_defers_and_second_closure_compiles() {
+        const HEAD: u32 = 0x0100;
+        let make_recording = || TraceRecording {
+            start_pc: HEAD,
+            cpu_type: CpuType::M68000,
+            ops: rts_region_ops(TRACE_MIN_INDIRECT_JSR_OPS),
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            pending_return: None,
+            skip_record_until: None,
+            from_exit_seed: false,
+        };
+        let mut cpu = cpu();
+        let mut jit = TraceJit::new();
+
+        jit.recording = Some(make_recording());
+        jit.finish_recording(&mut cpu, 0x0456, RecordingEnd::Region);
+        assert!(jit.linear_compilation_deferred(HEAD));
+        assert!(matches!(
+            &jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Counting {
+                pc: HEAD,
+                hits: 0,
+                deferred_trap: false,
+                deferred_linear: true,
+                ..
+            }
+        ));
+
+        // The shape verdict is independent of the direct-mapped trace slot:
+        // an alias can displace the candidate without making the original
+        // head look newly discovered and cheap to compile again.
+        let collider = HEAD + ((TRACE_CACHE_SIZE as u32) << 1);
+        assert_eq!(trace_cache_index(HEAD), trace_cache_index(collider));
+        jit.slots[trace_cache_index(HEAD)] = TraceSlot::Counting {
+            pc: collider,
+            cpu_type: CpuType::M68000,
+            hits: 1,
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            deferred_trap: false,
+            deferred_linear: false,
+        };
+        assert!(jit.linear_compilation_deferred(HEAD));
+
+        // Reinstall the head and prove that both exit-seeded admission and
+        // the second completed recording honor the raised threshold.
+        jit.slots[trace_cache_index(HEAD)] = TraceSlot::Counting {
+            pc: HEAD,
+            cpu_type: CpuType::M68000,
+            hits: 0,
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            deferred_trap: false,
+            deferred_linear: true,
+        };
+        for _ in 1..TRACE_LINEAR_HOT_THRESHOLD {
+            assert!(matches!(
+                jit.note_trace_exit(HEAD, CpuType::M68000, false),
+                ExitSeed::None
+            ));
+            assert!(jit.recording.is_none());
+        }
+        assert!(matches!(
+            jit.note_trace_exit(HEAD, CpuType::M68000, false),
+            ExitSeed::StartRecording
+        ));
+
+        jit.recording = Some(make_recording());
+        jit.finish_recording(&mut cpu, 0x0456, RecordingEnd::Region);
+        assert!(!jit.linear_compilation_deferred(HEAD));
+        assert!(matches!(
+            &jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Compiled(trace) if trace.pc == HEAD
+        ));
+    }
+
+    #[test]
+    fn exit_seeded_linear_trace_compiles_without_shape_deferral() {
+        const HEAD: u32 = 0x0100;
+        let mut cpu = cpu();
+        let mut jit = TraceJit::new();
+        jit.recording = Some(TraceRecording {
+            start_pc: HEAD,
+            cpu_type: CpuType::M68000,
+            ops: rts_region_ops(TRACE_MIN_INDIRECT_JSR_OPS),
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            pending_return: None,
+            skip_record_until: None,
+            from_exit_seed: true,
+        });
+
+        jit.finish_recording(&mut cpu, 0x0456, RecordingEnd::Region);
+
+        assert!(!jit.linear_compilation_deferred(HEAD));
+        assert!(matches!(
+            &jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Compiled(trace) if trace.pc == HEAD
+        ));
+    }
+
+    #[test]
+    fn self_loop_compiles_at_the_base_admission_threshold() {
+        const HEAD: u32 = 0x0100;
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x7001,
+                extension: None,
+                extension2: None,
+                pc: HEAD,
+                op: JitTraceOp::Moveq { reg: 0, data: 1 },
+            },
+            TraceBuildOp {
+                opcode: 0x7201,
+                extension: None,
+                extension2: None,
+                pc: HEAD + 2,
+                op: JitTraceOp::Moveq { reg: 1, data: 1 },
+            },
+            TraceBuildOp {
+                opcode: 0x60FA,
+                extension: None,
+                extension2: None,
+                pc: HEAD + 4,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: -6,
+                    length: 2,
+                    expected_taken: None,
+                },
+            },
+        ];
+        let mut cpu = cpu();
+        let mut jit = TraceJit::new();
+        jit.recording = Some(TraceRecording {
+            start_pc: HEAD,
+            cpu_type: CpuType::M68000,
+            ops,
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            pending_return: None,
+            skip_record_until: None,
+            from_exit_seed: false,
+        });
+
+        jit.finish_recording(&mut cpu, HEAD, RecordingEnd::Region);
+        assert!(!jit.linear_compilation_deferred(HEAD));
+        assert!(matches!(
+            &jit.slots[trace_cache_index(HEAD)],
+            TraceSlot::Compiled(trace) if trace.pc == HEAD
+        ));
+    }
+
+    #[test]
     fn return_exit_reuses_the_indirect_call_break_even_length() {
         let compile_cpu = cpu();
         let mut jit = TraceJit::new();
@@ -16954,6 +17228,9 @@ mod portable_tests {
         prefix.pop();
         let mut cpu = cpu();
         let mut jit = TraceJit::new();
+        // This test exercises ReturnExit recording semantics, not first-pass
+        // admission. Treat shape discovery as already completed.
+        jit.defer_linear_compilation(0x0100);
         jit.recording = Some(TraceRecording {
             start_pc: 0x0100,
             cpu_type: CpuType::M68000,
@@ -16992,6 +17269,9 @@ mod portable_tests {
         prefix.pop();
         let mut cpu = cpu();
         let mut jit = TraceJit::new();
+        // This test exercises ReturnExit recording semantics, not first-pass
+        // admission. Treat shape discovery as already completed.
+        jit.defer_linear_compilation(0x0100);
         jit.recording = Some(TraceRecording {
             start_pc: 0x0100,
             cpu_type: CpuType::M68000,
