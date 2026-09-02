@@ -493,6 +493,15 @@ pub(crate) enum JitTraceOp {
         return_pc: u32,
         cycles: i32,
     },
+    /// A nested call at the recorder's one-level depth cap. Execute the
+    /// architectural push, land at the observed static callee, and end the
+    /// trace there; normal exit seeding can then compile or chain that callee
+    /// without adding work to interpreted call dispatch.
+    CallExit {
+        return_pc: u32,
+        target_pc: u32,
+        cycles: i32,
+    },
     /// The callee's RTS: pops the return address and bails unless it
     /// equals the recorded call's return -- a different return value is
     /// a different flow. Checked before the stack pointer moves.
@@ -894,6 +903,11 @@ struct CompiledTrace {
     /// iterations.
     #[cfg_attr(all(feature = "jit", not(target_family = "wasm")), allow(dead_code))]
     self_loop: bool,
+    /// A clean completion should seed candidacy at its exit (a dynamic
+    /// return continuation or a forward nested-call callee). Computed once
+    /// when the trace is built instead of decoding the last op on every
+    /// native entry.
+    seeded_exit: bool,
     /// The native body was generated as a counted loop. Short read/write
     /// MoveMem loops deliberately retain the original one-pass body: the
     /// extra loop-carried state costs more than the saved call boundary.
@@ -1329,10 +1343,7 @@ impl TraceJit {
             // head, which a fresh continuation never is, so without this
             // the continuations after a returning subroutine would only
             // ever compile by luck of a backward branch.
-            let ends_in_return_exit = trace
-                .ops
-                .last()
-                .is_some_and(|op| matches!(op.op, JitTraceOp::ReturnExit { .. }));
+            let ends_in_seeded_exit = trace.seeded_exit;
             // A generated loop clearly amortizes the ABI boundary for
             // profiled mixed 3+-op and read-only loops. A
             // two-op read/write MoveMem loop is already dominated by its two
@@ -1544,12 +1555,12 @@ impl TraceJit {
             if clean_link_exit {
                 super::trace_profile::note_link_exit(pc, cpu_type);
             }
-            // A clean ReturnExit completion seeds its dynamic target
-            // (each caller's continuation) even when nothing is compiled
-            // there yet; see `ends_in_return_exit` above.
-            let return_exit_completion =
-                ends_in_return_exit && !guarded_branch_exit && !partial_call_this_entry;
-            if (guarded_branch_exit || clean_link_exit || return_exit_completion)
+            // A clean ReturnExit completion seeds its dynamic continuation;
+            // a CallExit similarly seeds the static nested callee that the
+            // recorder could not include at its one-level depth cap.
+            let seeded_exit_completion =
+                ends_in_seeded_exit && !guarded_branch_exit && !partial_call_this_entry;
+            if (guarded_branch_exit || clean_link_exit || seeded_exit_completion)
                 && !single_iter
                 && chain_budget > 0
                 && cpu.pc != pc
@@ -2494,9 +2505,24 @@ impl TraceJit {
                 JitTraceOp::CallThrough { return_pc, .. } => {
                     let recording = self.recording.as_mut().unwrap();
                     if recording.pending_return.is_some() {
-                        // Depth cap: a nested call ends the region at the
-                        // outer callee's boundary.
-                        self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                        // A forward nested call has no backward edge to seed
+                        // its callee independently. Make the call itself the
+                        // trace terminal so the normal compiled-exit path can
+                        // seed and eventually chain the callee. Backward
+                        // callees keep the existing edge-admission behavior.
+                        if next_pc > executed_pc {
+                            recording.ops.push(TraceBuildOp {
+                                op: JitTraceOp::CallExit {
+                                    return_pc,
+                                    target_pc: next_pc,
+                                    cycles: call_op.op.max_cycles(),
+                                },
+                                ..call_op
+                            });
+                            self.finish_recording(cpu, next_pc, RecordingEnd::Region);
+                        } else {
+                            self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                        }
                         return;
                     }
                     // The caller's recorded bytes and the callee's each get
@@ -2851,7 +2877,9 @@ impl TraceJit {
         let ends_in_dynamic_exit = ops.last().is_some_and(|op| {
             matches!(
                 op.op,
-                JitTraceOp::IndirectJsr { .. } | JitTraceOp::ReturnExit { .. }
+                JitTraceOp::IndirectJsr { .. }
+                    | JitTraceOp::ReturnExit { .. }
+                    | JitTraceOp::CallExit { .. }
             )
         });
         if ends_in_dynamic_exit && ops.len() < TRACE_MIN_INDIRECT_JSR_OPS {
@@ -2929,6 +2957,7 @@ impl TraceJit {
                     | JitTraceOp::AnDispBit { .. }
                     | JitTraceOp::IndirectJsr { .. }
                     | JitTraceOp::CallThrough { .. }
+                    | JitTraceOp::CallExit { .. }
                     | JitTraceOp::RtsReturn { .. }
                     | JitTraceOp::ReturnExit { .. }
             )
@@ -3370,7 +3399,7 @@ impl TraceJit {
                         let env = mem_env.as_ref().expect("Unlk implies a window env");
                         emit_unlk(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
-                    JitTraceOp::CallThrough { .. } => {
+                    JitTraceOp::CallThrough { .. } | JitTraceOp::CallExit { .. } => {
                         let env = mem_env.as_ref().expect("CallThrough implies a window env");
                         emit_call_through(&mut builder, cpu_ptr, *op, env, &mut bails, bail_at)
                     }
@@ -3494,6 +3523,12 @@ impl TraceJit {
         };
 
         let guarded_ops = guarded_op_mask(ops);
+        let seeded_exit = ops.last().is_some_and(|op| {
+            matches!(
+                op.op,
+                JitTraceOp::ReturnExit { .. } | JitTraceOp::CallExit { .. }
+            )
+        });
         Some(CompiledTrace {
             pc: start_pc,
             cpu_type,
@@ -3502,6 +3537,7 @@ impl TraceJit {
             code_segments,
             max_cycles,
             self_loop,
+            seeded_exit,
             native_loop,
             callee_start,
             callee_end,
@@ -3520,6 +3556,12 @@ impl TraceJit {
     #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
     fn compile_ops(&mut self, params: CompileParams<'_>) -> Option<CompiledTrace> {
         let guarded_ops = guarded_op_mask(params.ops);
+        let seeded_exit = params.ops.last().is_some_and(|op| {
+            matches!(
+                op.op,
+                JitTraceOp::ReturnExit { .. } | JitTraceOp::CallExit { .. }
+            )
+        });
         Some(CompiledTrace {
             pc: params.start_pc,
             cpu_type: params.cpu_type,
@@ -3530,6 +3572,7 @@ impl TraceJit {
             code_segments: params.code_segments,
             max_cycles: params.max_cycles,
             self_loop: params.self_loop,
+            seeded_exit,
             needs_window: params.needs_window,
             code_start: params.code_start,
             code_end: params.code_end,
@@ -3684,6 +3727,7 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::MoveImmReg { .. }
             | JitTraceOp::MoveImmMem { .. }
             | JitTraceOp::CallThrough { .. }
+            | JitTraceOp::CallExit { .. }
             | JitTraceOp::RtsReturn { .. }
             | JitTraceOp::ReturnExit { .. } => return false,
         }
@@ -4174,7 +4218,7 @@ impl JitTraceOp {
             Self::Unlk { .. } => 12,
             // MC68000 BSR is 18(2/2) for every displacement width; RTS is
             // 16(4/0).
-            Self::CallThrough { cycles, .. } => cycles,
+            Self::CallThrough { cycles, .. } | Self::CallExit { cycles, .. } => cycles,
             Self::RtsReturn { .. } => 16,
             Self::ReturnExit { cycles, .. } => cycles,
         }
@@ -4186,6 +4230,7 @@ impl JitTraceOp {
             Self::Branch { .. }
                 | Self::Dbcc { .. }
                 | Self::IndirectJsr { .. }
+                | Self::CallExit { .. }
                 | Self::PcIndexJmp {
                     expected_target: Some(_),
                     ..
@@ -5865,7 +5910,10 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     if matches!(op.op, JitTraceOp::Unlk { .. }) {
         return execute_portable_unlk(cpu, op);
     }
-    if matches!(op.op, JitTraceOp::CallThrough { .. }) {
+    if matches!(
+        op.op,
+        JitTraceOp::CallThrough { .. } | JitTraceOp::CallExit { .. }
+    ) {
         return execute_portable_call_through(cpu, op, spans);
     }
     if matches!(op.op, JitTraceOp::RtsReturn { .. }) {
@@ -7427,7 +7475,7 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::Link { .. } | JitTraceOp::Unlk { .. } => {
             unreachable!("LINK/UNLK are handled by execute_portable_link/unlk")
         }
-        JitTraceOp::CallThrough { .. } => {
+        JitTraceOp::CallThrough { .. } | JitTraceOp::CallExit { .. } => {
             unreachable!("CallThrough is handled by execute_portable_call_through")
         }
         JitTraceOp::RtsReturn { .. } => {
@@ -8133,7 +8181,7 @@ fn emit_jit_op(
         JitTraceOp::PeaInd { .. } | JitTraceOp::PeaDisp { .. } | JitTraceOp::PeaAbs { .. } => {
             unreachable!("PEA is emitted by emit_pea_disp")
         }
-        JitTraceOp::CallThrough { .. } => {
+        JitTraceOp::CallThrough { .. } | JitTraceOp::CallExit { .. } => {
             unreachable!("CallThrough is emitted by emit_call_through")
         }
         JitTraceOp::RtsReturn { .. } => {
@@ -9098,8 +9146,14 @@ fn emit_call_through(
     bails: &mut Vec<BailReq>,
     at: BailAt,
 ) -> Value {
-    let JitTraceOp::CallThrough { return_pc, .. } = trace.op else {
-        unreachable!("expected a call-through trace op")
+    let (return_pc, exit_target) = match trace.op {
+        JitTraceOp::CallThrough { return_pc, .. } => (return_pc, None),
+        JitTraceOp::CallExit {
+            return_pc,
+            target_pc,
+            ..
+        } => (return_pc, Some(target_pc)),
+        _ => unreachable!("expected a call-through or call-exit trace op"),
     };
     let bail = builder.create_block();
     bails.push(BailReq {
@@ -9114,6 +9168,10 @@ fn emit_call_through(
     let value = iconst_u32(builder, return_pc);
     window_store(builder, env, off, Size::Long, value);
     store_reg(builder, cpu, JitDirectReg::Addr(7), new_sp);
+    if let Some(target_pc) = exit_target {
+        store_bool(builder, cpu, offset_of!(CpuCore, change_of_flow), true);
+        store_u32(builder, cpu, offset_of!(CpuCore, pc), target_pc);
+    }
     cycles_const(builder, trace.op.max_cycles())
 }
 
@@ -9195,8 +9253,14 @@ fn execute_portable_call_through(
     trace: TraceBuildOp,
     spans: CodeSpans,
 ) -> Option<i32> {
-    let JitTraceOp::CallThrough { return_pc, .. } = trace.op else {
-        return None;
+    let (return_pc, exit_target) = match trace.op {
+        JitTraceOp::CallThrough { return_pc, .. } => (return_pc, None),
+        JitTraceOp::CallExit {
+            return_pc,
+            target_pc,
+            ..
+        } => (return_pc, Some(target_pc)),
+        _ => return None,
     };
     if cpu.fm_len == 0 {
         return None;
@@ -9222,6 +9286,10 @@ fn execute_portable_call_through(
         *p.add(3) = b[3];
     }
     cpu.dar[15] = new_sp;
+    if let Some(target_pc) = exit_target {
+        cpu.change_of_flow = true;
+        cpu.pc = target_pc;
+    }
     Some(trace.op.max_cycles())
 }
 
@@ -17094,6 +17162,128 @@ mod portable_tests {
             },
         });
         ops
+    }
+
+    #[test]
+    fn forward_nested_call_becomes_an_executing_seeded_exit() {
+        const HEAD: u32 = 0x0100;
+        const CALL_PC: u32 = 0x010C;
+        const TARGET: u32 = 0x0180;
+        const RETURN: u32 = 0x010E;
+
+        let mut prefix = rts_region_ops(TRACE_MIN_INDIRECT_JSR_OPS);
+        prefix.pop();
+        let mut recording_cpu = cpu();
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        // BSR.S +0x72: base is RETURN, destination is TARGET.
+        bus.write_word(CALL_PC, 0x6172);
+        recording_cpu.ir = 0x6172;
+        recording_cpu.pc = TARGET;
+        recording_cpu.trace_recording = true;
+
+        let mut jit = TraceJit::new();
+        // This test is about the depth-cap terminal, not first-pass linear
+        // admission, so treat the shape as already deferred once.
+        jit.defer_linear_compilation(HEAD);
+        jit.recording = Some(TraceRecording {
+            start_pc: HEAD,
+            cpu_type: CpuType::M68000,
+            ops: prefix,
+            adaptive_rerecords: 0,
+            allow_call_through: true,
+            pending_return: Some(0x0200),
+            skip_record_until: None,
+            from_exit_seed: false,
+        });
+        jit.record_executed(&mut recording_cpu, &mut bus, CALL_PC, TARGET);
+
+        let TraceSlot::Compiled(trace) = &jit.slots[trace_cache_index(HEAD)] else {
+            panic!("the forward nested-call region should compile");
+        };
+        assert!(matches!(
+            trace.ops.last().unwrap().op,
+            JitTraceOp::CallExit {
+                return_pc: RETURN,
+                target_pc: TARGET,
+                cycles: 18,
+            }
+        ));
+        assert!(trace.seeded_exit);
+        assert_eq!(
+            (trace.code_start, trace.code_end),
+            (HEAD, RETURN),
+            "the terminal call bytes belong to the caller snapshot"
+        );
+        assert_eq!(
+            (trace.callee_start, trace.callee_end),
+            (0, 0),
+            "CallExit does not pretend the separately compiled callee is inline"
+        );
+        let ops = trace.ops.clone();
+
+        let mut portable_memory = vec![0u8; 0x1000];
+        let mut portable = cpu();
+        attach_window(&mut portable, &mut portable_memory);
+        portable.set_a(7, 0x0800);
+        portable.change_of_flow = false;
+        let portable_packed =
+            execute_portable_trace(&mut portable, &ops, CodeSpans::caller(HEAD, RETURN));
+        assert_eq!(
+            (portable_packed >> 32) as u32,
+            TRACE_MIN_INDIRECT_JSR_OPS as u32
+        );
+        assert_eq!(portable_packed as u32 as i32, 42); // six MOVEQs + BSR
+        assert_eq!(portable.a(7), 0x07FC);
+        assert_eq!(&portable_memory[0x07FC..0x0800], &RETURN.to_be_bytes());
+        assert_eq!(portable.pc, TARGET);
+        assert!(portable.change_of_flow);
+
+        // The push is a checked operation. If its address is outside the
+        // active window, the prefix remains committed but the call itself
+        // must not change SP, PC, flow state, or memory; full dispatch will
+        // retry it at CALL_PC.
+        let prepare_bail = |memory: &mut Vec<u8>| {
+            let mut bail = cpu();
+            attach_window(&mut bail, memory);
+            bail.set_a(7, 2);
+            bail.pc = HEAD;
+            bail.change_of_flow = false;
+            bail
+        };
+        let mut portable_bail_memory = vec![0u8; 0x1000];
+        let mut portable_bail = prepare_bail(&mut portable_bail_memory);
+        let portable_bail_packed =
+            execute_portable_trace(&mut portable_bail, &ops, CodeSpans::caller(HEAD, RETURN));
+        assert_eq!((portable_bail_packed >> 32) as u32, ops.len() as u32 - 1);
+        assert_eq!(portable_bail_packed as u32 as i32, 24); // six MOVEQs only
+        assert_eq!(portable_bail.a(7), 2);
+        assert_eq!(portable_bail.pc, CALL_PC);
+        assert!(!portable_bail.change_of_flow);
+        assert!(portable_bail_memory.iter().all(|&byte| byte == 0));
+
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        {
+            let mut native_memory = vec![0u8; 0x1000];
+            let mut native = cpu();
+            attach_window(&mut native, &mut native_memory);
+            native.set_a(7, 0x0800);
+            native.change_of_flow = false;
+            let native_packed = unsafe { trace.call_native(&mut native, 1) };
+            assert_eq!(native_packed, portable_packed);
+            assert_eq!(native.dar, portable.dar);
+            assert_eq!(native.pc, portable.pc);
+            assert_eq!(native.change_of_flow, portable.change_of_flow);
+            assert_eq!(native_memory, portable_memory);
+
+            let mut native_bail_memory = vec![0u8; 0x1000];
+            let mut native_bail = prepare_bail(&mut native_bail_memory);
+            let native_bail_packed = unsafe { trace.call_native(&mut native_bail, 1) };
+            assert_eq!(native_bail_packed, portable_bail_packed);
+            assert_eq!(native_bail.dar, portable_bail.dar);
+            assert_eq!(native_bail.pc, portable_bail.pc);
+            assert_eq!(native_bail.change_of_flow, portable_bail.change_of_flow);
+            assert_eq!(native_bail_memory, portable_bail_memory);
+        }
     }
 
     #[test]
