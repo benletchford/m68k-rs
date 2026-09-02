@@ -485,6 +485,12 @@ pub(crate) enum JitTraceOp {
     IndirectJsr {
         target: JitEa,
     },
+    /// Terminal `JMP (An)`. Unlike an indirect call, this only transfers
+    /// control: there is no stack access, so a short region can still
+    /// amortize trace entry and validation.
+    IndirectJmp {
+        reg: u8,
+    },
     /// A BSR recorded THROUGH: pushes the constant return address and
     /// falls through to the callee's ops, which follow inline in the
     /// trace. Admitted only on a call-through retry recording.
@@ -2739,6 +2745,11 @@ impl TraceJit {
                 self.finish_recording(cpu, next_pc, RecordingEnd::Region);
                 return;
             }
+            JitTraceOp::IndirectJmp { .. } => {
+                self.recording.as_mut().unwrap().ops.push(op);
+                self.finish_recording(cpu, next_pc, RecordingEnd::Region);
+                return;
+            }
             // A bare return is the region's dynamic exit: the trace ends
             // here and execution continues at whatever address the guest
             // stack held (next_pc), which exit seeding turns into a
@@ -3759,6 +3770,7 @@ fn is_pure_poll_loop(ops: &[TraceBuildOp]) -> bool {
             | JitTraceOp::Swap { .. }
             | JitTraceOp::Dbcc { .. }
             | JitTraceOp::IndirectJsr { .. }
+            | JitTraceOp::IndirectJmp { .. }
             | JitTraceOp::MoveMem { .. }
             | JitTraceOp::MovemWordPostInc { .. }
             | JitTraceOp::AluMemToReg { .. }
@@ -4270,6 +4282,8 @@ impl JitTraceOp {
                 target: JitEa::Disp(_, _),
             } => 18,
             Self::IndirectJsr { .. } => unreachable!("JSR decoder admitted unsupported EA"),
+            // M68000UM control-address timing: JMP (An) is 8(2/0).
+            Self::IndirectJmp { .. } => 8,
             // These ops only execute in instruction-budgeted fastmem mode;
             // conservative cycle maxima preserve the trace headroom guard.
             Self::MemAddqSubq { .. } | Self::AnDispUnary { .. } | Self::AnDispBit { .. } => 24,
@@ -4296,6 +4310,7 @@ impl JitTraceOp {
             Self::Branch { .. }
                 | Self::Dbcc { .. }
                 | Self::IndirectJsr { .. }
+                | Self::IndirectJmp { .. }
                 | Self::CallExit { .. }
                 | Self::PcIndexJmp {
                     expected_target: Some(_),
@@ -4403,6 +4418,9 @@ fn decode_trace_op<B: AddressBus>(
         return Some(op);
     }
     if let Some(op) = decode_indirect_jsr_trace_op(cpu, bus, pc, opcode) {
+        return Some(op);
+    }
+    if let Some(op) = decode_indirect_jmp_trace_op(pc, opcode) {
         return Some(op);
     }
     if let Some(op) = decode_return_exit_trace_op(cpu, bus, pc, opcode, cpu_type) {
@@ -4886,6 +4904,21 @@ fn decode_indirect_jsr_trace_op<B: AddressBus>(
         extension2: None,
         pc,
         op: JitTraceOp::IndirectJsr { target },
+    })
+}
+
+fn decode_indirect_jmp_trace_op(pc: u32, opcode: u16) -> Option<TraceBuildOp> {
+    if (opcode & 0xFFF8) != 0x4ED0 {
+        return None;
+    }
+    Some(TraceBuildOp {
+        opcode,
+        extension: None,
+        extension2: None,
+        pc,
+        op: JitTraceOp::IndirectJmp {
+            reg: (opcode & 7) as u8,
+        },
     })
 }
 
@@ -7149,6 +7182,11 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
             cpu.change_of_flow = true;
             14
         }
+        JitTraceOp::IndirectJmp { reg } => {
+            cpu.pc = cpu.a(reg as usize);
+            cpu.change_of_flow = true;
+            8
+        }
         JitTraceOp::Moveq { reg, data } => {
             cpu.dar[reg as usize] = data;
             cpu.n_flag = if (data as i32) < 0 { NFLAG_SET } else { 0 };
@@ -8452,6 +8490,12 @@ fn emit_jit_op(
         }
         JitTraceOp::IndirectJsr { .. } => {
             unreachable!("IndirectJsr is emitted by emit_indirect_jsr")
+        }
+        JitTraceOp::IndirectJmp { reg } => {
+            let target = load_reg(builder, cpu, JitDirectReg::Addr(reg));
+            store_bool(builder, cpu, offset_of!(CpuCore, change_of_flow), true);
+            store_value_u32(builder, cpu, offset_of!(CpuCore, pc), target);
+            cycles_const(builder, 8)
         }
         JitTraceOp::Branch {
             condition,
@@ -12216,7 +12260,7 @@ mod portable_tests {
     }
 
     #[test]
-    fn decodes_indirect_jsr_trace_boundary() {
+    fn decodes_indirect_control_trace_boundaries() {
         let cpu = cpu();
         let mut mem = super::super::memory::LinearMemoryBus::new(0x1000);
         mem.write_word(0x0100, 0x4E90); // JSR (A0)
@@ -12243,6 +12287,35 @@ mod portable_tests {
                 target: JitEa::Disp(5, -16)
             }
         ));
+
+        mem.write_word(0x0100, 0x4ED1); // JMP (A1)
+        let jmp = decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68000).unwrap();
+        assert_eq!(jmp.extension, None);
+        assert_eq!(jmp.length(), 2);
+        assert_eq!(jmp.op.max_cycles(), 8);
+        assert!(matches!(jmp.op, JitTraceOp::IndirectJmp { reg: 1 }));
+        assert!(jmp.op.ends_trace());
+    }
+
+    #[test]
+    fn portable_indirect_jmp_uses_live_target_and_changes_flow() {
+        let mut cpu = cpu();
+        cpu.set_a(1, 0x0340);
+        cpu.change_of_flow = false;
+        let op = TraceBuildOp {
+            opcode: 0x4ED1,
+            extension: None,
+            extension2: None,
+            pc: 0x0100,
+            op: JitTraceOp::IndirectJmp { reg: 1 },
+        };
+
+        assert_eq!(
+            execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
+            Some(8)
+        );
+        assert_eq!(cpu.pc, 0x0340);
+        assert!(cpu.change_of_flow);
     }
 
     #[test]
@@ -17932,6 +18005,57 @@ mod portable_tests {
         assert_eq!(bail.pc, call_pc);
         assert!(!bail.change_of_flow);
         assert!(bail_mem[0x07FC..0x0800].iter().all(|&byte| byte == 0));
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_short_indirect_jmp_region_is_profitable_and_exact() {
+        let ops = vec![
+            TraceBuildOp {
+                opcode: 0x7001,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::Moveq { reg: 0, data: 1 },
+            },
+            TraceBuildOp {
+                opcode: 0x7202,
+                extension: None,
+                extension2: None,
+                pc: 0x0102,
+                op: JitTraceOp::Moveq { reg: 1, data: 2 },
+            },
+            TraceBuildOp {
+                opcode: 0x7403,
+                extension: None,
+                extension2: None,
+                pc: 0x0104,
+                op: JitTraceOp::Moveq { reg: 2, data: 3 },
+            },
+            TraceBuildOp {
+                opcode: 0x4ED5,
+                extension: None,
+                extension2: None,
+                pc: 0x0106,
+                op: JitTraceOp::IndirectJmp { reg: 5 },
+            },
+        ];
+        let mut jit = TraceJit::new();
+        let compiled = jit
+            .compile_decoded_ops(&cpu(), 0x0100, CpuType::M68000, ops, Some(0x0350))
+            .expect("four-op indirect-jump region should compile");
+        let mut actual = cpu();
+        actual.set_a(5, 0x0350);
+        actual.change_of_flow = false;
+
+        let packed = unsafe { compiled.call_native(&mut actual, 1) };
+
+        assert_eq!((packed >> 32) as u32, 4);
+        assert_eq!(packed as u32 as i32, 20);
+        assert_eq!(actual.pc, 0x0350);
+        assert_eq!(actual.ppc, 0x0106);
+        assert_eq!(actual.ir, 0x4ED5);
+        assert!(actual.change_of_flow);
     }
 
     /// A `count`-op region: `count - 1` MOVEQs then a bare RTS terminal.
