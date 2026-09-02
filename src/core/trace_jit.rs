@@ -57,7 +57,7 @@ const TRACE_HOT_THRESHOLD: u8 = 2;
 /// so true loops can compile with minimum latency; only the observed one-pass
 /// shape is deferred. This avoids paying the compiler and cache-displacement
 /// costs for startup and traversal paths that execute only a handful of times.
-const TRACE_LINEAR_HOT_THRESHOLD: u8 = 64 * TRACE_HOT_THRESHOLD;
+const TRACE_LINEAR_HOT_THRESHOLD: u8 = 208;
 
 /// Hits a head must re-accumulate after its first trap-boundary closure was
 /// deferred (see `finish_recording_at_trap`): the value only needs to sit
