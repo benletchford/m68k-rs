@@ -762,6 +762,120 @@ struct TraceCodeSegment {
     len: u32,
 }
 
+/// Compare live guest instructions with the bytes captured at compilation.
+///
+/// The helper stays outlined: trace entry already pays one call per segment,
+/// and inlining the SIMD loop expands the iterator closure enough to disturb
+/// instruction-cache locality in workloads dominated by tiny segments. Short
+/// ranges use early-out native-word loads; on x86-64, genuinely wide ranges
+/// fold 16-byte differences into one final decision. Very long ranges retain
+/// the platform `memcmp`, whose startup cost is then well amortized.
+#[inline(never)]
+unsafe fn trace_code_eq(live: *const u8, expected: *const u8, len: usize) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    if (48..=512).contains(&len) {
+        use std::arch::x86_64::{
+            __m128i, _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128,
+            _mm_setzero_si128, _mm_xor_si128,
+        };
+
+        let mut offset = 0;
+        // SAFETY: SSE2 is part of the x86-64 baseline ISA.
+        let zero = unsafe { _mm_setzero_si128() };
+        let mut difference = zero;
+        while len - offset >= 16 {
+            // SAFETY: each complete vector lies inside the caller-provided
+            // `len`-byte ranges. Unaligned loads are intentional.
+            let live_word = unsafe { _mm_loadu_si128(live.add(offset).cast::<__m128i>()) };
+            let expected_word = unsafe { _mm_loadu_si128(expected.add(offset).cast::<__m128i>()) };
+            // SAFETY: SSE2 is part of the x86-64 baseline ISA.
+            difference =
+                unsafe { _mm_or_si128(difference, _mm_xor_si128(live_word, expected_word)) };
+            offset += 16;
+        }
+
+        let mut tail_difference = 0u64;
+        if len - offset >= 8 {
+            // SAFETY: a complete eight-byte tail remains in both ranges.
+            let live_word = unsafe { std::ptr::read_unaligned(live.add(offset).cast::<u64>()) };
+            let expected_word =
+                unsafe { std::ptr::read_unaligned(expected.add(offset).cast::<u64>()) };
+            tail_difference |= live_word ^ expected_word;
+            offset += 8;
+        }
+        if len - offset >= 4 {
+            // SAFETY: a complete four-byte tail remains in both ranges.
+            let live_word = unsafe { std::ptr::read_unaligned(live.add(offset).cast::<u32>()) };
+            let expected_word =
+                unsafe { std::ptr::read_unaligned(expected.add(offset).cast::<u32>()) };
+            tail_difference |= u64::from(live_word ^ expected_word);
+            offset += 4;
+        }
+        if len - offset >= 2 {
+            // SAFETY: a complete two-byte tail remains in both ranges.
+            let live_word = unsafe { std::ptr::read_unaligned(live.add(offset).cast::<u16>()) };
+            let expected_word =
+                unsafe { std::ptr::read_unaligned(expected.add(offset).cast::<u16>()) };
+            tail_difference |= u64::from(live_word ^ expected_word);
+            offset += 2;
+        }
+        if len != offset {
+            // SAFETY: one byte remains inside each caller-provided range.
+            tail_difference |= u64::from(unsafe { *live.add(offset) ^ *expected.add(offset) });
+        }
+
+        // SAFETY: SSE2 is part of the x86-64 baseline ISA. A zero byte in
+        // every lane produces all 16 bits in the movemask.
+        let wide_equal = unsafe { _mm_movemask_epi8(_mm_cmpeq_epi8(difference, zero)) == 0xFFFF };
+        return wide_equal & (tail_difference == 0);
+    }
+
+    let scalar_limit = if cfg!(target_arch = "x86_64") {
+        47
+    } else {
+        128
+    };
+    if len <= scalar_limit {
+        let mut offset = 0;
+        while len - offset >= 8 {
+            // SAFETY: each complete word lies inside both ranges.
+            let live_word = unsafe { std::ptr::read_unaligned(live.add(offset).cast::<u64>()) };
+            let expected_word =
+                unsafe { std::ptr::read_unaligned(expected.add(offset).cast::<u64>()) };
+            if live_word != expected_word {
+                return false;
+            }
+            offset += 8;
+        }
+        if len - offset >= 4 {
+            // SAFETY: a complete four-byte tail remains in both ranges.
+            let live_word = unsafe { std::ptr::read_unaligned(live.add(offset).cast::<u32>()) };
+            let expected_word =
+                unsafe { std::ptr::read_unaligned(expected.add(offset).cast::<u32>()) };
+            if live_word != expected_word {
+                return false;
+            }
+            offset += 4;
+        }
+        if len - offset >= 2 {
+            // SAFETY: a complete two-byte tail remains in both ranges.
+            let live_word = unsafe { std::ptr::read_unaligned(live.add(offset).cast::<u16>()) };
+            let expected_word =
+                unsafe { std::ptr::read_unaligned(expected.add(offset).cast::<u16>()) };
+            if live_word != expected_word {
+                return false;
+            }
+            offset += 2;
+        }
+        return len == offset || unsafe { *live.add(offset) == *expected.add(offset) };
+    }
+
+    // SAFETY: the caller guarantees both ranges are readable for `len` bytes.
+    let live = unsafe { std::slice::from_raw_parts(live, len) };
+    let expected = unsafe { std::slice::from_raw_parts(expected, len) };
+    live == expected
+}
+
 struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
@@ -1135,13 +1249,10 @@ impl TraceJit {
                     }
                     let expected = &trace.code[segment.code_offset as usize
                         ..(segment.code_offset + segment.len) as usize];
-                    let live = unsafe {
-                        std::slice::from_raw_parts(
-                            (cpu.fm_ptr as *const u8).add(off as usize),
-                            segment.len as usize,
-                        )
-                    };
-                    live == expected
+                    let live = unsafe { (cpu.fm_ptr as *const u8).add(off as usize) };
+                    // SAFETY: the bounds check above covers the live range,
+                    // and `expected` has exactly `segment.len` bytes.
+                    unsafe { trace_code_eq(live, expected.as_ptr(), segment.len as usize) }
                 });
             }
 
@@ -13836,6 +13947,37 @@ mod portable_tests {
             "with budget to act the miss surfaces"
         );
         assert_eq!(pc, 0x010C, "the miss consumed the changed opcode");
+    }
+
+    #[test]
+    fn trace_code_compare_covers_scalar_simd_and_platform_boundaries() {
+        let lengths = [
+            0usize, 1, 2, 3, 7, 8, 9, 15, 16, 47, 48, 49, 511, 512, 513, 768,
+        ];
+        for len in lengths {
+            let mut live = vec![0xA5u8; len + 8];
+            let mut expected = vec![0x5Au8; len + 8];
+            for index in 0..len {
+                let byte = (index as u8).wrapping_mul(37).wrapping_add(11);
+                live[index + 1] = byte;
+                expected[index + 3] = byte;
+            }
+            let live_ptr = unsafe { live.as_ptr().add(1) };
+            let expected_ptr = unsafe { expected.as_ptr().add(3) };
+            assert!(unsafe { trace_code_eq(live_ptr, expected_ptr, len) });
+
+            if len != 0 {
+                let positions = [0, len / 2, len - 1];
+                for position in positions {
+                    live[position + 1] ^= 0x80;
+                    assert!(
+                        !unsafe { trace_code_eq(live.as_ptr().add(1), expected_ptr, len) },
+                        "length {len} mismatch at byte {position}"
+                    );
+                    live[position + 1] ^= 0x80;
+                }
+            }
+        }
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
