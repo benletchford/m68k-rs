@@ -1700,7 +1700,11 @@ mod tests {
             .iter()
             .find(|row| row.start_pc == HEAD)
             .expect("rare-exit loop head was profiled");
-        assert_eq!(row.recording_attempts, 1);
+        // The first complete non-self-loop observation establishes the
+        // raised admission threshold; the second recording compiles it.
+        // Neither is an adaptive branch-bias re-recording, which is the
+        // behavior this test pins below.
+        assert_eq!(row.recording_attempts, 2);
         assert_eq!(row.adaptive_rerecords, 0);
         assert_eq!(row.compiled_ops, 4);
         assert!(row.guarded_branch_exits > 64);
