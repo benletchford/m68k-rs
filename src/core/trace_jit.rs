@@ -2172,6 +2172,59 @@ impl TraceJit {
         }
     }
 
+    /// Close a recording that cannot add another callee without making its
+    /// bounded code intervals overly broad, retaining a completed prefix
+    /// when it belongs to an indexed-dispatch path.
+    #[cold]
+    #[inline(never)]
+    fn finish_recording_at_call_span(&mut self, cpu: &mut CpuCore, call_pc: u32) {
+        // A trace carries one caller and one callee SMC interval. SC2K's
+        // table-driven dispatch can cross an indexed JMP, finish one
+        // call/return, and then reach a second far callee. The second call
+        // cannot join this trace without making its callee interval overly
+        // broad, but the completed control-flow prefix before it is
+        // independently useful.
+        //
+        // Keep this salvage deliberately structural. An indexed jump is a
+        // multi-way dispatch boundary; a plain JMP (An) is commonly a cold
+        // function thunk, while an ordinary conditional branch can belong to
+        // an alternate path of an already-productive longer trace. Once the
+        // indexed dispatch proves this topology, retain through the LAST
+        // completed terminal: SC2K does useful work after the dispatch,
+        // including one bounded call/return, before a direct branch leads to
+        // the impossible second call.
+        let salvage = self.recording.as_ref().and_then(|recording| {
+            if recording.ops.last().is_some_and(|op| op.op.ends_trace()) {
+                return None;
+            }
+            let last_terminal = recording.ops.iter().rposition(|op| op.op.ends_trace())?;
+            let has_indexed_dispatch = recording.ops[..=last_terminal].iter().any(|op| {
+                matches!(
+                    op.op,
+                    JitTraceOp::IndirectJmp {
+                        target: JitEa::Index { .. } | JitEa::PcIndex { .. },
+                        expected_target: Some(_),
+                    }
+                )
+            });
+            if !has_indexed_dispatch || last_terminal + 1 < SALVAGE_MIN_OPS {
+                return None;
+            }
+            let continuation = recording.ops.get(last_terminal + 1)?.pc;
+            Some((last_terminal + 1, continuation))
+        });
+        if let Some((prefix_len, continuation)) = salvage {
+            self.recording
+                .as_mut()
+                .expect("salvage came from an active recording")
+                .ops
+                .truncate(prefix_len);
+            self.finish_recording(cpu, continuation, RecordingEnd::Region);
+        } else {
+            self.finish_recording(cpu, call_pc, RecordingEnd::Region);
+        }
+    }
+
     /// `call_retry_pending` marks the one case where a rescued prefix is
     /// worse than no trace at all: a recording stopped by its first
     /// unpermitted call. Salvaging there installs a compiled prefix that
@@ -2578,7 +2631,7 @@ impl TraceJit {
                     if caller_hi.wrapping_sub(caller_lo) > CALL_THROUGH_MAX_SPAN
                         || callee_hi.wrapping_sub(callee_lo) > CALL_THROUGH_MAX_SPAN
                     {
-                        self.finish_recording(cpu, executed_pc, RecordingEnd::Region);
+                        self.finish_recording_at_call_span(cpu, executed_pc);
                         return;
                     }
                     recording.pending_return = Some(return_pc);
@@ -16593,6 +16646,113 @@ mod portable_tests {
              ({compiled_ops} ops)"
         );
         assert_eq!(compiled_ops, 5, "call + leaf + return + tail + latch");
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn second_far_call_salvages_the_completed_control_flow_prefix() {
+        // The SC2K topology: a hot head reaches a dispatch target through
+        // a guarded computed jump, records one call/return and a later direct
+        // branch, then encounters a second call whose callee is too far from
+        // the first for one bounded callee-code interval. Refusing that
+        // second call must not throw away the independently reusable prefix
+        // through the last completed branch.
+        const HEAD: u32 = 0x0100;
+        const TARGET: u32 = 0x0200;
+        const TAIL: u32 = 0x0220;
+        const LEAF1: u32 = 0x3000;
+        const LEAF2: u32 = 0x7000;
+        let head = [
+            0x5282, // seven ADDQ.L #1,D2 ops make the guarded prefix
+            0x5282, // meet the measured salvage break-even length
+            0x5282, 0x5282, 0x5282, 0x5282, 0x5282, 0x4EF0,
+            0x1000, // JMP (0,A0,D1.W) -> TARGET (D1 = 0)
+        ];
+        let target = [
+            0x6100, 0x2DFE, // BSR.W LEAF1 (TARGET + 2 + $2DFE)
+            0x6000, 0x001A, // BRA.W TAIL (TARGET + 6 + $001A)
+        ];
+        let tail = [
+            0x5285, // ADDQ.L #1,D5 -- interpreted after the salvaged prefix
+            0x6100, 0x6DDC, // BSR.W LEAF2 (TAIL + 4 + $6DDC)
+            0x51C8, 0xFED8, // DBRA D0,HEAD
+            0x707F, // MOVEQ #127,D0
+            0x6000, 0xFED2, // BRA.W HEAD
+        ];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x10000);
+        for (index, word) in head.iter().enumerate() {
+            bus.write_word_at(HEAD + index as u32 * 2, *word);
+        }
+        for (index, word) in target.iter().enumerate() {
+            bus.write_word_at(TARGET + index as u32 * 2, *word);
+        }
+        for (index, word) in tail.iter().enumerate() {
+            bus.write_word_at(TAIL + index as u32 * 2, *word);
+        }
+        bus.write_word_at(LEAF1, 0x5283); // ADDQ.L #1,D3
+        bus.write_word_at(LEAF1 + 2, 0x4E75); // RTS
+        bus.write_word_at(LEAF2, 0x5284); // ADDQ.L #1,D4
+        bus.write_word_at(LEAF2 + 2, 0x4E75); // RTS
+
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = HEAD;
+        cpu.set_a(0, TARGET);
+        cpu.set_a(7, 0x9000);
+        cpu.set_d(0, 0x7F);
+        cpu.set_d(1, 0);
+        let result = cpu.run_batch(&mut bus, 100_000, &[0]);
+        assert_eq!(result.instructions, 100_000, "loop runs to budget");
+        assert!(cpu.d(3) > 1_000, "both callees actually ran");
+        assert!(
+            cpu.d(3).abs_diff(cpu.d(4)) <= 1,
+            "the two leaves stay in lockstep"
+        );
+
+        let salvaged = with_trace_jit(|jit| match &jit.slots[trace_cache_index(HEAD)] {
+            TraceSlot::Compiled(trace) if trace.pc == HEAD => Some((
+                trace.ops.len(),
+                matches!(
+                    trace.ops.last().map(|op| op.op),
+                    Some(JitTraceOp::Branch { .. })
+                ),
+                trace
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op.op, JitTraceOp::CallThrough { .. })),
+                trace.ops.iter().any(|op| {
+                    matches!(
+                        op.op,
+                        JitTraceOp::IndirectJmp {
+                            expected_target: Some(TARGET),
+                            ..
+                        }
+                    )
+                }),
+                trace
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op.op, JitTraceOp::RtsReturn { .. })),
+            )),
+            _ => None,
+        });
+        let (ops, ends_at_branch, contains_call, contains_indexed_dispatch, contains_return) =
+            salvaged.expect("the hot head compiles its reusable prefix");
+        assert_eq!(ops, 12, "the trace trims at the last completed branch");
+        assert!(
+            ends_at_branch,
+            "the post-call direct branch is the terminal"
+        );
+        assert!(contains_indexed_dispatch, "the dispatch anchors salvage");
+        assert!(
+            contains_call,
+            "the bounded first call remains in the prefix"
+        );
+        assert!(
+            contains_return,
+            "the first call's checked return remains too"
+        );
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
