@@ -16,7 +16,7 @@ use super::types::{CpuType, Size};
 use cranelift_codegen::Context;
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
+    AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
     condcodes::IntCC, types,
 };
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -102,11 +102,23 @@ pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
 /// (`i32`), so cycles never need this bit. The upper 32 retirement bits stay
 /// fully available for data-dependent retirement such as `CondSkip`.
 const TRACE_RETURN_COMPLETE: u64 = 1 << 31;
+/// A checked native entry returns this before touching guest state when its
+/// generated code-byte comparison cannot prove the trace current. Rust then
+/// uses the bus-aware slow path to distinguish changed code from an
+/// unavailable fastmem mapping.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+const TRACE_RETURN_VALIDATION_NEEDED: u64 = TRACE_RETURN_COMPLETE | (1 << 30);
 const TRACE_RETURN_CYCLES_MASK: u32 = i32::MAX as u32;
 
 #[inline]
 fn trace_return_complete(packed: u64) -> bool {
     packed & TRACE_RETURN_COMPLETE != 0
+}
+
+#[inline]
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn trace_return_validation_needed(packed: u64) -> bool {
+    packed == TRACE_RETURN_VALIDATION_NEEDED
 }
 
 #[inline]
@@ -998,6 +1010,229 @@ fn trace_code_segments_eq(
     }
 }
 
+/// Fold one fixed trace segment's live-byte comparison into an I64
+/// difference. Expected bytes become immediates in the checked entry, while
+/// overlapping final loads cover odd native-word tails without reading beyond
+/// the segment.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_trace_code_segment_difference(
+    builder: &mut FunctionBuilder<'_>,
+    live: Value,
+    expected: &[u8],
+) -> Value {
+    let mut difference = builder.ins().iconst(types::I64, 0);
+    let mut flags = MemFlags::new();
+    flags.set_notrap();
+
+    if expected.len() >= 8 {
+        let complete_words = expected.len() / 8;
+        for word in 0..complete_words {
+            let offset = word * 8;
+            let live_word = builder.ins().load(types::I64, flags, live, offset as i32);
+            let expected_word = u64::from_ne_bytes(
+                expected[offset..offset + 8]
+                    .try_into()
+                    .expect("eight-byte trace chunk"),
+            );
+            let expected_word = builder.ins().iconst(types::I64, expected_word as i64);
+            let word_difference = builder.ins().bxor(live_word, expected_word);
+            difference = builder.ins().bor(difference, word_difference);
+        }
+        if !expected.len().is_multiple_of(8) {
+            let offset = expected.len() - 8;
+            let live_word = builder.ins().load(types::I64, flags, live, offset as i32);
+            let expected_word = u64::from_ne_bytes(
+                expected[offset..]
+                    .try_into()
+                    .expect("overlapping eight-byte trace tail"),
+            );
+            let expected_word = builder.ins().iconst(types::I64, expected_word as i64);
+            let word_difference = builder.ins().bxor(live_word, expected_word);
+            difference = builder.ins().bor(difference, word_difference);
+        }
+    } else if expected.len() >= 4 {
+        for offset in [0, expected.len() - 4]
+            .into_iter()
+            .take(if expected.len() == 4 { 1 } else { 2 })
+        {
+            let live_word = builder.ins().load(types::I32, flags, live, offset as i32);
+            let expected_word = u32::from_ne_bytes(
+                expected[offset..offset + 4]
+                    .try_into()
+                    .expect("four-byte trace chunk"),
+            );
+            let expected_word = builder.ins().iconst(types::I32, i64::from(expected_word));
+            let word_difference = builder.ins().bxor(live_word, expected_word);
+            let word_difference = builder.ins().uextend(types::I64, word_difference);
+            difference = builder.ins().bor(difference, word_difference);
+        }
+    } else if expected.len() >= 2 {
+        for offset in [0, expected.len() - 2]
+            .into_iter()
+            .take(if expected.len() == 2 { 1 } else { 2 })
+        {
+            let live_word = builder.ins().load(types::I16, flags, live, offset as i32);
+            let expected_word = u16::from_ne_bytes(
+                expected[offset..offset + 2]
+                    .try_into()
+                    .expect("two-byte trace chunk"),
+            );
+            let expected_word = builder.ins().iconst(types::I16, i64::from(expected_word));
+            let word_difference = builder.ins().bxor(live_word, expected_word);
+            let word_difference = builder.ins().uextend(types::I64, word_difference);
+            difference = builder.ins().bor(difference, word_difference);
+        }
+    } else if let Some(&expected) = expected.first() {
+        let live_byte = builder.ins().load(types::I8, flags, live, 0);
+        let expected_byte = builder.ins().iconst(types::I8, i64::from(expected));
+        let byte_difference = builder.ins().bxor(live_byte, expected_byte);
+        let byte_difference = builder.ins().uextend(types::I64, byte_difference);
+        difference = builder.ins().bor(difference, byte_difference);
+    }
+
+    difference
+}
+
+/// Emit a checked entry point with the same ABI as the ordinary trace body.
+/// On success it calls that body and forwards its packed result. Rust calls
+/// the body directly for any later invocation covered by the same validation.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_checked_trace_wrapper(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    ptr_ty: Type,
+    expected_code: &[u8],
+    segments: &[TraceCodeSegment],
+    body: FuncRef,
+    body_args: &[Value],
+) {
+    let compare = builder.create_block();
+    let failed = builder.create_block();
+    let run = builder.create_block();
+
+    let fm_ptr = builder.ins().load(
+        ptr_ty,
+        MemFlags::trusted(),
+        cpu,
+        offset_of!(CpuCore, fm_ptr) as i32,
+    );
+    let fm_base = load_u32(builder, cpu, offset_of!(CpuCore, fm_base));
+    let fm_len = load_u32(builder, cpu, offset_of!(CpuCore, fm_len));
+    let mut segment_offsets = Vec::with_capacity(segments.len());
+    let mut any_bad = builder.ins().iconst(types::I8, 0);
+    for segment in segments {
+        let start = builder.ins().iconst(types::I32, i64::from(segment.start));
+        let off = builder.ins().isub(start, fm_base);
+        segment_offsets.push(off);
+
+        let len_too_large =
+            builder
+                .ins()
+                .icmp_imm(IntCC::UnsignedLessThan, fm_len, i64::from(segment.len));
+        // This may wrap when the length is too large, but `any_bad` prevents
+        // the compare block and all live loads from being reached then.
+        let limit = builder.ins().iadd_imm(fm_len, -i64::from(segment.len));
+        let off_too_large = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+        let segment_bad = builder.ins().bor(len_too_large, off_too_large);
+        any_bad = builder.ins().bor(any_bad, segment_bad);
+    }
+    builder.ins().brif(any_bad, failed, &[], compare, &[]);
+
+    builder.switch_to_block(compare);
+    let mut difference = builder.ins().iconst(types::I64, 0);
+    for (segment, off) in segments.iter().zip(segment_offsets) {
+        let off_ptr = if ptr_ty == types::I32 {
+            off
+        } else {
+            builder.ins().uextend(ptr_ty, off)
+        };
+        let live = builder.ins().iadd(fm_ptr, off_ptr);
+        let expected = &expected_code
+            [segment.code_offset as usize..(segment.code_offset + segment.len) as usize];
+        let segment_difference = emit_trace_code_segment_difference(builder, live, expected);
+        difference = builder.ins().bor(difference, segment_difference);
+    }
+    let changed = builder.ins().icmp_imm(IntCC::NotEqual, difference, 0);
+    builder.ins().brif(changed, failed, &[], run, &[]);
+
+    builder.switch_to_block(run);
+    let call = builder.ins().call(body, body_args);
+    let result = builder.inst_results(call)[0];
+    builder.ins().return_(&[result]);
+
+    builder.switch_to_block(failed);
+    let validation_needed = builder
+        .ins()
+        .iconst(types::I64, TRACE_RETURN_VALIDATION_NEEDED as i64);
+    builder.ins().return_(&[validation_needed]);
+}
+
+enum SlowTraceCodeValidation {
+    Valid,
+    Changed { index: usize, ppc: u32, opcode: u16 },
+    Unavailable,
+}
+
+/// Validate through the bus when fastmem validation fails, preserving the
+/// architecturally first changed instruction for the ordinary miss path.
+fn validate_trace_code_slow<B: AddressBus>(
+    trace: &CompiledTrace,
+    cpu: &CpuCore,
+    bus: &mut B,
+) -> SlowTraceCodeValidation {
+    for (index, op) in trace.ops.iter().enumerate() {
+        let addr = cpu.address(op.pc);
+        match bus.try_read_word(addr) {
+            Ok(opcode) if opcode == op.opcode => {}
+            Ok(opcode) => {
+                return SlowTraceCodeValidation::Changed {
+                    index,
+                    ppc: op.pc,
+                    opcode,
+                };
+            }
+            Err(_) => return SlowTraceCodeValidation::Unavailable,
+        }
+
+        for (word_offset, expected) in [(2, op.extension), (4, op.extension2)] {
+            let Some(expected) = expected else { continue };
+            let addr = cpu.address(op.pc.wrapping_add(word_offset));
+            match bus.try_read_word(addr) {
+                Ok(actual) if actual == expected => {}
+                Ok(_) => {
+                    return SlowTraceCodeValidation::Changed {
+                        index,
+                        ppc: op.pc,
+                        opcode: op.opcode,
+                    };
+                }
+                Err(_) => return SlowTraceCodeValidation::Unavailable,
+            }
+        }
+    }
+    SlowTraceCodeValidation::Valid
+}
+
+fn validate_trace_code<B: AddressBus>(
+    trace: &CompiledTrace,
+    cpu: &CpuCore,
+    bus: &mut B,
+) -> SlowTraceCodeValidation {
+    if cpu.fm_len != 0
+        && trace_code_segments_eq(
+            cpu.fm_ptr,
+            cpu.fm_base,
+            cpu.fm_len,
+            &trace.code,
+            &trace.code_segments,
+        )
+    {
+        SlowTraceCodeValidation::Valid
+    } else {
+        validate_trace_code_slow(trace, cpu, bus)
+    }
+}
+
 struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
@@ -1055,6 +1290,11 @@ struct CompiledTrace {
     adaptive_calls: Cell<u32>,
     adaptive_guard_exits: Cell<u32>,
     adaptive_rerecords: u8,
+    /// Optional first-call entry that validates fixed guest-code bytes, then
+    /// calls `func`. Repeated native calls in the same Rust entry use the
+    /// unchecked body because Rust has already established coherency.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    checked_func: Option<NativeTraceFn>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func: NativeTraceFn,
 }
@@ -1069,6 +1309,17 @@ impl CompiledTrace {
         // Direct executor tests assert the architectural cycles/retirement
         // payload; completion is internal call-driver metadata.
         packed & !TRACE_RETURN_COMPLETE
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm"), test))]
+    unsafe fn call_checked(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
+        match self
+            .checked_func
+            .expect("test trace should have a generated checked entry")
+        {
+            NativeTraceFn::Once(func) => unsafe { func(cpu) },
+            NativeTraceFn::Loop(func) => unsafe { func(cpu, max_iters) },
+        }
     }
 
     fn is_guarded_branch_exit(&self, cpu: &CpuCore) -> bool {
@@ -1282,6 +1533,31 @@ impl TraceJit {
         }
     }
 
+    fn invalidate_changed_trace(
+        &mut self,
+        idx: usize,
+        pc: u32,
+        cpu: &mut CpuCore,
+        index: usize,
+        ppc: u32,
+        opcode: u16,
+    ) -> Option<(CachedRunResult, u32)> {
+        self.slots[idx] = TraceSlot::Empty;
+        self.forget_structural_rejection(pc);
+        self.clear_linear_deferral(pc);
+        cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+        cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
+        if index > 0 {
+            // Nothing in the trace has executed yet. Restart from its head so
+            // valid operations before the changed one are not skipped.
+            return None;
+        }
+        cpu.ppc = ppc;
+        cpu.ir = opcode as u32;
+        cpu.pc = cpu.ppc.wrapping_add(2);
+        Some((CachedRunResult::Miss(opcode), 0))
+    }
+
     /// Attempt to execute a compiled trace at the current PC.
     ///
     /// On `CachedRunResult::Ran`, the returned count is the number of
@@ -1359,89 +1635,36 @@ impl TraceJit {
                 return None;
             }
 
-            // Fast validation: when the fastmem window covers every
-            // contiguous code segment, compare the live instruction bytes
-            // directly. This is one compare for a linear trace and a small
-            // handful for a recorded multi-block path, instead of a virtual
-            // bus read for every op. SMC is still caught because these are
-            // comparisons against the actual RAM; a mismatch falls through
-            // to the per-op path below to locate the architecturally first
-            // changed instruction.
-            let mut validated = false;
-            if cpu.fm_len != 0 {
-                validated = trace_code_segments_eq(
-                    cpu.fm_ptr,
-                    cpu.fm_base,
-                    cpu.fm_len,
-                    &trace.code,
-                    &trace.code_segments,
-                );
-            }
-
-            let mut miss = None;
-            if !validated {
-                for (index, op) in trace.ops.iter().enumerate() {
-                    let addr = cpu.address(op.pc);
-                    match bus.try_read_word(addr) {
-                        Ok(opcode) if opcode == op.opcode => {}
-                        Ok(opcode) => {
-                            miss = Some((index, op.pc, opcode));
-                            break;
-                        }
-                        Err(_) => return None,
-                    }
-
-                    if let Some(expected) = op.extension {
-                        let addr = cpu.address(op.pc.wrapping_add(2));
-                        match bus.try_read_word(addr) {
-                            Ok(extension) if extension == expected => {}
-                            Ok(_) => {
-                                miss = Some((index, op.pc, op.opcode));
-                                break;
-                            }
-                            Err(_) => return None,
-                        }
-                    }
-                    if let Some(expected) = op.extension2 {
-                        let addr = cpu.address(op.pc.wrapping_add(4));
-                        match bus.try_read_word(addr) {
-                            Ok(extension) if extension == expected => {}
-                            Ok(_) => {
-                                miss = Some((index, op.pc, op.opcode));
-                                break;
-                            }
-                            Err(_) => return None,
-                        }
+            // A checked native entry compares its fixed code bytes and then
+            // calls the ordinary body. Portable traces and native traces
+            // without that entry retain the shared host validator.
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            let generated_validation = trace.checked_func.is_some();
+            #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
+            let generated_validation = false;
+            if !generated_validation {
+                match validate_trace_code(trace, cpu, bus) {
+                    SlowTraceCodeValidation::Valid => {}
+                    SlowTraceCodeValidation::Unavailable => return None,
+                    SlowTraceCodeValidation::Changed { index, ppc, opcode } => {
+                        return self.invalidate_changed_trace(idx, pc, cpu, index, ppc, opcode);
                     }
                 }
-            }
-
-            if let Some((index, ppc, opcode)) = miss {
-                self.slots[idx] = TraceSlot::Empty;
-                // The trace at this target is gone; re-arm the per-CPU
-                // filters so the loop can be re-recorded and re-probed.
-                // Code changed under this head, so any structural verdict
-                // about the old bytes is void too.
-                self.forget_structural_rejection(pc);
-                self.clear_linear_deferral(pc);
-                cpu.trace_record_skip = [TRACE_PC_NONE; 4];
-                cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
-                if index > 0 {
-                    // Instruction memory changed mid-trace. Nothing has
-                    // executed yet (validation precedes the trace call),
-                    // so consuming the changed opcode here would silently
-                    // skip the still-valid ops before it. Leave PC at the
-                    // trace head and let the caller re-decode from there.
-                    return None;
-                }
-                cpu.ppc = ppc;
-                cpu.ir = opcode as u32;
-                cpu.pc = cpu.ppc.wrapping_add(2);
-                return Some((CachedRunResult::Miss(opcode), 0));
             }
 
             let ops_len = trace.ops.len() as u32;
             if instr_budget < ops_len {
+                // Preserve validation-before-budget ordering even though an
+                // undersized budget cannot enter the checked native wrapper.
+                if generated_validation {
+                    match validate_trace_code(trace, cpu, bus) {
+                        SlowTraceCodeValidation::Valid => {}
+                        SlowTraceCodeValidation::Unavailable => return None,
+                        SlowTraceCodeValidation::Changed { index, ppc, opcode } => {
+                            return self.invalidate_changed_trace(idx, pc, cpu, index, ppc, opcode);
+                        }
+                    }
+                }
                 return None;
             }
             // A ReturnExit completion lands at a per-caller continuation
@@ -1475,9 +1698,17 @@ impl TraceJit {
             let mut full_iters = 0u32;
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             let (guarded_branch_exit, partial_call_this_entry) = if batch_self_loop {
-                let NativeTraceFn::Loop(func) = trace.func else {
+                let NativeTraceFn::Loop(body_func) = trace.func else {
                     unreachable!("a batched trace must have a counted entry point")
                 };
+                let checked_func = match trace.checked_func {
+                    Some(NativeTraceFn::Loop(func)) => Some(func),
+                    Some(NativeTraceFn::Once(_)) => {
+                        unreachable!("checked and body entries must share an ABI")
+                    }
+                    None => None,
+                };
+                let mut first_native_call = true;
                 // When a trace combines data-dependent CondSkip retirement
                 // with an adaptive guard, a packed retirement count cannot
                 // reveal how many whole iterations preceded a side exit.
@@ -1494,7 +1725,25 @@ impl TraceJit {
                     } else {
                         max_iters - full_iters
                     };
-                    let packed = unsafe { func(cpu as *mut CpuCore, call_max_iters) };
+                    let entry = if first_native_call {
+                        first_native_call = false;
+                        checked_func.unwrap_or(body_func)
+                    } else {
+                        body_func
+                    };
+                    let mut packed = unsafe { entry(cpu as *mut CpuCore, call_max_iters) };
+                    if trace_return_validation_needed(packed) {
+                        match validate_trace_code_slow(trace, cpu, bus) {
+                            SlowTraceCodeValidation::Valid => {
+                                packed = unsafe { body_func(cpu as *mut CpuCore, call_max_iters) };
+                            }
+                            SlowTraceCodeValidation::Unavailable => return None,
+                            SlowTraceCodeValidation::Changed { index, ppc, opcode } => {
+                                return self
+                                    .invalidate_changed_trace(idx, pc, cpu, index, ppc, opcode);
+                            }
+                        }
+                    }
                     cycles_total += i64::from(trace_return_cycles(packed));
                     let ops_done = trace_return_retired(packed);
                     let complete = trace_return_complete(packed);
@@ -1533,11 +1782,37 @@ impl TraceJit {
                 // Tiny memory loops can execute this path once per two guest
                 // instructions, so even generalized result accounting is
                 // measurable here.
-                let NativeTraceFn::Once(func) = trace.func else {
+                let NativeTraceFn::Once(body_func) = trace.func else {
                     unreachable!("a one-pass trace must have a linear entry point")
                 };
+                let checked_func = match trace.checked_func {
+                    Some(NativeTraceFn::Once(func)) => Some(func),
+                    Some(NativeTraceFn::Loop(_)) => {
+                        unreachable!("checked and body entries must share an ABI")
+                    }
+                    None => None,
+                };
+                let mut first_native_call = true;
                 loop {
-                    let packed = unsafe { func(cpu as *mut CpuCore) };
+                    let entry = if first_native_call {
+                        first_native_call = false;
+                        checked_func.unwrap_or(body_func)
+                    } else {
+                        body_func
+                    };
+                    let mut packed = unsafe { entry(cpu as *mut CpuCore) };
+                    if trace_return_validation_needed(packed) {
+                        match validate_trace_code_slow(trace, cpu, bus) {
+                            SlowTraceCodeValidation::Valid => {
+                                packed = unsafe { body_func(cpu as *mut CpuCore) };
+                            }
+                            SlowTraceCodeValidation::Unavailable => return None,
+                            SlowTraceCodeValidation::Changed { index, ppc, opcode } => {
+                                return self
+                                    .invalidate_changed_trace(idx, pc, cpu, index, ppc, opcode);
+                            }
+                        }
+                    }
                     cycles_total += i64::from(trace_return_cycles(packed));
                     let ops_done = trace_return_retired(packed);
                     let complete = trace_return_complete(packed);
@@ -3238,6 +3513,12 @@ impl TraceJit {
                 || !ops
                     .iter()
                     .any(|op| matches!(op.op, JitTraceOp::MoveMem { .. })));
+        // Keep generated validators compact and on the measured x86-64 path.
+        // One through three short segments cover over 90% of SC2K entries;
+        // wider and unusually fragmented traces retain the shared comparator.
+        let generated_code_validation = cfg!(target_arch = "x86_64")
+            && code_segments.len() <= 3
+            && code_segments.iter().all(|segment| segment.len <= 47);
         let module = self.module.as_mut()?;
         let ptr_ty = module.target_config().pointer_type();
         let mut sig = module.make_signature();
@@ -3247,9 +3528,17 @@ impl TraceJit {
         }
         sig.returns.push(AbiParam::new(types::I64));
 
-        let name = format!("m68k_trace_{}", self.next_func);
+        let ordinal = self.next_func;
         self.next_func = self.next_func.wrapping_add(1);
+        let name = format!("m68k_trace_{ordinal}");
         let func_id = module.declare_function(&name, Linkage::Local, &sig).ok()?;
+        let checked_func_id = if generated_code_validation {
+            let name = format!("m68k_trace_checked_{ordinal}");
+            Some(module.declare_function(&name, Linkage::Local, &sig).ok()?)
+        } else {
+            None
+        };
+        let checked_sig = checked_func_id.map(|_| sig.clone());
 
         let mut ctx = Context::new();
         ctx.func = Function::with_name_signature(UserFuncName::user(0, func_id.as_u32()), sig);
@@ -3705,6 +3994,37 @@ impl TraceJit {
 
         module.define_function(func_id, &mut ctx).ok()?;
         module.clear_context(&mut ctx);
+        if let (Some(checked_func_id), Some(checked_sig)) = (checked_func_id, checked_sig) {
+            let mut checked_ctx = Context::new();
+            checked_ctx.func = Function::with_name_signature(
+                UserFuncName::user(0, checked_func_id.as_u32()),
+                checked_sig,
+            );
+            let body_ref = module.declare_func_in_func(func_id, &mut checked_ctx.func);
+            {
+                let mut builder = FunctionBuilder::new(&mut checked_ctx.func, &mut self.func_ctx);
+                let block = builder.create_block();
+                builder.switch_to_block(block);
+                builder.append_block_params_for_function_params(block);
+                let body_args = builder.block_params(block).to_vec();
+                let cpu_ptr = body_args[0];
+                emit_checked_trace_wrapper(
+                    &mut builder,
+                    cpu_ptr,
+                    ptr_ty,
+                    &code,
+                    &code_segments,
+                    body_ref,
+                    &body_args,
+                );
+                builder.seal_all_blocks();
+                builder.finalize();
+            }
+            module
+                .define_function(checked_func_id, &mut checked_ctx)
+                .ok()?;
+            module.clear_context(&mut checked_ctx);
+        }
         module.finalize_definitions().ok()?;
         let ptr = module.get_finalized_function(func_id);
         let func = if native_loop {
@@ -3712,6 +4032,14 @@ impl TraceJit {
         } else {
             NativeTraceFn::Once(unsafe { transmute::<*const u8, TraceOnceFn>(ptr) })
         };
+        let checked_func = checked_func_id.map(|checked_func_id| {
+            let ptr = module.get_finalized_function(checked_func_id);
+            if native_loop {
+                NativeTraceFn::Loop(unsafe { transmute::<*const u8, TraceLoopFn>(ptr) })
+            } else {
+                NativeTraceFn::Once(unsafe { transmute::<*const u8, TraceOnceFn>(ptr) })
+            }
+        });
 
         let guarded_ops = guarded_op_mask(ops);
         let seeded_exit = ops.last().is_some_and(|op| {
@@ -3740,6 +4068,7 @@ impl TraceJit {
             adaptive_calls: Cell::new(0),
             adaptive_guard_exits: Cell::new(0),
             adaptive_rerecords: 0,
+            checked_func,
             func,
         })
     }
@@ -15125,6 +15454,90 @@ mod portable_tests {
         );
     }
 
+    #[cfg(all(feature = "jit", not(target_family = "wasm"), target_arch = "x86_64"))]
+    #[test]
+    fn generated_checked_entry_covers_every_byte_of_short_linear_traces() {
+        const HEAD: u32 = 0x0100;
+
+        // M68k instructions are word-sized, so exercise every possible
+        // contiguous segment length accepted by the generated validator.
+        // Each byte is then changed independently: no comparison load or
+        // overlapping tail is allowed to leave a hole.
+        for len in (4usize..=46).step_by(2) {
+            let op_count = len / 2;
+            let mut ops = Vec::with_capacity(op_count);
+            for index in 0..op_count - 1 {
+                ops.push(TraceBuildOp {
+                    opcode: 0x5280,
+                    extension: None,
+                    extension2: None,
+                    pc: HEAD + index as u32 * 2,
+                    op: JitTraceOp::AddqSubqReg {
+                        reg: 0,
+                        data: 1,
+                        size: Size::Long,
+                        is_sub: false,
+                    },
+                });
+            }
+            let branch_pc = HEAD + (op_count as u32 - 1) * 2;
+            ops.push(TraceBuildOp {
+                opcode: 0x6000,
+                extension: None,
+                extension2: None,
+                pc: branch_pc,
+                op: JitTraceOp::Branch {
+                    condition: 0,
+                    displacement: HEAD as i32 - (branch_pc + 2) as i32,
+                    length: 2,
+                    expected_taken: None,
+                },
+            });
+
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&cpu(), HEAD, CpuType::M68000, ops, Some(HEAD))
+                .expect("short linear loop compiles");
+            assert_eq!(compiled.code_segments.len(), 1, "length {len}");
+            assert_eq!(compiled.code_segments[0].len as usize, len);
+            assert!(compiled.checked_func.is_some(), "length {len}");
+
+            let mut exact_mem = vec![0u8; 0x1000];
+            exact_mem[HEAD as usize..HEAD as usize + len].copy_from_slice(&compiled.code);
+            let mut exact_cpu = cpu();
+            attach_window(&mut exact_cpu, &mut exact_mem);
+            let packed = unsafe { compiled.call_checked(&mut exact_cpu, 1) };
+            assert!(!trace_return_validation_needed(packed), "length {len}");
+            assert!(trace_return_complete(packed), "length {len}");
+            assert_eq!(
+                trace_return_retired(packed),
+                op_count as u32,
+                "length {len}"
+            );
+            assert_eq!(exact_cpu.d(0), (op_count - 1) as u32, "length {len}");
+            assert_eq!(exact_cpu.pc, HEAD, "length {len}");
+
+            for position in 0..len {
+                let mut changed_mem = vec![0u8; 0x1000];
+                changed_mem[HEAD as usize..HEAD as usize + len].copy_from_slice(&compiled.code);
+                changed_mem[HEAD as usize + position] ^= 0x80;
+                let mut changed_cpu = cpu();
+                let initial_dar = changed_cpu.dar;
+                attach_window(&mut changed_cpu, &mut changed_mem);
+                let packed = unsafe { compiled.call_checked(&mut changed_cpu, 1) };
+                assert_eq!(
+                    packed, TRACE_RETURN_VALIDATION_NEEDED,
+                    "length {len} mismatch at byte {position}"
+                );
+                assert_eq!(changed_cpu.pc, HEAD, "length {len}, byte {position}");
+                assert_eq!(
+                    changed_cpu.dar, initial_dar,
+                    "validation must precede guest state mutation: length {len}, byte {position}"
+                );
+            }
+        }
+    }
+
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     #[test]
     fn fast_validation_checks_every_discontiguous_code_segment_before_execution() {
@@ -15198,7 +15611,32 @@ mod portable_tests {
                 },
             ]
         );
+        #[cfg(target_arch = "x86_64")]
+        assert!(
+            compiled.checked_func.is_some(),
+            "the test must exercise the generated multi-segment entry"
+        );
         jit.slots[trace_cache_index(HEAD)] = TraceSlot::Compiled(compiled);
+
+        // The checked entry cannot validate a segment outside this fastmem
+        // window. It must return without mutation so the bus-aware fallback
+        // can prove the same bytes valid and run the ordinary body once.
+        let mut fallback_cpu = cpu();
+        fallback_cpu.cycles_remaining = 1_000;
+        attach_window(&mut fallback_cpu, &mut mem);
+        fallback_cpu.fm_len = 0x0180;
+        let result = jit.try_execute(
+            &mut fallback_cpu,
+            &mut bus,
+            CpuType::M68000,
+            3,
+            false,
+            &[],
+            TRACE_EXIT_CHAIN_BUDGET,
+        );
+        assert!(matches!(result, Some((CachedRunResult::Ran, 3))));
+        assert_eq!((fallback_cpu.d(0), fallback_cpu.d(1)), (1, 1));
+        assert_eq!(fallback_cpu.pc, HEAD);
 
         // Change only the second segment. The aggregate fast check must
         // notice it, then the exact fallback must invalidate before the
