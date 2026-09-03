@@ -1381,6 +1381,18 @@ impl CompiledTrace {
         }
         false
     }
+
+    /// Whether a watch lies on an instruction the trace would execute after
+    /// its entry. Checking the two compact code intervals first keeps the
+    /// operation scan off the normal path (most embedding watches are return
+    /// sentinels outside application code).
+    #[inline(always)]
+    fn contains_interior_watch(&self, cpu: &CpuCore, watched: u32) -> bool {
+        let masked = cpu.address(watched);
+        let in_code = (masked >= self.code_start && masked < self.code_end)
+            || (masked >= self.callee_start && masked < self.callee_end);
+        in_code && self.ops.iter().skip(1).any(|op| op.pc == watched)
+    }
 }
 
 fn guarded_op_mask(ops: &[TraceBuildOp]) -> u128 {
@@ -1638,12 +1650,32 @@ impl TraceJit {
             // entry PC is intentionally excluded: run_batch does not check
             // watches on entry, and self-loop entry watches are handled by
             // `single_iter` after one complete iteration.
-            if watch_pcs.iter().any(|&watched| {
-                let masked = cpu.address(watched);
-                let in_code = (masked >= trace.code_start && masked < trace.code_end)
-                    || (masked >= trace.callee_start && masked < trace.callee_end);
-                in_code && trace.ops.iter().skip(1).any(|op| op.pc == watched)
-            }) {
+            // Systemless normally supplies one to four watches (the zero-PC
+            // sentinel plus callback/native-trap returns). Spell those small
+            // cases directly: generic Iterator::any was measurable even when
+            // the sole watch was zero and failed the cheap code-range test.
+            let interior_watched = match watch_pcs {
+                [] => false,
+                [a] => trace.contains_interior_watch(cpu, *a),
+                [a, b] => {
+                    trace.contains_interior_watch(cpu, *a) || trace.contains_interior_watch(cpu, *b)
+                }
+                [a, b, c] => {
+                    trace.contains_interior_watch(cpu, *a)
+                        || trace.contains_interior_watch(cpu, *b)
+                        || trace.contains_interior_watch(cpu, *c)
+                }
+                [a, b, c, d] => {
+                    trace.contains_interior_watch(cpu, *a)
+                        || trace.contains_interior_watch(cpu, *b)
+                        || trace.contains_interior_watch(cpu, *c)
+                        || trace.contains_interior_watch(cpu, *d)
+                }
+                watches => watches
+                    .iter()
+                    .any(|&watched| trace.contains_interior_watch(cpu, watched)),
+            };
+            if interior_watched {
                 return None;
             }
             if trace.needs_window && cpu.fm_len == 0 {
