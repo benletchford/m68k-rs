@@ -896,6 +896,63 @@ unsafe fn trace_code_eq(live: *const u8, expected: *const u8, len: usize) -> boo
     live == expected
 }
 
+/// Validate one captured code segment against the active fastmem window.
+///
+/// This stays inline in the trace-entry path: the bounds arithmetic is small,
+/// while the byte comparison itself remains in the outlined
+/// [`trace_code_eq`] helper.
+#[inline(always)]
+fn trace_code_segment_eq(
+    fm_ptr: usize,
+    fm_base: u32,
+    fm_len: u32,
+    expected_code: &[u8],
+    segment: &TraceCodeSegment,
+) -> bool {
+    let off = segment.start.wrapping_sub(fm_base);
+    if segment.len > fm_len || off > fm_len - segment.len {
+        return false;
+    }
+    let expected =
+        &expected_code[segment.code_offset as usize..(segment.code_offset + segment.len) as usize];
+    let live = unsafe { (fm_ptr as *const u8).add(off as usize) };
+    // SAFETY: the fastmem bounds check above covers the live range, and
+    // `expected` has exactly `segment.len` bytes.
+    unsafe { trace_code_eq(live, expected.as_ptr(), segment.len as usize) }
+}
+
+/// Validate every discontiguous code segment captured by a trace.
+///
+/// One- through three-segment traces dominate measured gameplay. Spell those
+/// shapes out so their native entries avoid the general iterator loop and its
+/// per-segment termination checks; unusual larger shapes retain the compact
+/// fallback.
+#[inline(always)]
+fn trace_code_segments_eq(
+    fm_ptr: usize,
+    fm_base: u32,
+    fm_len: u32,
+    expected_code: &[u8],
+    segments: &[TraceCodeSegment],
+) -> bool {
+    match segments {
+        [] => true,
+        [one] => trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, one),
+        [one, two] => {
+            trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, one)
+                && trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, two)
+        }
+        [one, two, three] => {
+            trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, one)
+                && trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, two)
+                && trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, three)
+        }
+        many => many
+            .iter()
+            .all(|segment| trace_code_segment_eq(fm_ptr, fm_base, fm_len, expected_code, segment)),
+    }
+}
+
 struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
@@ -1267,18 +1324,13 @@ impl TraceJit {
             // changed instruction.
             let mut validated = false;
             if cpu.fm_len != 0 {
-                validated = trace.code_segments.iter().all(|segment| {
-                    let off = segment.start.wrapping_sub(cpu.fm_base);
-                    if segment.len > cpu.fm_len || off > cpu.fm_len - segment.len {
-                        return false;
-                    }
-                    let expected = &trace.code[segment.code_offset as usize
-                        ..(segment.code_offset + segment.len) as usize];
-                    let live = unsafe { (cpu.fm_ptr as *const u8).add(off as usize) };
-                    // SAFETY: the bounds check above covers the live range,
-                    // and `expected` has exactly `segment.len` bytes.
-                    unsafe { trace_code_eq(live, expected.as_ptr(), segment.len as usize) }
-                });
+                validated = trace_code_segments_eq(
+                    cpu.fm_ptr,
+                    cpu.fm_base,
+                    cpu.fm_len,
+                    &trace.code,
+                    &trace.code_segments,
+                );
             }
 
             let mut miss = None;
@@ -14978,6 +15030,55 @@ mod portable_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn trace_code_segment_validation_covers_specialized_and_fallback_counts() {
+        const FM_BASE: u32 = 0x1000;
+        const OFFSETS: [usize; 5] = [0, 8, 20, 32, 48];
+        let mut live: Vec<u8> = (0..64).map(|byte| byte as u8).collect();
+        let mut expected = Vec::new();
+        let segments: Vec<_> = OFFSETS
+            .iter()
+            .enumerate()
+            .map(|(index, &offset)| {
+                expected.extend_from_slice(&live[offset..offset + 4]);
+                TraceCodeSegment {
+                    start: FM_BASE + offset as u32,
+                    code_offset: (index * 4) as u32,
+                    len: 4,
+                }
+            })
+            .collect();
+
+        for count in 0..=segments.len() {
+            assert!(trace_code_segments_eq(
+                live.as_ptr() as usize,
+                FM_BASE,
+                live.len() as u32,
+                &expected,
+                &segments[..count],
+            ));
+            for &offset in &OFFSETS[..count] {
+                live[offset] ^= 0x80;
+                assert!(
+                    !trace_code_segments_eq(
+                        live.as_ptr() as usize,
+                        FM_BASE,
+                        live.len() as u32,
+                        &expected,
+                        &segments[..count],
+                    ),
+                    "count {count} must check the segment at offset {offset}"
+                );
+                live[offset] ^= 0x80;
+            }
+        }
+
+        assert!(
+            !trace_code_segments_eq(live.as_ptr() as usize, FM_BASE, 51, &expected, &segments,),
+            "a segment extending past fastmem must reject"
+        );
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
