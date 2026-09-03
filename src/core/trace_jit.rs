@@ -102,17 +102,29 @@ pub(crate) const TRACE_PC_NONE: u32 = u32::MAX;
 /// (`i32`), so cycles never need this bit. The upper 32 retirement bits stay
 /// fully available for data-dependent retirement such as `CondSkip`.
 const TRACE_RETURN_COMPLETE: u64 = 1 << 31;
+/// A partial return caused by a recorded control-flow prediction missing.
+/// The generated branch knows this at the return site; carrying the reason
+/// avoids recovering it in Rust by scanning the trace's guarded operations.
+const TRACE_RETURN_GUARDED_BRANCH_EXIT: u64 = 1 << 30;
 /// A checked native entry returns this before touching guest state when its
 /// generated code-byte comparison cannot prove the trace current. Rust then
 /// uses the bus-aware slow path to distinguish changed code from an
 /// unavailable fastmem mapping.
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-const TRACE_RETURN_VALIDATION_NEEDED: u64 = TRACE_RETURN_COMPLETE | (1 << 30);
-const TRACE_RETURN_CYCLES_MASK: u32 = i32::MAX as u32;
+const TRACE_RETURN_VALIDATION_NEEDED: u64 =
+    TRACE_RETURN_COMPLETE | TRACE_RETURN_GUARDED_BRANCH_EXIT;
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+const TRACE_RETURN_METADATA: u64 = TRACE_RETURN_COMPLETE | TRACE_RETURN_GUARDED_BRANCH_EXIT;
+const TRACE_RETURN_CYCLES_MASK: u32 = TRACE_RETURN_GUARDED_BRANCH_EXIT as u32 - 1;
 
 #[inline]
 fn trace_return_complete(packed: u64) -> bool {
     packed & TRACE_RETURN_COMPLETE != 0
+}
+
+#[inline]
+fn trace_return_guarded_branch_exit(packed: u64) -> bool {
+    !trace_return_complete(packed) && packed & TRACE_RETURN_GUARDED_BRANCH_EXIT != 0
 }
 
 #[inline]
@@ -1282,6 +1294,7 @@ struct CompiledTrace {
     /// Trace entry checks this before inspecting `ops`, so the common
     /// guard-free return is constant-time; guarded traces visit only their
     /// guarded operations instead of scanning the complete recorded path.
+    #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
     guarded_ops: u128,
     /// A recorded interior branch is a path prediction eligible for adaptive
     /// rerecording. Cleared after the one allowed rerecord so completed traces
@@ -1301,14 +1314,19 @@ struct CompiledTrace {
 
 impl CompiledTrace {
     #[cfg(all(feature = "jit", not(target_family = "wasm"), test))]
-    unsafe fn call_native(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
-        let packed = match self.func {
+    unsafe fn call_native_raw(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
+        match self.func {
             NativeTraceFn::Once(func) => unsafe { func(cpu) },
             NativeTraceFn::Loop(func) => unsafe { func(cpu, max_iters) },
-        };
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm"), test))]
+    unsafe fn call_native(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
+        let packed = unsafe { self.call_native_raw(cpu, max_iters) };
         // Direct executor tests assert the architectural cycles/retirement
         // payload; completion is internal call-driver metadata.
-        packed & !TRACE_RETURN_COMPLETE
+        packed & !TRACE_RETURN_METADATA
     }
 
     #[cfg(all(feature = "jit", not(target_family = "wasm"), test))]
@@ -1322,6 +1340,7 @@ impl CompiledTrace {
         }
     }
 
+    #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
     fn is_guarded_branch_exit(&self, cpu: &CpuCore) -> bool {
         // A side exit can retire the trace's full numeric op count when the
         // guarded control-flow op is last, and future data-dependent ops can
@@ -1690,7 +1709,11 @@ impl TraceJit {
                 1
             } else {
                 let by_instrs = (instr_budget / ops_len).max(1);
-                let by_cycles = (cpu.cycles_remaining / trace.max_cycles).max(1) as u32;
+                // Bit 30 of the packed low word carries the side-exit reason.
+                // Bound a counted call to the remaining 30-bit cycle payload;
+                // ordinary run_batch calls already use exactly this ceiling.
+                let cycle_payload = cpu.cycles_remaining.min(TRACE_RETURN_CYCLES_MASK as i32);
+                let by_cycles = (cycle_payload / trace.max_cycles).max(1) as u32;
                 by_instrs.min(by_cycles)
             };
             let mut cycles_total = 0i64;
@@ -1747,7 +1770,7 @@ impl TraceJit {
                     cycles_total += i64::from(trace_return_cycles(packed));
                     let ops_done = trace_return_retired(packed);
                     let complete = trace_return_complete(packed);
-                    let guarded_branch_exit = !complete && trace.is_guarded_branch_exit(cpu);
+                    let guarded_branch_exit = trace_return_guarded_branch_exit(packed);
                     #[cfg(feature = "trace-profile")]
                     super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                     #[cfg(feature = "trace-profile")]
@@ -1816,7 +1839,7 @@ impl TraceJit {
                     cycles_total += i64::from(trace_return_cycles(packed));
                     let ops_done = trace_return_retired(packed);
                     let complete = trace_return_complete(packed);
-                    let guarded_branch_exit = !complete && trace.is_guarded_branch_exit(cpu);
+                    let guarded_branch_exit = trace_return_guarded_branch_exit(packed);
                     #[cfg(feature = "trace-profile")]
                     super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                     #[cfg(feature = "trace-profile")]
@@ -1848,7 +1871,7 @@ impl TraceJit {
                 cycles_total += i64::from(trace_return_cycles(packed));
                 let ops_done = trace_return_retired(packed);
                 let complete = trace_return_complete(packed);
-                let guarded_branch_exit = !complete && trace.is_guarded_branch_exit(cpu);
+                let guarded_branch_exit = trace_return_guarded_branch_exit(packed);
                 #[cfg(feature = "trace-profile")]
                 super::trace_profile::note_native_call(pc, cpu_type, ops_done);
                 #[cfg(feature = "trace-profile")]
@@ -4065,6 +4088,7 @@ impl TraceJit {
             needs_window,
             code_start,
             code_end,
+            #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
             guarded_ops,
             adaptive_branch: guarded_ops != 0,
             adaptive_calls: Cell::new(0),
@@ -4098,6 +4122,7 @@ impl TraceJit {
             needs_window: params.needs_window,
             code_start: params.code_start,
             code_end: params.code_end,
+            #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
             guarded_ops,
             adaptive_branch: guarded_ops != 0,
             adaptive_calls: Cell::new(0),
@@ -6486,7 +6511,9 @@ fn execute_portable_trace_raw(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: Co
                     if taken != expected {
                         cpu.ppc = op.pc;
                         cpu.ir = op.opcode as u32;
-                        return ((retired as u64) << 32) | cycles as u32 as u64;
+                        return ((retired as u64) << 32)
+                            | cycles as u32 as u64
+                            | TRACE_RETURN_GUARDED_BRANCH_EXIT;
                     }
                 }
                 if let JitTraceOp::IndirectJmp {
@@ -6499,7 +6526,9 @@ fn execute_portable_trace_raw(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: Co
                     if cpu.pc != expected {
                         cpu.ppc = op.pc;
                         cpu.ir = op.opcode as u32;
-                        return ((retired as u64) << 32) | cycles as u32 as u64;
+                        return ((retired as u64) << 32)
+                            | cycles as u32 as u64
+                            | TRACE_RETURN_GUARDED_BRANCH_EXIT;
                     }
                 }
             }
@@ -6527,7 +6556,7 @@ fn execute_portable_trace_raw(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: Co
 /// driver metadata, not part of their cycles/count contract.
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
 fn execute_portable_trace(cpu: &mut CpuCore, ops: &[TraceBuildOp], spans: CodeSpans) -> u64 {
-    execute_portable_trace_raw(cpu, ops, spans) & !TRACE_RETURN_COMPLETE
+    execute_portable_trace_raw(cpu, ops, spans) & !TRACE_RETURN_METADATA
 }
 
 /// Execute one trace op; `None` means a mem-op check failed and nothing
@@ -11296,6 +11325,10 @@ fn emit_guarded_branch(
         }
     };
     let packed = builder.ins().bor(cycles64, retired);
+    let guarded_exit = builder
+        .ins()
+        .iconst(types::I64, TRACE_RETURN_GUARDED_BRANCH_EXIT as i64);
+    let packed = builder.ins().bor(packed, guarded_exit);
     builder.ins().return_(&[packed]);
 
     builder.switch_to_block(continue_block);
@@ -11411,6 +11444,10 @@ fn emit_guarded_indirect_jmp(
         }
     };
     let packed = builder.ins().bor(cycles64, retired);
+    let guarded_exit = builder
+        .ins()
+        .iconst(types::I64, TRACE_RETURN_GUARDED_BRANCH_EXIT as i64);
+    let packed = builder.ins().bor(packed, guarded_exit);
     builder.ins().return_(&[packed]);
 
     builder.switch_to_block(continue_block);
@@ -12183,7 +12220,12 @@ mod portable_tests {
             let compiled = jit
                 .compile_decoded_ops(&actual, 0x0100, CpuType::M68040, ops.clone(), Some(0x0100))
                 .expect("CondSkip self-loop should compile");
-            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            let actual_raw = unsafe { compiled.call_native_raw(&mut actual, 1) };
+            let actual_packed = actual_raw & !TRACE_RETURN_METADATA;
+            assert!(
+                !trace_return_guarded_branch_exit(actual_raw),
+                "an ordinary completed CondSkip trace must not carry a side-exit tag"
+            );
 
             assert_eq!(
                 actual_packed, expected_packed,
@@ -12295,7 +12337,8 @@ mod portable_tests {
                 1 << 2,
                 "only the predicted BNE is a runtime guard"
             );
-            let actual_packed = unsafe { compiled.call_native(&mut actual, 1) };
+            let actual_raw = unsafe { compiled.call_native_raw(&mut actual, 1) };
+            let actual_packed = actual_raw & !TRACE_RETURN_METADATA;
 
             assert_eq!(
                 actual_packed, expected_packed,
@@ -12306,6 +12349,10 @@ mod portable_tests {
             assert!(
                 compiled.is_guarded_branch_exit(&actual),
                 "the exit must remain recognizable without indexing by retired count"
+            );
+            assert!(
+                trace_return_guarded_branch_exit(actual_raw),
+                "the generated guarded branch must tag its own side exit"
             );
             if carry == 0x01 {
                 assert_eq!(actual.d(3), 7, "BCS skipped MOVEQ");
@@ -13009,7 +13056,8 @@ mod portable_tests {
                 native.pc = 0x0100;
                 native.set_a(0, a0 + if target_uses_a0 { delta } else { 0 });
                 native.set_d(1, d1 + if target_uses_a0 { 0 } else { delta });
-                let native_packed = unsafe { compiled.call_native(&mut native, 1) };
+                let native_raw = unsafe { compiled.call_native_raw(&mut native, 1) };
+                let native_packed = native_raw & !TRACE_RETURN_METADATA;
 
                 let mut portable = cpu();
                 portable.pc = 0x0100;
@@ -13034,6 +13082,11 @@ mod portable_tests {
                     compiled.is_guarded_branch_exit(&native),
                     delta != 0,
                     "opcode {opcode:04X}, delta={delta}: guard classification"
+                );
+                assert_eq!(
+                    trace_return_guarded_branch_exit(native_raw),
+                    delta != 0,
+                    "opcode {opcode:04X}, delta={delta}: packed guard-exit tag"
                 );
             }
         }
@@ -15534,6 +15587,10 @@ mod portable_tests {
                 assert_eq!(
                     packed, TRACE_RETURN_VALIDATION_NEEDED,
                     "length {len} mismatch at byte {position}"
+                );
+                assert!(
+                    !trace_return_guarded_branch_exit(packed),
+                    "the validation sentinel must not be classified as a guarded exit"
                 );
                 assert_eq!(changed_cpu.pc, HEAD, "length {len}, byte {position}");
                 assert_eq!(
