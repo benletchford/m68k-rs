@@ -3514,11 +3514,13 @@ impl TraceJit {
                     .iter()
                     .any(|op| matches!(op.op, JitTraceOp::MoveMem { .. })));
         // Keep generated validators compact and on the measured x86-64 path.
-        // One through three short segments cover over 90% of SC2K entries;
-        // wider and unusually fragmented traces retain the shared comparator.
+        // One through three short segments cover over 90% of SC2K entries.
+        // Its one wider hot shape is a contiguous 50-byte region; other wide
+        // and unusually fragmented traces retain the shared SIMD comparator.
         let generated_code_validation = cfg!(target_arch = "x86_64")
             && code_segments.len() <= 3
-            && code_segments.iter().all(|segment| segment.len <= 47);
+            && (code_segments.iter().all(|segment| segment.len <= 47)
+                || matches!(code_segments.as_slice(), [segment] if segment.len == 50));
         let module = self.module.as_mut()?;
         let ptr_ty = module.target_config().pointer_type();
         let mut sig = module.make_signature();
@@ -15456,14 +15458,10 @@ mod portable_tests {
 
     #[cfg(all(feature = "jit", not(target_family = "wasm"), target_arch = "x86_64"))]
     #[test]
-    fn generated_checked_entry_covers_every_byte_of_short_linear_traces() {
+    fn generated_checked_entry_covers_every_byte_of_eligible_linear_traces() {
         const HEAD: u32 = 0x0100;
 
-        // M68k instructions are word-sized, so exercise every possible
-        // contiguous segment length accepted by the generated validator.
-        // Each byte is then changed independently: no comparison load or
-        // overlapping tail is allowed to leave a hole.
-        for len in (4usize..=46).step_by(2) {
+        let loop_ops = |len: usize| {
             let op_count = len / 2;
             let mut ops = Vec::with_capacity(op_count);
             for index in 0..op_count - 1 {
@@ -15493,10 +15491,18 @@ mod portable_tests {
                     expected_taken: None,
                 },
             });
+            ops
+        };
 
+        // M68k instructions are word-sized, so exercise every possible short
+        // contiguous length plus the profiled exact-50 case accepted by the
+        // generated validator. Each byte is then changed independently: no
+        // comparison load or overlapping tail is allowed to leave a hole.
+        for len in (4usize..=46).step_by(2).chain([50]) {
+            let op_count = len / 2;
             let mut jit = TraceJit::new();
             let compiled = jit
-                .compile_decoded_ops(&cpu(), HEAD, CpuType::M68000, ops, Some(HEAD))
+                .compile_decoded_ops(&cpu(), HEAD, CpuType::M68000, loop_ops(len), Some(HEAD))
                 .expect("short linear loop compiles");
             assert_eq!(compiled.code_segments.len(), 1, "length {len}");
             assert_eq!(compiled.code_segments[0].len as usize, len);
@@ -15535,6 +15541,16 @@ mod portable_tests {
                     "validation must precede guest state mutation: length {len}, byte {position}"
                 );
             }
+        }
+
+        // Fifty bytes is an exact profiled shape, not a new range cutoff.
+        // Neighboring wide lengths must retain the shared SIMD validator.
+        for len in [48usize, 52, 64] {
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops(&cpu(), HEAD, CpuType::M68000, loop_ops(len), Some(HEAD))
+                .expect("wide linear loop compiles with shared validation");
+            assert!(compiled.checked_func.is_none(), "length {len}");
         }
     }
 
