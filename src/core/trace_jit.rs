@@ -850,6 +850,51 @@ unsafe fn trace_code_eq(live: *const u8, expected: *const u8, len: usize) -> boo
         return wide_equal & (tail_difference == 0);
     }
 
+    // These exact lengths dominate measured trace entry in real games. The
+    // generic scalar loop below has the right algorithm, but its induction,
+    // remaining-length tests, and per-word early-out branches are fixed costs
+    // when the overwhelmingly common case is unchanged code. Fold each known
+    // shape into one branchless difference and one final decision. Keep this
+    // inside the outlined helper so every trace shares the code instead of
+    // expanding its generated body.
+    #[cfg(target_arch = "x86_64")]
+    {
+        macro_rules! difference_at {
+            ($ty:ty, $offset:expr) => {{
+                // SAFETY: every specialized offset lies wholly within its
+                // matched length; unaligned guest-code addresses are valid.
+                let live_word =
+                    unsafe { std::ptr::read_unaligned(live.add($offset).cast::<$ty>()) };
+                let expected_word =
+                    unsafe { std::ptr::read_unaligned(expected.add($offset).cast::<$ty>()) };
+                (live_word ^ expected_word) as u64
+            }};
+        }
+
+        match len {
+            6 => return (difference_at!(u32, 0) | difference_at!(u16, 4)) == 0,
+            8 => return difference_at!(u64, 0) == 0,
+            10 => return (difference_at!(u64, 0) | difference_at!(u16, 8)) == 0,
+            12 => return (difference_at!(u64, 0) | difference_at!(u32, 8)) == 0,
+            28 => {
+                return (difference_at!(u64, 0)
+                    | difference_at!(u64, 8)
+                    | difference_at!(u64, 16)
+                    | difference_at!(u32, 24))
+                    == 0;
+            }
+            36 => {
+                return (difference_at!(u64, 0)
+                    | difference_at!(u64, 8)
+                    | difference_at!(u64, 16)
+                    | difference_at!(u64, 24)
+                    | difference_at!(u32, 32))
+                    == 0;
+            }
+            _ => {}
+        }
+    }
+
     let scalar_limit = if cfg!(target_arch = "x86_64") {
         47
     } else {
@@ -15004,7 +15049,7 @@ mod portable_tests {
     #[test]
     fn trace_code_compare_covers_scalar_simd_and_platform_boundaries() {
         let lengths = [
-            0usize, 1, 2, 3, 7, 8, 9, 15, 16, 47, 48, 49, 511, 512, 513, 768,
+            0usize, 1, 2, 3, 6, 7, 8, 9, 10, 12, 15, 16, 28, 36, 47, 48, 49, 511, 512, 513, 768,
         ];
         for len in lengths {
             let mut live = vec![0xA5u8; len + 8];
@@ -15019,8 +15064,7 @@ mod portable_tests {
             assert!(unsafe { trace_code_eq(live_ptr, expected_ptr, len) });
 
             if len != 0 {
-                let positions = [0, len / 2, len - 1];
-                for position in positions {
+                for position in 0..len {
                     live[position + 1] ^= 0x80;
                     assert!(
                         !unsafe { trace_code_eq(live.as_ptr().add(1), expected_ptr, len) },
