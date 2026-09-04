@@ -60,6 +60,53 @@ fn budget_exhausted_count_is_exact_with_jit_traces() {
     assert_eq!(cpu.d(0) as u64, total / 2);
 }
 
+#[cfg(all(
+    feature = "jit",
+    feature = "instruction-generation",
+    not(target_family = "wasm")
+))]
+#[test]
+fn instruction_generation_transition_observes_rewritten_code_and_zero_withdraws_trust() {
+    // Each version is ADDQ.L #1,Dn; BRA.S head. Start with an ordinary
+    // zero-budget batch so this test cannot reuse a nonzero thread-local
+    // generation left by another test worker.
+    let mut bus = bus_with(&[(0x1000, 0x5280), (0x1002, 0x60FC)]);
+    let mut cpu = cpu_at(0x1000);
+    assert_eq!(cpu.run_batch(&mut bus, 0, &[]).instructions, 0);
+
+    let first = cpu.run_batch_with_instruction_memory_generation(&mut bus, 100_000, &[], 1);
+    assert_eq!(first.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(0), 50_000);
+
+    // Publication advances the generation. The retained trace must compare
+    // its captured bytes before the rewritten ADDQ targeting D1 can execute.
+    bus.load(0x1000, &0x5281u16.to_be_bytes());
+    let d0_before = cpu.d(0);
+    let second = cpu.run_batch_with_instruction_memory_generation(&mut bus, 10_000, &[], 2);
+    assert_eq!(second.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(0), d0_before);
+    assert_eq!(cpu.d(1), 5_000);
+
+    // An unchanged publication keeps the recompiled trace usable: its proof
+    // is withdrawn and re-established by one validation, not by recompiling.
+    let third = cpu.run_batch_with_instruction_memory_generation(&mut bus, 10_000, &[], 3);
+    assert_eq!(third.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(1), 10_000);
+
+    // The ordinary API supplies generation zero. Its transition withdraws
+    // the cached proof and restores exact byte validation on every entry.
+    bus.load(0x1000, &0x5282u16.to_be_bytes());
+    let d1_before = cpu.d(1);
+    let fourth = cpu.run_batch(&mut bus, 10_000, &[]);
+    assert_eq!(fourth.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(1), d1_before);
+    assert_eq!(cpu.d(2), 5_000);
+}
+
 #[test]
 fn unrelated_watch_keeps_jit_loop_budget_exact() {
     // A caller may always watch PC 0 as a clean-exit sentinel. A trace whose

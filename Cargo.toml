@@ -39,6 +39,10 @@ jit = [
 # Serialize the complete architectural CPU state for deterministic save states.
 # Runtime-only decode, FastMem, and JIT caches are rebuilt after deserialization.
 serde = ["dep:serde"]
+# Let an embedder provide an authoritative generation for instruction-visible
+# memory. This is opt-in because the embedder must uphold the publication
+# contract; ordinary callers retain exact byte validation.
+instruction-generation = []
 # Opt-in trace-opportunity accounting for emulator profiling. Disabled builds
 # contain none of the counters or reporting code.
 trace-profile = []
