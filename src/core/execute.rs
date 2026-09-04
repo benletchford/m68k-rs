@@ -583,6 +583,24 @@ impl CpuCore {
         max_instructions: u32,
         watch_pcs: &[u32],
     ) -> BatchResult {
+        #[cfg(feature = "instruction-generation")]
+        {
+            // Mixing the ordinary and generation-aware APIs remains safe: the
+            // first JIT access observes zero, withdraws any earlier publication
+            // promise, and resets direct-linked authoritative traces to
+            // per-entry validation before using or extending the cache.
+            self.instruction_memory_generation = 0;
+        }
+        self.run_batch_synchronized(bus, max_instructions, watch_pcs)
+    }
+
+    #[inline]
+    fn run_batch_synchronized<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_instructions: u32,
+        watch_pcs: &[u32],
+    ) -> BatchResult {
         let prior_precision = self.precise_bus;
         self.set_precise_bus(false);
         // Capture the bus's fastmem window for the duration of this batch.
@@ -601,11 +619,50 @@ impl CpuCore {
             self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
             self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
-        let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
+        let result = trace_jit::with_trace_jit_batch(self, |cpu| {
+            cpu.run_batch_inner(bus, max_instructions, watch_pcs)
+        });
         self.fm_ptr = 0;
         self.fm_base = 0;
         self.fm_len = 0;
         self.set_precise_bus(prior_precision);
+        result
+    }
+
+    /// Execute a throughput batch under an embedder-managed instruction-memory
+    /// publication generation.
+    ///
+    /// A nonzero `generation` promises that every change which may become
+    /// visible to instruction fetch advances the value before another batch
+    /// executes. On a transition, m68k withdraws the byte proofs of its
+    /// compiled traces but retains their native code. Each unchanged trace
+    /// compares its captured bytes once in the new generation and then enters
+    /// its native body directly; a changed trace is discarded. Traces compiled
+    /// in the current generation start already proven. Generation zero makes
+    /// no promise and retains ordinary per-entry byte validation.
+    ///
+    /// Values belong to this thread's trace-cache lifetime: an embedder that
+    /// replaces the backing bus must supply a generation not previously used
+    /// for different instruction bytes. A generation must never wrap and reuse
+    /// an earlier nonzero value.
+    #[cfg(feature = "instruction-generation")]
+    pub fn run_batch_with_instruction_memory_generation<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        max_instructions: u32,
+        watch_pcs: &[u32],
+        generation: u32,
+    ) -> BatchResult {
+        // Synchronization is deliberately lazy: the first operation that
+        // already needs `TRACE_JIT` compares this value with the cache's
+        // generation and withdraws cached byte proofs on a transition. This
+        // avoids a separate macOS TLV resolver call at every batch boundary.
+        self.instruction_memory_generation = generation;
+        if generation == 0 {
+            return self.run_batch_synchronized(bus, max_instructions, watch_pcs);
+        }
+        let result = self.run_batch_synchronized(bus, max_instructions, watch_pcs);
+        self.instruction_memory_generation = 0;
         result
     }
 
@@ -635,7 +692,7 @@ impl CpuCore {
         if let Some(expected) = self.pending_trap_resume.take()
             && expected == self.pc
         {
-            trace_jit::record_trace_target(self.pc, self.cpu_type);
+            trace_jit::record_trace_target(self);
             probe_on_entry = true;
         }
 
