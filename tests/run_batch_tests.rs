@@ -1845,3 +1845,57 @@ fn movem_long_roundtrip_loop_matches_step() {
         cpu.set_d(7, 5);
     });
 }
+
+/// A bus whose first word read runs one instruction on a second core (with
+/// its own memory) before serving the read, the way a host bus can run a
+/// coprocessor or a device model from a read callback.
+struct NestedBatchBus {
+    outer: LinearMemoryBus,
+    nested_runs: u32,
+    nested_d0: u32,
+}
+
+impl AddressBus for NestedBatchBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.outer.read_byte(address)
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        if self.nested_runs == 0 {
+            self.nested_runs += 1;
+            let mut inner_bus = LinearMemoryBus::new(0x10000);
+            inner_bus.load(0x2000, &0x7005u16.to_be_bytes()); // MOVEQ #5,D0
+            let mut inner = cpu_at(0x2000);
+            let result = inner.run_batch(&mut inner_bus, 1, &[]);
+            assert_eq!(result.instructions, 1);
+            self.nested_d0 = inner.d(0);
+        }
+        self.outer.read_word(address)
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        self.outer.read_long(address)
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        self.outer.write_byte(address, value)
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.outer.write_word(address, value)
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.outer.write_long(address, value)
+    }
+}
+
+#[test]
+fn nested_batch_from_a_bus_callback_runs_without_the_outer_batch_jit() {
+    let mut bus = NestedBatchBus {
+        outer: bus_with(&[(0x1000, 0x7003)]), // MOVEQ #3,D0
+        nested_runs: 0,
+        nested_d0: 0,
+    };
+    let mut cpu = cpu_at(0x1000);
+    let result = cpu.run_batch(&mut bus, 1, &[]);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(cpu.d(0), 3, "the outer batch retires its instruction");
+    assert_eq!(bus.nested_runs, 1, "the callback ran the nested batch once");
+    assert_eq!(bus.nested_d0, 5, "the nested core retired its instruction");
+}
