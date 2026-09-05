@@ -172,19 +172,10 @@ thread_local! {
     static TRACE_JIT: RefCell<Option<TraceJit>> = const { RefCell::new(None) };
 }
 /// Run `f` on the thread's trace-JIT state, creating it on first use.
+/// Borrow this thread's JIT outside any batch; tests inspect and prime it.
+#[cfg(test)]
 fn with_trace_jit<R>(f: impl FnOnce(&mut TraceJit) -> R) -> R {
     TRACE_JIT.with_borrow_mut(|slot| f(slot.get_or_insert_with(TraceJit::new)))
-}
-
-#[inline]
-fn with_synchronized_trace_jit<R>(
-    cpu: &mut CpuCore,
-    f: impl FnOnce(&mut TraceJit, &mut CpuCore) -> R,
-) -> R {
-    with_trace_jit(|jit| {
-        jit.synchronize_instruction_memory_generation(cpu);
-        f(jit, cpu)
-    })
 }
 
 struct TraceJitBatchPtrGuard(*mut usize);
@@ -206,10 +197,26 @@ impl Drop for TraceJitBatchPtrGuard {
 /// pointer lives on `CpuCore`, which is already live throughout execution;
 /// this deliberately avoids carrying an additional Rust reference through
 /// the interpreter loop and increasing register pressure on non-JIT code.
+/// Run one batch with this thread's trace JIT borrowed for its whole
+/// duration, reachable from the core through `trace_jit_batch_ptr`.
+///
+/// A host bus may run another core's batch from inside a bus callback on
+/// the same thread while the outer batch holds that borrow. Such a nested
+/// batch cannot share the JIT (the outer batch may be mid-recording or
+/// mid-trace in it), so it runs without one: every JIT hook sees a null
+/// batch pointer and the core interprets, records nothing and starts no
+/// recording. The outer batch resumes with its JIT untouched.
 #[inline]
 pub(crate) fn with_trace_jit_batch<R>(cpu: &mut CpuCore, f: impl FnOnce(&mut CpuCore) -> R) -> R {
-    with_synchronized_trace_jit(cpu, |jit, cpu| {
-        debug_assert_eq!(cpu.trace_jit_batch_ptr, 0);
+    debug_assert_eq!(cpu.trace_jit_batch_ptr, 0);
+    TRACE_JIT.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            // Nested inside another batch on this thread: interpret only.
+            cpu.trace_recording = false;
+            return f(cpu);
+        };
+        let jit = slot.get_or_insert_with(TraceJit::new);
+        jit.synchronize_instruction_memory_generation(cpu);
         let ptr_slot = &raw mut cpu.trace_jit_batch_ptr;
         cpu.trace_jit_batch_ptr = jit as *mut TraceJit as usize;
         let _guard = TraceJitBatchPtrGuard(ptr_slot);
@@ -217,19 +224,21 @@ pub(crate) fn with_trace_jit_batch<R>(cpu: &mut CpuCore, f: impl FnOnce(&mut Cpu
     })
 }
 
-/// Access the JIT exclusively borrowed by `with_trace_jit_batch`.
+/// Access the JIT borrowed by the enclosing `with_trace_jit_batch`, or
+/// `None` inside a nested batch that runs without one.
 #[inline(always)]
 fn with_batch_trace_jit<R>(
     cpu: &mut CpuCore,
     f: impl FnOnce(&mut TraceJit, &mut CpuCore) -> R,
-) -> R {
+) -> Option<R> {
     let jit = cpu.trace_jit_batch_ptr as *mut TraceJit;
-    debug_assert!(!jit.is_null());
-    // SAFETY: `with_trace_jit_batch` owns the thread-local JIT's one mutable
-    // `RefCell` borrow for this entire call and installs its address in this
-    // exclusively borrowed CPU.  The pointer is cleared before that borrow is
-    // released, and JIT state does not overlap the CPU allocation.
-    unsafe { f(&mut *jit, cpu) }
+    if jit.is_null() {
+        return None;
+    }
+    // SAFETY: `with_trace_jit_batch` installed this pointer from the JIT it
+    // holds exclusively borrowed for the duration of the batch, and clears
+    // it before that borrow ends; a nested batch never installs one.
+    Some(unsafe { f(&mut *jit, cpu) })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4714,6 +4723,7 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
             TRACE_EXIT_CHAIN_BUDGET,
         )
     })
+    .flatten()
 }
 
 /// Finish an in-progress recording at an A-line trap: the trap word itself
@@ -4726,7 +4736,7 @@ pub(crate) fn finish_recording_at_trap(cpu: &mut CpuCore) -> TrapFinish {
     if !cpu.trace_recording {
         return TrapFinish::None;
     }
-    with_batch_trace_jit(cpu, |jit, cpu| jit.finish_recording_at_trap(cpu))
+    with_batch_trace_jit(cpu, |jit, cpu| jit.finish_recording_at_trap(cpu)).unwrap_or(TrapFinish::None)
 }
 
 /// How a recording responded to an A-line at its sequential continuation.
@@ -4747,7 +4757,7 @@ pub(crate) enum TrapFinish {
 pub(crate) fn record_trace_target(cpu: &mut CpuCore) {
     let pc = cpu.pc;
     let cpu_type = cpu.cpu_type;
-    with_batch_trace_jit(cpu, |jit, _cpu| jit.record_trace_target(pc, cpu_type));
+    let _ = with_batch_trace_jit(cpu, |jit, _cpu| jit.record_trace_target(pc, cpu_type));
 }
 
 /// Append one instruction that the interpreter just executed while a hot
@@ -4776,7 +4786,7 @@ fn record_executed_active<B: AddressBus>(
     executed_pc: u32,
     next_pc: u32,
 ) {
-    with_batch_trace_jit(cpu, |jit, cpu| jit.record_executed(cpu, bus, executed_pc, next_pc));
+    let _ = with_batch_trace_jit(cpu, |jit, cpu| jit.record_executed(cpu, bus, executed_pc, next_pc));
 }
 
 /// End an in-progress recording before control leaves the fast decoded-op
@@ -4791,7 +4801,7 @@ pub(crate) fn stop_recording(cpu: &mut CpuCore, cause: RecordingStop) {
 
 #[inline(never)]
 fn stop_recording_active(cpu: &mut CpuCore, cause: RecordingStop) {
-    with_batch_trace_jit(cpu, |jit, cpu| {
+    let _ = with_batch_trace_jit(cpu, |jit, cpu| {
         jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause))
     });
 }
@@ -4812,7 +4822,8 @@ pub(crate) fn note_backward_branch(cpu: &mut CpuCore, _cpu_type: CpuType) -> boo
         // Consult the actual direct-mapped slot instead of relying only on
         // the CPU's four-entry skip cache: a busy workload can evict a PC
         // from that tiny filter even though its trace remains rejected.
-        let rejected = with_batch_trace_jit(cpu, |jit, _cpu| jit.is_rejected(pc, _cpu_type));
+        let rejected =
+            with_batch_trace_jit(cpu, |jit, _cpu| jit.is_rejected(pc, _cpu_type)).unwrap_or(false);
         super::trace_profile::note_backward_edge(pc, _cpu_type, rejected);
     }
     if cpu.trace_probe_skip.contains(&pc) {
