@@ -1266,7 +1266,10 @@ fn jit_bit_op(op: BitOp) -> JitBitOp {
     }
 }
 
-#[inline]
+/// Always inlined: a masked register load on the decoded-op fast path. Left
+/// to the inliner it drops out of line whenever the surrounding interpreter
+/// grows, and the call then costs more than the load.
+#[inline(always)]
 fn read_direct_reg(cpu: &CpuCore, reg: DirectReg, size: Size) -> u32 {
     match reg {
         DirectReg::Data(reg) => cpu.dar[reg as usize] & size.mask(),

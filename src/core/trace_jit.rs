@@ -4471,8 +4471,13 @@ pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
 }
 
 /// Append one instruction that the interpreter just executed while a hot
-/// multi-block path is being recorded. The normal path checks the CPU flag
-/// first, so no TLS access occurs when recording is inactive.
+/// multi-block path is being recorded. Called for every interpreted
+/// instruction, so the inactive check is pinned inline at the call site and
+/// the recording body stays out of line: left to the inliner, the decision
+/// flips with the size of the recorder, and an out-of-line call per guest
+/// instruction just to test the flag costs interpreted workloads several
+/// percent.
+#[inline(always)]
 pub(crate) fn record_executed<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
@@ -4480,17 +4485,33 @@ pub(crate) fn record_executed<B: AddressBus>(
     next_pc: u32,
 ) {
     if cpu.trace_recording {
-        with_trace_jit(|jit| jit.record_executed(cpu, bus, executed_pc, next_pc));
+        record_executed_active(cpu, bus, executed_pc, next_pc);
     }
+}
+
+#[inline(never)]
+fn record_executed_active<B: AddressBus>(
+    cpu: &mut CpuCore,
+    bus: &mut B,
+    executed_pc: u32,
+    next_pc: u32,
+) {
+    with_trace_jit(|jit| jit.record_executed(cpu, bus, executed_pc, next_pc));
 }
 
 /// End an in-progress recording before control leaves the fast decoded-op
 /// path. A usable prefix ending in a branch is compiled; otherwise the
-/// target is marked rejected.
+/// target is marked rejected. Same inline split as `record_executed`.
+#[inline(always)]
 pub(crate) fn stop_recording(cpu: &mut CpuCore, cause: RecordingStop) {
     if cpu.trace_recording {
-        with_trace_jit(|jit| jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause)));
+        stop_recording_active(cpu, cause);
     }
+}
+
+#[inline(never)]
+fn stop_recording_active(cpu: &mut CpuCore, cause: RecordingStop) {
+    with_trace_jit(|jit| jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause)));
 }
 
 /// Note that execution just took a backward branch to `cpu.pc` (a potential
