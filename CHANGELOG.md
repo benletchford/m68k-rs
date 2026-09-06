@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.12.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.12.1...m68k-v0.12.2) (2026-09-06)
+
+
+### Performance Improvements
+
+* keep recorder checks and register reads inline ([f62d228](https://github.com/benletchford/m68k-rs/commit/f62d2284dea2bf607501bf4ab84fecb8941334fd))
+* **trace:** bypass admission for compiled exits ([3db98cf](https://github.com/benletchford/m68k-rs/commit/3db98cf35399b950bd914b323c2b9d737e00f89c))
+* **trace:** compile absolute-byte immediate compares ([12f309b](https://github.com/benletchford/m68k-rs/commit/12f309b7501996f059821a76126b8d31ec3c737d))
+* **trace:** compile displacement indirect calls ([4c06797](https://github.com/benletchford/m68k-rs/commit/4c06797bcf370d23f63632161fcd1f2adb81e616))
+* **trace:** compile indexed byte AND-immediate loops ([649468e](https://github.com/benletchford/m68k-rs/commit/649468e0e0473e19087abcb101f66e564368adf4))
+* **trace:** compile PC-relative LEA ([fdd6700](https://github.com/benletchford/m68k-rs/commit/fdd6700cc6a8ee6e87cafb98ea1f49dec95109b8))
+* **trace:** compile register-indirect jumps ([8e89a40](https://github.com/benletchford/m68k-rs/commit/8e89a40b26a4ca6c15a6f30b7fc6fdc8329cdc4f))
+* **trace:** exit at nested forward calls ([c3a5072](https://github.com/benletchford/m68k-rs/commit/c3a5072d8b1e4e11cff2d947ef77a031aebeaccb))
+* **trace:** follow guarded indirect jumps ([798a20a](https://github.com/benletchford/m68k-rs/commit/798a20a4b7597a932f1938986625e217640e3c57))
+* **trace:** generate the hot 50-byte validator ([5420742](https://github.com/benletchford/m68k-rs/commit/54207424caff9182b2850832a4a6af4c1355d161))
+* **trace:** salvage indexed-dispatch prefixes at call spans ([d2b9bc1](https://github.com/benletchford/m68k-rs/commit/d2b9bc1b3b1cbf82ff42a659750c3494445d2553))
+* **trace:** specialize code validation by segment width ([c8e57b9](https://github.com/benletchford/m68k-rs/commit/c8e57b9a842ee5e1dc6c242e9775a5384b361344))
+* **trace:** specialize common validation segment counts ([ef4f446](https://github.com/benletchford/m68k-rs/commit/ef4f446dd8f919bfcbddb3d708d1cf01903f63b3))
+* **trace:** specialize hot validation lengths ([39c929b](https://github.com/benletchford/m68k-rs/commit/39c929b42247b3befd05af52407db758e49aca87))
+* **trace:** specialize small watch lists ([1cf40fa](https://github.com/benletchford/m68k-rs/commit/1cf40fa53abcd416f0a440217b583bee317ce0cb))
+* **trace:** tag guarded exits in generated code ([3c02c10](https://github.com/benletchford/m68k-rs/commit/3c02c1075fa298e568ed57f5499f3196d5eed457))
+* **trace:** validate generated traces once per entry ([d7d57ce](https://github.com/benletchford/m68k-rs/commit/d7d57ce60238698d89b447e962055206628e90a4))
+
 ## [0.12.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.12.0...m68k-v0.12.1) (2026-09-02)
 
 
