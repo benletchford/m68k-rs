@@ -1610,6 +1610,134 @@ fn rewritten_continuation_head_after_side_exit_matches_step() {
     );
 }
 
+#[test]
+fn host_rewrite_between_batches_matches_step_with_unchanged_trace_head() {
+    struct Case {
+        name: &'static str,
+        words: &'static [u16],
+        rewrite_index: usize,
+        rewritten_word: u16,
+    }
+
+    let cases = [
+        Case {
+            name: "interior opcode",
+            words: &[
+                0x5280, // $1000: ADDQ.L #1,D0 (trace head remains unchanged)
+                0x5281, // $1002: ADDQ.L #1,D1 (rewritten to ADDQ.L #2,D1)
+                0x4E71, // $1004: NOP
+                0x51CF, 0xFFF8, // $1006: DBRA D7,$1000
+                0xA000, // $100A: sentinel
+            ],
+            rewrite_index: 1,
+            rewritten_word: 0x5481,
+        },
+        Case {
+            name: "interior extension",
+            words: &[
+                0x5280, // $1000: ADDQ.L #1,D0 (trace head remains unchanged)
+                0x223C, 0x0000, 0x0001, // $1002: MOVE.L #1,D1
+                0x5282, // $1008: ADDQ.L #1,D2
+                0x51CF, 0xFFF4, // $100A: DBRA D7,$1000
+                0xA000, // $100E: sentinel
+            ],
+            rewrite_index: 3,
+            rewritten_word: 0x0002,
+        },
+    ];
+
+    for case in cases {
+        #[cfg(feature = "trace-profile")]
+        m68k::core::trace_profile::reset();
+
+        let bytes = assemble(case.words);
+        let mut batch_bus = FastRamBus::new(0x20000);
+        batch_bus.load(0x1000, &bytes);
+        let mut batch_cpu = cpu_at(0x1000);
+        batch_cpu.set_cpu_type(CpuType::M68020);
+        batch_cpu.set_d(7, 0xFFFF);
+
+        let warmup = batch_cpu.run_batch(&mut batch_bus, 40_000, &[]);
+        assert_eq!(warmup.exit, BatchExit::BudgetExhausted, "{}", case.name);
+        assert_eq!(warmup.instructions, 40_000, "{}", case.name);
+        assert_eq!(batch_cpu.pc, 0x1000, "{}", case.name);
+
+        #[cfg(feature = "trace-profile")]
+        {
+            let snapshot = m68k::core::trace_profile::snapshot();
+            let row = snapshot
+                .rows
+                .iter()
+                .find(|row| row.start_pc == 0x1000 && row.cpu_type == CpuType::M68020)
+                .unwrap_or_else(|| panic!("{}: trace-head profile is absent", case.name));
+            assert!(
+                row.compiled_ops >= 4,
+                "{}: trace did not compile",
+                case.name
+            );
+            assert!(row.native_calls > 0, "{}: trace never executed", case.name);
+            assert!(row.jit_retired > 0, "{}: trace retired nothing", case.name);
+        }
+
+        batch_cpu.set_d(7, 1);
+        let mut step_cpu = cpu_at(batch_cpu.pc);
+        step_cpu.set_cpu_type(CpuType::M68020);
+        step_cpu.set_sr(batch_cpu.get_sr());
+        for register in 0..8 {
+            step_cpu.set_d(register, batch_cpu.d(register));
+            step_cpu.set_a(register, batch_cpu.a(register));
+        }
+        let mut step_bus = FastRamBus::new(0x20000);
+        step_bus.fm_len = 0;
+        step_bus.load(0x1000, &bytes);
+
+        let rewrite_addr = 0x1000 + case.rewrite_index as u32 * 2;
+        batch_bus.write_word(rewrite_addr, case.rewritten_word);
+        step_bus.write_word(rewrite_addr, case.rewritten_word);
+
+        let mut stepped = 0;
+        let mut reached_sentinel = false;
+        for _ in 0..100 {
+            match step_cpu.step(&mut step_bus) {
+                m68k::StepResult::Ok { .. } => stepped += 1,
+                m68k::StepResult::AlineTrap { opcode: 0xA000 } => {
+                    reached_sentinel = true;
+                    break;
+                }
+                other => panic!("{}: unexpected step result {other:?}", case.name),
+            }
+        }
+        assert!(reached_sentinel, "{}: step run diverged", case.name);
+        let batch = batch_cpu.run_batch(&mut batch_bus, 100, &[]);
+
+        assert_eq!(
+            batch.exit,
+            BatchExit::AlineTrap { opcode: 0xA000 },
+            "{}",
+            case.name
+        );
+        assert_eq!(batch.instructions, stepped, "{}: retirements", case.name);
+        assert_eq!(batch_cpu.pc, step_cpu.pc, "{}: pc", case.name);
+        assert_eq!(batch_cpu.ppc, step_cpu.ppc, "{}: ppc", case.name);
+        assert_eq!(batch_cpu.get_sr(), step_cpu.get_sr(), "{}: sr", case.name);
+        for register in 0..8 {
+            assert_eq!(
+                batch_cpu.d(register),
+                step_cpu.d(register),
+                "{}: D{register}",
+                case.name
+            );
+            assert_eq!(
+                batch_cpu.a(register),
+                step_cpu.a(register),
+                "{}: A{register}",
+                case.name
+            );
+        }
+        assert_eq!(batch_bus.mem, step_bus.mem, "{}: memory", case.name);
+    }
+}
+
 /// The census exemplar: AND.W of a displaced field into a register,
 /// with a counter.
 #[test]
