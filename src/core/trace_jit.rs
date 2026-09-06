@@ -4736,7 +4736,8 @@ pub(crate) fn finish_recording_at_trap(cpu: &mut CpuCore) -> TrapFinish {
     if !cpu.trace_recording {
         return TrapFinish::None;
     }
-    with_batch_trace_jit(cpu, |jit, cpu| jit.finish_recording_at_trap(cpu)).unwrap_or(TrapFinish::None)
+    with_batch_trace_jit(cpu, |jit, cpu| jit.finish_recording_at_trap(cpu))
+        .unwrap_or(TrapFinish::None)
 }
 
 /// How a recording responded to an A-line at its sequential continuation.
@@ -4786,7 +4787,9 @@ fn record_executed_active<B: AddressBus>(
     executed_pc: u32,
     next_pc: u32,
 ) {
-    let _ = with_batch_trace_jit(cpu, |jit, cpu| jit.record_executed(cpu, bus, executed_pc, next_pc));
+    let _ = with_batch_trace_jit(cpu, |jit, cpu| {
+        jit.record_executed(cpu, bus, executed_pc, next_pc)
+    });
 }
 
 /// End an in-progress recording before control leaves the fast decoded-op
