@@ -70,6 +70,29 @@ pub trait AddressBus {
     /// Write one big-endian 32-bit longword to `address`.
     fn write_long(&mut self, address: u32, value: u32);
 
+    /// Snapshot host metadata for a memory-to-memory MOVE operand, after its
+    /// source read and before any destination write. `bytes` is 1, 2, or 4.
+    /// Addresses have the CPU address mask applied. These notifications are
+    /// omitted with an enabled MMU and for accesses through `fast_mem`.
+    /// A bus that needs them must not expose a fast memory window.
+    ///
+    /// This is observational: implementations must not change guest memory,
+    /// device state, faults, or timing. Return `true` when a snapshot was
+    /// captured; only then is `end_memory_copy` called, including when
+    /// destination resolution/write faults. Returning `false` avoids the
+    /// completion callback when the source has no metadata.
+    #[inline]
+    fn begin_memory_copy(&mut self, _source: u32, _bytes: u32) -> bool {
+        false
+    }
+
+    /// Finish a MOVE metadata transfer. `Some` identifies a completed
+    /// destination write; `None` discards the snapshot after a fault.
+    /// Source metadata must be captured by `begin_memory_copy`, since source
+    /// and destination may overlap. This callback must not write guest bytes.
+    #[inline]
+    fn end_memory_copy(&mut self, _destination: Option<u32>) {}
+
     /// Precise-timing callback (Part E.2): called immediately before each bus
     /// access with the number of CPU clocks of internal (non-bus) processing
     /// the core performed since its previous access. The access itself then
