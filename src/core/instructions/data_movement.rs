@@ -4,6 +4,7 @@
 
 use crate::core::cpu::CpuCore;
 use crate::core::ea::{AddressingMode, EaResult};
+use crate::core::execute::RUN_MODE_BERR_AERR_RESET;
 use crate::core::memory::AddressBus;
 use crate::core::types::{CpuType, Size};
 
@@ -19,8 +20,20 @@ impl CpuCore {
         src_mode: AddressingMode,
         dst_mode: AddressingMode,
     ) -> i32 {
-        // Read source value
-        let value = self.read_ea(bus, src_mode, size);
+        let source = self.resolve_ea(bus, src_mode, size);
+        let value = self.read_resolved_ea(bus, source, size);
+        let copying = matches!(source, EaResult::Memory(_))
+            && !dst_mode.is_register_direct()
+            && !(self.has_pmmu && self.pmmu_enabled)
+            && self.run_mode != RUN_MODE_BERR_AERR_RESET;
+        let copying = copying
+            && match source {
+                EaResult::Memory(address) => {
+                    bus.begin_memory_copy(self.address(address), size.bytes())
+                }
+                _ => false,
+            };
+        let mut destination = None;
 
         // Write to destination. The 68000 sequences its final prefetch
         // differently per destination mode:
@@ -60,6 +73,7 @@ impl CpuCore {
                     // trailing write does not re-latch it.
                     self.ipl_poll_point(bus);
                     if let EaResult::Memory(addr) = ea {
+                        destination = Some(addr);
                         match size {
                             Size::Byte => self.write_8(bus, addr, value as u8),
                             Size::Word => self.write_16(bus, addr, value as u16),
@@ -81,6 +95,7 @@ impl CpuCore {
                     // write is split explicitly.
                     let ea = self.resolve_ea(bus, dst_mode, size);
                     if let EaResult::Memory(addr) = ea {
+                        destination = Some(addr);
                         self.write_move_dest_68000(bus, addr, size, value);
                     }
                     self.ipl_poll_point(bus);
@@ -97,6 +112,7 @@ impl CpuCore {
                     // poll rides the final prefetch instead (the default).
                     let ea = self.resolve_ea(bus, dst_mode, size);
                     if let EaResult::Memory(addr) = ea {
+                        destination = Some(addr);
                         self.write_move_dest_68000(bus, addr, size, value);
                     }
                     self.ipl_poll_point(bus);
@@ -109,6 +125,7 @@ impl CpuCore {
                     let lo = self.read_imm_16(bus) as u32;
                     self.consume_without_prefetch = false;
                     let addr = (hi << 16) | lo;
+                    destination = Some(addr);
                     match size {
                         Size::Byte => self.write_8(bus, addr, value as u8),
                         Size::Word => self.write_16(bus, addr, value as u16),
@@ -118,11 +135,19 @@ impl CpuCore {
                     // end-of-instruction top-up.
                 }
                 _ => {
-                    self.write_ea(bus, dst_mode, size, value);
+                    destination = self.write_move_ea(bus, dst_mode, size, value);
                 }
             }
         } else {
-            self.write_ea(bus, dst_mode, size, value);
+            destination = self.write_move_ea(bus, dst_mode, size, value);
+        }
+
+        if copying {
+            bus.end_memory_copy(if self.run_mode == RUN_MODE_BERR_AERR_RESET {
+                None
+            } else {
+                destination.map(|address| self.address(address))
+            });
         }
 
         // Set flags
@@ -599,6 +624,17 @@ impl CpuCore {
         size: Size,
         value: u32,
     ) {
+        self.write_move_ea(bus, mode, size, value);
+    }
+
+    #[inline]
+    fn write_move_ea<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        mode: AddressingMode,
+        size: Size,
+        value: u32,
+    ) -> Option<u32> {
         match self.resolve_ea(bus, mode, size) {
             EaResult::DataReg(reg) => {
                 let reg = reg as usize;
@@ -618,15 +654,19 @@ impl CpuCore {
                 // Address registers always get full 32-bit value
                 self.dar[8 + reg as usize] = value;
             }
-            EaResult::Memory(addr) => match size {
-                Size::Byte => self.write_8(bus, addr, value as u8),
-                Size::Word => self.write_16(bus, addr, value as u16),
-                Size::Long => self.write_32(bus, addr, value),
-            },
+            EaResult::Memory(addr) => {
+                match size {
+                    Size::Byte => self.write_8(bus, addr, value as u8),
+                    Size::Word => self.write_16(bus, addr, value as u16),
+                    Size::Long => self.write_32(bus, addr, value),
+                }
+                return Some(addr);
+            }
             EaResult::Immediate(_) => {
                 // Can't write to immediate - should not happen
             }
         }
+        None
     }
 
     /// Read value from an already-resolved effective address.
