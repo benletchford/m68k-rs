@@ -36,6 +36,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 // because its byte-address period is only 0x2000; four times as many entries
 // keeps the lookup branchless while moving the collision period to 0x8000.
 const TRACE_CACHE_SIZE: usize = 16_384;
+/// Words in the membership bitset behind `linked_slot_indices`.
+#[cfg(feature = "instruction-generation")]
+const TRACE_CACHE_MEMBER_WORDS: usize = TRACE_CACHE_SIZE / u64::BITS as usize;
 pub(crate) const TRACE_MAX_OPS: usize = 128;
 pub(crate) const TRACE_MIN_OPS: usize = 3;
 
@@ -162,16 +165,80 @@ enum NativeTraceFn {
 static TRACE_JIT_HAS_CANDIDATES: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
-    // Const-initialized so access compiles to a direct TLS slot read. The
-    // lazily-initialized form re-ran its platform once-guard on every
-    // access, and `try_execute_trace` probes once per batch entry and per
-    // backward branch -- in EV Override's crawl that guard alone was 4% of
-    // the main thread (252 of 6,417 sampled ms).
+    // Const-initialized so access avoids the lazily-initialized form's
+    // platform once-guard. `try_execute_trace` probes once per batch entry
+    // and per backward branch; in EV Override's crawl that guard alone was
+    // 4% of the main thread (252 of 6,417 sampled ms).
     static TRACE_JIT: RefCell<Option<TraceJit>> = const { RefCell::new(None) };
 }
 /// Run `f` on the thread's trace-JIT state, creating it on first use.
+/// Borrow this thread's JIT outside any batch; tests inspect and prime it.
+#[cfg(test)]
 fn with_trace_jit<R>(f: impl FnOnce(&mut TraceJit) -> R) -> R {
     TRACE_JIT.with_borrow_mut(|slot| f(slot.get_or_insert_with(TraceJit::new)))
+}
+
+struct TraceJitBatchPtrGuard(*mut usize);
+
+impl Drop for TraceJitBatchPtrGuard {
+    fn drop(&mut self) {
+        // SAFETY: `with_trace_jit_batch` creates this guard from the address
+        // of a field in its exclusively borrowed `CpuCore`.  The CPU cannot
+        // move or be destroyed before the guard, and the guard is dropped
+        // before the enclosing thread-local `RefCell` borrow is released.
+        unsafe { *self.0 = 0 };
+    }
+}
+
+/// Borrow this thread's JIT for a whole throughput batch.
+///
+/// Generation synchronization shares the batch's one TLS access and runs
+/// exactly once before any trace can be used or created.  The scoped JIT
+/// pointer lives on `CpuCore`, which is already live throughout execution;
+/// this deliberately avoids carrying an additional Rust reference through
+/// the interpreter loop and increasing register pressure on non-JIT code.
+/// Run one batch with this thread's trace JIT borrowed for its whole
+/// duration, reachable from the core through `trace_jit_batch_ptr`.
+///
+/// A host bus may run another core's batch from inside a bus callback on
+/// the same thread while the outer batch holds that borrow. Such a nested
+/// batch cannot share the JIT (the outer batch may be mid-recording or
+/// mid-trace in it), so it runs without one: every JIT hook sees a null
+/// batch pointer and the core interprets, records nothing and starts no
+/// recording. The outer batch resumes with its JIT untouched.
+#[inline]
+pub(crate) fn with_trace_jit_batch<R>(cpu: &mut CpuCore, f: impl FnOnce(&mut CpuCore) -> R) -> R {
+    debug_assert_eq!(cpu.trace_jit_batch_ptr, 0);
+    TRACE_JIT.with(|cell| {
+        let Ok(mut slot) = cell.try_borrow_mut() else {
+            // Nested inside another batch on this thread: interpret only.
+            cpu.trace_recording = false;
+            return f(cpu);
+        };
+        let jit = slot.get_or_insert_with(TraceJit::new);
+        jit.synchronize_instruction_memory_generation(cpu);
+        let ptr_slot = &raw mut cpu.trace_jit_batch_ptr;
+        cpu.trace_jit_batch_ptr = jit as *mut TraceJit as usize;
+        let _guard = TraceJitBatchPtrGuard(ptr_slot);
+        f(cpu)
+    })
+}
+
+/// Access the JIT borrowed by the enclosing `with_trace_jit_batch`, or
+/// `None` inside a nested batch that runs without one.
+#[inline(always)]
+fn with_batch_trace_jit<R>(
+    cpu: &mut CpuCore,
+    f: impl FnOnce(&mut TraceJit, &mut CpuCore) -> R,
+) -> Option<R> {
+    let jit = cpu.trace_jit_batch_ptr as *mut TraceJit;
+    if jit.is_null() {
+        return None;
+    }
+    // SAFETY: `with_trace_jit_batch` installed this pointer from the JIT it
+    // holds exclusively borrowed for the duration of the batch, and clears
+    // it before that borrow ends; a nested batch never installs one.
+    Some(unsafe { f(&mut *jit, cpu) })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1245,6 +1312,18 @@ fn validate_trace_code<B: AddressBus>(
     }
 }
 
+/// Diagnostic shadow check for embedders evaluating an authoritative
+/// instruction publication generation. Production builds compile this path
+/// out; trace-profile builds can detect any changed bytes that survived under
+/// an unchanged nonzero generation.
+#[cfg(all(feature = "trace-profile", feature = "instruction-generation"))]
+fn instruction_generation_audit_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("M68K_INSTRUCTION_GENERATION_AUDIT").is_some())
+}
+
 struct CompiledTrace {
     pc: u32,
     cpu_type: CpuType,
@@ -1303,11 +1382,18 @@ struct CompiledTrace {
     adaptive_calls: Cell<u32>,
     adaptive_guard_exits: Cell<u32>,
     adaptive_rerecords: u8,
-    /// Optional first-call entry that validates fixed guest-code bytes, then
-    /// calls `func`. Repeated native calls in the same Rust entry use the
-    /// unchecked body because Rust has already established coherency.
+    /// First-call entry. Ordinary traces use a wrapper that validates fixed
+    /// guest-code bytes then calls `func`; `None` selects the shared Rust
+    /// validator. Under an authoritative publication generation this is the
+    /// trace's byte proof: `func` itself once the bytes have been proven in
+    /// the current generation, `None` after a publication withdraws that
+    /// proof. A transition resets the link without discarding the body and
+    /// the next successful validation restores it, so the proven hot path
+    /// carries no generation compare or side-table lookup. Repeated native
+    /// calls in the same Rust entry use the unchecked body after either
+    /// proof.
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-    checked_func: Option<NativeTraceFn>,
+    checked_func: Cell<Option<NativeTraceFn>>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func: NativeTraceFn,
 }
@@ -1333,6 +1419,7 @@ impl CompiledTrace {
     unsafe fn call_checked(&self, cpu: *mut CpuCore, max_iters: u32) -> u64 {
         match self
             .checked_func
+            .get()
             .expect("test trace should have a generated checked entry")
         {
             NativeTraceFn::Once(func) => unsafe { func(cpu) },
@@ -1475,6 +1562,23 @@ pub(crate) struct TraceJit {
     func_ctx: FunctionBuilderContext,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     next_func: u32,
+    /// Embedder publication generation under which the reachable trace slots
+    /// were built. This lives beside the cache instead of in a second TLS
+    /// object: synchronization happens only after a caller has already paid
+    /// to access `TRACE_JIT` for useful work.
+    #[cfg(feature = "instruction-generation")]
+    instruction_memory_generation: u32,
+    /// Cache indices whose compiled trace currently holds a first-call link
+    /// (`checked_func` is `Some`): every slot compiled or re-proven since the
+    /// last publication. A membership bitset keeps the list duplicate-free.
+    /// Both are touched only when a link is installed or restored and when a
+    /// publication drains the list; the proven trace-entry path never reads
+    /// them. Draining exactly the linked set means a publication costs the
+    /// working set between two publications, not the whole cache.
+    #[cfg(feature = "instruction-generation")]
+    linked_slot_indices: Vec<u16>,
+    #[cfg(feature = "instruction-generation")]
+    linked_slot_members: Vec<u64>,
     slots: Vec<TraceSlot>,
     recording: Option<TraceRecording>,
     /// A guarded exit already counted candidacy at this exact target. The
@@ -1553,6 +1657,12 @@ impl TraceJit {
             func_ctx: FunctionBuilderContext::new(),
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             next_func: 0,
+            #[cfg(feature = "instruction-generation")]
+            instruction_memory_generation: 0,
+            #[cfg(feature = "instruction-generation")]
+            linked_slot_indices: Vec::new(),
+            #[cfg(feature = "instruction-generation")]
+            linked_slot_members: vec![0; TRACE_CACHE_MEMBER_WORDS],
             slots: (0..TRACE_CACHE_SIZE).map(|_| TraceSlot::Empty).collect(),
             recording: None,
             pending_exit_seed: None,
@@ -1562,6 +1672,97 @@ impl TraceJit {
             no_terminal_strikes: vec![[(u32::MAX, 0); 2]; TRACE_CACHE_SIZE],
             deferred_linear: vec![[u32::MAX; 2]; TRACE_CACHE_SIZE],
         }
+    }
+
+    /// Apply a pending embedder publication transition at the first JIT
+    /// access made by this CPU. Every execution, admission, and recording
+    /// path enters through this synchronization point, so a trace cannot be
+    /// used or created under stale instruction bytes. Generation zero is a
+    /// real transition: it withdraws the embedder's publication promise and
+    /// restores ordinary per-entry byte validation.
+    #[inline]
+    fn synchronize_instruction_memory_generation(&mut self, cpu: &mut CpuCore) {
+        #[cfg(feature = "instruction-generation")]
+        {
+            let generation = cpu.instruction_memory_generation;
+            if self.instruction_memory_generation == generation {
+                return;
+            }
+            self.instruction_memory_generation = generation;
+            self.reset_linked_entry_proofs();
+            cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+            cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
+            cpu.trace_recording = false;
+        }
+        #[cfg(not(feature = "instruction-generation"))]
+        let _ = cpu;
+    }
+
+    /// Remember that slot `idx` now holds a first-call link so the next
+    /// publication can withdraw it without scanning the cache. Called when a
+    /// trace with a link is installed and when a validation restores a link;
+    /// the proven entry path never reaches it. Takes the two fields directly
+    /// so a caller that still holds `&self.slots[idx]` can record the link.
+    #[cfg(feature = "instruction-generation")]
+    fn track_linked_slot(indices: &mut Vec<u16>, members: &mut [u64], idx: usize) {
+        let word = &mut members[idx / u64::BITS as usize];
+        let mask = 1u64 << (idx % u64::BITS as usize);
+        if *word & mask == 0 {
+            *word |= mask;
+            indices.push(idx as u16);
+        }
+    }
+
+    /// Restore a trace's direct link after the shared validator proved its
+    /// bytes in the current nonzero generation, and list the slot for the
+    /// next publication. Out of line: this runs once per trace per
+    /// publication, and keeping it out of `try_execute` leaves the proven
+    /// entry path's code exactly as it was without the feature.
+    #[cfg(all(
+        feature = "jit",
+        feature = "instruction-generation",
+        not(target_family = "wasm")
+    ))]
+    #[cold]
+    #[inline(never)]
+    fn relink_proven_trace(
+        indices: &mut Vec<u16>,
+        members: &mut [u64],
+        trace: &CompiledTrace,
+        idx: usize,
+    ) {
+        trace.checked_func.set(Some(trace.func));
+        Self::track_linked_slot(indices, members, idx);
+    }
+
+    /// Withdraw every byte proof cached under the preceding publication
+    /// generation while retaining compiled traces. The linked list is
+    /// drained: each listed slot that still holds a compiled trace has its
+    /// first-call link reset to `None`, so its next entry runs the shared
+    /// validator, which restores the link for unchanged bytes and discards
+    /// the trace for changed bytes. A listed slot that was evicted, rejected
+    /// or recompiled meanwhile needs nothing (a recompiled occupant is listed
+    /// in its own right). Nothing is compiled, freed, or rewritten here, and
+    /// the proven entry path is untouched.
+    ///
+    /// Recording cannot survive: unlike a finished trace, its partial path
+    /// has no captured-byte validator. The admission side tables remain:
+    /// they can only affect whether or when current bytes are compiled,
+    /// never execute stale code.
+    #[cfg(feature = "instruction-generation")]
+    #[cold]
+    fn reset_linked_entry_proofs(&mut self) {
+        for idx in self.linked_slot_indices.drain(..) {
+            if let TraceSlot::Compiled(trace) = &self.slots[usize::from(idx)] {
+                #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+                trace.checked_func.set(None);
+                #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
+                let _ = trace;
+            }
+        }
+        self.linked_slot_members.fill(0);
+        self.recording = None;
+        self.pending_exit_seed = None;
     }
 
     fn invalidate_changed_trace(
@@ -1686,16 +1887,54 @@ impl TraceJit {
                 return None;
             }
 
+            #[cfg(all(feature = "trace-profile", feature = "instruction-generation"))]
+            if cpu.instruction_memory_generation != 0 && instruction_generation_audit_enabled() {
+                match validate_trace_code(trace, cpu, bus) {
+                    SlowTraceCodeValidation::Valid => {}
+                    SlowTraceCodeValidation::Unavailable => return None,
+                    SlowTraceCodeValidation::Changed { index, ppc, opcode } => {
+                        eprintln!(
+                            "m68k instruction-generation audit: generation {} hid changed trace ${pc:08X} at ${ppc:08X}",
+                            cpu.instruction_memory_generation
+                        );
+                        return self.invalidate_changed_trace(idx, pc, cpu, index, ppc, opcode);
+                    }
+                }
+            }
+
             // A checked native entry compares its fixed code bytes and then
             // calls the ordinary body. Portable traces and native traces
-            // without that entry retain the shared host validator.
+            // without that entry retain the shared host validator. Under an
+            // authoritative generation the entry is the trace's byte proof:
+            // the body itself once proven, `None` after a publication.
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-            let generated_validation = trace.checked_func.is_some();
+            let checked_func = trace.checked_func.get();
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            let generated_validation = checked_func.is_some();
             #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
             let generated_validation = false;
             if !generated_validation {
                 match validate_trace_code(trace, cpu, bus) {
-                    SlowTraceCodeValidation::Valid => {}
+                    SlowTraceCodeValidation::Valid => {
+                        // The embedder promises these bytes stay published
+                        // until its next transition, so later entries in this
+                        // generation may link straight to the body. Generation
+                        // zero makes no promise: leave the link empty so every
+                        // entry keeps validating.
+                        #[cfg(all(
+                            feature = "jit",
+                            feature = "instruction-generation",
+                            not(target_family = "wasm")
+                        ))]
+                        if cpu.instruction_memory_generation != 0 {
+                            Self::relink_proven_trace(
+                                &mut self.linked_slot_indices,
+                                &mut self.linked_slot_members,
+                                trace,
+                                idx,
+                            );
+                        }
+                    }
                     SlowTraceCodeValidation::Unavailable => return None,
                     SlowTraceCodeValidation::Changed { index, ppc, opcode } => {
                         return self.invalidate_changed_trace(idx, pc, cpu, index, ppc, opcode);
@@ -1756,12 +1995,16 @@ impl TraceJit {
                 let NativeTraceFn::Loop(body_func) = trace.func else {
                     unreachable!("a batched trace must have a counted entry point")
                 };
-                let checked_func = match trace.checked_func {
-                    Some(NativeTraceFn::Loop(func)) => Some(func),
-                    Some(NativeTraceFn::Once(_)) => {
-                        unreachable!("checked and body entries must share an ABI")
+                let checked_func = if generated_validation {
+                    match checked_func {
+                        Some(NativeTraceFn::Loop(func)) => Some(func),
+                        Some(NativeTraceFn::Once(_)) => {
+                            unreachable!("checked and body entries must share an ABI")
+                        }
+                        None => None,
                     }
-                    None => None,
+                } else {
+                    None
                 };
                 let mut first_native_call = true;
                 // When a trace combines data-dependent CondSkip retirement
@@ -1840,12 +2083,16 @@ impl TraceJit {
                 let NativeTraceFn::Once(body_func) = trace.func else {
                     unreachable!("a one-pass trace must have a linear entry point")
                 };
-                let checked_func = match trace.checked_func {
-                    Some(NativeTraceFn::Once(func)) => Some(func),
-                    Some(NativeTraceFn::Loop(_)) => {
-                        unreachable!("checked and body entries must share an ABI")
+                let checked_func = if generated_validation {
+                    match checked_func {
+                        Some(NativeTraceFn::Once(func)) => Some(func),
+                        Some(NativeTraceFn::Loop(_)) => {
+                            unreachable!("checked and body entries must share an ABI")
+                        }
+                        None => None,
                     }
-                    None => None,
+                } else {
+                    None
                 };
                 let mut first_native_call = true;
                 loop {
@@ -2782,6 +3029,21 @@ impl TraceJit {
                 // accumulated before this first compile are disproven.
                 self.remember_compiled(start_pc);
                 self.clear_no_terminal_strikes(start_pc);
+                // A trace born with a first-call link (a direct link under an
+                // authoritative generation, or a generated wrapper) must be
+                // reachable by the next publication.
+                #[cfg(all(
+                    feature = "jit",
+                    feature = "instruction-generation",
+                    not(target_family = "wasm")
+                ))]
+                if trace.checked_func.get().is_some() {
+                    Self::track_linked_slot(
+                        &mut self.linked_slot_indices,
+                        &mut self.linked_slot_members,
+                        idx,
+                    );
+                }
                 TraceSlot::Compiled(trace)
             }
             Err(reason) => {
@@ -3521,6 +3783,10 @@ impl TraceJit {
             return Err(RegionRejectReason::CallSpan);
         }
 
+        #[cfg(feature = "instruction-generation")]
+        let authoritative_generation = cpu.instruction_memory_generation != 0;
+        #[cfg(not(feature = "instruction-generation"))]
+        let authoritative_generation = false;
         self.compile_ops(CompileParams {
             start_pc,
             cpu_type,
@@ -3536,6 +3802,7 @@ impl TraceJit {
             callee_end,
             aligned_only: cpu.is_pre_68020,
             address_mask: cpu.address_mask,
+            authoritative_generation,
         })
         .ok_or(RegionRejectReason::Backend)
     }
@@ -3557,6 +3824,7 @@ impl TraceJit {
             code_end,
             aligned_only,
             address_mask,
+            authoritative_generation,
         } = params;
         // Matched application and microbenchmark profiles show a clear win
         // for mixed 3+-op and read-only self-loops. A two-op read/write MoveMem
@@ -3572,7 +3840,8 @@ impl TraceJit {
         // One through three short segments cover over 90% of SC2K entries.
         // Its one wider hot shape is a contiguous 50-byte region; other wide
         // and unusually fragmented traces retain the shared SIMD comparator.
-        let generated_code_validation = cfg!(target_arch = "x86_64")
+        let generated_code_validation = !authoritative_generation
+            && cfg!(target_arch = "x86_64")
             && code_segments.len() <= 3
             && (code_segments.iter().all(|segment| segment.len <= 47)
                 || matches!(code_segments.as_slice(), [segment] if segment.len == 50));
@@ -4089,14 +4358,26 @@ impl TraceJit {
         } else {
             NativeTraceFn::Once(unsafe { transmute::<*const u8, TraceOnceFn>(ptr) })
         };
-        let checked_func = checked_func_id.map(|checked_func_id| {
-            let ptr = module.get_finalized_function(checked_func_id);
-            if native_loop {
-                NativeTraceFn::Loop(unsafe { transmute::<*const u8, TraceLoopFn>(ptr) })
-            } else {
-                NativeTraceFn::Once(unsafe { transmute::<*const u8, TraceOnceFn>(ptr) })
-            }
-        });
+        // Under an authoritative generation the existing first-entry slot is
+        // the stable direct link: point it at the body itself, so the trace
+        // is born proven for the current generation. A later publication
+        // resets this link to `None` and the shared validator restores it
+        // (see `reset_compiled_entry_proofs`). Ordinary generation-zero traces
+        // contain either a real checked wrapper or `None` for the shared Rust
+        // validator. This encodes the decision at compilation time without
+        // adding a field, table lookup, or hot branch.
+        let checked_func = if authoritative_generation {
+            Some(func)
+        } else {
+            checked_func_id.map(|checked_func_id| {
+                let ptr = module.get_finalized_function(checked_func_id);
+                if native_loop {
+                    NativeTraceFn::Loop(unsafe { transmute::<*const u8, TraceLoopFn>(ptr) })
+                } else {
+                    NativeTraceFn::Once(unsafe { transmute::<*const u8, TraceOnceFn>(ptr) })
+                }
+            })
+        };
 
         let guarded_ops = guarded_op_mask(ops);
         let seeded_exit = ops.last().is_some_and(|op| {
@@ -4126,7 +4407,7 @@ impl TraceJit {
             adaptive_calls: Cell::new(0),
             adaptive_guard_exits: Cell::new(0),
             adaptive_rerecords: 0,
-            checked_func,
+            checked_func: Cell::new(checked_func),
             func,
         })
     }
@@ -4182,6 +4463,12 @@ struct CompileParams<'a> {
     aligned_only: bool,
     #[cfg_attr(any(not(feature = "jit"), target_family = "wasm"), allow(dead_code))]
     address_mask: u32,
+    /// Traces compiled under an authoritative generation are born proven and
+    /// re-proven by the shared validator after each later transition, so a
+    /// generated checked entry is never needed. Omitting it saves backend
+    /// work and executable memory.
+    #[cfg_attr(any(not(feature = "jit"), target_family = "wasm"), allow(dead_code))]
+    authoritative_generation: bool,
 }
 
 const CC_N: u8 = 0b1000;
@@ -4425,7 +4712,7 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
         return None;
     }
 
-    with_trace_jit(|jit| {
+    with_batch_trace_jit(cpu, |jit, cpu| {
         jit.try_execute(
             cpu,
             bus,
@@ -4436,6 +4723,7 @@ pub(crate) fn try_execute_trace<B: AddressBus>(
             TRACE_EXIT_CHAIN_BUDGET,
         )
     })
+    .flatten()
 }
 
 /// Finish an in-progress recording at an A-line trap: the trap word itself
@@ -4448,7 +4736,8 @@ pub(crate) fn finish_recording_at_trap(cpu: &mut CpuCore) -> TrapFinish {
     if !cpu.trace_recording {
         return TrapFinish::None;
     }
-    with_trace_jit(|jit| jit.finish_recording_at_trap(cpu))
+    with_batch_trace_jit(cpu, |jit, cpu| jit.finish_recording_at_trap(cpu))
+        .unwrap_or(TrapFinish::None)
 }
 
 /// How a recording responded to an A-line at its sequential continuation.
@@ -4466,8 +4755,10 @@ pub(crate) enum TrapFinish {
     Compiled,
 }
 
-pub(crate) fn record_trace_target(pc: u32, cpu_type: CpuType) {
-    with_trace_jit(|jit| jit.record_trace_target(pc, cpu_type));
+pub(crate) fn record_trace_target(cpu: &mut CpuCore) {
+    let pc = cpu.pc;
+    let cpu_type = cpu.cpu_type;
+    let _ = with_batch_trace_jit(cpu, |jit, _cpu| jit.record_trace_target(pc, cpu_type));
 }
 
 /// Append one instruction that the interpreter just executed while a hot
@@ -4496,7 +4787,9 @@ fn record_executed_active<B: AddressBus>(
     executed_pc: u32,
     next_pc: u32,
 ) {
-    with_trace_jit(|jit| jit.record_executed(cpu, bus, executed_pc, next_pc));
+    let _ = with_batch_trace_jit(cpu, |jit, cpu| {
+        jit.record_executed(cpu, bus, executed_pc, next_pc)
+    });
 }
 
 /// End an in-progress recording before control leaves the fast decoded-op
@@ -4511,7 +4804,9 @@ pub(crate) fn stop_recording(cpu: &mut CpuCore, cause: RecordingStop) {
 
 #[inline(never)]
 fn stop_recording_active(cpu: &mut CpuCore, cause: RecordingStop) {
-    with_trace_jit(|jit| jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause)));
+    let _ = with_batch_trace_jit(cpu, |jit, cpu| {
+        jit.finish_recording(cpu, cpu.pc, RecordingEnd::Stopped(cause))
+    });
 }
 
 /// Note that execution just took a backward branch to `cpu.pc` (a potential
@@ -4523,15 +4818,16 @@ fn stop_recording_active(cpu: &mut CpuCore, cause: RecordingStop) {
 /// per-CPU compares before any TLS access. `TraceJit::try_execute` re-arms
 /// the filters whenever it invalidates or rejects a trace.
 #[inline]
-pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool {
+pub(crate) fn note_backward_branch(cpu: &mut CpuCore, _cpu_type: CpuType) -> bool {
     let pc = cpu.pc;
     #[cfg(feature = "trace-profile")]
     {
         // Consult the actual direct-mapped slot instead of relying only on
         // the CPU's four-entry skip cache: a busy workload can evict a PC
         // from that tiny filter even though its trace remains rejected.
-        let rejected = with_trace_jit(|jit| jit.is_rejected(pc, cpu_type));
-        super::trace_profile::note_backward_edge(pc, cpu_type, rejected);
+        let rejected =
+            with_batch_trace_jit(cpu, |jit, _cpu| jit.is_rejected(pc, _cpu_type)).unwrap_or(false);
+        super::trace_profile::note_backward_edge(pc, _cpu_type, rejected);
     }
     if cpu.trace_probe_skip.contains(&pc) {
         // Known-uncompilable target: recording is a no-op and probing
@@ -4542,7 +4838,7 @@ pub(crate) fn note_backward_branch(cpu: &mut CpuCore, cpu_type: CpuType) -> bool
         let at = (cpu.trace_record_skip_at & 3) as usize;
         cpu.trace_record_skip[at] = pc;
         cpu.trace_record_skip_at = cpu.trace_record_skip_at.wrapping_add(1);
-        record_trace_target(pc, cpu_type);
+        record_trace_target(cpu);
     }
     true
 }
@@ -15483,6 +15779,336 @@ mod portable_tests {
         assert_eq!(pc, 0x010C, "the miss consumed the changed opcode");
     }
 
+    #[cfg(all(
+        feature = "jit",
+        feature = "instruction-generation",
+        not(target_family = "wasm")
+    ))]
+    fn first_entry_links_to_body(trace: &CompiledTrace) -> Option<bool> {
+        Some(match (trace.checked_func.get()?, trace.func) {
+            (NativeTraceFn::Once(first), NativeTraceFn::Once(body)) => {
+                std::ptr::fn_addr_eq(first, body)
+            }
+            (NativeTraceFn::Loop(first), NativeTraceFn::Loop(body)) => {
+                std::ptr::fn_addr_eq(first, body)
+            }
+            _ => false,
+        })
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "instruction-generation",
+        not(target_family = "wasm")
+    ))]
+    fn track_linked(jit: &mut TraceJit, idx: usize) {
+        TraceJit::track_linked_slot(
+            &mut jit.linked_slot_indices,
+            &mut jit.linked_slot_members,
+            idx,
+        );
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "instruction-generation",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn authoritative_trace_uses_existing_first_entry_as_a_direct_link() {
+        // ADDQ.L #1,D5 ; ADDQ.L #1,D6 ; BRA.S head
+        const HEAD: u32 = 0x010A;
+        let words = [0x5285u16, 0x5286, 0x60FA];
+        let mut mem = vec![0u8; 0x1000];
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (index, word) in words.iter().enumerate() {
+            let addr = HEAD as usize + index * 2;
+            mem[addr..addr + 2].copy_from_slice(&word.to_be_bytes());
+            bus.write_word(HEAD + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.set_sr(0x2700);
+        cpu.pc = HEAD;
+        cpu.cycles_remaining = 1_000;
+        cpu.instruction_memory_generation = 7;
+        let ops = [HEAD, HEAD + 2, HEAD + 4]
+            .into_iter()
+            .map(|pc| {
+                decode_trace_op(&cpu, &mut bus, pc, CpuType::M68040)
+                    .expect("test operation is traceable")
+            })
+            .collect();
+        let mut jit = TraceJit::new();
+        jit.instruction_memory_generation = 7;
+        let trace = jit
+            .compile_decoded_ops(&cpu, HEAD, CpuType::M68040, ops, None)
+            .expect("trace compiles");
+        assert_eq!(
+            first_entry_links_to_body(&trace),
+            Some(true),
+            "the first-entry link aliases the unchecked body"
+        );
+
+        let idx = trace_cache_index(HEAD);
+        jit.slots[idx] = TraceSlot::Compiled(trace);
+        track_linked(&mut jit, idx);
+
+        // Publication keeps the native body but withdraws its byte proof.
+        cpu.instruction_memory_generation = 8;
+        jit.synchronize_instruction_memory_generation(&mut cpu);
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            panic!("publication retains the compiled trace");
+        };
+        assert_eq!(
+            first_entry_links_to_body(trace),
+            None,
+            "the old generation's proof cannot survive publication"
+        );
+        assert!(
+            jit.linked_slot_indices.is_empty(),
+            "publication drains the linked list"
+        );
+
+        // Unchanged bytes: the shared validator proves them once and the
+        // trace re-links its first entry to the body for this generation.
+        attach_window(&mut cpu, &mut mem);
+        let result = jit.try_execute(
+            &mut cpu,
+            &mut bus,
+            CpuType::M68040,
+            3,
+            false,
+            &[],
+            TRACE_EXIT_CHAIN_BUDGET,
+        );
+        assert!(
+            matches!(result, Some((CachedRunResult::Ran, 3))),
+            "the shared validator proves the retained trace once"
+        );
+        assert_eq!((cpu.d(5), cpu.d(6)), (1, 1));
+        assert_eq!(cpu.pc, HEAD);
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            panic!("a proven trace stays compiled");
+        };
+        assert_eq!(
+            first_entry_links_to_body(trace),
+            Some(true),
+            "validation under a nonzero generation restores the direct link"
+        );
+        assert_eq!(
+            jit.linked_slot_indices,
+            [idx as u16],
+            "a restored link is listed for the next publication"
+        );
+
+        // Withdrawing the promise resets the link, and a successful
+        // validation under generation zero must not restore it.
+        cpu.instruction_memory_generation = 0;
+        jit.synchronize_instruction_memory_generation(&mut cpu);
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            panic!("withdrawing the promise retains the compiled trace");
+        };
+        assert_eq!(first_entry_links_to_body(trace), None);
+        let result = jit.try_execute(
+            &mut cpu,
+            &mut bus,
+            CpuType::M68040,
+            3,
+            false,
+            &[],
+            TRACE_EXIT_CHAIN_BUDGET,
+        );
+        assert!(
+            matches!(result, Some((CachedRunResult::Ran, 3))),
+            "generation zero still runs a validated trace"
+        );
+        assert_eq!((cpu.d(5), cpu.d(6)), (2, 2));
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            panic!("generation zero retains the compiled trace");
+        };
+        assert_eq!(
+            first_entry_links_to_body(trace),
+            None,
+            "generation zero validates on every entry"
+        );
+
+        // Rewrite the second op, then publish: the retained trace must be
+        // discarded by its next validation, never run against stale bytes.
+        let addr = HEAD as usize + 2;
+        mem[addr..addr + 2].copy_from_slice(&0x5287u16.to_be_bytes()); // ADDQ.L #1,D7
+        bus.write_word(HEAD + 2, 0x5287);
+        cpu.instruction_memory_generation = 9;
+        jit.synchronize_instruction_memory_generation(&mut cpu);
+        let result = jit.try_execute(
+            &mut cpu,
+            &mut bus,
+            CpuType::M68040,
+            3,
+            false,
+            &[],
+            TRACE_EXIT_CHAIN_BUDGET,
+        );
+        assert!(result.is_none(), "a mid-trace change restarts at the head");
+        assert_eq!(cpu.pc, HEAD);
+        assert_eq!((cpu.d(5), cpu.d(6), cpu.d(7)), (2, 2, 0));
+        assert!(matches!(jit.slots[idx], TraceSlot::Empty));
+    }
+
+    #[cfg(all(
+        feature = "jit",
+        feature = "instruction-generation",
+        not(target_family = "wasm")
+    ))]
+    #[test]
+    fn linked_slot_list_is_deduplicated_and_drained_by_publication() {
+        const HEAD: u32 = 0x010A;
+        let mut bus = super::super::memory::LinearMemoryBus::new(0x1000);
+        for (index, word) in [0x5285, 0x5286, 0x60FA].iter().enumerate() {
+            bus.write_word(HEAD + index as u32 * 2, *word);
+        }
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        cpu.instruction_memory_generation = 7;
+        let mut jit = TraceJit::new();
+        let mut compile = |jit: &mut TraceJit| {
+            let ops = [HEAD, HEAD + 2, HEAD + 4]
+                .into_iter()
+                .map(|pc| {
+                    decode_trace_op(&cpu, &mut bus, pc, CpuType::M68040)
+                        .expect("test operation is traceable")
+                })
+                .collect();
+            jit.compile_decoded_ops(&cpu, HEAD, CpuType::M68040, ops, None)
+                .expect("trace compiles")
+        };
+        let idx = trace_cache_index(HEAD);
+        let word = idx / u64::BITS as usize;
+        let mask = 1u64 << (idx % u64::BITS as usize);
+
+        let first = compile(&mut jit);
+        jit.slots[idx] = TraceSlot::Compiled(first);
+        track_linked(&mut jit, idx);
+        track_linked(&mut jit, idx);
+        assert_eq!(jit.linked_slot_indices, [idx as u16], "no duplicates");
+        assert_eq!(jit.linked_slot_members[word] & mask, mask);
+
+        // Publication drains the list and withdraws the listed proof.
+        jit.reset_linked_entry_proofs();
+        assert!(jit.linked_slot_indices.is_empty());
+        assert_eq!(jit.linked_slot_members[word] & mask, 0);
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            panic!("publication retains compiled code");
+        };
+        assert_eq!(first_entry_links_to_body(trace), None);
+
+        // A slot that lost its trace before the publication needs nothing.
+        track_linked(&mut jit, idx);
+        jit.slots[idx] = TraceSlot::Empty;
+        jit.reset_linked_entry_proofs();
+        assert!(jit.linked_slot_indices.is_empty());
+
+        // Eviction and recompilation between two publications lists the slot
+        // once, and the new occupant is what the publication resets.
+        let second = compile(&mut jit);
+        jit.slots[idx] = TraceSlot::Compiled(second);
+        track_linked(&mut jit, idx);
+        jit.slots[idx] = TraceSlot::Empty;
+        let third = compile(&mut jit);
+        jit.slots[idx] = TraceSlot::Compiled(third);
+        track_linked(&mut jit, idx);
+        assert_eq!(jit.linked_slot_indices, [idx as u16]);
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            unreachable!()
+        };
+        assert_eq!(first_entry_links_to_body(trace), Some(true));
+        jit.reset_linked_entry_proofs();
+        assert!(jit.linked_slot_indices.is_empty());
+        let TraceSlot::Compiled(trace) = &jit.slots[idx] else {
+            panic!("publication retains compiled code");
+        };
+        assert_eq!(first_entry_links_to_body(trace), None);
+    }
+
+    #[test]
+    fn batch_jit_pointer_is_cleared_before_unwind_releases_the_borrow() {
+        let mut cpu = CpuCore::new();
+        assert_eq!(cpu.trace_jit_batch_ptr, 0);
+
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_trace_jit_batch(&mut cpu, |cpu| {
+                assert_ne!(cpu.trace_jit_batch_ptr, 0);
+                panic!("exercise the batch guard");
+            });
+        }));
+        assert!(unwound.is_err());
+        assert_eq!(cpu.trace_jit_batch_ptr, 0);
+
+        // The first panic must also have released the RefCell borrow: a new
+        // batch can acquire the same JIT and installs a fresh scoped pointer.
+        with_trace_jit_batch(&mut cpu, |cpu| {
+            assert_ne!(cpu.trace_jit_batch_ptr, 0);
+        });
+        assert_eq!(cpu.trace_jit_batch_ptr, 0);
+    }
+
+    #[cfg(feature = "instruction-generation")]
+    #[test]
+    fn lazy_generation_sync_resets_only_on_transitions() {
+        const HEAD: u32 = 0x010A;
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(CpuType::M68040);
+        let mut jit = TraceJit::new();
+        let idx = trace_cache_index(HEAD);
+
+        // A transition cancels in-flight recording state, but a slot that
+        // holds no compiled code has no proof to withdraw and is retained.
+        jit.slots[idx] = TraceSlot::Counting {
+            pc: HEAD,
+            cpu_type: CpuType::M68040,
+            hits: 1,
+            adaptive_rerecords: 0,
+            allow_call_through: false,
+            deferred_trap: false,
+            deferred_linear: false,
+        };
+        cpu.trace_record_skip[0] = HEAD;
+        cpu.trace_probe_skip[0] = HEAD;
+        cpu.trace_recording = true;
+        cpu.instruction_memory_generation = 7;
+        jit.synchronize_instruction_memory_generation(&mut cpu);
+        assert_eq!(jit.instruction_memory_generation, 7);
+        assert!(matches!(
+            jit.slots[idx],
+            TraceSlot::Counting { pc: HEAD, .. }
+        ));
+        assert_eq!(cpu.trace_record_skip, [TRACE_PC_NONE; 4]);
+        assert_eq!(cpu.trace_probe_skip, [TRACE_PC_NONE; 4]);
+        assert!(!cpu.trace_recording);
+
+        // A stable generation must leave useful cache state untouched.
+        cpu.trace_record_skip[0] = HEAD;
+        cpu.trace_recording = true;
+        jit.synchronize_instruction_memory_generation(&mut cpu);
+        assert!(matches!(
+            jit.slots[idx],
+            TraceSlot::Counting { pc: HEAD, .. }
+        ));
+        assert_eq!(cpu.trace_record_skip[0], HEAD);
+        assert!(cpu.trace_recording);
+
+        // Withdrawing the promise is a transition too.
+        cpu.instruction_memory_generation = 0;
+        jit.synchronize_instruction_memory_generation(&mut cpu);
+        assert_eq!(jit.instruction_memory_generation, 0);
+        assert!(matches!(
+            jit.slots[idx],
+            TraceSlot::Counting { pc: HEAD, .. }
+        ));
+        assert_eq!(cpu.trace_record_skip, [TRACE_PC_NONE; 4]);
+        assert!(!cpu.trace_recording);
+    }
+
     #[test]
     fn trace_code_compare_covers_scalar_simd_and_platform_boundaries() {
         let lengths = [
@@ -15612,7 +16238,7 @@ mod portable_tests {
                 .expect("short linear loop compiles");
             assert_eq!(compiled.code_segments.len(), 1, "length {len}");
             assert_eq!(compiled.code_segments[0].len as usize, len);
-            assert!(compiled.checked_func.is_some(), "length {len}");
+            assert!(compiled.checked_func.get().is_some(), "length {len}");
 
             let mut exact_mem = vec![0u8; 0x1000];
             exact_mem[HEAD as usize..HEAD as usize + len].copy_from_slice(&compiled.code);
@@ -15660,7 +16286,7 @@ mod portable_tests {
             let compiled = jit
                 .compile_decoded_ops(&cpu(), HEAD, CpuType::M68000, loop_ops(len), Some(HEAD))
                 .expect("wide linear loop compiles with shared validation");
-            assert!(compiled.checked_func.is_none(), "length {len}");
+            assert!(compiled.checked_func.get().is_none(), "length {len}");
         }
     }
 
@@ -15739,7 +16365,7 @@ mod portable_tests {
         );
         #[cfg(target_arch = "x86_64")]
         assert!(
-            compiled.checked_func.is_some(),
+            compiled.checked_func.get().is_some(),
             "the test must exercise the generated multi-segment entry"
         );
         jit.slots[trace_cache_index(HEAD)] = TraceSlot::Compiled(compiled);
@@ -21771,9 +22397,10 @@ mod portable_tests {
         // and parks `pc` on the A-line, ready for host dispatch.
         cpu.pc = A;
         let before = (cpu.d(2), cpu.d(3), cpu.d(4));
-        let (result, retired) =
-            try_execute_trace(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[])
-                .expect("compiled segment executes");
+        let (result, retired) = with_trace_jit_batch(&mut cpu, |cpu| {
+            try_execute_trace(cpu, &mut bus, CpuType::M68040, 1_000, false, &[])
+        })
+        .expect("compiled segment executes");
         assert!(matches!(result, CachedRunResult::Ran));
         assert_eq!(retired, 3, "three real ops, the A-line not counted");
         assert_eq!(cpu.pc, TRAP1, "pc parked on the trap for host dispatch");
@@ -21786,7 +22413,9 @@ mod portable_tests {
         // region: the segment must refuse to run stale semantics.
         bus.write_word_at(TRAP1, 0xA125);
         cpu.pc = A;
-        let after_smc = try_execute_trace(&mut cpu, &mut bus, CpuType::M68040, 1_000, false, &[]);
+        let after_smc = with_trace_jit_batch(&mut cpu, |cpu| {
+            try_execute_trace(cpu, &mut bus, CpuType::M68040, 1_000, false, &[])
+        });
         match after_smc {
             None => {}
             Some((CachedRunResult::Miss(opcode), 0)) => assert_eq!(opcode, 0x5282),
@@ -21830,14 +22459,22 @@ mod portable_tests {
         // Non-sequential: the A-line is not at 0x0102.
         cpu.ppc = 0x0200;
         cpu.ir = 0xA123;
-        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::None);
+        assert_eq!(
+            with_trace_jit_batch(&mut cpu, finish_recording_at_trap),
+            TrapFinish::None
+        );
         // Sequential but not an A-line word.
         cpu.ppc = 0x0102;
         cpu.ir = 0x4E71;
-        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::None);
+        assert_eq!(
+            with_trace_jit_batch(&mut cpu, finish_recording_at_trap),
+            TrapFinish::None
+        );
         // The recording is still open for the ordinary paths.
         with_trace_jit(|jit| assert!(jit.recording.is_some()));
-        stop_recording(&mut cpu, RecordingStop::TrapOrException);
+        with_trace_jit_batch(&mut cpu, |cpu| {
+            stop_recording(cpu, RecordingStop::TrapOrException)
+        });
         with_trace_jit(|jit| assert!(jit.recording.is_none()));
     }
 
@@ -21878,7 +22515,10 @@ mod portable_tests {
         cpu.ppc = 0x0102;
         cpu.ir = 0xA123;
         // First closure: deferred, not compiled.
-        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::Closed);
+        assert_eq!(
+            with_trace_jit_batch(&mut cpu, finish_recording_at_trap),
+            TrapFinish::Closed
+        );
         assert!(!cpu.trace_recording);
         with_trace_jit(|jit| {
             assert!(jit.recording.is_none());
@@ -21902,7 +22542,10 @@ mod portable_tests {
         // compile gate rejects it -- but it must NOT defer again (Closed
         // comes from the too-short rejection, and the slot moves off
         // Counting instead of re-arming).
-        assert_eq!(finish_recording_at_trap(&mut cpu), TrapFinish::Closed);
+        assert_eq!(
+            with_trace_jit_batch(&mut cpu, finish_recording_at_trap),
+            TrapFinish::Closed
+        );
         with_trace_jit(|jit| {
             assert!(jit.recording.is_none());
             assert!(matches!(

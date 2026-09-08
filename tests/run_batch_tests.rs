@@ -60,6 +60,53 @@ fn budget_exhausted_count_is_exact_with_jit_traces() {
     assert_eq!(cpu.d(0) as u64, total / 2);
 }
 
+#[cfg(all(
+    feature = "jit",
+    feature = "instruction-generation",
+    not(target_family = "wasm")
+))]
+#[test]
+fn instruction_generation_transition_observes_rewritten_code_and_zero_withdraws_trust() {
+    // Each version is ADDQ.L #1,Dn; BRA.S head. Start with an ordinary
+    // zero-budget batch so this test cannot reuse a nonzero thread-local
+    // generation left by another test worker.
+    let mut bus = bus_with(&[(0x1000, 0x5280), (0x1002, 0x60FC)]);
+    let mut cpu = cpu_at(0x1000);
+    assert_eq!(cpu.run_batch(&mut bus, 0, &[]).instructions, 0);
+
+    let first = cpu.run_batch_with_instruction_memory_generation(&mut bus, 100_000, &[], 1);
+    assert_eq!(first.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(0), 50_000);
+
+    // Publication advances the generation. The retained trace must compare
+    // its captured bytes before the rewritten ADDQ targeting D1 can execute.
+    bus.load(0x1000, &0x5281u16.to_be_bytes());
+    let d0_before = cpu.d(0);
+    let second = cpu.run_batch_with_instruction_memory_generation(&mut bus, 10_000, &[], 2);
+    assert_eq!(second.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(0), d0_before);
+    assert_eq!(cpu.d(1), 5_000);
+
+    // An unchanged publication keeps the recompiled trace usable: its proof
+    // is withdrawn and re-established by one validation, not by recompiling.
+    let third = cpu.run_batch_with_instruction_memory_generation(&mut bus, 10_000, &[], 3);
+    assert_eq!(third.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(1), 10_000);
+
+    // The ordinary API supplies generation zero. Its transition withdraws
+    // the cached proof and restores exact byte validation on every entry.
+    bus.load(0x1000, &0x5282u16.to_be_bytes());
+    let d1_before = cpu.d(1);
+    let fourth = cpu.run_batch(&mut bus, 10_000, &[]);
+    assert_eq!(fourth.exit, BatchExit::BudgetExhausted);
+    assert_eq!(cpu.pc, 0x1000);
+    assert_eq!(cpu.d(1), d1_before);
+    assert_eq!(cpu.d(2), 5_000);
+}
+
 #[test]
 fn unrelated_watch_keeps_jit_loop_budget_exact() {
     // A caller may always watch PC 0 as a clean-exit sentinel. A trace whose
@@ -1925,4 +1972,58 @@ fn movem_long_roundtrip_loop_matches_step() {
         cpu.set_d(0, 50);
         cpu.set_d(7, 5);
     });
+}
+
+/// A bus whose first word read runs one instruction on a second core (with
+/// its own memory) before serving the read, the way a host bus can run a
+/// coprocessor or a device model from a read callback.
+struct NestedBatchBus {
+    outer: LinearMemoryBus,
+    nested_runs: u32,
+    nested_d0: u32,
+}
+
+impl AddressBus for NestedBatchBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.outer.read_byte(address)
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        if self.nested_runs == 0 {
+            self.nested_runs += 1;
+            let mut inner_bus = LinearMemoryBus::new(0x10000);
+            inner_bus.load(0x2000, &0x7005u16.to_be_bytes()); // MOVEQ #5,D0
+            let mut inner = cpu_at(0x2000);
+            let result = inner.run_batch(&mut inner_bus, 1, &[]);
+            assert_eq!(result.instructions, 1);
+            self.nested_d0 = inner.d(0);
+        }
+        self.outer.read_word(address)
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        self.outer.read_long(address)
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        self.outer.write_byte(address, value)
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.outer.write_word(address, value)
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.outer.write_long(address, value)
+    }
+}
+
+#[test]
+fn nested_batch_from_a_bus_callback_runs_without_the_outer_batch_jit() {
+    let mut bus = NestedBatchBus {
+        outer: bus_with(&[(0x1000, 0x7003)]), // MOVEQ #3,D0
+        nested_runs: 0,
+        nested_d0: 0,
+    };
+    let mut cpu = cpu_at(0x1000);
+    let result = cpu.run_batch(&mut bus, 1, &[]);
+    assert_eq!(result.instructions, 1);
+    assert_eq!(cpu.d(0), 3, "the outer batch retires its instruction");
+    assert_eq!(bus.nested_runs, 1, "the callback ran the nested batch once");
+    assert_eq!(bus.nested_d0, 5, "the nested core retired its instruction");
 }

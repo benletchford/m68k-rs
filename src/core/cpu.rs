@@ -355,6 +355,13 @@ pub struct CpuCore {
     pub(crate) fm_base: u32,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_len: u32,
+    /// Nonzero while the current batch is covered by an embedder's
+    /// authoritative instruction-memory publication generation. A generation
+    /// transition withdraws older byte proofs before this value is exposed;
+    /// traces built in this batch are already proven for the current value.
+    #[cfg(feature = "instruction-generation")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) instruction_memory_generation: u32,
 
     // ========== Trace-JIT hot-loop filters ==========
     // Small PC sets (entries hold a PC or `TRACE_PC_NONE`). They keep
@@ -397,6 +404,19 @@ pub struct CpuCore {
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
     pub sst_m68000_compat: bool,
+
+    /// Address of the thread-local [`TraceJit`](super::trace_jit::TraceJit)
+    /// borrowed for the active throughput batch, or zero outside a batch.
+    ///
+    /// Keeping this transient pointer on the already-live CPU object lets the
+    /// uncommon trace paths find the batch's one JIT borrow without carrying
+    /// another reference through every interpreted instruction.  It is kept
+    /// at the tail so adding this runtime-only state does not displace existing
+    /// hot fields.  The batch guard owns the `RefCell` borrow and clears this
+    /// field even while unwinding; users must only dereference it through
+    /// `trace_jit`'s scoped helpers.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) trace_jit_batch_ptr: usize,
 }
 
 // CACR bit assignments (68020/68030). The 68040 redefines CACR (IE/DE
@@ -532,6 +552,9 @@ impl CpuCore {
             fm_ptr: 0,
             fm_base: 0,
             fm_len: 0,
+            trace_jit_batch_ptr: 0,
+            #[cfg(feature = "instruction-generation")]
+            instruction_memory_generation: 0,
             trace_record_skip: [super::trace_jit::TRACE_PC_NONE; 4],
             pending_trap_resume: None,
             trace_probe_skip: [super::trace_jit::TRACE_PC_NONE; 4],
