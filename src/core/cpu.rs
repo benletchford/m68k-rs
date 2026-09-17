@@ -355,6 +355,11 @@ pub struct CpuCore {
     pub(crate) fm_base: u32,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_len: u32,
+    // Nonzero only for a tracked read window; raw stores are forbidden then.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) fm_bus: usize,
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) fm_write_hook: usize,
 
     // ========== Trace-JIT hot-loop filters ==========
     // Small PC sets (entries hold a PC or `TRACE_PC_NONE`). They keep
@@ -532,6 +537,8 @@ impl CpuCore {
             fm_ptr: 0,
             fm_base: 0,
             fm_len: 0,
+            fm_bus: 0,
+            fm_write_hook: 0,
             trace_record_skip: [super::trace_jit::TRACE_PC_NONE; 4],
             pending_trap_resume: None,
             trace_probe_skip: [super::trace_jit::TRACE_PC_NONE; 4],

@@ -264,6 +264,23 @@ allowing every unhandled trap to follow hardware behavior. Use
 **`run_batch()`** for HLE workloads where host-call latency and instruction
 throughput matter more than observing the physical prefetch bus.
 
+### Direct RAM and observed writes
+
+`run_batch()` prefers `AddressBus::fast_mem()`, whose `FastMem` window permits
+side-effect-free direct reads and writes. With native JIT enabled on 68020 and
+later CPUs, a bus that needs write bookkeeping can instead return `TrackedMem`
+from `AddressBus::tracked_mem()`. Compiled code reads RAM directly and calls
+`write_byte/word/long` for stores; memory-to-memory MOVE also retains
+`begin_memory_copy`/`end_memory_copy` notifications. This supports metadata such
+as retained graphics coverage and write journals without interpreting the loop.
+
+Both capabilities are opt-in. `TrackedMem` requires stable, side-effect-free
+reads and infallible writes with the restrictions documented on the type;
+faulting, relocating, MMIO, and read-observing buses must decline it. Active MMU
+translation and pre-68020 store sequencing retain the ordinary path. A compiled
+memory trace is specialized for its write mode and re-recorded if that mode
+changes between batches, keeping notification checks out of direct stores.
+
 ## Supported CPU Types
 
 | CPU        | Description                            |

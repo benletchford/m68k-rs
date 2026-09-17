@@ -1518,6 +1518,11 @@ pub(crate) fn peek_window_word(cpu: &CpuCore, addr: u32) -> Option<u16> {
 }
 
 pub(crate) fn execute_mem_op(cpu: &mut CpuCore, op: DecodedMemOp) -> bool {
+    // These decoded handlers perform raw stores. Until they support tracked
+    // writes, preserve ordinary dispatch and its metadata hooks between traces.
+    if cpu.fm_write_hook != 0 {
+        return false;
+    }
     let Some(win) = Win::from_cpu(cpu) else {
         return false;
     };

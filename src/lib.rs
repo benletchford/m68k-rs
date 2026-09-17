@@ -63,7 +63,7 @@ pub use core::cpu::{
     CACR_060_EIC, CACR_060_ESB, CACR_CD, CACR_CED, CACR_CEI, CACR_CI, CACR_ED, CACR_EI, CACR_FD,
     CACR_FI, PCR_060_RESET, PCR_DFP, PCR_ESS,
 };
-pub use core::memory::{AddressBus, FastMem, LinearMemoryBus};
+pub use core::memory::{AddressBus, FastMem, LinearMemoryBus, TrackedMem};
 pub use core::types::{
     BatchExit, BatchResult, CpuType, CycleBatchControl, CycleBatchExit, CycleBatchResult,
     CycleBoundaryEvent, HleHandler, NoOpHleHandler, Size, StepResult,

@@ -50,6 +50,28 @@ pub struct FastMem {
     pub len: u32,
 }
 
+/// Read-direct RAM whose writes must still pass through the bus.
+///
+/// This is an opt-in native-JIT capability for 68020 and later CPUs, not a
+/// general MMIO mapping. Earlier CPUs retain interpreter bus sequencing. Reads
+/// within the window must have no side effects and must equal the bus methods.
+/// The allocation and address mapping must remain stable throughout `run_batch`,
+/// including across writes and copy notifications. Writes within the window must
+/// be infallible through `write_byte/word/long`; they may update host metadata or
+/// enforce write protection, but may not modify other guest bytes or reenter the
+/// CPU. Copy notifications retain their existing observational contract. These
+/// callbacks must not unwind through generated code. Tracers requiring individual
+/// reads, faulting mappings, MMIO, and relocating storage must decline this window.
+#[derive(Debug, Clone, Copy)]
+pub struct TrackedMem {
+    /// Stable host pointer backing `base`; generated code may only read it.
+    pub ptr: *const u8,
+    /// First guest address covered by the window.
+    pub base: u32,
+    /// Number of contiguous readable bytes; windows shorter than four are ignored.
+    pub len: u32,
+}
+
 /// Host-provided memory and device bus used by [`CpuCore`](crate::CpuCore).
 ///
 /// Multi-byte values use the 68k's big-endian byte order. The six basic
@@ -323,6 +345,14 @@ pub trait AddressBus {
     /// entry points (`execute`/`step`) never use the window either way.
     #[inline]
     fn fast_mem(&mut self) -> Option<FastMem> {
+        None
+    }
+
+    /// Optionally expose read-direct RAM with intercepted writes. Native traces
+    /// use this only when `fast_mem` is unavailable. Interpreter memory stores
+    /// and compiled stores both retain bus write and MOVE metadata notifications.
+    /// See [`TrackedMem`] for the required, stronger-than-ordinary-bus contract.
+    fn tracked_mem(&mut self) -> Option<TrackedMem> {
         None
     }
 }

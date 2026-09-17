@@ -1276,6 +1276,7 @@ struct CompiledTrace {
     /// Contains memory ops: only executable while a fastmem window is active
     /// (i.e. inside `run_batch`).
     needs_window: bool,
+    tracked_writes: bool,
     /// Address-masked range of the trace's code bytes; trace stores into
     /// this range bail so self-modification is observed like the
     /// interpreter would. Baked into the compiled function on native
@@ -1680,6 +1681,18 @@ impl TraceJit {
             }
             if trace.needs_window && cpu.fm_len == 0 {
                 push_probe_skip(cpu, pc);
+                return None;
+            }
+            if trace.needs_window && trace.tracked_writes != (cpu.fm_write_hook != 0) {
+                // Memory capabilities can change between batches. Re-record
+                // before entering code specialized for the previous bus mode.
+                // Keeping the mode out of each generated store preserves the
+                // original raw-FastMem instruction sequence.
+                self.slots[idx] = TraceSlot::Empty;
+                self.forget_structural_rejection(pc);
+                self.clear_linear_deferral(pc);
+                cpu.trace_record_skip = [TRACE_PC_NONE; 4];
+                cpu.trace_probe_skip = [TRACE_PC_NONE; 4];
                 return None;
             }
             if cpu.cycles_remaining < trace.max_cycles {
@@ -3536,6 +3549,7 @@ impl TraceJit {
             callee_end,
             aligned_only: cpu.is_pre_68020,
             address_mask: cpu.address_mask,
+            tracked_writes: cpu.fm_write_hook != 0,
         })
         .ok_or(RegionRejectReason::Backend)
     }
@@ -3553,6 +3567,7 @@ impl TraceJit {
             callee_end,
             self_loop,
             needs_window,
+            tracked_writes,
             code_start,
             code_end,
             aligned_only,
@@ -3618,8 +3633,30 @@ impl TraceJit {
                 );
                 let fm_base = load_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, fm_base));
                 let fm_len = load_u32(&mut builder, cpu_ptr, offset_of!(CpuCore, fm_len));
+                let fm_bus = builder.ins().load(
+                    ptr_ty,
+                    MemFlags::trusted(),
+                    cpu_ptr,
+                    offset_of!(CpuCore, fm_bus) as i32,
+                );
+                let fm_hook = builder.ins().load(
+                    ptr_ty,
+                    MemFlags::trusted(),
+                    cpu_ptr,
+                    offset_of!(CpuCore, fm_write_hook) as i32,
+                );
+                let mut hook_sig = module.make_signature();
+                hook_sig.params.push(AbiParam::new(ptr_ty));
+                for _ in 0..4 {
+                    hook_sig.params.push(AbiParam::new(types::I32));
+                }
+                let hook_sig = builder.import_signature(hook_sig);
                 Some(MemEnv {
+                    tracked_writes,
                     fm_ptr,
+                    fm_bus,
+                    fm_hook,
+                    hook_sig,
                     fm_ptr_ty: ptr_ty,
                     fm_base,
                     fm_len,
@@ -4118,6 +4155,7 @@ impl TraceJit {
             callee_start,
             callee_end,
             needs_window,
+            tracked_writes,
             code_start,
             code_end,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -4152,6 +4190,7 @@ impl TraceJit {
             self_loop: params.self_loop,
             seeded_exit,
             needs_window: params.needs_window,
+            tracked_writes: params.tracked_writes,
             code_start: params.code_start,
             code_end: params.code_end,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -4174,6 +4213,7 @@ struct CompileParams<'a> {
     max_cycles: i32,
     self_loop: bool,
     needs_window: bool,
+    tracked_writes: bool,
     code_start: u32,
     code_end: u32,
     callee_start: u32,
@@ -9078,7 +9118,11 @@ fn emit_jit_op(
 /// Window/bounds context shared by all mem ops in one trace function.
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 struct MemEnv {
+    tracked_writes: bool,
     fm_ptr: Value,
+    fm_bus: Value,
+    fm_hook: Value,
+    hook_sig: cranelift_codegen::ir::SigRef,
     fm_ptr_ty: Type,
     fm_base: Value,
     fm_len: Value,
@@ -9344,6 +9388,32 @@ fn window_store(
     size: Size,
     value: Value,
 ) {
+    window_store_with_copy(builder, env, off, size, value, None);
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn window_store_with_copy(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    off: Value,
+    size: Size,
+    value: Value,
+    source: Option<Value>,
+) {
+    if env.tracked_writes {
+        let address = builder.ins().iadd(env.fm_base, off);
+        let operation = builder.ins().iconst(
+            types::I32,
+            i64::from(size.bytes() | if source.is_some() { 8 } else { 0 }),
+        );
+        let source = source.unwrap_or_else(|| builder.ins().iconst(types::I32, 0));
+        builder.ins().call_indirect(
+            env.hook_sig,
+            env.fm_hook,
+            &[env.fm_bus, operation, address, value, source],
+        );
+        return;
+    }
     let addr = window_host_addr(builder, env, off);
     let mut flags = MemFlags::new();
     flags.set_notrap();
@@ -10677,6 +10747,7 @@ fn emit_move_mem(
     // Resolve the source: its value plus any staged post-inc/pre-dec
     // register update (not committed until every check has passed).
     let mut staged: Option<(u8, Value)> = None; // (An index, new value)
+    let mut source_address = None;
     let value = match op.src {
         JitEa::Data(r) => {
             let v = load_reg(builder, cpu, JitDirectReg::Data(r));
@@ -10689,11 +10760,13 @@ fn emit_move_mem(
         JitEa::Ind(r) => {
             let a = load_an(builder, r);
             let (off, _) = checked_window_off(builder, env, bail, a, size);
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::PcDisp(address) | JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
             let address = iconst_u32(builder, address);
             let (off, _) = checked_window_off(builder, env, bail, address, size);
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::PostInc(r) => {
@@ -10701,6 +10774,7 @@ fn emit_move_mem(
             let (off, _) = checked_window_off(builder, env, bail, a, size);
             let next = builder.ins().iadd_imm(a, jit_ea_step(size, r) as i64);
             staged = Some((r, next));
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::PreDec(r) => {
@@ -10708,12 +10782,14 @@ fn emit_move_mem(
             let a = builder.ins().iadd_imm(a0, -(jit_ea_step(size, r) as i64));
             let (off, _) = checked_window_off(builder, env, bail, a, size);
             staged = Some((r, a));
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::Disp(r, displacement) => {
             let base = load_an(builder, r);
             let a = builder.ins().iadd_imm(base, displacement as i64);
             let (off, _) = checked_window_off(builder, env, bail, a, size);
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::Index {
@@ -10739,6 +10815,7 @@ fn emit_move_mem(
             let a = builder.ins().iadd(base, index);
             let a = builder.ins().iadd_imm(a, displacement as i64);
             let (off, _) = checked_window_off(builder, env, bail, a, size);
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
         JitEa::PcIndex {
@@ -10764,6 +10841,7 @@ fn emit_move_mem(
             };
             let a = builder.ins().iadd(base, index);
             let (off, _) = checked_window_off(builder, env, bail, a, size);
+            source_address = Some(builder.ins().iadd(env.fm_base, off));
             window_load(builder, env, off, size)
         }
     };
@@ -10829,7 +10907,7 @@ fn emit_move_mem(
             if let Some(v) = new_reg {
                 store_reg(builder, cpu, JitDirectReg::Addr(r), v);
             }
-            window_store(builder, env, off, size, value);
+            window_store_with_copy(builder, env, off, size, value, source_address);
             set_logic_flags(builder, cpu, value, size);
         }
         JitEa::Index {
@@ -10863,7 +10941,7 @@ fn emit_move_mem(
             let (off, masked) = checked_window_off(builder, env, bail, addr, size);
             guard_store_not_code(builder, env, bail, masked, size);
             commit_staged(builder);
-            window_store(builder, env, off, size, value);
+            window_store_with_copy(builder, env, off, size, value, source_address);
             set_logic_flags(builder, cpu, value, size);
         }
         JitEa::AbsWord(address) | JitEa::AbsLong(address) => {
@@ -10871,7 +10949,7 @@ fn emit_move_mem(
             let (off, masked) = checked_window_off(builder, env, bail, address, size);
             guard_store_not_code(builder, env, bail, masked, size);
             commit_staged(builder);
-            window_store(builder, env, off, size, value);
+            window_store_with_copy(builder, env, off, size, value, source_address);
             set_logic_flags(builder, cpu, value, size);
         }
     }
