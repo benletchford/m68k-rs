@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.13.0...m68k-v0.14.0) (2026-09-19)
+
+
+### Features
+
+* **jit:** support observed writes in native memory traces ([47da649](https://github.com/benletchford/m68k-rs/commit/47da649313c8ffd63ef53ecb63c4a6933fd79ec7))
+
 ## [0.13.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.12.1...m68k-v0.13.0) (2026-09-07)
 
 
