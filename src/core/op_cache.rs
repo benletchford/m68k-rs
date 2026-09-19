@@ -1123,7 +1123,12 @@ impl CpuCore {
                 }
                 CachedOp::Mem(op) => {
                     if !super::mem_ops::execute_mem_op(self, op) {
-                        trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                        // Tracked windows intentionally use full dispatch for
+                        // this instruction, whose successful completion is
+                        // recorded by run_batch_inner. This is not a host yield.
+                        if self.fm_write_hook == 0 {
+                            trace_jit::stop_recording(self, trace_jit::RecordingStop::HostBoundary);
+                        }
                         return BatchInnerExit::Miss(opcode);
                     }
                     #[cfg(feature = "trace-profile")]

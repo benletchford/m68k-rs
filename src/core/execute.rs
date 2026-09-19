@@ -12,6 +12,32 @@ use super::types::{
     CycleBoundaryEvent, Size, StepResult,
 };
 
+/// Write callback used only during a native trace with a TrackedMem window.
+/// The window contract excludes faults, reentry and unwinding here.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+unsafe extern "C" fn tracked_write<B: AddressBus>(
+    bus: usize,
+    operation: u32,
+    address: u32,
+    value: u32,
+    source: u32,
+) {
+    // SAFETY: run_batch retains exclusive access to this bus and clears the
+    // callback and opaque pointer before returning to its caller.
+    let bus = unsafe { &mut *(bus as *mut B) };
+    let bytes = operation & 7;
+    let copied = operation & 8 != 0 && bus.begin_memory_copy(source, bytes);
+    match bytes {
+        1 => bus.write_byte(address, value as u8),
+        2 => bus.write_word(address, value as u16),
+        4 => bus.write_long(address, value),
+        _ => unreachable!("invalid generated store width"),
+    }
+    if copied {
+        bus.end_memory_copy(Some(address));
+    }
+}
+
 /// Stop level constants.
 pub const STOP_LEVEL_STOP: u32 = 1;
 /// Halted after a double bus/address fault; only reset can resume execution.
@@ -601,10 +627,30 @@ impl CpuCore {
             self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
             self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        // The pre-020 interpreter splits some long stores into ordered word
+        // writes. Keep that bus sequencing until tracked codegen models it.
+        if self.fm_len == 0
+            && !super::op_cache::is_pre_68020(self.cpu_type)
+            && !(self.has_pmmu && self.pmmu_enabled)
+            && let Some(window) = bus.tracked_mem()
+            && window.len >= 4
+            && !window.ptr.is_null()
+        {
+            self.fm_ptr = window.ptr as usize;
+            self.fm_base = window.base;
+            self.fm_len = window.len;
+            self.fm_bus = bus as *mut B as usize;
+            self.fm_write_hook = tracked_write::<B> as *const () as usize;
+            self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+            self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+        }
         let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
         self.fm_ptr = 0;
         self.fm_base = 0;
         self.fm_len = 0;
+        self.fm_bus = 0;
+        self.fm_write_hook = 0;
         self.set_precise_bus(prior_precision);
         result
     }
