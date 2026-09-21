@@ -24708,3 +24708,6 @@ mod durable_rejection_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod flow_latch_tests;
