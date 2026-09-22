@@ -152,6 +152,8 @@ impl CpuCore {
 
         // Main execution loop
         while self.cycles_remaining > 0 {
+            // Flow/timing belongs to the instruction about to execute.
+            self.change_of_flow = false;
             self.instruction_exception_vector = None;
             bus.begin_instruction_fetches();
             // Save previous PC
@@ -750,6 +752,11 @@ impl CpuCore {
                 self.ir = opcode as u32;
             }
 
+            // The decoded/native loop runs with tracing disabled and can leave
+            // its last flow latch set. This full-dispatch instruction starts a
+            // new trace/timing decision; its own SR writes and branches may set
+            // the latch again before the existing old-SR check below.
+            self.change_of_flow = false;
             if known_complex {
                 self.prepare_rollback_snapshot_full();
             } else {
@@ -904,6 +911,9 @@ impl CpuCore {
             return StepResult::Stopped;
         }
 
+        // A trace-disabled batch or fault may leave the previous flow latch set.
+        // Reset it only when a new instruction starts, before its own effects.
+        self.change_of_flow = false;
         self.instruction_exception_vector = None;
         bus.begin_instruction_fetches();
         self.ppc = self.pc;
@@ -1053,6 +1063,9 @@ impl CpuCore {
             return StepResult::Stopped;
         }
 
+        // A trace-disabled batch or fault may leave the previous flow latch set.
+        // Reset it only when a new instruction starts, before its own effects.
+        self.change_of_flow = false;
         self.instruction_exception_vector = None;
         bus.begin_instruction_fetches();
         self.ppc = self.pc;
