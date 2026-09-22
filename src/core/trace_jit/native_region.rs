@@ -40,10 +40,9 @@ pub(super) enum RegionMode {
 
 impl RegionMode {
     // Read once when the thread-local JIT is created. Unknown values keep the
-    // ordinary execution path; x86-64 defaults to background promotion.
+    // ordinary execution path. Promotion is opt-in, including on x86-64.
     pub(super) fn from_value(value: Option<&str>) -> Self {
         match value {
-            None if cfg!(target_arch = "x86_64") => Self::Public,
             Some("public" | "on" | "1") => Self::Public,
             _ => Self::Disabled,
         }
@@ -55,16 +54,9 @@ mod configuration_tests {
     use super::{RegionMode, TraceJit};
 
     #[test]
-    fn native_regions_default_on_for_x86_with_explicit_disable() {
-        assert_eq!(
-            RegionMode::from_value(None),
-            if cfg!(target_arch = "x86_64") {
-                RegionMode::Public
-            } else {
-                RegionMode::Disabled
-            }
-        );
+    fn native_regions_require_explicit_enablement() {
         for value in [
+            None,
             Some(""),
             Some("off"),
             Some("0"),
@@ -77,6 +69,7 @@ mod configuration_tests {
             assert!(!jit.native_region_enabled, "{value:?}");
             assert!(!jit.native_region_public, "{value:?}");
             assert!(jit.native_region.is_none());
+            assert!(jit.native_region_worker.is_none());
         }
         for value in ["public", "on", "1"] {
             let mode = RegionMode::from_value(Some(value));

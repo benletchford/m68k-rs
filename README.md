@@ -38,11 +38,11 @@ The default build has no JIT compiler dependency. Native applications that use
 m68k = { version = "0.7", features = ["jit"] }
 ```
 
-With `jit` enabled on x86-64, eligible indirect-dispatch loops and short
-return arms are combined by default. Set `M68K_NATIVE_REGIONS=off` (or `0`)
-before starting the process to keep ordinary trace execution and skip the
-extra combination IR and compiler worker. `public`, `on` and `1` explicitly
-enable it; empty or unrecognized values disable it. Configuration is read
+With `jit` enabled on x86-64, set `M68K_NATIVE_REGIONS=public` before starting
+the process to opt into combining eligible indirect-dispatch loops and short
+return arms. `on` and `1` also enable it. An absent variable, `off`, `0`, empty
+or unrecognized values keep ordinary trace execution and skip the extra
+combination IR and compiler worker. Configuration is read
 when the thread-local JIT is created, so restart the process to change it.
 Other architectures keep their existing execution path.
 
