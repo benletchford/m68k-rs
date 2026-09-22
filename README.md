@@ -38,19 +38,26 @@ The default build has no JIT compiler dependency. Native applications that use
 m68k = { version = "0.7", features = ["jit"] }
 ```
 
-An experimental trace-combining tier is disabled by default. With `jit`
-enabled, set `M68K_NATIVE_REGIONS=public` (or `on`/`1`) before starting the
-process to combine eligible indirect-dispatch loops and short return arms.
-`off`, an unset variable, or an unrecognized value retains ordinary trace
-execution without retaining the extra combination IR. Configuration is read
+With `jit` enabled on x86-64, eligible indirect-dispatch loops and short
+return arms are combined by default. Set `M68K_NATIVE_REGIONS=off` (or `0`)
+before starting the process to keep ordinary trace execution and skip the
+extra combination IR and compiler worker. `public`, `on` and `1` explicitly
+enable it; empty or unrecognized values disable it. Configuration is read
 when the thread-local JIT is created, so restart the process to change it.
+Other architectures keep their existing execution path.
 
 This tier preserves exact `run_batch()` instruction limits and observable
 memory, watch, trap and fault behavior. As already documented for
 `run_batch()`, it does not provide cycle accounting; precise execution APIs
-are unchanged. Promotion currently compiles synchronously on the execution
-thread and can pause it. Enable it explicitly for evaluation; background
-compilation is a separate follow-up rather than a guarantee of this option.
+are unchanged. Promotion compiles immutable IR snapshots on a background
+worker while existing native traces continue executing. Publication rechecks
+the captured trace identities; stale or failed results keep the old tier.
+The worker owns its executable memory, with leases keeping installed code
+alive. Submission, polling and shutdown do not wait for compilation.
+Thread creation, snapshot capture and publication still require foreground
+work, and ordinary first-tier compilation remains synchronous. The
+`trace-profile` feature retains the original per-head instrumentation and
+does not start this worker.
 
 
 ### Basic Usage

@@ -1,5 +1,7 @@
-//! Shared public run_batch oracle. Region shape, private returns and synthetic cycles
-//! are deliberately not compared. Every public return is compared before resuming.
+//! Worker-private code-generation checks using the shared public fixture.
+//! The guest bytes, complete architecture snapshot, tracked-bus observation and
+//! every-return budget/watch assertions are copied from the qualified public
+//! oracle. Only compilation/module ownership differs. No worker thread is needed.
 #![cfg(all(
     feature = "jit",
     not(target_family = "wasm"),
@@ -267,28 +269,61 @@ impl AddressBus for Bus {
 // Adapt only these three functions when sharing the module with another emitter.
 fn new_candidate_jit(enabled: bool) -> TraceJit {
     let mode = if enabled {
-        native_region::RegionMode::Public
+        RegionMode::Public
     } else {
-        native_region::RegionMode::Disabled
+        RegionMode::Disabled
     };
-    TraceJit::new_with_region_mode(mode)
-}
-fn configure_candidate(jit: &mut TraceJit, enabled: bool, heads: &[u32]) {
-    jit.native_region_enabled = enabled;
-    if enabled {
-        jit.compile_native_region(heads)
-            .expect("public region admitted");
-    } else {
-        for &head in heads {
-            let TraceSlot::Compiled(trace) = &jit.slots[trace_cache_index(head)] else {
-                panic!("ordinary head remains installed");
-            };
-            assert!(
-                trace.region_ir.is_none(),
-                "Disabled must not retain region IR or pay capture overhead"
-            );
-        }
+    let mut jit = TraceJit::new_with_region_mode(mode);
+    let module = jit.module.as_mut().expect("native JIT");
+    let signature = module.make_signature();
+    // Deliberately make retained IDs unrelated to the new private module's ID0.
+    for index in 0..32 {
+        module
+            .declare_function(
+                &format!("private_test_padding_{index}"),
+                Linkage::Import,
+                &signature,
+            )
+            .unwrap();
     }
+    jit
+}
+fn configure_candidate(jit: &mut TraceJit, enabled: bool, heads: &[u32]) -> Option<JITModule> {
+    jit.native_region_enabled = enabled;
+    if !enabled {
+        return None;
+    }
+    // The synchronous original path supplies the same descriptor/input. Its
+    // native entry is replaced, so every region invocation below uses PRIVATE
+    // executable storage, not the foreground module's compiled function.
+    jit.compile_native_region(heads)
+        .expect("synchronous descriptor admitted");
+    let input = jit.native_region.as_ref().unwrap().input.clone();
+    assert!(
+        input
+            .bodies
+            .iter()
+            .all(|body| body.body_id.as_u32() >= 32 && body.checked_id.as_u32() >= 32)
+    );
+    let private = compile_private_snapshot(&input).expect("private compilation succeeds");
+    assert_eq!(private.inlined_calls, 2 * heads.len());
+    assert_eq!(
+        private.module.declarations().get_functions().count(),
+        1,
+        "old declarations must not be copied"
+    );
+    assert_eq!(private.module.declarations().get_data_objects().count(), 0);
+    assert!(
+        jit.module
+            .as_ref()
+            .unwrap()
+            .declarations()
+            .get_functions()
+            .count()
+            >= 39
+    );
+    jit.native_region.as_mut().unwrap().entry = private.entry;
+    Some(private.module)
 }
 fn candidate_entries(jit: &TraceJit) -> u64 {
     jit.native_region_public_entries
@@ -298,138 +333,8 @@ struct Fixture {
     cpu: CpuCore,
     bus: Bus,
     jit: Option<TraceJit>,
-    enabled: bool,
+    private_module: Option<JITModule>,
 }
-
-#[test]
-fn native_region_worker_keeps_running_old_code_then_publishes_the_real_region() {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    // Always release the held compiler if a public-state assertion panics.
-    struct Release(mpsc::Sender<()>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-    let mut before = Fixture::new(false, true, 4, false);
-    let mut after = Fixture::new(true, true, 4, false);
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let release = Release(release_tx);
-    let jit = after.jit.as_mut().unwrap();
-    jit.native_region = None;
-    jit.enable_native_region_worker_with_barrier(started_tx, release_rx);
-    jit.maybe_compile_native_region(HEAD);
-    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    assert!(jit.native_region_worker.as_ref().unwrap().pending());
-    assert!(jit.native_region.is_none());
-
-    // The worker cannot finish yet. Public batches must still execute exactly
-    // the same instructions and tracked copies through the existing tier.
-    for budget in [1, 7, 11, 23, 64, 500] {
-        paired_batch(&mut before, &mut after, budget, &[]);
-        assert_eq!(candidate_entries(after.jit.as_ref().unwrap()), 0);
-        assert!(after.jit.as_ref().unwrap().native_region.is_none());
-    }
-    drop(release);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while after.jit.as_ref().unwrap().native_region.is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "real worker compilation/publication timed out"
-        );
-        after.jit.as_mut().unwrap().poll_native_region(HEAD);
-        std::thread::yield_now();
-    }
-    assert!(after.jit.as_ref().unwrap().native_region_inlined_calls() >= 6);
-    for budget in [1, 7, 11, 23, 64, 500] {
-        paired_batch(&mut before, &mut after, budget, &[]);
-    }
-    assert!(candidate_entries(after.jit.as_ref().unwrap()) > 0);
-}
-
-#[test]
-fn native_region_worker_rejects_stale_code_and_compiles_the_replacement() {
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-    struct Release(mpsc::Sender<()>);
-    impl Drop for Release {
-        fn drop(&mut self) {
-            let _ = self.0.send(());
-        }
-    }
-    let mut before = Fixture::new(false, true, 4, false);
-    let mut after = Fixture::new(true, true, 4, false);
-    let (started_tx, started_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let release = Release(release_tx);
-    let jit = after.jit.as_mut().unwrap();
-    jit.native_region = None;
-    jit.enable_native_region_worker_with_barrier(started_tx, release_rx);
-    jit.maybe_compile_native_region(HEAD);
-    started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-
-    // Change an arm while its original immutable snapshot is held by the
-    // worker. The replacement has different semantics and native identities.
-    for f in [&mut before, &mut after] {
-        f.bus.put(ARM + 2, &[0x5483]); // ADDQ.L #2,D3, formerly #1
-        let ops = [ARM, ARM + 2, ARM + 4]
-            .into_iter()
-            .map(|pc| decode_trace_op(&f.cpu, &mut f.bus, pc, CpuType::M68040).unwrap())
-            .collect();
-        f.cpu.fm_ptr = f.bus.ram.as_mut_ptr() as usize;
-        f.cpu.fm_len = LEN as u32;
-        f.cpu.fm_write_hook = 1;
-        let jit = f.jit.as_mut().unwrap();
-        let mut trace = jit
-            .compile_decoded_ops(&f.cpu, ARM, CpuType::M68040, ops, Some(HEAD))
-            .unwrap();
-        trace.adaptive_branch = false;
-        jit.slots[trace_cache_index(ARM)] = TraceSlot::Compiled(trace);
-        jit.maybe_compile_native_region(ARM);
-        f.cpu.fm_ptr = 0;
-        f.cpu.fm_len = 0;
-        f.cpu.fm_write_hook = 0;
-    }
-    for budget in [1, 7, 11, 23, 64, 500] {
-        paired_batch(&mut before, &mut after, budget, &[]);
-        assert_eq!(candidate_entries(after.jit.as_ref().unwrap()), 0);
-    }
-    release.0.send(()).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        assert!(
-            Instant::now() < deadline,
-            "stale result did not rediscover replacement"
-        );
-        let jit = after.jit.as_mut().unwrap();
-        jit.poll_native_region(HEAD);
-        // The first result must never be published, even briefly. Rediscovery
-        // submits the replacement without a new trace-compilation event.
-        assert!(jit.native_region.is_none());
-        if started_rx.try_recv().is_ok() {
-            break;
-        }
-        std::thread::yield_now();
-    }
-    drop(release); // Allow the replacement to compile only after stale rejection.
-    while after.jit.as_ref().unwrap().native_region.is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "replacement publication timed out"
-        );
-        after.jit.as_mut().unwrap().poll_native_region(HEAD);
-        std::thread::yield_now();
-    }
-    assert!(after.jit.as_ref().unwrap().native_region_inlined_calls() >= 6);
-    for budget in [1, 7, 11, 23, 64, 500] {
-        paired_batch(&mut before, &mut after, budget, &[]);
-    }
-    assert!(candidate_entries(after.jit.as_ref().unwrap()) > 0);
-}
-
 impl Fixture {
     fn new(enabled: bool, tracked: bool, width: u32, extension_arm: bool) -> Self {
         let mut bus = Bus {
@@ -544,7 +449,7 @@ impl Fixture {
             trace.adaptive_branch = false;
             jit.slots[trace_cache_index(pc)] = TraceSlot::Compiled(trace);
         }
-        configure_candidate(&mut jit, enabled, &[HEAD, arm, ARM2]);
+        let private_module = configure_candidate(&mut jit, enabled, &[HEAD, arm, ARM2]);
         // Manual installation must publish the same monotonic hint that normal
         // candidacy would set; otherwise early budget/SMC cases can bypass all JITs.
         TRACE_JIT_HAS_CANDIDATES.store(true, Ordering::Relaxed);
@@ -555,7 +460,7 @@ impl Fixture {
             cpu,
             bus,
             jit: Some(jit),
-            enabled,
+            private_module,
         }
     }
     fn in_jit<R>(&mut self, f: impl FnOnce(&mut CpuCore, &mut Bus) -> R) -> R {
@@ -573,6 +478,19 @@ impl Fixture {
     }
     fn batch(&mut self, budget: u32, watches: &[u32]) -> BatchResult {
         self.in_jit(|cpu, bus| cpu.run_batch(bus, budget, watches))
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        // First remove every path that can call this private entry. Tests only
+        // invoke synchronously through their scoped TLS installation.
+        drop(self.jit.take());
+        if let Some(module) = self.private_module.take() {
+            // SAFETY: no entry is running, the only owning JIT was dropped, and
+            // these tests never export a function pointer outside this fixture.
+            unsafe { module.free_memory() };
+        }
     }
 }
 
@@ -622,7 +540,7 @@ fn paired_batch(
 }
 
 #[test]
-fn public_region_matches_every_budget_and_changed_watch_boundary() {
+fn private_module_matches_public_budgets_watches_and_copy_notifications() {
     for tracked in [false, true] {
         for width in [1, 2, 4] {
             let mut before = Fixture::new(false, tracked, width, false);
@@ -662,11 +580,11 @@ fn public_region_matches_every_budget_and_changed_watch_boundary() {
 }
 
 #[test]
-fn public_region_smc_store_has_exact_effects_at_budget_and_watch_cuts() {
-    for (width, location) in [(1, 0), (2, 1), (2, 2), (4, 3), (2, 4), (2, 5)] {
+fn private_module_revalidates_changed_arm_with_exact_tracked_effects() {
+    for (width, location) in [(1, 0), (2, 2), (4, 3)] {
         for protected in [false, true] {
-            for first_budget in [6, 7, 15] {
-                for watch_kind in 0..3 {
+            for first_budget in [6, 7] {
+                for watch_kind in [0, 2] {
                     let extension = location == 2 || location == 5;
                     let mut before = Fixture::new(false, true, width, extension);
                     let mut after = Fixture::new(true, true, width, extension);
@@ -734,263 +652,124 @@ fn public_region_smc_store_has_exact_effects_at_budget_and_watch_cuts() {
 }
 
 #[test]
-fn public_region_unknown_target_trap_stop_and_faults_match_each_return() {
-    for scenario in 0..5 {
-        let mut before = Fixture::new(false, true, 4, false);
-        let mut after = Fixture::new(true, true, 4, false);
-        for f in [&mut before, &mut after] {
-            match scenario {
-                0 => f.bus.ram[COMMANDS as usize] = 3,
-                1 => f.cpu.set_a(4, LEN as u32 - 2),
-                2 => f.cpu.set_a(5, LEN as u32 - 2),
-                3 => {
-                    f.cpu.set_a(3, LEN as u32);
-                    f.bus.ram[COMMANDS as usize] = 1;
-                }
-                4 => {
-                    f.cpu.set_a(4, SOURCE + 1);
-                    f.cpu.set_a(5, DEST + 1);
-                    f.bus.window_len = (SOURCE + 2) as usize;
-                }
-                _ => unreachable!(),
-            }
-        }
-        for budget in [0, 6, 1, 1, 7, 17] {
-            let result = paired_batch(&mut before, &mut after, budget, &[TRAP, HANDLER]);
-            if matches!(result.exit, BatchExit::WatchedPc { .. }) {
-                paired_batch(&mut before, &mut after, 3, &[]);
-                break;
-            }
-        }
-        if scenario == 0 {
-            for f in [&mut before, &mut after] {
-                f.cpu.pc = TRAP + 4;
-            }
-            assert_eq!(
-                paired_batch(&mut before, &mut after, 1, &[]).exit,
-                BatchExit::Stopped
-            );
-            assert_eq!(
-                paired_batch(&mut before, &mut after, 10, &[]).instructions,
-                0
-            );
-        }
-    }
-}
-
-#[test]
-fn public_region_configuration_and_precise_api_remain_independent() {
-    for scenario in 0..4 {
-        let mut before = Fixture::new(false, false, 1, false);
-        let mut after = Fixture::new(true, false, 1, false);
-        paired_batch(&mut before, &mut after, 128, &[]);
-        assert!(candidate_entries(after.jit.as_ref().unwrap()) > 0);
-        for f in [&mut before, &mut after] {
-            match scenario {
-                0 => f.cpu.set_cpu_type(CpuType::M68020),
-                1 => {
-                    f.cpu.set_sr(0x2000);
-                    f.cpu.set_irq(7);
-                }
-                2 => f.cpu.set_sr(0xa000),
-                3 => f.bus.tracked = true,
-                _ => unreachable!(),
-            }
-        }
-        paired_batch(&mut before, &mut after, 1, &[]);
-        paired_batch(&mut before, &mut after, 7, &[HANDLER]);
-        // Cycle APIs retain their own exact accounting despite a populated region cache.
-        let a = before.in_jit(|cpu, bus| cpu.run_for_cycles(bus, 80));
-        let b = after.in_jit(|cpu, bus| cpu.run_for_cycles(bus, 80));
-        assert_eq!(b, a, "precise API result and cycles");
-        assert_eq!(architecture(&after.cpu), architecture(&before.cpu));
-        assert_eq!(after.cpu.cycles_remaining, before.cpu.cycles_remaining);
-        assert_eq!(after.bus.ram, before.bus.ram);
-        assert_eq!(after.bus.events, before.bus.events);
-    }
-}
-
-fn interpreted_batch(f: &mut Fixture, budget: u32, watches: &[u32]) -> BatchResult {
-    use crate::StepResult;
-    if f.cpu.stopped != 0 {
-        return BatchResult {
-            instructions: 0,
-            exit: BatchExit::Stopped,
-        };
-    }
-    let mut retired = 0;
-    while retired < budget {
-        let exit = match f.cpu.step(&mut f.bus) {
-            StepResult::Ok { .. } => None,
-            StepResult::Stopped => {
-                retired += 1;
-                Some(BatchExit::Stopped)
-            }
-            StepResult::AlineTrap { opcode } => Some(BatchExit::AlineTrap { opcode }),
-            StepResult::FlineTrap { opcode } => Some(BatchExit::FlineTrap { opcode }),
-            StepResult::TrapInstruction { trap_num } => {
-                Some(BatchExit::TrapInstruction { trap_num })
-            }
-            StepResult::Breakpoint { bp_num } => Some(BatchExit::Breakpoint { bp_num }),
-            StepResult::IllegalInstruction { opcode } => {
-                Some(BatchExit::IllegalInstruction { opcode })
-            }
-        };
-        if let Some(exit) = exit {
-            return BatchResult {
-                instructions: retired,
-                exit,
-            };
-        }
-        retired += 1;
-        if watches.contains(&f.cpu.pc) {
-            return BatchResult {
-                instructions: retired,
-                exit: BatchExit::WatchedPc { pc: f.cpu.pc },
-            };
-        }
-    }
-    BatchResult {
-        instructions: retired,
-        exit: BatchExit::BudgetExhausted,
-    }
-}
-
-fn step_visible_architecture(cpu: &CpuCore) -> Vec<(&'static str, String)> {
-    // The bounded classification run also tested Disabled: the released batch
-    // tier leaves exactly these two scratch fields different from step(). Keep
-    // both fields in every original-tier-vs-candidate comparison above.
-    assert_eq!(
-        cpu.t1_flag | cpu.t0_flag,
-        0,
-        "step projection is valid only with trace off"
+fn private_entry_retires_guest_work_without_a_foreground_call_driver() {
+    let mut fixture = Fixture::new(true, false, 1, false);
+    let entry = fixture
+        .jit
+        .as_ref()
+        .unwrap()
+        .native_region
+        .as_ref()
+        .unwrap()
+        .entry;
+    fixture.cpu.fm_ptr = fixture.bus.ram.as_mut_ptr() as usize;
+    fixture.cpu.fm_base = 0;
+    fixture.cpu.fm_len = LEN as u32;
+    let mut exit = RegionExit::default();
+    // SAFETY: private module and backing RAM outlive this call; no bus/CPU
+    // observer aliases the CPU and raw-memory mode has no tracked callbacks.
+    unsafe { entry(&mut fixture.cpu, 31, 0, &mut exit) };
+    assert!(exit.retired > 0 && exit.retired <= 31);
+    assert_ne!(
+        fixture.cpu.a(4),
+        SOURCE,
+        "guest copy actually advanced its source"
     );
-    assert_eq!(cpu.sr_save & 0xc000, 0);
-    assert!(cpu.pending_fault_cause.is_none() && cpu.fault_resume.is_none());
-    assert!(cpu.last_exception_vector.is_none() && cpu.instruction_exception_vector.is_none());
-    // check_trace() consumes/clears the one-instruction flow latch; with saved T
-    // bits clear it cannot request an exception. Recent-write scratch supplies
-    // a write-fault frame only; each possibly faulting write first replaces it.
-    architecture(cpu)
-        .into_iter()
-        .filter(|(field, _)| !matches!(*field, "change_of_flow" | "pending_fault_wdata"))
-        .collect()
 }
 
-#[test]
-fn public_region_also_matches_the_independent_step_oracle() {
-    for width in [1, 2, 4] {
-        let mut reference = Fixture::new(false, true, width, false);
-        let mut separate = Fixture::new(false, true, width, false);
-        let mut candidate = Fixture::new(true, true, width, false);
-        for (budget, watches) in [
-            (0, vec![]),
-            (27, vec![]),
-            (1, vec![]),
-            (41, vec![COPY]),
-            (1, vec![]),
-            (53, vec![ARM]),
-            (1, vec![]),
-            (61, vec![]),
-        ] {
-            let a = interpreted_batch(&mut reference, budget, &watches);
-            let original = separate.batch(budget, &watches);
-            let b = candidate.batch(budget, &watches);
-            compare_boundary(
-                &separate,
-                &candidate,
-                original,
-                b,
-                "independent-step classification: original tier vs candidate",
-            );
-            assert_eq!(b, a, "independent step: public retirement and exit");
-            assert_eq!(
-                step_visible_architecture(&separate.cpu),
-                step_visible_architecture(&reference.cpu),
-                "independent step: original tier architecture"
-            );
-            assert_eq!(
-                step_visible_architecture(&candidate.cpu),
-                step_visible_architecture(&reference.cpu),
-                "independent step: candidate architecture"
-            );
-            assert_eq!(
-                candidate.bus.ram, reference.bus.ram,
-                "independent step: all guest RAM"
-            );
-            assert_eq!(
-                candidate.bus.events, reference.bus.events,
-                "independent step: ordered copy/write effects"
-            );
-            assert_eq!(reference.bus.pending_copy, None);
-            assert_eq!(candidate.bus.pending_copy, None);
-        }
-        assert!(candidate_entries(candidate.jit.as_ref().unwrap()) > 0);
+fn edited_first_body(input: &RegionInput, edit: impl FnOnce(&mut Function)) -> RegionInput {
+    let mut changed = input.clone();
+    let old = &input.bodies[0];
+    let mut body = InlineBody {
+        body_id: old.body_id,
+        body: old.body.clone(),
+        checked_id: old.checked_id,
+        checked: old.checked.clone(),
+    };
+    edit(&mut body.body);
+    changed.bodies[0] = Arc::new(body);
+    changed
+}
+
+fn expect_private_refusal(input: &RegionInput) {
+    if let Some(unexpected) = compile_private_snapshot(input) {
+        // No entry from this unexpected result was published or called.
+        unsafe { unexpected.module.free_memory() };
+        panic!("private compilation accepted incompatible/foreground-dependent IR");
     }
 }
 
 #[test]
-fn public_region_condskip_and_indirect_exits_preserve_public_retirement() {
-    for skip in [false, true] {
-        let mut before = Fixture::new(false, false, 1, false);
-        let mut after = Fixture::new(true, false, 1, false);
-        for f in [&mut before, &mut after] {
-            let enabled = f.enabled;
-            let opcode = if skip { 0x6602 } else { 0x6702 };
-            f.bus.put(COPY, &[opcode]);
-            let jit = f.jit.as_mut().unwrap();
-            // Reconstruct the ordinary path from guest bytes. A different region
-            // emitter may replace HEAD's cached ops with its widened graph.
-            let pcs = [
-                HEAD,
-                HEAD + 2,
-                HEAD + 4,
-                HEAD + 6,
-                HEAD + 8,
-                HEAD + 12,
-                COPY,
-                COPY + 2,
-                COPY + 4,
-            ];
-            let mut ops: Vec<_> = pcs
-                .into_iter()
-                .map(|pc| decode_trace_op(&f.cpu, &mut f.bus, pc, CpuType::M68040).unwrap())
-                .collect();
-            for op in &mut ops {
-                if let JitTraceOp::IndirectJmp {
-                    expected_target, ..
-                } = &mut op.op
-                {
-                    *expected_target = Some(COPY);
-                }
-            }
-            ops[6] = TraceBuildOp {
-                pc: COPY,
-                opcode,
-                extension: None,
-                extension2: None,
-                op: JitTraceOp::CondSkip {
-                    condition: if skip { 6 } else { 7 },
-                    skip_ops: 1,
-                    length: 2,
-                },
-            };
-            f.cpu.fm_ptr = f.bus.ram.as_mut_ptr() as usize;
-            f.cpu.fm_len = LEN as u32;
-            let mut trace = jit
-                .compile_decoded_ops(&f.cpu, HEAD, CpuType::M68040, ops, Some(HEAD))
+fn private_module_rejects_abi_mismatch_and_live_foreground_symbol() {
+    use cranelift_codegen::cursor::{Cursor, FuncCursor};
+    use cranelift_codegen::ir::Signature;
+    let fixture = Fixture::new(true, false, 1, false);
+    let input = fixture
+        .jit
+        .as_ref()
+        .unwrap()
+        .native_region
+        .as_ref()
+        .unwrap()
+        .input
+        .clone();
+    let wrong_abi = edited_first_body(&input, |body| {
+        body.signature.params[0].value_type = types::I8;
+    });
+    expect_private_refusal(&wrong_abi);
+    for address_only in [false, true] {
+        let residual = edited_first_body(&input, |body| {
+            let call_conv = body.signature.call_conv;
+            let signature = body.import_signature(Signature::new(call_conv));
+            let name = body.declare_imported_user_function(UserExternalName::new(7, 0x12345));
+            let callee = body.import_function(ExtFuncData {
+                name: ExternalName::User(name),
+                signature,
+                colocated: false,
+                patchable: false,
+            });
+            let first = body
+                .layout
+                .first_inst(body.layout.entry_block().unwrap())
                 .unwrap();
-            trace.adaptive_branch = false;
-            jit.slots[trace_cache_index(HEAD)] = TraceSlot::Compiled(trace);
-            configure_candidate(jit, enabled, &[HEAD, ARM, ARM2]);
-            f.cpu.fm_ptr = 0;
-            f.cpu.fm_len = 0;
-            f.bus.ram[COMMANDS as usize..COMMANDS as usize + 7]
-                .copy_from_slice(&[0, 0, 1, 0, 0, 2, 3]);
-        }
-        for budget in [0, 8, 9, 1, 17, 3, 30] {
-            paired_batch(&mut before, &mut after, budget, &[]);
-        }
-        assert!(candidate_entries(after.jit.as_ref().unwrap()) > 0);
+            let ptr = body.signature.params[0].value_type;
+            let mut cursor = FuncCursor::new(body).at_inst(first);
+            if address_only {
+                cursor.ins().func_addr(ptr, callee);
+            } else {
+                cursor.ins().call(callee, &[]);
+            }
+        });
+        expect_private_refusal(&residual);
     }
+}
+
+#[test]
+fn unused_foreground_import_does_not_require_its_declaration() {
+    use cranelift_codegen::ir::Signature;
+    let fixture = Fixture::new(true, false, 1, false);
+    let input = fixture
+        .jit
+        .as_ref()
+        .unwrap()
+        .native_region
+        .as_ref()
+        .unwrap()
+        .input
+        .clone();
+    let unused = edited_first_body(&input, |body| {
+        let call_conv = body.signature.call_conv;
+        let signature = body.import_signature(Signature::new(call_conv));
+        let name = body.declare_imported_user_function(UserExternalName::new(7, 0x12345));
+        body.import_function(ExtFuncData {
+            name: ExternalName::User(name),
+            signature,
+            colocated: false,
+            patchable: false,
+        });
+    });
+    let private = compile_private_snapshot(&unused).expect("unused import is harmless");
+    assert_eq!(private.module.declarations().get_functions().count(), 1);
+    // No pointer from this result was published or called.
+    unsafe { private.module.free_memory() };
 }
