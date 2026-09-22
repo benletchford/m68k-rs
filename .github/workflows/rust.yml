@@ -65,6 +65,11 @@ jobs:
       - name: Run tests (default features)
         run: cargo test --locked
 
+      # all-features enables trace-profile, which excludes normal region
+      # execution fixtures. Keep this separate JIT configuration as a gate.
+      - name: Run tests (JIT without profiling)
+        run: cargo test --features jit --lib --locked
+
       - name: Run tests (all features)
         run: cargo test --all-features --locked
 
