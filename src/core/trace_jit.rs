@@ -31,6 +31,24 @@ use std::fmt;
 use std::mem::{offset_of, size_of, transmute};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+mod native_region;
+#[cfg(all(
+    test,
+    feature = "jit",
+    target_arch = "x86_64",
+    not(feature = "trace-profile")
+))]
+mod native_region_public_tests;
+#[cfg(all(
+    test,
+    feature = "jit",
+    target_arch = "x86_64",
+    not(target_family = "wasm"),
+    not(feature = "trace-profile")
+))]
+mod native_region_tests;
+
 // Guest code in large applications commonly places unrelated hot loops one
 // 8 KiB region apart. A 4K-entry direct-mapped cache aliases those heads
 // because its byte-address period is only 0x2000; four times as many entries
@@ -1311,6 +1329,11 @@ struct CompiledTrace {
     checked_func: Option<NativeTraceFn>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func: NativeTraceFn,
+    /// Legalized IR retained only for bounded indirect-dispatch region shapes.
+    /// Native execution still uses the original entries unless an upgrade is
+    /// installed; its owned snapshot can later be compiled off-thread.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    region_ir: Option<std::sync::Arc<native_region::InlineBody>>,
 }
 
 impl CompiledTrace {
@@ -1471,6 +1494,20 @@ enum TraceSlot {
 
 pub(crate) struct TraceJit {
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    native_region: Option<native_region::NativeRegion>,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    native_region_enabled: bool,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    native_region_public: bool,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    native_region_status: &'static str,
+    #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+    native_region_entries: u64,
+    #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+    native_region_public_entries: u64,
+    #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+    native_region_heads_run: u64,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     module: Option<JITModule>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func_ctx: FunctionBuilderContext,
@@ -1544,10 +1581,47 @@ impl fmt::Debug for TraceJit {
 impl TraceJit {
     fn new() -> Self {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        {
+            #[cfg(test)]
+            let mode = native_region::RegionMode::Reference;
+            #[cfg(not(test))]
+            let mode = native_region::RegionMode::from_value(
+                std::env::var("M68K_NATIVE_REGIONS").ok().as_deref(),
+            );
+            Self::new_with_region_mode(mode)
+        }
+        #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
+        Self::new_base()
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    fn new_with_region_mode(mode: native_region::RegionMode) -> Self {
+        let mut jit = Self::new_base();
+        jit.native_region_enabled = mode != native_region::RegionMode::Disabled;
+        jit.native_region_public = mode == native_region::RegionMode::Public;
+        jit
+    }
+
+    fn new_base() -> Self {
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         let module = JITBuilder::new(default_libcall_names())
             .ok()
             .map(JITModule::new);
         Self {
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            native_region: None,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            native_region_enabled: true,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            native_region_public: false,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            native_region_status: "no eligible compiled region",
+            #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+            native_region_entries: 0,
+            #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+            native_region_public_entries: 0,
+            #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+            native_region_heads_run: 0,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             module,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -1636,6 +1710,25 @@ impl TraceJit {
             // thread. Nested backward edges and interleaved CPU instances
             // stay in the interpreter until that path closes.
             return None;
+        }
+
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        if self.native_region_enabled
+            && self
+                .native_region
+                .as_ref()
+                .is_some_and(|region| region.matches_root(cpu.pc, cpu_type, instr_budget))
+            && let Some(result) = self.try_native_region(
+                cpu,
+                bus,
+                cpu_type,
+                instr_budget,
+                single_iter,
+                watch_pcs,
+                chain_budget,
+            )
+        {
+            return result;
         }
 
         let pc = cpu.pc;
@@ -2840,6 +2933,8 @@ impl TraceJit {
                 }
             }
         };
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        self.maybe_compile_native_region(start_pc);
         #[cfg(feature = "trace-profile")]
         if matches!(self.slots[idx], TraceSlot::Compiled(_)) {
             super::trace_profile::note_compiled(start_pc, cpu_type, recorded_shape);
@@ -4086,8 +4181,15 @@ impl TraceJit {
             builder.finalize();
         }
 
+        let retain_region_ir = self.native_region_enabled
+            && generated_code_validation
+            && native_region::retain_inline_body(ops, native_loop);
         module.define_function(func_id, &mut ctx).ok()?;
+        // define_function has legalized and optimized this IR. The inliner
+        // requires a legalized callee; capture it before clear_context.
+        let region_body_ir = retain_region_ir.then(|| ctx.func.clone());
         module.clear_context(&mut ctx);
+        let mut region_ir = None;
         if let (Some(checked_func_id), Some(checked_sig)) = (checked_func_id, checked_sig) {
             let mut checked_ctx = Context::new();
             checked_ctx.func = Function::with_name_signature(
@@ -4117,6 +4219,14 @@ impl TraceJit {
             module
                 .define_function(checked_func_id, &mut checked_ctx)
                 .ok()?;
+            if let Some(body) = region_body_ir {
+                region_ir = Some(std::sync::Arc::new(native_region::InlineBody {
+                    body_id: func_id,
+                    body,
+                    checked_id: checked_func_id,
+                    checked: checked_ctx.func.clone(),
+                }));
+            }
             module.clear_context(&mut checked_ctx);
         }
         module.finalize_definitions().ok()?;
@@ -4166,6 +4276,7 @@ impl TraceJit {
             adaptive_rerecords: 0,
             checked_func,
             func,
+            region_ir,
         })
     }
 

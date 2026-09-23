@@ -38,6 +38,21 @@ The default build has no JIT compiler dependency. Native applications that use
 m68k = { version = "0.7", features = ["jit"] }
 ```
 
+An experimental trace-combining tier is disabled by default. With `jit`
+enabled, set `M68K_NATIVE_REGIONS=public` (or `on`/`1`) before starting the
+process to combine eligible indirect-dispatch loops and short return arms.
+`off`, an unset variable, or an unrecognized value retains ordinary trace
+execution without retaining the extra combination IR. Configuration is read
+when the thread-local JIT is created, so restart the process to change it.
+
+This tier preserves exact `run_batch()` instruction limits and observable
+memory, watch, trap and fault behavior. As already documented for
+`run_batch()`, it does not provide cycle accounting; precise execution APIs
+are unchanged. Promotion currently compiles synchronously on the execution
+thread and can pause it. Enable it explicitly for evaluation; background
+compilation is a separate follow-up rather than a guarantee of this option.
+
+
 ### Basic Usage
 
 ```rust
