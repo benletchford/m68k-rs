@@ -355,6 +355,31 @@ pub trait AddressBus {
     fn tracked_mem(&mut self) -> Option<TrackedMem> {
         None
     }
+
+    /// Optional inline store filter for the [`TrackedMem`] window returned by
+    /// the same batch. Null (the default) sends every compiled store through
+    /// the write callbacks, as before.
+    ///
+    /// A non-null pointer addresses bytes the bus owns: byte 0 is a global
+    /// flag, and byte `1 + (address >> 12)` describes the 4 KiB guest page
+    /// holding `address`, for every page of the window (plus one byte beyond
+    /// it). Generated code reads these bytes on every tracked store. When the
+    /// global byte and the bytes of every page a store touches (and, for a
+    /// memory-to-memory copy, every page its source touches) are all zero, it
+    /// writes the value directly to window RAM in big-endian order and does
+    /// **not** call the bus. Otherwise it calls the bus exactly as without a
+    /// filter.
+    ///
+    /// The bus must therefore keep a byte zero only while a direct store to
+    /// that page would be indistinguishable from its own `write_*` and copy
+    /// notifications: no metadata to update, no protection to enforce, no
+    /// journal to record. It may change bytes at any time, including inside a
+    /// write callback, and the next compiled store observes the change. The
+    /// allocation must stay valid and fixed for the whole `run_batch`. A
+    /// filter is used only with a `TrackedMem` window whose `base` is zero.
+    fn tracked_store_filter(&mut self) -> *const u8 {
+        std::ptr::null()
+    }
 }
 
 /// Optional companion trait for buses that version instruction-visible memory.
