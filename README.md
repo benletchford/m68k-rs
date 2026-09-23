@@ -38,13 +38,21 @@ The default build has no JIT compiler dependency. Native applications that use
 m68k = { version = "0.7", features = ["jit"] }
 ```
 
-With `jit` enabled on x86-64, set `M68K_NATIVE_REGIONS=public` before starting
-the process to opt into combining eligible indirect-dispatch loops and short
-return arms. `on` and `1` also enable it. An absent variable, `off`, `0`, empty
-or unrecognized values keep ordinary trace execution and skip the extra
-combination IR and compiler worker. Configuration is read
-when the thread-local JIT is created, so restart the process to change it.
-Other architectures keep their existing execution path.
+With `jit` enabled on x86-64, eligible indirect-dispatch loops and short
+return arms are combined in the background by default, including on Windows,
+Linux and Intel macOS. Set `M68K_NATIVE_REGIONS=off` before starting the process
+to use ordinary trace execution without the extra combination IR or compiler
+worker. `0`, empty and unrecognized values also disable combining; `public`,
+`on` and `1` explicitly enable it. Configuration is read when the thread-local
+JIT is created, so restart the process to change it. Other architectures,
+including native Apple Silicon, keep their existing execution path.
+
+The architecture limit is implemented in code, not just a lack of performance
+measurements: combining requires checked trace wrappers and retained inline
+IR currently generated only on x86-64, and worker startup is also gated to
+x86-64. Setting the override on ARM64 does not activate this tier. This does
+not disable the ordinary JIT or imply that the combining algorithm cannot be
+ported to ARM64; that path needs implementation and validation separately.
 
 This tier preserves exact `run_batch()` instruction limits and observable
 memory, watch, trap and fault behavior. As already documented for

@@ -1607,8 +1607,11 @@ impl TraceJit {
     fn new_production() -> Self {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         {
+            let value = std::env::var_os("M68K_NATIVE_REGIONS");
+            // Invalid Unicode is an explicit unrecognized value, not an
+            // absent variable that should select the enabled default.
             let mode = native_region::RegionMode::from_value(
-                std::env::var("M68K_NATIVE_REGIONS").ok().as_deref(),
+                value.as_ref().map(|value| value.to_str().unwrap_or("")),
             );
             let jit = Self::new_with_region_mode(mode);
             #[cfg(all(target_arch = "x86_64", any(not(test), not(feature = "trace-profile"))))]

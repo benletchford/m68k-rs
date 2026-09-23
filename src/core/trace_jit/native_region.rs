@@ -39,10 +39,14 @@ pub(super) enum RegionMode {
 }
 
 impl RegionMode {
-    // Read once when the thread-local JIT is created. Unknown values keep the
-    // ordinary execution path. Promotion is opt-in, including on x86-64.
+    // Read once when the thread-local JIT is created. Only an absent variable
+    // selects the native x86-64 default; explicit unknown values stay disabled.
+    // Profiling keeps the original per-head instrumentation.
     pub(super) fn from_value(value: Option<&str>) -> Self {
         match value {
+            None if cfg!(all(target_arch = "x86_64", not(feature = "trace-profile"))) => {
+                Self::Public
+            }
             Some("public" | "on" | "1") => Self::Public,
             _ => Self::Disabled,
         }
@@ -54,9 +58,8 @@ mod configuration_tests {
     use super::{RegionMode, TraceJit};
 
     #[test]
-    fn native_regions_require_explicit_enablement() {
+    fn explicit_region_configuration_preserves_overrides() {
         for value in [
-            None,
             Some(""),
             Some("off"),
             Some("0"),
@@ -78,6 +81,16 @@ mod configuration_tests {
             assert!(jit.native_region_enabled, "{value}");
             assert!(jit.native_region_public, "{value}");
         }
+    }
+
+    #[test]
+    fn absent_region_configuration_follows_native_target_default() {
+        let expected = if cfg!(all(target_arch = "x86_64", not(feature = "trace-profile"))) {
+            RegionMode::Public
+        } else {
+            RegionMode::Disabled
+        };
+        assert_eq!(RegionMode::from_value(None), expected);
     }
 }
 
