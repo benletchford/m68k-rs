@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.1...m68k-v0.14.2) (2026-09-23)
+
+
+### Performance Improvements
+
+* **jit:** let tracked-window stores skip the bus when the host proves them plain ([#188](https://github.com/benletchford/m68k-rs/issues/188)) ([31c72a0](https://github.com/benletchford/m68k-rs/commit/31c72a06b6b2924bf1a160c57464ad69690ed7bb))
+
 ## [0.14.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.0...m68k-v0.14.1) (2026-09-23)
 
 
