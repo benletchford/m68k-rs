@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.14.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.0...m68k-v0.14.1) (2026-09-23)
+
+
+### Bug Fixes
+
+* **cpu:** reset stale flow state before interpreted instructions ([bfa30c5](https://github.com/benletchford/m68k-rs/commit/bfa30c59bd258010497bd4767d64afcb51b08aa8))
+* **cpu:** reset stale flow state before interpreted instructions ([95e0b66](https://github.com/benletchford/m68k-rs/commit/95e0b664d088edd2179ed80dbbef1d3ad8c61e3c))
+* **cpu:** reset stale flow state before interpreted instructions ([#183](https://github.com/benletchford/m68k-rs/issues/183)) ([bfa30c5](https://github.com/benletchford/m68k-rs/commit/bfa30c59bd258010497bd4767d64afcb51b08aa8))
+
+
+### Performance Improvements
+
+* **jit:** add opt-in inlining of native dispatch regions ([#184](https://github.com/benletchford/m68k-rs/issues/184)) ([c764b5f](https://github.com/benletchford/m68k-rs/commit/c764b5f9ea787ae54583042ccf986b2adc71112f))
+* **jit:** compile opt-in native regions in the background ([#185](https://github.com/benletchford/m68k-rs/issues/185)) ([be397a7](https://github.com/benletchford/m68k-rs/commit/be397a70fab145ab38235bf1714cf478e4a06e1b))
+* **jit:** enable background regions by default on x86-64 ([#186](https://github.com/benletchford/m68k-rs/issues/186)) ([438edd8](https://github.com/benletchford/m68k-rs/commit/438edd8199b44757306d0d68f4e8a28d5c90a345))
+
 ## [0.14.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.13.0...m68k-v0.14.0) (2026-09-19)
 
 
