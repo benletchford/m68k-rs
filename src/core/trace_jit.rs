@@ -52,6 +52,13 @@ mod native_region_tests;
     test,
     feature = "jit",
     target_arch = "x86_64",
+    not(target_family = "wasm")
+))]
+mod store_filter_tests;
+#[cfg(all(
+    test,
+    feature = "jit",
+    target_arch = "x86_64",
     not(target_family = "wasm"),
     not(feature = "trace-profile")
 ))]
@@ -3787,6 +3794,12 @@ impl TraceJit {
                     cpu_ptr,
                     offset_of!(CpuCore, fm_write_hook) as i32,
                 );
+                let fm_store_filter = builder.ins().load(
+                    ptr_ty,
+                    MemFlags::trusted(),
+                    cpu_ptr,
+                    offset_of!(CpuCore, fm_store_filter) as i32,
+                );
                 let mut hook_sig = module.make_signature();
                 hook_sig.params.push(AbiParam::new(ptr_ty));
                 for _ in 0..4 {
@@ -3798,6 +3811,7 @@ impl TraceJit {
                     fm_ptr,
                     fm_bus,
                     fm_hook,
+                    fm_store_filter,
                     hook_sig,
                     fm_ptr_ty: ptr_ty,
                     fm_base,
@@ -9281,6 +9295,9 @@ struct MemEnv {
     fm_ptr: Value,
     fm_bus: Value,
     fm_hook: Value,
+    /// `AddressBus::tracked_store_filter`, or zero. Only read when
+    /// `tracked_writes`.
+    fm_store_filter: Value,
     hook_sig: cranelift_codegen::ir::SigRef,
     fm_ptr_ty: Type,
     fm_base: Value,
@@ -9561,6 +9578,49 @@ fn window_store_with_copy(
 ) {
     if env.tracked_writes {
         let address = builder.ins().iadd(env.fm_base, off);
+        // With a bus store filter, a store whose pages (and copy-source pages)
+        // the bus reports as plain RAM is written directly; anything else, or
+        // no filter at all, takes the bus callback exactly as before.
+        let hook = builder.create_block();
+        let direct = builder.create_block();
+        let done = builder.create_block();
+        let has_filter = builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, env.fm_store_filter, 0);
+        let check = builder.create_block();
+        builder.ins().brif(has_filter, check, &[], hook, &[]);
+
+        builder.switch_to_block(check);
+        let filter_byte = |builder: &mut FunctionBuilder<'_>, guest: Value| -> Value {
+            let page = builder.ins().ushr_imm(guest, 12);
+            let page = builder.ins().iadd_imm(page, 1);
+            let page = if env.fm_ptr_ty == types::I32 {
+                page
+            } else {
+                builder.ins().uextend(env.fm_ptr_ty, page)
+            };
+            let at = builder.ins().iadd(env.fm_store_filter, page);
+            builder.ins().uload8(types::I32, MemFlags::trusted(), at, 0)
+        };
+        let mut marked =
+            builder
+                .ins()
+                .uload8(types::I32, MemFlags::trusted(), env.fm_store_filter, 0);
+        let last = builder.ins().iadd_imm(address, i64::from(size.bytes()) - 1);
+        for guest in [address, last] {
+            let byte = filter_byte(builder, guest);
+            marked = builder.ins().bor(marked, byte);
+        }
+        if let Some(source) = source {
+            let source_last = builder.ins().iadd_imm(source, i64::from(size.bytes()) - 1);
+            for guest in [source, source_last] {
+                let byte = filter_byte(builder, guest);
+                marked = builder.ins().bor(marked, byte);
+            }
+        }
+        builder.ins().brif(marked, hook, &[], direct, &[]);
+
+        builder.switch_to_block(hook);
         let operation = builder.ins().iconst(
             types::I32,
             i64::from(size.bytes() | if source.is_some() { 8 } else { 0 }),
@@ -9571,8 +9631,27 @@ fn window_store_with_copy(
             env.fm_hook,
             &[env.fm_bus, operation, address, value, source],
         );
+        builder.ins().jump(done, &[]);
+
+        builder.switch_to_block(direct);
+        window_store_raw(builder, env, off, size, value);
+        builder.ins().jump(done, &[]);
+
+        builder.switch_to_block(done);
         return;
     }
+    window_store_raw(builder, env, off, size, value);
+}
+
+/// Big-endian store straight into window RAM, with no bus involvement.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn window_store_raw(
+    builder: &mut FunctionBuilder<'_>,
+    env: &MemEnv,
+    off: Value,
+    size: Size,
+    value: Value,
+) {
     let addr = window_host_addr(builder, env, off);
     let mut flags = MemFlags::new();
     flags.set_notrap();

@@ -360,6 +360,10 @@ pub struct CpuCore {
     pub(crate) fm_bus: usize,
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_write_hook: usize,
+    // Nonzero only with a tracked window whose bus offers an inline store
+    // filter; see `AddressBus::tracked_store_filter`.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) fm_store_filter: usize,
 
     // ========== Trace-JIT hot-loop filters ==========
     // Small PC sets (entries hold a PC or `TRACE_PC_NONE`). They keep
@@ -539,6 +543,7 @@ impl CpuCore {
             fm_len: 0,
             fm_bus: 0,
             fm_write_hook: 0,
+            fm_store_filter: 0,
             trace_record_skip: [super::trace_jit::TRACE_PC_NONE; 4],
             pending_trap_resume: None,
             trace_probe_skip: [super::trace_jit::TRACE_PC_NONE; 4],

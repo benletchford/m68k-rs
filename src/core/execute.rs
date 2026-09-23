@@ -644,6 +644,12 @@ impl CpuCore {
             self.fm_len = window.len;
             self.fm_bus = bus as *mut B as usize;
             self.fm_write_hook = tracked_write::<B> as *const () as usize;
+            // Only a zero-based window can index the filter by guest page.
+            self.fm_store_filter = if window.base == 0 {
+                bus.tracked_store_filter() as usize
+            } else {
+                0
+            };
             self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
             self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
@@ -653,6 +659,7 @@ impl CpuCore {
         self.fm_len = 0;
         self.fm_bus = 0;
         self.fm_write_hook = 0;
+        self.fm_store_filter = 0;
         self.set_precise_bus(prior_precision);
         result
     }
