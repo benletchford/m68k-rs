@@ -48,6 +48,14 @@ mod native_region_public_tests;
     not(feature = "trace-profile")
 ))]
 mod native_region_tests;
+#[cfg(all(
+    test,
+    feature = "jit",
+    target_arch = "x86_64",
+    not(target_family = "wasm"),
+    not(feature = "trace-profile")
+))]
+mod worker_startup_tests;
 
 // Guest code in large applications commonly places unrelated hot loops one
 // 8 KiB region apart. A 4K-entry direct-mapped cache aliases those heads
@@ -1496,6 +1504,10 @@ pub(crate) struct TraceJit {
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     native_region: Option<native_region::NativeRegion>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    native_region_worker: Option<native_region::worker::Worker>,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    native_region_background: bool,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     native_region_enabled: bool,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     native_region_public: bool,
@@ -1580,15 +1592,34 @@ impl fmt::Debug for TraceJit {
 
 impl TraceJit {
     fn new() -> Self {
+        // Normal unit fixtures use a deterministic synchronous oracle. Only
+        // the isolated startup-test child selects production initialization.
+        // This marker is not consulted by a production build.
+        #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+        if std::env::var_os("M68K_STARTUP_PROBE").is_none() {
+            return Self::new_with_region_mode(native_region::RegionMode::Reference);
+        }
+        Self::new_production()
+    }
+
+    /// The real entry and startup-test children share environment selection
+    /// and worker activation; the test must not approximate this policy.
+    fn new_production() -> Self {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         {
-            #[cfg(test)]
-            let mode = native_region::RegionMode::Reference;
-            #[cfg(not(test))]
             let mode = native_region::RegionMode::from_value(
                 std::env::var("M68K_NATIVE_REGIONS").ok().as_deref(),
             );
-            Self::new_with_region_mode(mode)
+            let jit = Self::new_with_region_mode(mode);
+            #[cfg(all(target_arch = "x86_64", any(not(test), not(feature = "trace-profile"))))]
+            let jit = {
+                let mut jit = jit;
+                if jit.native_region_enabled && !cfg!(feature = "trace-profile") {
+                    jit.enable_native_region_worker();
+                }
+                jit
+            };
+            jit
         }
         #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         Self::new_base()
@@ -1610,6 +1641,10 @@ impl TraceJit {
         Self {
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             native_region: None,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            native_region_worker: None,
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            native_region_background: false,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             native_region_enabled: true,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -1710,6 +1745,15 @@ impl TraceJit {
             // thread. Nested backward edges and interleaved CPU instances
             // stay in the interpreter until that path closes.
             return None;
+        }
+
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        if self
+            .native_region_worker
+            .as_ref()
+            .is_some_and(|worker| worker.pending())
+        {
+            self.poll_native_region(cpu.pc);
         }
 
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -4187,7 +4231,8 @@ impl TraceJit {
         module.define_function(func_id, &mut ctx).ok()?;
         // define_function has legalized and optimized this IR. The inliner
         // requires a legalized callee; capture it before clear_context.
-        let region_body_ir = retain_region_ir.then(|| ctx.func.clone());
+        let region_body_ir =
+            retain_region_ir.then(|| std::mem::replace(&mut ctx.func, Function::new()));
         module.clear_context(&mut ctx);
         let mut region_ir = None;
         if let (Some(checked_func_id), Some(checked_sig)) = (checked_func_id, checked_sig) {
@@ -4224,7 +4269,7 @@ impl TraceJit {
                     body_id: func_id,
                     body,
                     checked_id: checked_func_id,
-                    checked: checked_ctx.func.clone(),
+                    checked: std::mem::replace(&mut checked_ctx.func, Function::new()),
                 }));
             }
             module.clear_context(&mut checked_ctx);

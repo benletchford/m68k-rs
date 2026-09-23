@@ -1,15 +1,24 @@
 //! Experimental bounded region combining existing checked-wrapper/body IR.
 //! Region-only egraph optimization follows inlining; original eager-state
 //! stores and callback semantics remain the input contract.
-//! Snapshots and compilation are separate so an eventual profitable upgrade can
-//! be compiled off-thread. This proof currently compiles at trace installation.
+//! Owned snapshots compile on a worker while the original tier keeps executing.
+//! Publication rechecks identities and leases keep installed code alive.
 
 use super::*;
+use cranelift_codegen::FinalizedRelocTarget;
 use cranelift_codegen::inline::{Inline, InlineCommand};
-use cranelift_codegen::ir::{ExternalName, Inst, Opcode};
+use cranelift_codegen::ir::{
+    ExtFuncData, ExternalName, GlobalValue, GlobalValueData, Inst, InstructionData, Opcode,
+    UserExternalName,
+};
 use cranelift_module::FuncId;
 use std::borrow::Cow;
 use std::sync::Arc;
+
+pub(super) mod worker;
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "native_region_worker_tests.rs"]
+mod worker_compile_tests;
 
 #[path = "instruction_accounting.rs"]
 mod instruction_accounting;
@@ -31,7 +40,7 @@ pub(super) enum RegionMode {
 
 impl RegionMode {
     // Read once when the thread-local JIT is created. Unknown values keep the
-    // released execution path; promotion remains explicitly opt-in.
+    // ordinary execution path. Promotion is opt-in, including on x86-64.
     pub(super) fn from_value(value: Option<&str>) -> Self {
         match value {
             Some("public" | "on" | "1") => Self::Public,
@@ -45,7 +54,7 @@ mod configuration_tests {
     use super::{RegionMode, TraceJit};
 
     #[test]
-    fn native_regions_require_explicit_runtime_opt_in() {
+    fn native_regions_require_explicit_enablement() {
         for value in [
             None,
             Some(""),
@@ -60,6 +69,7 @@ mod configuration_tests {
             assert!(!jit.native_region_enabled, "{value:?}");
             assert!(!jit.native_region_public, "{value:?}");
             assert!(jit.native_region.is_none());
+            assert!(jit.native_region_worker.is_none());
         }
         for value in ["public", "on", "1"] {
             let mode = RegionMode::from_value(Some(value));
@@ -115,6 +125,8 @@ pub(super) struct NativeRegion {
     root_ops: u32,
     cpu_type: CpuType,
     input: RegionInput,
+    // Keep after input: the worker owns the heavy IR until this lease drops.
+    _lease: Option<Arc<worker::CodeLease>>,
     entry: RegionFn,
     reported_first_execution: bool,
     inlined_calls: usize,
@@ -310,7 +322,7 @@ impl TraceJit {
         result
     }
 
-    fn prepare_native_region(&mut self, pcs: &[u32]) -> Result<(), &'static str> {
+    fn capture_native_region(&self, pcs: &[u32]) -> Result<RegionInput, &'static str> {
         if cfg!(feature = "trace-profile") {
             return Err("trace-profile retains original per-head instrumentation");
         }
@@ -351,23 +363,20 @@ impl TraceJit {
             }
             heads.push(head);
             let body = trace.region_ir.as_ref().ok_or("no retained inline IR")?;
-            bodies.push(if self.native_region_public {
-                Arc::new(InlineBody {
-                    body_id: body.body_id,
-                    body: instruction_accounting::without_synthetic_cycles(&body.body)
-                        .ok_or("unrecognized cycle return packing")?,
-                    checked_id: body.checked_id,
-                    checked: body.checked.clone(),
-                })
-            } else {
-                body.clone()
-            });
+            // Capture only shared immutable IR. Public return rewriting belongs
+            // to compile_snapshot, so an asynchronous caller does not clone or
+            // transform Function graphs on the CPU thread.
+            bodies.push(Arc::clone(body));
         }
-        let input = RegionInput {
+        Ok(RegionInput {
             heads,
             bodies,
             public: self.native_region_public,
-        };
+        })
+    }
+
+    fn prepare_native_region(&mut self, pcs: &[u32]) -> Result<(), &'static str> {
+        let input = self.capture_native_region(pcs)?;
         if self
             .native_region
             .as_ref()
@@ -385,6 +394,7 @@ impl TraceJit {
             root_ops: input.heads[0].ops,
             cpu_type: input.heads[0].cpu_type,
             input,
+            _lease: None,
             entry,
             reported_first_execution: false,
             inlined_calls,
@@ -392,8 +402,84 @@ impl TraceJit {
         Ok(())
     }
 
+    /// Initialize before interactive work where the embedder prepares its JIT.
+    /// Failure keeps the old tier; it never falls back to foreground promotion.
+    #[cfg(all(target_arch = "x86_64", any(not(test), not(feature = "trace-profile"))))]
+    pub(super) fn enable_native_region_worker(&mut self) {
+        self.native_region_background = true;
+        if self.native_region_enabled && self.module.is_some() {
+            self.native_region_worker = worker::Worker::new();
+        }
+    }
+
+    #[cfg(all(test, target_arch = "x86_64", not(feature = "trace-profile")))]
+    pub(super) fn enable_native_region_worker_with_barrier(
+        &mut self,
+        started: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.native_region_background = true;
+        self.native_region_worker = worker::Worker::new_with_compiler(move |input| {
+            started.send(()).unwrap();
+            release.recv().unwrap();
+            compile_private_snapshot(input)
+        });
+    }
+
+    pub(super) fn poll_native_region(&mut self, pc: u32) {
+        if !self.native_region_enabled {
+            return;
+        }
+        let Some(completed) = self
+            .native_region_worker
+            .as_mut()
+            .and_then(|worker| worker.poll(pc))
+        else {
+            return;
+        };
+        let (entry, inlined_calls) = match completed.code {
+            Ok(code) => code,
+            Err(reason) => {
+                self.native_region_status = reason;
+                return;
+            }
+        };
+        if completed.input.public != self.native_region_public || !completed.input.heads.iter().all(|head| {
+            matches!(&self.slots[trace_cache_index(head.pc)], TraceSlot::Compiled(trace) if matches_installed(head, trace))
+        }) {
+            self.native_region_status = "background region became stale";
+            // A replacement may have compiled while this request was pending.
+            // Retry discovery once now; otherwise that settled group would
+            // need another unrelated compilation event to become eligible.
+            let root = completed.input.heads[0].pc;
+            self.maybe_compile_native_region(root);
+            return;
+        }
+        // Slot identities guard publication; normal entry still validates live
+        // guest code, memory/write mode, exact budget, and watched instructions.
+        self.native_region = Some(NativeRegion {
+            root_pc: completed.input.heads[0].pc,
+            root_ops: completed.input.heads[0].ops,
+            cpu_type: completed.input.heads[0].cpu_type,
+            input: completed.input,
+            _lease: Some(completed.lease),
+            entry,
+            reported_first_execution: false,
+            inlined_calls,
+        });
+        self.native_region_status = "background region installed";
+    }
+
     pub(super) fn maybe_compile_native_region(&mut self, installed_pc: u32) {
         if !self.native_region_enabled || cfg!(feature = "trace-profile") {
+            return;
+        }
+        if self.native_region_background
+            && self
+                .native_region_worker
+                .as_ref()
+                .is_none_or(|worker| worker.pending())
+        {
             return;
         }
         let TraceSlot::Compiled(installed) = &self.slots[trace_cache_index(installed_pc)] else {
@@ -468,7 +554,20 @@ impl TraceJit {
             }
         }
         if pcs.len() == 3 {
-            let _ = self.compile_native_region(&pcs);
+            if self.native_region_background {
+                let result = self.capture_native_region(&pcs).and_then(|input| {
+                    self.native_region_worker
+                        .as_mut()
+                        .ok_or("region compiler unavailable")?
+                        .submit(input)
+                });
+                self.native_region_status = match result {
+                    Ok(()) => "background region compilation queued",
+                    Err(reason) => reason,
+                };
+            } else {
+                let _ = self.compile_native_region(&pcs);
+            }
         }
     }
 
@@ -749,12 +848,154 @@ impl Inline for RegionInliner<'_> {
     }
 }
 
+/// Completed private code plus its executable-memory owner. A worker must keep
+/// `module` alive until no published entry can execute, then call free_memory
+/// there. Ordinary JITModule drop intentionally does not reclaim code memory.
+/// This type stays private to this module and its worker descendants.
+struct PrivateCompiledRegion {
+    module: JITModule,
+    entry: RegionFn,
+    inlined_calls: usize,
+}
+
+/// No entry has escaped this guard. Refusal and compiler unwinding must not leak
+/// a private executable allocation; success explicitly transfers ownership.
+#[cfg(any(not(test), not(feature = "trace-profile")))]
+struct UnpublishedRegionModule(Option<JITModule>);
+
+#[cfg(any(not(test), not(feature = "trace-profile")))]
+impl Drop for UnpublishedRegionModule {
+    fn drop(&mut self) {
+        if let Some(module) = self.0.take() {
+            // SAFETY: compile_private_snapshot has not published or invoked any
+            // entry while this guard still owns the module. On success it takes
+            // the module before returning its pointer; this Drop then does none.
+            unsafe { module.free_memory() };
+        }
+    }
+}
+
+/// Compiler-thread seam: no foreground JITModule, live CpuCore or guest RAM is
+/// touched. The captured numeric IDs are temporary inliner keys, never exports
+/// that must be resolved against the foreground module.
+#[cfg(any(not(test), not(feature = "trace-profile")))]
+fn compile_private_snapshot(input: &RegionInput) -> Option<PrivateCompiledRegion> {
+    // Match TraceJit::new_base's native target/settings policy. Signature checks
+    // below fail closed if retained IR is ever captured from a different ABI.
+    let builder = JITBuilder::new(default_libcall_names()).ok()?;
+    let mut owner = UnpublishedRegionModule(Some(JITModule::new(builder)));
+    let mut frontend = FunctionBuilderContext::new();
+    let (entry, inlined_calls) = compile_snapshot(owner.0.as_mut()?, &mut frontend, 0, input)?;
+    Some(PrivateCompiledRegion {
+        module: owner.0.take()?,
+        entry,
+        inlined_calls,
+    })
+}
+
+/// Confirm every captured function belongs to this target ABI, and that a
+/// numeric inliner lookup has one exact meaning within this immutable snapshot.
+fn snapshot_signatures_match(module: &JITModule, input: &RegionInput) -> bool {
+    if !(2..=3).contains(&input.heads.len()) || input.heads.len() != input.bodies.len() {
+        return false;
+    }
+    let ptr = module.target_config().pointer_type();
+    let mut ids = Vec::with_capacity(input.bodies.len() * 2);
+    input.heads.iter().zip(&input.bodies).all(|(head, body)| {
+        let mut expected = module.make_signature();
+        expected.params.push(AbiParam::new(ptr));
+        if head.native_loop {
+            expected.params.push(AbiParam::new(types::I32));
+        }
+        expected.returns.push(AbiParam::new(types::I64));
+        for (id, function) in [(body.body_id, &body.body), (body.checked_id, &body.checked)] {
+            let name = UserExternalName::new(0, id.as_u32());
+            if function.signature != expected
+                || function.name.get_user() != Some(&name)
+                || ids.contains(&id)
+            {
+                return false;
+            }
+            ids.push(id);
+        }
+        true
+    })
+}
+
+fn unresolved_name(name: &ExternalName) -> bool {
+    matches!(name, ExternalName::User(_) | ExternalName::TestCase(_))
+}
+
+fn global_uses_unresolved_name(function: &Function, mut global: GlobalValue) -> bool {
+    // Bound traversal even for malformed/cyclic IR. VMContext/target constants
+    // need no foreground symbol; indirect global chains still may reach one.
+    for _ in 0..=function.global_values.len() {
+        match function.global_values.get(global) {
+            Some(GlobalValueData::Symbol { name, .. }) => return unresolved_name(name),
+            Some(GlobalValueData::Load { base, .. } | GlobalValueData::IAddImm { base, .. }) => {
+                global = *base;
+            }
+            Some(GlobalValueData::VMContext | GlobalValueData::DynScaleTargetConst { .. }) => {
+                return false;
+            }
+            None => return true,
+        }
+    }
+    true
+}
+
+/// Imports left unused after inlining are harmless. Inspect live operands, not
+/// merely the import table. Cranelift0.132's Call format also includes tail calls;
+/// TryCall covers exceptional direct calls, and FuncAddr can escape via an
+/// indirect call/store. Follow live global-value chains as well.
+fn has_unresolved_user_references(function: &Function) -> bool {
+    function.layout.blocks().any(|block| {
+        function
+            .layout
+            .block_insts(block)
+            .any(|inst| match function.dfg.insts[inst] {
+                InstructionData::Call { func_ref, .. }
+                | InstructionData::TryCall { func_ref, .. }
+                | InstructionData::FuncAddr { func_ref, .. } => function
+                    .dfg
+                    .ext_funcs
+                    .get(func_ref)
+                    .is_none_or(|callee| unresolved_name(&callee.name)),
+                InstructionData::UnaryGlobalValue { global_value, .. } => {
+                    global_uses_unresolved_name(function, global_value)
+                }
+                _ => false,
+            })
+    })
+}
+
 fn compile_snapshot(
     module: &mut JITModule,
     frontend: &mut FunctionBuilderContext,
     ordinal: u32,
     input: &RegionInput,
 ) -> Option<(RegionFn, usize)> {
+    if !snapshot_signatures_match(module, input) {
+        return None;
+    }
+    // This runs on the compiler thread for the private path. The legacy
+    // synchronous oracle deliberately calls the same preparation/compiler.
+    let bodies: Vec<_> = input
+        .bodies
+        .iter()
+        .map(|body| {
+            if input.public {
+                Some(Arc::new(InlineBody {
+                    body_id: body.body_id,
+                    body: instruction_accounting::without_synthetic_cycles(&body.body)?,
+                    checked_id: body.checked_id,
+                    checked: body.checked.clone(),
+                }))
+            } else {
+                Some(Arc::clone(body))
+            }
+        })
+        .collect::<Option<_>>()?;
     let ptr = module.target_config().pointer_type();
     let mut signature = module.make_signature();
     signature.params.extend([
@@ -881,7 +1122,24 @@ fn compile_snapshot(
                 };
                 arguments.push(iterations);
             }
-            let callee = module.declare_func_in_func(input.bodies[index].checked_id, builder.func);
+            // Original IDs belong to a different module in the worker path.
+            // Import their exact IR signature/name directly, solely as keys for
+            // RegionInliner. No old declaration is copied into the new module.
+            let signature = builder
+                .func
+                .import_signature(bodies[index].checked.signature.clone());
+            let name = builder
+                .func
+                .declare_imported_user_function(UserExternalName::new(
+                    0,
+                    bodies[index].checked_id.as_u32(),
+                ));
+            let callee = builder.func.import_function(ExtFuncData {
+                name: ExternalName::User(name),
+                signature,
+                colocated: false,
+                patchable: false,
+            });
             let call = builder.ins().call(callee, &arguments);
             let packed = builder.inst_results(call)[0];
             let invalid =
@@ -1002,23 +1260,16 @@ fn compile_snapshot(
     // call site. Therefore every existing guard/fault/completion return flows
     // through the same packed accounting without new handwritten emitters.
     let mut inliner = RegionInliner {
-        bodies: &input.bodies,
+        bodies: &bodies,
         calls: 0,
     };
     if !context.inline(&mut inliner).ok()? || inliner.calls != 2 * input.heads.len() {
         return None;
     }
-    // This is an actual combined function, not a dispatcher that merely
-    // replaced indirect calls with direct calls. Refuse an incomplete splice.
-    for block in context.func.layout.blocks() {
-        for inst in context.func.layout.block_insts(block) {
-            if let cranelift_codegen::ir::InstructionData::Call { func_ref, .. } =
-                context.func.dfg.insts[inst]
-                && inliner.callee(&context.func, func_ref).is_some()
-            {
-                return None;
-            }
-        }
+    // Neither direct calls nor escaped addresses may retain foreground IDs.
+    // Bus hooks remain indirect CPU-field loads; normal libcalls remain valid.
+    if has_unresolved_user_references(&context.func) {
+        return None;
     }
     let inlined_calls = inliner.calls;
     // The ordinary first tier deliberately uses Cranelift's default
@@ -1031,7 +1282,18 @@ fn compile_snapshot(
     let mut control_plane = Default::default();
     context.optimize(module.isa(), &mut control_plane).ok()?;
     context.egraph_pass(module.isa(), &mut control_plane).ok()?;
+    if has_unresolved_user_references(&context.func) {
+        return None;
+    }
     module.define_function(function, &mut context).ok()?;
+    // Machine-code check before linking/finalization. This also guards against
+    // future lowering that might introduce a user-symbol relocation despite
+    // the live-IR check; unused IR imports never produce a relocation.
+    if context.compiled_code()?.buffer.relocs().iter().any(|reloc| {
+        matches!(&reloc.target, FinalizedRelocTarget::ExternalName(name) if unresolved_name(name))
+    }) {
+        return None;
+    }
     module.clear_context(&mut context);
     module.finalize_definitions().ok()?;
     Some((
