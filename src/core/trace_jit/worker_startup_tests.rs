@@ -155,6 +155,11 @@ fn drain<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Strin
 /// never touched, so cases cannot race each other and cannot disturb the rest
 /// of the suite.
 fn observe(regions: Option<&str>, workload: &str) -> Observed {
+    observe_os(regions.map(std::ffi::OsStr::new), workload)
+}
+
+/// Preserve malformed OS strings so the real environment parser is exercised.
+fn observe_os(regions: Option<&std::ffi::OsStr>, workload: &str) -> Observed {
     let exe = std::env::current_exe().expect("the running test binary");
     let mut command = Command::new(exe);
     command
@@ -437,18 +442,25 @@ fn startup_probe_child() {
     println!("\n{}", observed.line());
 }
 
-/// Absent means the worker never starts and no region IR is ever retained.
+/// The native x86-64 default must publish and execute, not merely start a worker.
 #[test]
-fn absent_variable_starts_no_worker_and_retains_no_region() {
+fn absent_variable_publishes_from_the_worker_and_runs_the_region() {
     let observed = observe(None, "dispatch");
-    assert!(!observed.worker, "no worker: {observed:?}");
-    assert!(!observed.published, "nothing published: {observed:?}");
-    assert!(!observed.retained, "no region IR retained: {observed:?}");
-    assert_eq!(observed.entries, 0, "no region ran: {observed:?}");
-    assert!(observed.retired > 0, "the guest ran at all: {observed:?}");
+    assert!(observed.worker, "default built a worker: {observed:?}");
+    assert!(observed.published, "default published code: {observed:?}");
+    assert!(
+        observed.public_entries > 0,
+        "default ran code: {observed:?}"
+    );
+    assert!(observed.retained, "region IR retained: {observed:?}");
+
+    let off = observe(Some("off"), "dispatch");
+    assert_eq!(observed.retired, off.retired, "same guest work as off");
+    assert_eq!(observed.digest, off.digest, "same registers as off");
+    assert_eq!(observed.memory, off.memory, "same guest memory as off");
 }
 
-/// Explicitly off must be indistinguishable from absent.
+/// The escape hatch removes worker/IR overhead while preserving guest results.
 #[test]
 fn explicit_off_starts_no_worker_and_retains_no_region() {
     let off = observe(Some("off"), "dispatch");
@@ -484,13 +496,10 @@ fn explicit_public_publishes_from_the_worker_and_runs_the_region() {
     assert!(enabled.retained, "region IR retained: {enabled:?}");
 
     // Same measured guest work, or the region is not doing the guest's job.
-    let absent = observe(None, "dispatch");
-    assert_eq!(
-        enabled.retired, absent.retired,
-        "same measured work as absent"
-    );
-    assert_eq!(enabled.digest, absent.digest, "same registers as absent");
-    assert_eq!(enabled.memory, absent.memory, "same guest memory as absent");
+    let off = observe(Some("off"), "dispatch");
+    assert_eq!(enabled.retired, off.retired, "same measured work as off");
+    assert_eq!(enabled.digest, off.digest, "same registers as off");
+    assert_eq!(enabled.memory, off.memory, "same guest memory as off");
     assert!(
         enabled.memory != 0xcbf2_9ce4_8422_2325,
         "the memory digest actually covered something: {enabled:?}"
@@ -502,15 +511,17 @@ fn explicit_public_publishes_from_the_worker_and_runs_the_region() {
 /// or entered.
 #[test]
 fn an_enabled_process_reports_no_region_for_a_workload_that_cannot_qualify() {
-    let plain = observe(Some("public"), "plain");
-    assert!(
-        plain.worker,
-        "production startup still built a worker: {plain:?}"
-    );
-    assert!(!plain.published, "nothing to publish: {plain:?}");
-    assert!(!plain.retained, "no region IR retained: {plain:?}");
-    assert_eq!(plain.entries, 0, "no region ran: {plain:?}");
-    assert!(plain.retired > 0, "the guest ran at all: {plain:?}");
+    for value in [None, Some("public")] {
+        let plain = observe(value, "plain");
+        assert!(
+            plain.worker,
+            "production startup still built a worker: {plain:?}"
+        );
+        assert!(!plain.published, "nothing to publish: {plain:?}");
+        assert!(!plain.retained, "no region IR retained: {plain:?}");
+        assert_eq!(plain.entries, 0, "no region ran: {plain:?}");
+        assert!(plain.retired > 0, "the guest ran at all: {plain:?}");
+    }
 
     // And the same binary does publish for a workload that qualifies, so the
     // absence above is a property of the workload, not a broken probe.
@@ -519,4 +530,30 @@ fn an_enabled_process_reports_no_region_for_a_workload_that_cannot_qualify() {
         dispatching.published,
         "the probe can publish: {dispatching:?}"
     );
+}
+
+/// Invalid Unicode must not be mistaken for an absent, default-enabled value.
+#[test]
+#[cfg(any(unix, windows))]
+fn malformed_environment_value_keeps_the_worker_disabled() {
+    #[cfg(unix)]
+    let value = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let value = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+    let observed = observe_os(Some(&value), "dispatch");
+    assert!(!observed.worker, "no worker: {observed:?}");
+    assert!(!observed.published, "nothing published: {observed:?}");
+    assert!(!observed.retained, "no region IR retained: {observed:?}");
+    assert_eq!(observed.entries, 0, "no region ran: {observed:?}");
+
+    let off = observe(Some("off"), "dispatch");
+    assert_eq!(observed.retired, off.retired, "same guest work as off");
+    assert_eq!(observed.digest, off.digest, "same registers as off");
+    assert_eq!(observed.memory, off.memory, "same guest memory as off");
 }
