@@ -404,7 +404,7 @@ impl TraceJit {
 
     /// Initialize before interactive work where the embedder prepares its JIT.
     /// Failure keeps the old tier; it never falls back to foreground promotion.
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", any(not(test), not(feature = "trace-profile"))))]
     pub(super) fn enable_native_region_worker(&mut self) {
         self.native_region_background = true;
         if self.native_region_enabled && self.module.is_some() {

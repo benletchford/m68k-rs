@@ -61,7 +61,7 @@ pub(in super::super) struct Worker {
 }
 
 impl Worker {
-    #[cfg(all(not(test), target_arch = "x86_64"))]
+    #[cfg(all(target_arch = "x86_64", any(not(test), not(feature = "trace-profile"))))]
     pub(in super::super) fn new() -> Option<Self> {
         Self::new_with_compiler(super::compile_private_snapshot)
     }

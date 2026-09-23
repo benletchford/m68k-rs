@@ -48,6 +48,14 @@ mod native_region_public_tests;
     not(feature = "trace-profile")
 ))]
 mod native_region_tests;
+#[cfg(all(
+    test,
+    feature = "jit",
+    target_arch = "x86_64",
+    not(target_family = "wasm"),
+    not(feature = "trace-profile")
+))]
+mod worker_startup_tests;
 
 // Guest code in large applications commonly places unrelated hot loops one
 // 8 KiB region apart. A 4K-entry direct-mapped cache aliases those heads
@@ -1584,15 +1592,34 @@ impl fmt::Debug for TraceJit {
 
 impl TraceJit {
     fn new() -> Self {
+        // Normal unit fixtures use a deterministic synchronous oracle. Only
+        // the isolated startup-test child selects production initialization.
+        // This marker is not consulted by a production build.
+        #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
+        if std::env::var_os("M68K_STARTUP_PROBE").is_none() {
+            return Self::new_with_region_mode(native_region::RegionMode::Reference);
+        }
+        Self::new_production()
+    }
+
+    /// The real entry and startup-test children share environment selection
+    /// and worker activation; the test must not approximate this policy.
+    fn new_production() -> Self {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         {
-            #[cfg(test)]
-            let mode = native_region::RegionMode::Reference;
-            #[cfg(not(test))]
             let mode = native_region::RegionMode::from_value(
                 std::env::var("M68K_NATIVE_REGIONS").ok().as_deref(),
             );
-            Self::new_with_region_mode(mode)
+            let jit = Self::new_with_region_mode(mode);
+            #[cfg(all(target_arch = "x86_64", any(not(test), not(feature = "trace-profile"))))]
+            let jit = {
+                let mut jit = jit;
+                if jit.native_region_enabled && !cfg!(feature = "trace-profile") {
+                    jit.enable_native_region_worker();
+                }
+                jit
+            };
+            jit
         }
         #[cfg(any(not(feature = "jit"), target_family = "wasm"))]
         Self::new_base()
@@ -1603,10 +1630,6 @@ impl TraceJit {
         let mut jit = Self::new_base();
         jit.native_region_enabled = mode != native_region::RegionMode::Disabled;
         jit.native_region_public = mode == native_region::RegionMode::Public;
-        #[cfg(all(not(test), target_arch = "x86_64"))]
-        if jit.native_region_enabled && !cfg!(feature = "trace-profile") {
-            jit.enable_native_region_worker();
-        }
         jit
     }
 
