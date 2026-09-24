@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.14.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.2...m68k-v0.14.3) (2026-09-24)
+
+
+### Performance Improvements
+
+* **jit:** grow native regions with hot handler arms ([#190](https://github.com/benletchford/m68k-rs/issues/190)) ([385d712](https://github.com/benletchford/m68k-rs/commit/385d7120532182114f74f6612fea0091668a5383))
+* **jit:** keep guest registers and flags in native values within a trace ([#191](https://github.com/benletchford/m68k-rs/issues/191)) ([933c1c2](https://github.com/benletchford/m68k-rs/commit/933c1c2bca4d8f789b2405102f62ff2a34d2cb4e))
+
 ## [0.14.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.1...m68k-v0.14.2) (2026-09-23)
 
 
