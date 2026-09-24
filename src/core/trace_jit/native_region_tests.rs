@@ -13,6 +13,8 @@ const HEAD: u32 = 0x2000;
 const CASE0: u32 = 0x2018;
 const CASE1: u32 = 0x201e;
 const CASE2: u32 = 0x2024;
+/// A memory-storing arm only hot-edge discovery admits (command 3).
+const CASE3: u32 = 0x202a;
 const SOURCE: u32 = 0x3000;
 const DESTINATION: u32 = 0x4000;
 const COMMANDS: u32 = 0x5000;
@@ -263,7 +265,8 @@ impl Fixture {
             0x0008,
             0x000e,
             0x0014,
-            0x4e71,
+            // Table entry 3: CASE3. Commands 0..=2 never read it.
+            (CASE3 - 0x2010) as u16,
             copy_opcode,
             0x5281,
             0x60e2,
@@ -273,6 +276,11 @@ impl Fixture {
             0x5286,
             0x5287,
             0x60d6,
+            // CASE3: MOVE.W D5,(A5); ADDQ.L #1,D3; ADDQ.L #1,D6; BRA HEAD.
+            0x3a85,
+            0x5283,
+            0x5286,
+            0x60ce,
         ];
         for (i, word) in words.iter().enumerate() {
             bus.ram[HEAD as usize + i * 2..HEAD as usize + i * 2 + 2]
@@ -328,6 +336,7 @@ impl Fixture {
             ),
             (CASE1, vec![CASE1, CASE1 + 2, CASE1 + 4], HEAD),
             (CASE2, vec![CASE2, CASE2 + 2, CASE2 + 4], HEAD),
+            (CASE3, vec![CASE3, CASE3 + 2, CASE3 + 4, CASE3 + 6], HEAD),
         ] {
             let mut ops: Vec<_> = pcs
                 .into_iter()
@@ -593,16 +602,45 @@ fn native_region_changed_modes_fall_back_without_using_stale_entries() {
 }
 
 #[test]
-fn native_region_refuses_adaptive_components() {
-    let mut f = Fixture::new(true, false, 0x1adc);
-    let TraceSlot::Compiled(trace) = &mut f.jit.slots[trace_cache_index(HEAD)] else {
-        unreachable!()
+fn native_region_admits_adaptive_components_exactly() {
+    // Adaptive re-record policy counts Rust entries; inside a region those
+    // entries pause, but execution must stay identical to the old driver.
+    let mark_adaptive = |f: &mut Fixture| {
+        for pc in [HEAD, CASE1] {
+            let TraceSlot::Compiled(trace) = &mut f.jit.slots[trace_cache_index(pc)] else {
+                unreachable!()
+            };
+            trace.adaptive_branch = true;
+        }
     };
-    trace.adaptive_branch = true;
-    assert!(
-        f.jit.compile_native_region(&[HEAD, CASE1, CASE2]).is_err(),
-        "adaptive traces stay on their existing policy path"
-    );
+    let mut f = Fixture::new(true, false, 0x1adc);
+    mark_adaptive(&mut f);
+    assert!(f.jit.compile_native_region(&[HEAD, CASE1, CASE2]).is_ok());
+    let mut entered = 0;
+    for budget in [1, 5, 9, 17, 40, 100] {
+        let mut before = Fixture::new(false, false, 0x1adc);
+        let mut after = Fixture::new(true, false, 0x1adc);
+        mark_adaptive(&mut before);
+        mark_adaptive(&mut after);
+        let result_before = before.run(budget, &[], TRACE_EXIT_CHAIN_BUDGET);
+        let result_after = after.run(budget, &[], TRACE_EXIT_CHAIN_BUDGET);
+        let context = format!("budget={budget}");
+        // Everything guest-visible is identical; only the adaptive policy's
+        // Rust-entry counters differ, by design.
+        assert_eq!(
+            result_after, result_before,
+            "{context}: return/miss/retirement"
+        );
+        assert_eq!(
+            raw_state(&after.cpu),
+            raw_state(&before.cpu),
+            "{context}: CPU"
+        );
+        assert_eq!(after.bus.ram, before.bus.ram, "{context}: RAM");
+        assert_eq!(after.bus.events, before.bus.events, "{context}: callbacks");
+        entered += after.jit.native_region_entries;
+    }
+    assert!(entered > 0, "the region runs adaptive heads");
 }
 
 #[test]
@@ -1142,4 +1180,38 @@ fn native_region_guest_load_observes_an_aliased_cpu_register_store() {
     );
     assert_eq!(raw_state(&after.cpu), raw_state(&before.cpu));
     assert_eq!(after.bus.events, before.bus.events);
+}
+
+#[test]
+fn hot_edge_region_with_a_fourth_memory_head_matches_every_budget() {
+    // Commands mix all four cases so the region's fourth head (index 3)
+    // runs, exits back to the root, and is cut by the budget at each point.
+    let configure = |f: &mut Fixture| {
+        for i in 0..256 {
+            f.bus.ram[COMMANDS as usize + i] = [3, 1, 3, 2, 0, 3, 3, 1][i % 8];
+        }
+        if f.jit.native_region_enabled {
+            for _ in 0..native_region::HOT_REGION_EDGE {
+                f.jit.note_region_edge(CASE3, HEAD);
+            }
+            f.jit
+                .compile_native_region(&[HEAD, CASE1, CASE2, CASE3])
+                .expect("hot memory arm joins the region");
+            assert_eq!(f.jit.native_region_inlined_calls(), 8, "four inlined heads");
+        }
+    };
+    for tracked in [false, true] {
+        let mut entered = 0;
+        for budget in (1..=40).chain([63, 64, 65, 100, 257]) {
+            entered += compare(
+                budget,
+                &[],
+                TRACE_EXIT_CHAIN_BUDGET,
+                tracked,
+                0x1adc,
+                configure,
+            );
+        }
+        assert!(entered > 0, "tracked={tracked}: the four-head region ran");
+    }
 }
