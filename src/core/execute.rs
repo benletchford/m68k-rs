@@ -653,6 +653,18 @@ impl CpuCore {
             self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
             self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
         }
+        #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+        if self.fm_len != 0 && self.window_overlaps_cpu() {
+            // Generated traces keep guest registers and flags in native
+            // values between entry and exit, so guest memory must never alias
+            // this CpuCore. A host that maps it there gets the interpreter.
+            self.fm_ptr = 0;
+            self.fm_base = 0;
+            self.fm_len = 0;
+            self.fm_bus = 0;
+            self.fm_write_hook = 0;
+            self.fm_store_filter = 0;
+        }
         let result = self.run_batch_inner(bus, max_instructions, watch_pcs);
         self.fm_ptr = 0;
         self.fm_base = 0;
@@ -662,6 +674,15 @@ impl CpuCore {
         self.fm_store_filter = 0;
         self.set_precise_bus(prior_precision);
         result
+    }
+
+    /// Whether the installed guest window overlaps this `CpuCore`.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    pub(crate) fn window_overlaps_cpu(&self) -> bool {
+        let cpu = self as *const Self as usize;
+        let cpu_end = cpu + std::mem::size_of::<Self>();
+        let window_end = self.fm_ptr.saturating_add(self.fm_len as usize);
+        self.fm_ptr < cpu_end && cpu < window_end
     }
 
     fn run_batch_inner<B: AddressBus>(
