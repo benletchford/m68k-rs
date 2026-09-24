@@ -3,7 +3,7 @@
 
 use super::*;
 use cranelift_codegen::cursor::{Cursor, FuncCursor};
-use cranelift_codegen::ir::InstructionData;
+use cranelift_codegen::ir::{InstructionData, ValueDef};
 
 enum PackedPart {
     ZeroCycles,
@@ -17,6 +17,12 @@ impl PackedPart {
         let value = function.dfg.resolve_aliases(value);
         if function.dfg.value_type(value) != types::I64 {
             return None;
+        }
+        // A trace body's exits return through blocks that store its cached
+        // registers; follow such a parameter to the one jump supplying it.
+        if let ValueDef::Param(block, index) = function.dfg.value_def(value) {
+            let incoming = sole_incoming_argument(function, block, index)?;
+            return Self::parse(function, incoming, cycle_parts);
         }
         let inst = function.dfg.value_def(value).inst()?;
         let data = &function.dfg.insts[inst];
@@ -82,6 +88,32 @@ impl PackedPart {
             }
         }
     }
+}
+
+/// The value passed as parameter `index` of `block`, when exactly one branch
+/// targets `block`. The rewritten return then uses that value directly; it
+/// dominates `block` because it is defined before the block's only entry.
+fn sole_incoming_argument(function: &Function, block: Block, index: usize) -> Option<Value> {
+    let dfg = &function.dfg;
+    let mut incoming = None;
+    for source in function.layout.blocks() {
+        for inst in function.layout.block_insts(source) {
+            for call in dfg.insts[inst].branch_destination(&dfg.jump_tables, &dfg.exception_tables)
+            {
+                if call.block(&dfg.value_lists) != block {
+                    continue;
+                }
+                if incoming.is_some() {
+                    return None;
+                }
+                match call.args(&dfg.value_lists).nth(index)? {
+                    BlockArg::Value(value) => incoming = Some(value),
+                    _ => return None,
+                }
+            }
+        }
+    }
+    incoming
 }
 
 pub(super) fn without_synthetic_cycles(function: &Function) -> Option<Function> {

@@ -16,11 +16,11 @@ use super::types::{CpuType, Size};
 use cranelift_codegen::Context;
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_codegen::ir::{
-    AbiParam, Block, BlockArg, FuncRef, Function, InstBuilder, MemFlags, Type, UserFuncName, Value,
-    condcodes::IntCC, types,
+    AbiParam, Block, BlockArg, FuncRef, Function, Inst, InstBuilder, MemFlags, Type, UserFuncName,
+    Value, condcodes::IntCC, types,
 };
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 use cranelift_jit::{JITBuilder, JITModule};
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -3841,6 +3841,7 @@ impl TraceJit {
                 None
             };
 
+            let register_cache = begin_register_cache(&mut builder, cpu_ptr);
             let zero = builder.ins().iconst(types::I32, 0);
             let max_iters = if native_loop {
                 builder.block_params(block)[1]
@@ -4231,7 +4232,7 @@ impl TraceJit {
                 .ins()
                 .iconst(types::I64, TRACE_RETURN_COMPLETE as i64);
             let packed = builder.ins().bor(packed, complete);
-            builder.ins().return_(&[packed]);
+            emit_trace_return(&mut builder, packed);
 
             // Bail exits: set PC to the un-executed op, return the ops and
             // accumulated cycles/instructions retired before it.
@@ -4249,10 +4250,12 @@ impl TraceJit {
                     }
                 };
                 let packed = builder.ins().bor(cycles64, retired);
-                builder.ins().return_(&[packed]);
+                emit_trace_return(&mut builder, packed);
             }
 
+            let register_entry = finish_register_cache(&mut builder, cpu_ptr, register_cache);
             builder.seal_all_blocks();
+            prune_register_cache(&mut builder, register_entry);
             builder.finalize();
         }
 
@@ -4260,6 +4263,16 @@ impl TraceJit {
             && generated_code_validation
             && native_region::retain_inline_body(ops, native_loop);
         module.define_function(func_id, &mut ctx).ok()?;
+        #[cfg(test)]
+        if let Some(dir) = std::env::var_os("M68K_TEST_DUMP_CODE")
+            && let Some(code) = ctx.compiled_code()
+        {
+            let bytes = code.code_buffer();
+            let _ = std::fs::write(
+                std::path::Path::new(&dir).join(format!("{start_pc:08x}-{}.bin", bytes.len())),
+                bytes,
+            );
+        }
         // define_function has legalized and optimized this IR. The inliner
         // requires a legalized callee; capture it before clear_context.
         let region_body_ir =
@@ -11217,17 +11230,237 @@ fn emit_move_mem(
     )
 }
 
+/// Guest D0-D7/A0-A7 and the X/N/Z/V/C flag fields held in Cranelift
+/// variables for the trace body being emitted, instead of a load and store in
+/// `CpuCore` per instruction. `load_u32` and `store_value` route these fields
+/// through the cache, so every emitter is covered by construction.
+///
+/// Entry loads every field into the body's parameters; once the function is
+/// sealed, loads whose value nothing uses (on any path, including an exit
+/// before the field is written) become constants. Each exit stores the
+/// fields the trace writes anywhere: a compile-time set, with no runtime
+/// dirty state, since storing an unchanged value is harmless. Nothing between
+/// entry and exit reads these fields from memory: the only call a body makes
+/// is the tracked-write hook, which receives the bus and the store's
+/// operands, never the CPU, and `run_batch` never installs a guest window
+/// that overlaps `CpuCore`.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+struct RegisterCache {
+    vars: [Variable; CACHED_FIELDS],
+    /// Fields some store defined; each exit stores these.
+    written: u32,
+    /// Exit blocks taking the packed return value, filled at finish.
+    exits: Vec<Block>,
+    entry_loads: [Inst; CACHED_FIELDS],
+    entry_values: [Value; CACHED_FIELDS],
+}
+
+/// The entry loads and body parameters, for pruning after sealing.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+struct RegisterCacheEntry {
+    loads: [Inst; CACHED_FIELDS],
+    params: [Value; CACHED_FIELDS],
+    /// Each exit store and the field it writes back.
+    stores: Vec<(Inst, usize)>,
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+thread_local! {
+    static REGISTER_CACHE: RefCell<Option<RegisterCache>> = const { RefCell::new(None) };
+}
+
+/// Start caching registers and flags for the body emitted from here on.
+/// Returns a guard that discards the cache if emission is abandoned.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn begin_register_cache(builder: &mut FunctionBuilder<'_>, cpu: Value) -> RegisterCacheGuard {
+    let body = builder.create_block();
+    let mut entry_loads = Vec::with_capacity(CACHED_FIELDS);
+    let mut loaded = Vec::with_capacity(CACHED_FIELDS);
+    for index in 0..CACHED_FIELDS {
+        let value = load_field_u32(builder, cpu, cached_field_offset(index));
+        entry_loads.push(builder.func.dfg.value_def(value).unwrap_inst());
+        loaded.push(BlockArg::from(value));
+    }
+    builder.ins().jump(body, &loaded);
+    let vars: [Variable; CACHED_FIELDS] = std::array::from_fn(|_| builder.declare_var(types::I32));
+    let mut entry_values = Vec::with_capacity(CACHED_FIELDS);
+    for var in vars {
+        let param = builder.append_block_param(body, types::I32);
+        builder.def_var(var, param);
+        entry_values.push(param);
+    }
+    builder.switch_to_block(body);
+    REGISTER_CACHE.with_borrow_mut(|cache| {
+        debug_assert!(cache.is_none(), "register caches do not nest");
+        *cache = Some(RegisterCache {
+            vars,
+            written: 0,
+            exits: Vec::new(),
+            entry_loads: entry_loads.try_into().unwrap(),
+            entry_values: entry_values.try_into().unwrap(),
+        });
+    });
+    RegisterCacheGuard
+}
+
+/// Fill every exit block. Call after the last exit has been requested and
+/// before sealing; pass the result to `prune_register_cache` after sealing.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn finish_register_cache(
+    builder: &mut FunctionBuilder<'_>,
+    cpu: Value,
+    _guard: RegisterCacheGuard,
+) -> RegisterCacheEntry {
+    let Some(cache) = REGISTER_CACHE.with_borrow_mut(Option::take) else {
+        unreachable!("finish_register_cache without begin_register_cache");
+    };
+    let mut stores = Vec::new();
+    for exit in &cache.exits {
+        builder.switch_to_block(*exit);
+        let packed = builder.block_params(*exit)[0];
+        for index in 0..CACHED_FIELDS {
+            if cache.written & (1 << index) != 0 {
+                let value = builder.use_var(cache.vars[index]);
+                let store = builder.ins().store(
+                    MemFlags::trusted(),
+                    value,
+                    cpu,
+                    cached_field_offset(index) as i32,
+                );
+                stores.push((store, index));
+            }
+        }
+        builder.ins().return_(&[packed]);
+    }
+    RegisterCacheEntry {
+        loads: cache.entry_loads,
+        params: cache.entry_values,
+        stores,
+    }
+}
+
+/// Once sealed, every value is explicit. An exit store of a field's own
+/// entry value writes back unchanged data on every path to that exit, so it
+/// is removed; then loads of fields nothing observes become constants.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn prune_register_cache(builder: &mut FunctionBuilder<'_>, entry: RegisterCacheEntry) {
+    let func = &mut *builder.func;
+    for (store, index) in entry.stores {
+        let value = func.dfg.resolve_aliases(func.dfg.inst_args(store)[0]);
+        if value == entry.params[index] {
+            func.layout.remove_inst(store);
+        }
+    }
+    let mut used = 0u32;
+    for block in func.layout.blocks() {
+        for inst in func.layout.block_insts(block) {
+            for value in func.dfg.inst_values(inst) {
+                let value = func.dfg.resolve_aliases(value);
+                if let Some(index) = entry.params.iter().position(|&param| param == value) {
+                    used |= 1 << index;
+                }
+            }
+        }
+    }
+    for (index, load) in entry.loads.into_iter().enumerate() {
+        if used & (1 << index) == 0 {
+            func.dfg.replace(load).iconst(types::I32, 0);
+        }
+    }
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+struct RegisterCacheGuard;
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+impl Drop for RegisterCacheGuard {
+    fn drop(&mut self) {
+        REGISTER_CACHE.with_borrow_mut(|cache| *cache = None);
+    }
+}
+
+/// Return `packed` from the trace body, through an exit block that stores
+/// the cached fields when a register cache is active.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn emit_trace_return(builder: &mut FunctionBuilder<'_>, packed: Value) {
+    let exit = REGISTER_CACHE.with_borrow_mut(|cache| {
+        cache.as_mut().map(|cache| {
+            let exit = builder.create_block();
+            builder.append_block_param(exit, types::I64);
+            cache.exits.push(exit);
+            exit
+        })
+    });
+    match exit {
+        Some(exit) => {
+            builder.ins().jump(exit, &[packed.into()]);
+        }
+        None => {
+            builder.ins().return_(&[packed]);
+        }
+    }
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+const CACHED_FIELDS: usize = 21;
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn dar_offset(index: usize) -> usize {
+    offset_of!(CpuCore, dar) + index * size_of::<u32>()
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn cached_field_offset(index: usize) -> usize {
+    match index {
+        0..16 => dar_offset(index),
+        16 => offset_of!(CpuCore, x_flag),
+        17 => offset_of!(CpuCore, n_flag),
+        18 => offset_of!(CpuCore, not_z_flag),
+        19 => offset_of!(CpuCore, v_flag),
+        20 => offset_of!(CpuCore, c_flag),
+        _ => unreachable!("{index} is not a cached field"),
+    }
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn cached_field_index(offset: usize) -> Option<usize> {
+    let dar = offset_of!(CpuCore, dar);
+    if (dar..dar + 16 * size_of::<u32>()).contains(&offset) {
+        debug_assert_eq!((offset - dar) % size_of::<u32>(), 0);
+        return Some((offset - dar) / size_of::<u32>());
+    }
+    (16..CACHED_FIELDS).find(|&index| cached_field_offset(index) == offset)
+}
+
+/// The cached variable for `offset`, if a register cache is active and
+/// `offset` is a cached field. Marks it read or written.
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn cached_field_var(offset: usize, write: bool) -> Option<Variable> {
+    let index = cached_field_index(offset)?;
+    REGISTER_CACHE.with_borrow_mut(|cache| {
+        cache.as_mut().map(|cache| {
+            if write {
+                cache.written |= 1 << index;
+            }
+            cache.vars[index]
+        })
+    })
+}
+
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
+fn load_field_u32(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize) -> Value {
+    builder
+        .ins()
+        .load(types::I32, MemFlags::trusted(), cpu, offset as i32)
+}
+
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn load_reg(builder: &mut FunctionBuilder<'_>, cpu: Value, reg: JitDirectReg) -> Value {
     let index = match reg {
         JitDirectReg::Data(reg) => reg as usize,
         JitDirectReg::Addr(reg) => 8 + reg as usize,
     };
-    load_u32(
-        builder,
-        cpu,
-        offset_of!(CpuCore, dar) + index * size_of::<u32>(),
-    )
+    load_u32(builder, cpu, dar_offset(index))
 }
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -11236,12 +11469,7 @@ fn store_reg(builder: &mut FunctionBuilder<'_>, cpu: Value, reg: JitDirectReg, v
         JitDirectReg::Data(reg) => reg as usize,
         JitDirectReg::Addr(reg) => 8 + reg as usize,
     };
-    store_value_u32(
-        builder,
-        cpu,
-        offset_of!(CpuCore, dar) + index * size_of::<u32>(),
-        value,
-    );
+    store_value_u32(builder, cpu, dar_offset(index), value);
 }
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -11712,7 +11940,7 @@ fn emit_guarded_branch(
         .ins()
         .iconst(types::I64, TRACE_RETURN_GUARDED_BRANCH_EXIT as i64);
     let packed = builder.ins().bor(packed, guarded_exit);
-    builder.ins().return_(&[packed]);
+    emit_trace_return(builder, packed);
 
     builder.switch_to_block(continue_block);
     op_cycles
@@ -11831,7 +12059,7 @@ fn emit_guarded_indirect_jmp(
         .ins()
         .iconst(types::I64, TRACE_RETURN_GUARDED_BRANCH_EXIT as i64);
     let packed = builder.ins().bor(packed, guarded_exit);
-    builder.ins().return_(&[packed]);
+    emit_trace_return(builder, packed);
 
     builder.switch_to_block(continue_block);
     op_cycles
@@ -12050,9 +12278,10 @@ fn select_flag(builder: &mut FunctionBuilder<'_>, condition: Value, flag: u32) -
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn load_u32(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize) -> Value {
-    builder
-        .ins()
-        .load(types::I32, MemFlags::trusted(), cpu, offset as i32)
+    match cached_field_var(offset, false) {
+        Some(var) => builder.use_var(var),
+        None => load_field_u32(builder, cpu, offset),
+    }
 }
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -12093,6 +12322,11 @@ fn store_value_u32(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize,
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
 fn store_value(builder: &mut FunctionBuilder<'_>, cpu: Value, offset: usize, value: Value) {
+    if let Some(var) = cached_field_var(offset, true) {
+        debug_assert_eq!(builder.func.dfg.value_type(value), types::I32);
+        builder.def_var(var, value);
+        return;
+    }
     builder
         .ins()
         .store(MemFlags::trusted(), value, cpu, offset as i32);
