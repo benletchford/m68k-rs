@@ -1520,6 +1520,10 @@ pub(crate) struct TraceJit {
     native_region_public: bool,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     native_region_status: &'static str,
+    /// Transitions between compiled heads observed on the Rust exit path;
+    /// hot edges into a dispatcher choose its region's arms.
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    region_edges: Box<[native_region::RegionEdge]>,
     #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
     native_region_entries: u64,
     #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -1661,6 +1665,12 @@ impl TraceJit {
             native_region_public: false,
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             native_region_status: "no eligible compiled region",
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            region_edges: vec![
+                native_region::RegionEdge::default();
+                native_region::REGION_EDGE_SLOTS
+            ]
+            .into_boxed_slice(),
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
             native_region_entries: 0,
             #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
@@ -2149,6 +2159,10 @@ impl TraceJit {
             let clean_link_exit = !guarded_branch_exit
                 && !partial_call_this_entry
                 && self.compiled_head_at(cpu.pc, cpu_type);
+            #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+            if self.native_region_enabled && !partial_call_this_entry && cpu.pc != pc {
+                self.note_region_edge(pc, cpu.pc);
+            }
             #[cfg(feature = "trace-profile")]
             if clean_link_exit {
                 super::trace_profile::note_link_exit(pc, cpu_type);

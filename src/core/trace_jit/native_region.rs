@@ -191,10 +191,35 @@ fn pointer(function: NativeTraceFn) -> usize {
     }
 }
 
+/// Most heads a region inlines: the dispatcher plus its hot handlers.
+pub(super) const MAX_REGION_HEADS: usize = 8;
+
+/// Longest non-loop trace whose IR is retained for inlining as a region arm.
+const INLINE_ARM_MAX_OPS: usize = 32;
+
+/// Arm-to-root transitions after which a compiled trace joins its
+/// dispatcher's region.
+pub(super) const HOT_REGION_EDGE: u32 = 64;
+
+/// Direct-mapped `(from, to)` transition counters between compiled heads.
+pub(super) const REGION_EDGE_SLOTS: usize = 1024;
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct RegionEdge {
+    from: u32,
+    to: u32,
+    count: u32,
+}
+
+fn region_edge_index(from: u32, to: u32) -> usize {
+    let mixed = (u64::from(from) << 32 | u64::from(to)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    (mixed >> 54) as usize & (REGION_EDGE_SLOTS - 1)
+}
+
 fn snapshot(trace: &CompiledTrace) -> Result<Head, &'static str> {
-    if trace.adaptive_branch {
-        return Err("adaptive trace");
-    }
+    // Adaptive heads are admitted: their re-record policy counts Rust
+    // entries, which simply pause while a region runs them, and a
+    // re-recorded slot fails `matches_installed` and drops the region.
     if trace.seeded_exit {
         return Err("call/return seeded exit");
     }
@@ -232,7 +257,6 @@ fn matches_installed(head: &Head, trace: &CompiledTrace) -> bool {
     // only mutable admission metadata and is checked explicitly.
     trace.pc == head.pc
         && trace.cpu_type == head.cpu_type
-        && !trace.adaptive_branch
         && pointer(trace.func) == head.body
         && trace
             .checked_func
@@ -269,16 +293,18 @@ fn read_only_arm_ops(ops: &[TraceBuildOp]) -> bool {
 }
 
 pub(super) fn retain_inline_body(ops: &[TraceBuildOp], native_loop: bool) -> bool {
-    (native_loop
-        && ops.iter().any(|op| {
-            matches!(
-                op.op,
-                JitTraceOp::IndirectJmp {
-                    expected_target: Some(_),
-                    ..
-                }
-            )
-        }))
+    // Any short trace may become a hot arm of some dispatcher's region.
+    (!native_loop && !ops.is_empty() && ops.len() <= INLINE_ARM_MAX_OPS)
+        || (native_loop
+            && ops.iter().any(|op| {
+                matches!(
+                    op.op,
+                    JitTraceOp::IndirectJmp {
+                        expected_target: Some(_),
+                        ..
+                    }
+                )
+            }))
         || (!ops.is_empty()
             && ops.len() <= 4
             && matches!(
@@ -339,8 +365,8 @@ impl TraceJit {
         if cfg!(feature = "trace-profile") {
             return Err("trace-profile retains original per-head instrumentation");
         }
-        if !(2..=3).contains(&pcs.len()) {
-            return Err("requires two or three heads");
+        if !(2..=MAX_REGION_HEADS).contains(&pcs.len()) {
+            return Err("requires two to eight heads");
         }
         let mut heads: Vec<Head> = Vec::with_capacity(pcs.len());
         let mut bodies = Vec::with_capacity(pcs.len());
@@ -365,8 +391,8 @@ impl TraceJit {
                 {
                     return Err("root is not a counted indirect dispatcher");
                 }
-            } else if !return_arm(trace, pcs[0]) {
-                return Err("not a short read-only return arm");
+            } else if !return_arm(trace, pcs[0]) && !self.hot_region_arm(pc, pcs[0]) {
+                return Err("neither a short return arm nor a hot arm");
             }
             let head = snapshot(trace)?;
             if let Some(first) = heads.first()
@@ -523,15 +549,6 @@ impl TraceJit {
         } else {
             return;
         };
-        // An unrelated/new short arm does not require rescanning the entire
-        // cache when the existing selected group is still valid. Preserve
-        // that group until an actual constituent changes.
-        if self.native_region.as_ref().is_some_and(|region| {
-            region.root_pc == root && region.input.public == self.native_region_public
-                && region.input.heads.iter().all(|head| {
-                    matches!(&self.slots[trace_cache_index(head.pc)], TraceSlot::Compiled(trace) if matches_installed(head, trace))
-                })
-        }) { return; }
         let TraceSlot::Compiled(trace) = &self.slots[trace_cache_index(root)] else {
             return;
         };
@@ -553,12 +570,21 @@ impl TraceJit {
             self.native_region_status = "root not settled/eligible";
             return;
         }
+        let root_type = trace.cpu_type;
+        let root_tracked = trace.tracked_writes;
+        let eligible = |arm: &CompiledTrace| {
+            arm.pc != root
+                && arm.cpu_type == root_type
+                && arm.tracked_writes == root_tracked
+                && arm.region_ir.is_some()
+                && snapshot(arm).is_ok()
+        };
         let mut pcs = vec![root];
+        // Short read-only return arms, as before...
         for slot in &self.slots {
             if let TraceSlot::Compiled(arm) = slot
-                && arm.cpu_type == trace.cpu_type
+                && eligible(arm)
                 && return_arm(arm, root)
-                && snapshot(arm).is_ok()
             {
                 pcs.push(arm.pc);
                 if pcs.len() == 3 {
@@ -566,7 +592,36 @@ impl TraceJit {
                 }
             }
         }
-        if pcs.len() == 3 {
+        // ...then any compiled head observed returning to the root often,
+        // hottest first, up to the region's capacity.
+        let mut hot: Vec<(u32, u32)> = self
+            .region_edges
+            .iter()
+            .filter(|edge| edge.to == root && edge.count >= HOT_REGION_EDGE && !pcs.contains(&edge.from))
+            .filter(|edge| {
+                matches!(&self.slots[trace_cache_index(edge.from)], TraceSlot::Compiled(arm) if arm.pc == edge.from && eligible(arm))
+            })
+            .map(|edge| (edge.count, edge.from))
+            .collect();
+        hot.sort_unstable_by(|a, b| b.cmp(a));
+        pcs.extend(
+            hot.into_iter()
+                .map(|(_, pc)| pc)
+                .take(MAX_REGION_HEADS - pcs.len()),
+        );
+        // An unrelated new arm does not require recompiling while the
+        // existing group is still valid and already contains every candidate.
+        if self.native_region.as_ref().is_some_and(|region| {
+            region.root_pc == root
+                && region.input.public == self.native_region_public
+                && pcs.iter().all(|pc| region.input.heads.iter().any(|head| head.pc == *pc))
+                && region.input.heads.iter().all(|head| {
+                    matches!(&self.slots[trace_cache_index(head.pc)], TraceSlot::Compiled(trace) if matches_installed(head, trace))
+                })
+        }) {
+            return;
+        }
+        if pcs.len() >= 3 {
             if self.native_region_background {
                 let result = self.capture_native_region(&pcs).and_then(|input| {
                     self.native_region_worker
@@ -582,6 +637,28 @@ impl TraceJit {
                 let _ = self.compile_native_region(&pcs);
             }
         }
+    }
+
+    /// Count a Rust-observed transition between two compiled heads. Crossing
+    /// the hot threshold into a dispatcher re-evaluates its region.
+    pub(super) fn note_region_edge(&mut self, from: u32, to: u32) {
+        let edge = &mut self.region_edges[region_edge_index(from, to)];
+        if edge.from != from || edge.to != to {
+            if edge.count >= HOT_REGION_EDGE {
+                // Keep an established hot edge; a colliding cold one waits.
+                return;
+            }
+            *edge = RegionEdge { from, to, count: 0 };
+        }
+        edge.count = edge.count.saturating_add(1);
+        if edge.count == HOT_REGION_EDGE {
+            self.maybe_compile_native_region(to);
+        }
+    }
+
+    fn hot_region_arm(&self, arm: u32, root: u32) -> bool {
+        let edge = &self.region_edges[region_edge_index(arm, root)];
+        edge.from == arm && edge.to == root && edge.count >= HOT_REGION_EDGE
     }
 
     /// Outer None means ordinary execution should handle this entry. Inner
@@ -632,7 +709,7 @@ impl TraceJit {
             }
         }
         let entry = region.entry;
-        let pcs: [u32; 3] =
+        let pcs: [u32; MAX_REGION_HEADS] =
             std::array::from_fn(|index| region.input.heads.get(index).map_or(0, |head| head.pc));
         let report_execution = !region.reported_first_execution;
         let inlined_calls = region.inlined_calls;
@@ -909,7 +986,9 @@ fn compile_private_snapshot(input: &RegionInput) -> Option<PrivateCompiledRegion
 /// Confirm every captured function belongs to this target ABI, and that a
 /// numeric inliner lookup has one exact meaning within this immutable snapshot.
 fn snapshot_signatures_match(module: &JITModule, input: &RegionInput) -> bool {
-    if !(2..=3).contains(&input.heads.len()) || input.heads.len() != input.bodies.len() {
+    if !(2..=MAX_REGION_HEADS).contains(&input.heads.len())
+        || input.heads.len() != input.bodies.len()
+    {
         return false;
     }
     let ptr = module.target_config().pointer_type();
