@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.3...m68k-v0.14.4) (2026-10-10)
+
+
+### Bug Fixes
+
+* **fpu:** use twelve-byte MC68060 NULL state frames ([a661575](https://github.com/benletchford/m68k-rs/commit/a6615752924028d476372ac3eb06812a868aa299))
+
 ## [0.14.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.2...m68k-v0.14.3) (2026-09-24)
 
 
