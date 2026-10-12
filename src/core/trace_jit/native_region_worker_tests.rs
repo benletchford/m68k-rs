@@ -274,6 +274,8 @@ fn new_candidate_jit(enabled: bool) -> TraceJit {
         RegionMode::Disabled
     };
     let mut jit = TraceJit::new_with_region_mode(mode);
+    // Also keep snapshot IDs distinct from the private module's local ID zero.
+    jit.next_func = 16;
     let module = jit.module.as_mut().expect("native JIT");
     let signature = module.make_signature();
     // Deliberately make retained IDs unrelated to the new private module's ID0.
@@ -313,15 +315,10 @@ fn configure_candidate(jit: &mut TraceJit, enabled: bool, heads: &[u32]) -> Opti
         "old declarations must not be copied"
     );
     assert_eq!(private.module.declarations().get_data_objects().count(), 0);
-    assert!(
-        jit.module
-            .as_ref()
-            .unwrap()
-            .declarations()
-            .get_functions()
-            .count()
-            >= 39
-    );
+    // Foreground compilations can now live in different modules, so the
+    // current module need not contain the earlier padding declarations.
+    // The retained snapshot IDs above still differ from the private ID zero;
+    // its single declaration proves that unrelated declarations stay behind.
     jit.native_region.as_mut().unwrap().entry = private.entry;
     Some(private.module)
 }
@@ -675,6 +672,101 @@ fn private_entry_retires_guest_work_without_a_foreground_call_driver() {
         SOURCE,
         "guest copy actually advanced its source"
     );
+}
+
+#[test]
+fn snapshot_across_batches_survives_reclamation_of_all_original_code() {
+    let mut fixture = Fixture::new(true, false, 1, false);
+    let jit = fixture.jit.as_mut().unwrap();
+    jit.native_region = None;
+    let mut leases = Vec::new();
+    for pc in [HEAD, ARM, ARM2] {
+        let index = trace_cache_index(pc);
+        let TraceSlot::Compiled(old) = std::mem::replace(&mut jit.slots[index], TraceSlot::Empty)
+        else {
+            panic!("missing constituent");
+        };
+        // Deliberately reuse local FuncIds zero and one for every constituent.
+        jit.module = Some(super::super::code_memory::CodeModule::new().unwrap());
+        let trace = jit
+            .compile_decoded_ops(
+                &fixture.cpu,
+                pc,
+                CpuType::M68040,
+                old.ops.clone(),
+                Some(HEAD),
+            )
+            .unwrap();
+        assert_eq!(
+            jit.module
+                .as_ref()
+                .unwrap()
+                .declarations()
+                .get_functions()
+                .count(),
+            2
+        );
+        leases.push(std::rc::Rc::downgrade(&trace._code_lease));
+        jit.slots[index] = TraceSlot::Compiled(trace);
+    }
+    let input = jit.capture_native_region(&[HEAD, ARM, ARM2]).unwrap();
+    for pc in [HEAD, ARM, ARM2] {
+        jit.slots[trace_cache_index(pc)] = TraceSlot::Empty;
+    }
+    jit.module = None;
+    assert!(
+        leases.iter().all(|lease| lease.upgrade().is_none()),
+        "immutable IR must not pin retired executable allocations"
+    );
+    let private = compile_private_snapshot(&input).expect("mixed batches have unambiguous IR IDs");
+    let _owner = UnpublishedRegionModule(Some(private.module));
+    fixture.cpu.fm_ptr = fixture.bus.ram.as_mut_ptr() as usize;
+    fixture.cpu.fm_base = 0;
+    fixture.cpu.fm_len = LEN as u32;
+    let mut exit = RegionExit::default();
+    unsafe { (private.entry)(&mut fixture.cpu, 31, 0, &mut exit) };
+    assert!(exit.retired > 0 && exit.retired <= 31);
+    assert_ne!(fixture.cpu.a(4), SOURCE);
+}
+
+#[test]
+fn synchronous_region_owns_its_code_after_all_traces_and_active_module_drop() {
+    let mut fixture = Fixture::new(true, false, 1, false);
+    let jit = fixture.jit.as_mut().unwrap();
+    jit.native_region = None;
+    jit.prepare_native_region(&[HEAD, ARM, ARM2]).unwrap();
+    let region = jit.native_region.take().unwrap();
+    let lease = std::rc::Rc::downgrade(region._foreground_lease.as_ref().unwrap());
+    for pc in [HEAD, ARM, ARM2] {
+        jit.slots[trace_cache_index(pc)] = TraceSlot::Empty;
+    }
+    jit.module = None;
+    assert!(lease.upgrade().is_some());
+    fixture.cpu.fm_ptr = fixture.bus.ram.as_mut_ptr() as usize;
+    fixture.cpu.fm_base = 0;
+    fixture.cpu.fm_len = LEN as u32;
+    let mut exit = RegionExit::default();
+    unsafe { (region.entry)(&mut fixture.cpu, 31, 0, &mut exit) };
+    assert!(exit.retired > 0 && exit.retired <= 31);
+    drop(region);
+    assert!(lease.upgrade().is_none());
+}
+
+#[test]
+fn reused_native_addresses_do_not_match_an_older_compilation() {
+    let mut fixture = Fixture::new(true, false, 1, false);
+    let jit = fixture.jit.as_mut().unwrap();
+    let input = jit.capture_native_region(&[HEAD, ARM, ARM2]).unwrap();
+    let TraceSlot::Compiled(trace) = &mut jit.slots[trace_cache_index(HEAD)] else {
+        panic!()
+    };
+    assert!(matches_installed(&input.heads[0], trace));
+    // Hold all addresses and other metadata equal, as if the allocator reused
+    // both entry addresses for a replacement trace. Identity alone must reject it.
+    trace.compile_id += 100;
+    assert!(!matches_installed(&input.heads[0], trace));
+    let replacement = jit.capture_native_region(&[HEAD, ARM, ARM2]).unwrap();
+    assert!(input != replacement);
 }
 
 fn edited_first_body(input: &RegionInput, edit: impl FnOnce(&mut Function)) -> RegionInput {

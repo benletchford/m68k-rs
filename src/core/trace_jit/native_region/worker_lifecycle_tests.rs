@@ -34,6 +34,7 @@ impl Drop for ReleaseOnDrop {
 fn input(root: u32) -> RegionInput {
     RegionInput {
         heads: vec![Head {
+            compile_id: 0,
             pc: root,
             cpu_type: CpuType::M68040,
             ops: 1,
