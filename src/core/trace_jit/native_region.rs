@@ -98,6 +98,7 @@ type RegionFn = unsafe extern "C" fn(*mut CpuCore, u32, u32, *mut RegionExit);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Head {
+    compile_id: u32,
     pc: u32,
     cpu_type: CpuType,
     ops: u32,
@@ -112,7 +113,7 @@ struct Head {
 }
 
 /// Already-legalized code from the original checked wrapper and body. Keep
-/// their module identities with the IR so inlining never guesses a callee.
+/// their unique snapshot identities with the IR so inlining never guesses a callee.
 pub(super) struct InlineBody {
     pub(super) body_id: FuncId,
     pub(super) body: Function,
@@ -129,8 +130,8 @@ struct RegionInput {
 
 impl PartialEq for RegionInput {
     fn eq(&self, other: &Self) -> bool {
-        // A module never reuses finalized entry addresses while this JIT
-        // lives. These identities also identify the captured immutable IR.
+        // Compilation identities remain unique even after retired executable
+        // storage is freed and an allocator reuses its native addresses.
         self.public == other.public && self.heads == other.heads
     }
 }
@@ -142,6 +143,7 @@ pub(super) struct NativeRegion {
     input: RegionInput,
     // Keep after input: the worker owns the heavy IR until this lease drops.
     _lease: Option<Arc<worker::CodeLease>>,
+    _foreground_lease: Option<std::rc::Rc<super::code_memory::CodeLease>>,
     entry: RegionFn,
     reported_first_execution: bool,
     inlined_calls: usize,
@@ -241,6 +243,7 @@ fn snapshot(trace: &CompiledTrace) -> Result<Head, &'static str> {
         return Err("native ABI mismatch");
     }
     Ok(Head {
+        compile_id: trace.compile_id,
         pc: trace.pc,
         cpu_type: trace.cpu_type,
         ops: trace.ops.len() as u32,
@@ -256,10 +259,10 @@ fn snapshot(trace: &CompiledTrace) -> Result<Head, &'static str> {
 }
 
 fn matches_installed(head: &Head, trace: &CompiledTrace) -> bool {
-    // Fixed metadata cannot change on an installed trace; finalized native
-    // addresses are unique for this module lifetime. Adaptive policy is the
-    // only mutable admission metadata and is checked explicitly.
-    trace.pc == head.pc
+    // Include the compilation identity so address reuse cannot admit stale
+    // worker output after a trace has been evicted and recompiled.
+    trace.compile_id == head.compile_id
+        && trace.pc == head.pc
         && trace.cpu_type == head.cpu_type
         && pointer(trace.func) == head.body
         && trace
@@ -428,7 +431,11 @@ impl TraceJit {
             return Ok(());
         }
         let ordinal = self.next_func;
-        self.next_func = self.next_func.wrapping_add(1);
+        self.next_func = self
+            .next_func
+            .checked_add(1)
+            .ok_or("compilation identity exhausted")?;
+        self.prepare_code_module().ok_or("native JIT unavailable")?;
         let module = self.module.as_mut().ok_or("native JIT unavailable")?;
         let (entry, inlined_calls) = compile_snapshot(module, &mut self.func_ctx, ordinal, &input)
             .ok_or("region code generation failed")?;
@@ -438,6 +445,7 @@ impl TraceJit {
             cpu_type: input.heads[0].cpu_type,
             input,
             _lease: None,
+            _foreground_lease: Some(module.lease()),
             entry,
             reported_first_execution: false,
             inlined_calls,
@@ -506,6 +514,7 @@ impl TraceJit {
             cpu_type: completed.input.heads[0].cpu_type,
             input: completed.input,
             _lease: Some(completed.lease),
+            _foreground_lease: None,
             entry,
             reported_first_execution: false,
             inlined_calls,
