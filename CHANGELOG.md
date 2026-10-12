@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.4...m68k-v0.14.5) (2026-10-12)
+
+
+### Bug Fixes
+
+* **fpu:** execute FINT and FINTRZ natively on the 68060 ([980f79b](https://github.com/benletchford/m68k-rs/commit/980f79b9c6f89d2c714e5db07ffe3829cc9a35f2))
+
 ## [0.14.4](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.3...m68k-v0.14.4) (2026-10-10)
 
 
