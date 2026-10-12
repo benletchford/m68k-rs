@@ -58,16 +58,14 @@ fn f64_to_int_saturating(value: f64, fpcr: u32, min: i64, max: i64) -> i64 {
 }
 
 /// The FP opmodes the 68060 dropped from silicon, emulated by the 68060SP:
-/// the transcendental set, FINT/FINTRZ, FGETEXP/FGETMAN, FMOD/FREM/FSCALE,
-/// and FSINCOS (FMOVECR is gated separately by encoding). FSGLMUL/FSGLDIV
-/// and every rounded (FS/FD-prefixed) variant remain in hardware. Keep in
-/// sync with fpu_apply_op's table.
+/// the transcendental set, FGETEXP/FGETMAN, FMOD/FREM/FSCALE, and FSINCOS
+/// (FMOVECR is gated separately by encoding). FINT/FINTRZ, which the 68040
+/// lacks, are back in 68060 hardware, as are FSGLMUL/FSGLDIV and every
+/// rounded (FS/FD-prefixed) variant. Keep in sync with fpu_apply_op's table.
 fn fpu_060_traps_opmode(opmode: u16) -> bool {
     matches!(
         opmode,
-        0x01 | 0x02
-            | 0x03
-            | 0x06
+        0x02 | 0x06
             | 0x08
             | 0x09
             | 0x0A

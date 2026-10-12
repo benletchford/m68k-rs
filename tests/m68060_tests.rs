@@ -432,6 +432,27 @@ fn fadd_register_form_executes_natively_on_68060() {
 }
 
 #[test]
+fn fint_and_fintrz_execute_natively_on_68060() {
+    // Unlike the 68040, the 68060 implements FINT and FINTRZ in hardware;
+    // compilers emit FINTRZ for every float-to-integer conversion.
+    let (mut cpu, mut bus) = setup_060();
+    bus.write_word_at(0x0200, 0xF200);
+    bus.write_word_at(0x0202, 0x0083); // FINTRZ.X FP0,FP1
+    cpu.fpr[0] = m68k::fpu::FloatX80::from_f64(2.75);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, 0x0204, "FINTRZ must not trap");
+    assert_eq!(cpu.fpr[1].to_f64(), 2.0, "round toward zero");
+
+    let (mut cpu, mut bus) = setup_060();
+    bus.write_word_at(0x0200, 0xF200);
+    bus.write_word_at(0x0202, 0x0081); // FINT.X FP0,FP1
+    cpu.fpr[0] = m68k::fpu::FloatX80::from_f64(2.75);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, 0x0204, "FINT must not trap");
+    assert_eq!(cpu.fpr[1].to_f64(), 3.0, "round to nearest");
+}
+
+#[test]
 fn fsin_register_form_traps_fp_unimplemented_on_68060() {
     let (mut cpu, mut bus) = setup_060();
     // FSIN.X FP0,FP1
