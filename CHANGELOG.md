@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.14.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.5...m68k-v0.14.6) (2026-10-15)
+
+
+### Bug Fixes
+
+* **cpu:** model the FPU-less MC68LC060/MC68EC060 PCR ([245de18](https://github.com/benletchford/m68k-rs/commit/245de18a6602f6e2f0b375a39165179c7ea3ac8b))
+
 ## [0.14.5](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.4...m68k-v0.14.5) (2026-10-12)
 
 
