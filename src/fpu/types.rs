@@ -30,11 +30,13 @@ impl FloatX80 {
         }
     }
 
-    /// Signed infinity.
+    /// Signed infinity. The integer bit of an extended infinity is "don't
+    /// care" (M68000 PRM, Table 1-6); results carry it clear, which is also
+    /// what WinUAE's MC68881 softfloat and GCC's constants use.
     pub const fn infinity(sign: bool) -> Self {
         Self {
             sign_exp: ((sign as u16) << 15) | 0x7FFF,
-            mantissa: 0x8000_0000_0000_0000,
+            mantissa: 0,
         }
     }
 
@@ -154,7 +156,7 @@ impl FloatX80 {
         if exp == 0x7FF {
             // Infinity / NaN.
             let mantissa = if frac == 0 {
-                0x8000_0000_0000_0000
+                Self::infinity(false).mantissa
             } else {
                 0xC000_0000_0000_0000 | (frac << 11)
             };
