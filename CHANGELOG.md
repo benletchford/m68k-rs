@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.14.7](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.6...m68k-v0.14.7) (2026-10-17)
+
+
+### Bug Fixes
+
+* **cpu:** correct MC68000 division timing and overflow ([7e20ef1](https://github.com/benletchford/m68k-rs/commit/7e20ef1849bd4073543215e76d56f7a36692dc77))
+* **fpu:** correct extended exponent and rounding behavior ([3be19f7](https://github.com/benletchford/m68k-rs/commit/3be19f7aef9c4f29142b4338d0bbc49027f3a234))
+* **fpu:** round FMOVE to single, double and integer formats ([8c8a3b4](https://github.com/benletchford/m68k-rs/commit/8c8a3b4397e4fb98e63d803b7d9745bdfb134ca5))
+
 ## [0.14.6](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.5...m68k-v0.14.6) (2026-10-15)
 
 
