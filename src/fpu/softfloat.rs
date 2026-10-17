@@ -599,6 +599,124 @@ pub fn to_i64(x: FloatX80, mode: RoundMode, min: i64, max: i64, f: &mut ExcFlags
     }
 }
 
+/// Shift `m` right by `sh` and round the result by `mode`, as for a value of
+/// sign `sign`. Returns the rounded quotient and whether bits were lost.
+fn shift_round(m: u64, sh: u32, sign: bool, mode: RoundMode) -> (u64, bool) {
+    if sh == 0 {
+        return (m, false);
+    }
+    let m = m as u128;
+    let (q, rem, half) = if sh >= 128 {
+        (0, m, u128::MAX)
+    } else {
+        (m >> sh, m & ((1u128 << sh) - 1), 1u128 << (sh - 1))
+    };
+    let round_up = match mode {
+        RoundMode::Nearest => rem > half || (rem == half && (q & 1) == 1),
+        RoundMode::Zero => false,
+        RoundMode::PosInf => !sign && rem != 0,
+        RoundMode::NegInf => sign && rem != 0,
+    };
+    ((q + u128::from(round_up)) as u64, rem != 0)
+}
+
+/// Convert `x` to an IEEE binary format with `frac_bits` fraction bits and
+/// `exp_bits` exponent bits, rounding by `mode` (FMOVE to `.s`/`.d`). The
+/// result is rounded once, straight from the extended significand, with the
+/// destination's exponent range: denormals below it, and overflow to
+/// infinity or the largest finite value as the mode dictates. Raises INEX2,
+/// UNFL and OVFL like an arithmetic result, and SNAN for a signaling NaN,
+/// which is stored quiet.
+fn to_ieee_bits(
+    x: FloatX80,
+    frac_bits: u32,
+    exp_bits: u32,
+    mode: RoundMode,
+    f: &mut ExcFlags,
+) -> u64 {
+    let sign = x.sign();
+    let sign_bit = (sign as u64) << (frac_bits + exp_bits);
+    let exp_max = (1u64 << exp_bits) - 1;
+    let frac_mask = (1u64 << frac_bits) - 1;
+    let quiet = 1u64 << (frac_bits - 1);
+
+    if x.is_nan() {
+        if x.is_signaling_nan() {
+            f.raise(ExcFlags::SNAN);
+        }
+        let frac = ((x.mantissa << 1) >> (64 - frac_bits)) | quiet;
+        return sign_bit | (exp_max << frac_bits) | frac;
+    }
+    if x.is_inf() {
+        return sign_bit | (exp_max << frac_bits);
+    }
+    if x.mantissa == 0 {
+        // Zero, or a pseudo-zero with a nonzero exponent.
+        return sign_bit;
+    }
+
+    // Normalize, so unnormals (integer bit clear, exponent nonzero) round
+    // like the value they hold.
+    let u = unpack(x);
+    let lz = u.mant.leading_zeros();
+    let mant = u.mant << lz;
+    let bias = (exp_max >> 1) as i32;
+    let p = frac_bits + 1; // significand bits, integer bit included
+    let mut e = u.exp - lz as i32 + bias;
+    let (q, inexact) = if e >= 1 {
+        let (mut q, inexact) = shift_round(mant, 64 - p, sign, mode);
+        if q >> p != 0 {
+            // Rounded up to the next power of two.
+            q >>= 1;
+            e += 1;
+        }
+        (q, inexact)
+    } else {
+        // Below the normal range: denormalize. A quotient that rounds up to
+        // 2^(p-1) carries into the exponent field, giving the smallest
+        // normal number, which is right.
+        let (q, inexact) = shift_round(mant, (64 - p) + (1 - e) as u32, sign, mode);
+        if inexact {
+            f.raise(ExcFlags::UNFL);
+        }
+        e = 0;
+        (q, inexact)
+    };
+    if inexact {
+        f.raise(ExcFlags::INEX2);
+    }
+
+    if e as u64 >= exp_max {
+        f.raise(ExcFlags::OVFL | ExcFlags::INEX2);
+        let to_inf = match mode {
+            RoundMode::Nearest => true,
+            RoundMode::Zero => false,
+            RoundMode::PosInf => !sign,
+            RoundMode::NegInf => sign,
+        };
+        return if to_inf {
+            sign_bit | (exp_max << frac_bits)
+        } else {
+            sign_bit | ((exp_max - 1) << frac_bits) | frac_mask
+        };
+    }
+    if e == 0 {
+        // Denormal, or the smallest normal after rounding up (see above).
+        return sign_bit | q;
+    }
+    sign_bit | ((e as u64) << frac_bits) | (q & frac_mask)
+}
+
+/// Convert to binary64 bits, rounding by `mode` (FMOVE.D to memory).
+pub fn to_f64_bits(x: FloatX80, mode: RoundMode, f: &mut ExcFlags) -> u64 {
+    to_ieee_bits(x, 52, 11, mode, f)
+}
+
+/// Convert to binary32 bits, rounding by `mode` (FMOVE.S).
+pub fn to_f32_bits(x: FloatX80, mode: RoundMode, f: &mut ExcFlags) -> u32 {
+    to_ieee_bits(x, 23, 8, mode, f) as u32
+}
+
 // ============================== compare ==================================
 
 /// Compare magnitudes of two finite/inf operands as (biased exp, mantissa).
@@ -984,5 +1102,157 @@ mod tests {
         );
         assert!(f.has(ExcFlags::INEX2));
         assert_eq!(up.mantissa, down.mantissa + 1);
+    }
+
+    /// FMOVE.D rounds the extended value once, by the FPCR mode: 1/10 is
+    /// 0x3fb999999999999a to nearest, ...9999 toward zero.
+    #[test]
+    fn to_f64_rounds_by_mode() {
+        let tenth = div(x(1.0), x(10.0), rn(), &mut ExcFlags::default());
+        assert_eq!(tenth.mantissa, 0xCCCC_CCCC_CCCC_CCCD);
+        let cases = [
+            (RoundMode::Nearest, 0x3FB9_9999_9999_999A_u64),
+            (RoundMode::Zero, 0x3FB9_9999_9999_9999),
+            (RoundMode::PosInf, 0x3FB9_9999_9999_999A),
+            (RoundMode::NegInf, 0x3FB9_9999_9999_9999),
+        ];
+        for (mode, want) in cases {
+            let mut f = ExcFlags::default();
+            assert_eq!(to_f64_bits(tenth, mode, &mut f), want, "{mode:?}");
+            assert!(f.has(ExcFlags::INEX2));
+            assert!(!f.has(ExcFlags::UNFL | ExcFlags::OVFL));
+            let mut f = ExcFlags::default();
+            assert_eq!(
+                to_f64_bits(neg(tenth), mode, &mut f) & !(1 << 63),
+                match mode {
+                    RoundMode::PosInf => 0x3FB9_9999_9999_9999,
+                    RoundMode::NegInf => 0x3FB9_9999_9999_999A,
+                    _ => want,
+                }
+            );
+        }
+    }
+
+    /// Pseudo-random f64 bit patterns: every class from denormals to
+    /// infinity, both signs.
+    fn sample_f64s() -> impl Iterator<Item = f64> {
+        let mut s = 0x2545_F491_4F6C_DD1D_u64;
+        (0..20000).map(move |_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            f64::from_bits(s)
+        })
+    }
+
+    /// Every f64 survives FMOVE.D exactly, without raising anything.
+    #[test]
+    fn to_f64_is_exact_for_f64_values() {
+        for v in sample_f64s().filter(|v| !v.is_nan()) {
+            let mut f = ExcFlags::default();
+            assert_eq!(
+                to_f64_bits(x(v), RoundMode::Nearest, &mut f),
+                v.to_bits(),
+                "{v:e}"
+            );
+            assert_eq!(f, ExcFlags::default(), "{v:e}");
+        }
+    }
+
+    /// FMOVE.S of an f64 value rounds like Rust's `as f32` (to nearest,
+    /// ties to even, with f32 denormals and overflow to infinity).
+    #[test]
+    fn to_f32_matches_rust_rounding() {
+        for v in sample_f64s().filter(|v| !v.is_nan()) {
+            let want = v as f32;
+            let mut f = ExcFlags::default();
+            assert_eq!(
+                to_f32_bits(x(v), RoundMode::Nearest, &mut f),
+                want.to_bits(),
+                "{v:e}"
+            );
+            assert_eq!(
+                f.has(ExcFlags::INEX2),
+                want as f64 != v && v.is_finite(),
+                "{v:e}"
+            );
+            assert_eq!(
+                f.has(ExcFlags::OVFL),
+                want.is_infinite() && v.is_finite(),
+                "{v:e}"
+            );
+        }
+    }
+
+    #[test]
+    fn to_f64_underflow_and_overflow() {
+        // 0.75 * 2^-1022 is an exact f64 denormal.
+        let mut f = ExcFlags::default();
+        let d = mul(x(f64::MIN_POSITIVE), x(0.75), rn(), &mut f);
+        let mut f = ExcFlags::default();
+        assert_eq!(
+            to_f64_bits(d, RoundMode::Nearest, &mut f),
+            0x000C_0000_0000_0000
+        );
+        assert_eq!(f, ExcFlags::default());
+
+        // 1e-600 is far below the f64 range: zero, or the smallest
+        // denormal when rounding up.
+        let tiny = mul(x(1e-300), x(1e-300), rn(), &mut ExcFlags::default());
+        let mut f = ExcFlags::default();
+        assert_eq!(to_f64_bits(tiny, RoundMode::Nearest, &mut f), 0);
+        assert!(f.has(ExcFlags::UNFL) && f.has(ExcFlags::INEX2));
+        assert_eq!(to_f64_bits(tiny, RoundMode::PosInf, &mut f), 1);
+
+        // 1e600 overflows to infinity, or to the largest finite value.
+        let huge = mul(x(1e300), x(1e300), rn(), &mut ExcFlags::default());
+        let mut f = ExcFlags::default();
+        assert_eq!(
+            to_f64_bits(huge, RoundMode::Nearest, &mut f),
+            f64::INFINITY.to_bits()
+        );
+        assert!(f.has(ExcFlags::OVFL) && f.has(ExcFlags::INEX2));
+        assert_eq!(
+            to_f64_bits(huge, RoundMode::Zero, &mut f),
+            f64::MAX.to_bits()
+        );
+        assert_eq!(
+            to_f64_bits(neg(huge), RoundMode::PosInf, &mut f),
+            (-f64::MAX).to_bits()
+        );
+
+        // The largest f64 plus half an ulp rounds up into infinity.
+        let edge = FloatX80 {
+            sign_exp: 0x43FE,
+            mantissa: 0xFFFF_FFFF_FFFF_FC00,
+        };
+        let mut f = ExcFlags::default();
+        assert_eq!(
+            to_f64_bits(edge, RoundMode::Nearest, &mut f),
+            f64::INFINITY.to_bits()
+        );
+        assert!(f.has(ExcFlags::OVFL));
+    }
+
+    #[test]
+    fn to_f64_nans() {
+        // A signaling NaN is stored quiet, keeping its payload, and raises SNAN.
+        let snan = FloatX80 {
+            sign_exp: 0xFFFF,
+            mantissa: 0x8000_0000_0000_0800,
+        };
+        let mut f = ExcFlags::default();
+        assert_eq!(
+            to_f64_bits(snan, RoundMode::Nearest, &mut f),
+            0xFFF8_0000_0000_0001
+        );
+        assert!(f.has(ExcFlags::SNAN));
+        let mut f = ExcFlags::default();
+        let qnan = FloatX80 {
+            sign_exp: 0x7FFF,
+            mantissa: 0xC000_0000_0000_0000,
+        };
+        assert_eq!(to_f32_bits(qnan, RoundMode::Nearest, &mut f), 0x7FC0_0000);
+        assert_eq!(f, ExcFlags::default());
     }
 }

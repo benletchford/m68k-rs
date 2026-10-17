@@ -24,39 +24,6 @@ enum FpuEa {
     Immediate,
 }
 
-/// Round an f64 to an integer using the FPCR rounding mode and saturate
-/// into the destination integer width, as the 6888x does for FMOVE to an
-/// integer format. Out-of-range values and NaNs produce the most negative
-/// destination value; this conversion helper does not currently report the
-/// corresponding OPERR status.
-fn f64_to_int_saturating(value: f64, fpcr: u32, min: i64, max: i64) -> i64 {
-    if value.is_nan() {
-        return min;
-    }
-    // FPCR rounding mode, bits 4-5: 0=nearest, 1=zero, 2=minus, 3=plus.
-    let rounded = match (fpcr >> 4) & 3 {
-        1 => value.trunc(),
-        2 => value.floor(),
-        3 => value.ceil(),
-        _ => {
-            // Round to nearest, ties to even.
-            let r = value.round();
-            if (value - value.trunc()).abs() == 0.5 && r % 2.0 != 0.0 {
-                r - value.signum()
-            } else {
-                r
-            }
-        }
-    };
-    if rounded < min as f64 {
-        min
-    } else if rounded > max as f64 {
-        max
-    } else {
-        rounded as i64
-    }
-}
-
 /// The FP opmodes the 68060 dropped from silicon, emulated by the 68060SP:
 /// the transcendental set, FGETEXP/FGETMAN, FMOD/FREM/FSCALE, and FSINCOS
 /// (FMOVECR is gated separately by encoding). FINT/FINTRZ, which the 68040
@@ -1352,28 +1319,32 @@ impl CpuCore {
         let Some(ea) = self.fpu_ea(bus, ea_mode, ea_reg, bytes) else {
             return false;
         };
-        // Bridge: integer/single/double formats round through f64 for now;
-        // the extended format is written losslessly. Phase 1 replaces the
-        // bridge with exact softfloat conversions.
-        let fv = value.to_f64();
-        match ea {
+        // Integer, single and double results are rounded once, straight
+        // from the extended value, by the FPCR rounding mode, and report
+        // their exceptions in FPSR like an arithmetic result.
+        let mode = RoundMode::from_fpcr(self.fpcr);
+        let mut f = ExcFlags::default();
+        let written = match ea {
             FpuEa::DataReg(r) => match fmt {
                 0 => {
-                    let v = f64_to_int_saturating(fv, self.fpcr, i32::MIN as i64, i32::MAX as i64);
+                    let v =
+                        softfloat::to_i64(value, mode, i32::MIN as i64, i32::MAX as i64, &mut f);
                     self.set_d(r, v as u32);
                     true
                 }
                 1 => {
-                    self.set_d(r, (fv as f32).to_bits());
+                    let v = softfloat::to_f32_bits(value, mode, &mut f);
+                    self.set_d(r, v);
                     true
                 }
                 4 => {
-                    let v = f64_to_int_saturating(fv, self.fpcr, i16::MIN as i64, i16::MAX as i64);
+                    let v =
+                        softfloat::to_i64(value, mode, i16::MIN as i64, i16::MAX as i64, &mut f);
                     self.set_d(r, (self.d(r) & 0xFFFF_0000) | (v as u16 as u32));
                     true
                 }
                 6 => {
-                    let v = f64_to_int_saturating(fv, self.fpcr, i8::MIN as i64, i8::MAX as i64);
+                    let v = softfloat::to_i64(value, mode, i8::MIN as i64, i8::MAX as i64, &mut f);
                     self.set_d(r, (self.d(r) & 0xFFFF_FF00) | (v as u8 as u32));
                     true
                 }
@@ -1381,26 +1352,29 @@ impl CpuCore {
             },
             FpuEa::Memory(addr) => match fmt {
                 0 => {
-                    let v = f64_to_int_saturating(fv, self.fpcr, i32::MIN as i64, i32::MAX as i64);
+                    let v =
+                        softfloat::to_i64(value, mode, i32::MIN as i64, i32::MAX as i64, &mut f);
                     self.write_32(bus, addr, v as u32);
                     true
                 }
                 1 => {
-                    self.write_32(bus, addr, (fv as f32).to_bits());
+                    let v = softfloat::to_f32_bits(value, mode, &mut f);
+                    self.write_32(bus, addr, v);
                     true
                 }
                 4 => {
-                    let v = f64_to_int_saturating(fv, self.fpcr, i16::MIN as i64, i16::MAX as i64);
+                    let v =
+                        softfloat::to_i64(value, mode, i16::MIN as i64, i16::MAX as i64, &mut f);
                     self.write_16(bus, addr, v as u16);
                     true
                 }
                 6 => {
-                    let v = f64_to_int_saturating(fv, self.fpcr, i8::MIN as i64, i8::MAX as i64);
+                    let v = softfloat::to_i64(value, mode, i8::MIN as i64, i8::MAX as i64, &mut f);
                     self.write_8(bus, addr, v as u8);
                     true
                 }
                 5 => {
-                    let bits = fv.to_bits();
+                    let bits = softfloat::to_f64_bits(value, mode, &mut f);
                     self.write_32(bus, addr, (bits >> 32) as u32);
                     self.write_32(bus, addr.wrapping_add(4), bits as u32);
                     true
@@ -1410,7 +1384,7 @@ impl CpuCore {
                     self.write_32(bus, addr, (exp_word as u32) << 16);
                     self.write_32(bus, addr.wrapping_add(4), (mantissa >> 32) as u32);
                     self.write_32(bus, addr.wrapping_add(8), mantissa as u32);
-                    true
+                    return true;
                 }
                 3 | 7 => {
                     // Packed decimal (static or dynamic k-factor).
@@ -1419,12 +1393,16 @@ impl CpuCore {
                         let w = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         self.write_32(bus, addr.wrapping_add(4 * i as u32), w);
                     }
-                    true
+                    return true;
                 }
                 _ => false,
             },
             FpuEa::Immediate => false,
+        };
+        if written {
+            self.fpu_commit(f);
         }
+        written
     }
 }
 
