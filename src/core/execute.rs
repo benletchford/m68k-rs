@@ -616,6 +616,8 @@ impl CpuCore {
     ) -> BatchResult {
         let prior_precision = self.precise_bus;
         self.set_precise_bus(false);
+        self.fm_readonly = false;
+        self.fm_region_count = 0;
         // Capture the bus's fastmem window for the duration of this batch.
         // Its addresses are physical: with the PMMU enabled every access
         // through it is translated first (`crate::core::window`).
@@ -631,6 +633,14 @@ impl CpuCore {
             // re-arm the trace filters.
             self.trace_record_skip = [super::trace_jit::TRACE_PC_NONE; 4];
             self.trace_probe_skip = [super::trace_jit::TRACE_PC_NONE; 4];
+        }
+        let regions = bus.fast_mem_regions();
+        // Keep the default empty table cheap even when the full capture loop
+        // is too large for the optimizer to unroll and eliminate.
+        if regions.iter().any(Option::is_some) {
+            for region in regions.into_iter().flatten() {
+                self.capture_extra_window(region);
+            }
         }
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
         // The pre-020 interpreter splits some long stores into ordered word
@@ -666,6 +676,7 @@ impl CpuCore {
             self.fm_bus = 0;
             self.fm_write_hook = 0;
             self.fm_store_filter = 0;
+            self.fm_region_count = 0;
         }
         if self.has_pmmu {
             self.refresh_window_mmu();
@@ -678,6 +689,8 @@ impl CpuCore {
         self.fm_write_hook = 0;
         self.fm_store_filter = 0;
         self.fm_mmu = crate::mmu::ResidentMmu::default();
+        self.fm_readonly = false;
+        self.fm_region_count = 0;
         self.set_precise_bus(prior_precision);
         result
     }

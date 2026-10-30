@@ -105,6 +105,8 @@ struct Head {
     native_loop: bool,
     needs_window: bool,
     tracked_writes: bool,
+    multi_window: bool,
+    primary_readonly: bool,
     checked: usize,
     body: usize,
 }
@@ -246,6 +248,8 @@ fn snapshot(trace: &CompiledTrace) -> Result<Head, &'static str> {
         native_loop: trace.native_loop,
         needs_window: trace.needs_window,
         tracked_writes: trace.tracked_writes,
+        multi_window: trace.multi_window,
+        primary_readonly: trace.primary_readonly,
         checked: pointer(checked),
         body: pointer(trace.func),
     })
@@ -1191,6 +1195,27 @@ fn compile_snapshot(
                     i64::from(head.tracked_writes),
                 );
                 decline = builder.ins().bor(decline, bad_mode);
+                let count = builder.ins().load(
+                    ptr,
+                    MemFlags::trusted(),
+                    cpu,
+                    offset_of!(CpuCore, fm_region_count) as i32,
+                );
+                let extra = builder.ins().icmp_imm(IntCC::NotEqual, count, 0);
+                let readonly = load_u8(&mut builder, cpu, offset_of!(CpuCore, fm_readonly));
+                let readonly = builder.ins().icmp_imm(IntCC::NotEqual, readonly, 0);
+                let multi = builder.ins().bor(extra, readonly);
+                let wrong =
+                    builder
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, multi, i64::from(head.multi_window));
+                decline = builder.ins().bor(decline, wrong);
+                let wrong_readonly = builder.ins().icmp_imm(
+                    IntCC::NotEqual,
+                    readonly,
+                    i64::from(head.primary_readonly),
+                );
+                decline = builder.ins().bor(decline, wrong_readonly);
             }
             builder.ins().brif(decline, resume, &[], invoke, &[]);
             builder.switch_to_block(invoke);
