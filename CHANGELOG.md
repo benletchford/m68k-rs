@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.15.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.7...m68k-v0.15.0) (2026-10-30)
+
+
+### Features
+
+* **batch:** expose host synchronization boundaries ([f95e678](https://github.com/benletchford/m68k-rs/commit/f95e678e46fe5cd77b94f87ccf2c90ba15b16f47))
+* **fastmem:** support multiple physical regions and read-only ROM ([1d60f0c](https://github.com/benletchford/m68k-rs/commit/1d60f0c107d0c3d87e72e7df2fb5c4c533dcfbe7))
+
 ## [0.14.7](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.6...m68k-v0.14.7) (2026-10-20)
 
 
