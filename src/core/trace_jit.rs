@@ -32,6 +32,8 @@ use std::mem::{offset_of, size_of, transmute};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+mod code_memory;
+#[cfg(all(feature = "jit", not(target_family = "wasm")))]
 mod native_region;
 #[cfg(all(
     test,
@@ -1525,6 +1527,10 @@ struct CompiledTrace {
     checked_func: Option<NativeTraceFn>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func: NativeTraceFn,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    _code_lease: std::rc::Rc<code_memory::CodeLease>,
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    compile_id: u32,
     /// Legalized IR retained only for bounded indirect-dispatch region shapes.
     /// Native execution still uses the original entries unless an upgrade is
     /// installed; its owned snapshot can later be compiled off-thread.
@@ -1712,7 +1718,7 @@ pub(crate) struct TraceJit {
     #[cfg(all(test, feature = "jit", not(target_family = "wasm")))]
     native_region_heads_run: u64,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-    module: Option<JITModule>,
+    module: Option<code_memory::CodeModule>,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
     func_ctx: FunctionBuilderContext,
     #[cfg(all(feature = "jit", not(target_family = "wasm")))]
@@ -1830,9 +1836,7 @@ impl TraceJit {
 
     fn new_base() -> Self {
         #[cfg(all(feature = "jit", not(target_family = "wasm")))]
-        let module = JITBuilder::new(default_libcall_names())
-            .ok()
-            .map(JITModule::new);
+        let module = code_memory::CodeModule::new();
         Self {
             #[cfg(all(feature = "jit", not(target_family = "wasm")))]
             native_region: None,
@@ -3989,6 +3993,7 @@ impl TraceJit {
             && code_segments.len() <= 3
             && (code_segments.iter().all(|segment| segment.len <= 47)
                 || matches!(code_segments.as_slice(), [segment] if segment.len == 50));
+        self.prepare_code_module()?;
         let module = self.module.as_mut()?;
         let ptr_ty = module.target_config().pointer_type();
         let mut sig = module.make_signature();
@@ -3999,7 +4004,9 @@ impl TraceJit {
         sig.returns.push(AbiParam::new(types::I64));
 
         let ordinal = self.next_func;
-        self.next_func = self.next_func.wrapping_add(1);
+        self.next_func = self.next_func.checked_add(1)?;
+        let ir_body_id = ordinal.checked_mul(2)?;
+        let ir_checked_id = ir_body_id.checked_add(1)?;
         let name = format!("m68k_trace_{ordinal}");
         let func_id = module.declare_function(&name, Linkage::Local, &sig).ok()?;
         let checked_func_id = if generated_code_validation {
@@ -4582,12 +4589,30 @@ impl TraceJit {
             module
                 .define_function(checked_func_id, &mut checked_ctx)
                 .ok()?;
-            if let Some(body) = region_body_ir {
+            if let Some(mut body) = region_body_ir {
+                // Each allocation batch starts its module-local FuncIds at zero.
+                // Saved IR instead uses identities unique across this TraceJit;
+                // worker snapshots can mix batches without guessing callees.
+                let mut checked = std::mem::replace(&mut checked_ctx.func, Function::new());
+                body.name = UserFuncName::user(0, ir_body_id);
+                checked.name = UserFuncName::user(0, ir_checked_id);
+                let body_name =
+                    checked
+                        .params
+                        .user_named_funcs()
+                        .iter()
+                        .find_map(|(index, name)| {
+                            (name.namespace == 0 && name.index == func_id.as_u32()).then_some(index)
+                        })?;
+                checked.params.reset_user_func_name(
+                    body_name,
+                    cranelift_codegen::ir::UserExternalName::new(0, ir_body_id),
+                );
                 region_ir = Some(std::sync::Arc::new(native_region::InlineBody {
-                    body_id: func_id,
+                    body_id: cranelift_module::FuncId::from_u32(ir_body_id),
                     body,
-                    checked_id: checked_func_id,
-                    checked: std::mem::replace(&mut checked_ctx.func, Function::new()),
+                    checked_id: cranelift_module::FuncId::from_u32(ir_checked_id),
+                    checked,
                 }));
             }
             module.clear_context(&mut checked_ctx);
@@ -4642,6 +4667,8 @@ impl TraceJit {
             adaptive_rerecords: 0,
             checked_func,
             func,
+            _code_lease: module.lease(),
+            compile_id: ordinal,
             region_ir,
         })
     }
