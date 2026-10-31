@@ -11,6 +11,7 @@
 
 use super::dd::{self, Df};
 use super::softfloat::{self, ExcFlags, FpCmp, RoundCtx, RoundMode};
+use super::two_over_pi::TWO_OVER_PI;
 use super::types::FloatX80;
 
 // ============================== small helpers ============================
@@ -320,14 +321,132 @@ fn log1p(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
 
 // ============================== trig family ==============================
 
-/// Reduce x = k*(pi/2) + r with |r| <= pi/4, returning (k, r). Accurate while
-/// k*(pi/2) does not exceed the ~128-bit reduction precision (very large
-/// arguments degrade, as they do on real hardware).
+/// Reduce x = k*(pi/2) + r with |r| <= pi/4, returning (k, r). `k` is only
+/// meaningful modulo 4. Every finite operand reduces accurately, so results
+/// stay in [-1, +1] and are correct for any argument: Motorola only promises
+/// the range for arguments above about 10^20 (M68000PM FSIN), and these
+/// results are not chip-bit-exact anyway.
 fn reduce_quadrant(x: FloatX80) -> (i64, Df) {
+    if !x.is_zero() && unbiased_exp(x) >= 0 {
+        return reduce_payne_hanek(x);
+    }
+    // |x| < 1: at most one multiple of pi/2, so a Df pi/2 is plenty.
     let kf = (x.to_f64() * std::f64::consts::FRAC_2_PI).round();
     let k = kf as i64;
     let r = dd::sub(Df::from_x80(x), dd::mul_x80(dd::consts().pi_2, fx(kf)));
     (k, r)
+}
+
+/// Bits of 2/pi multiplied by the operand in Payne-Hanek reduction. The
+/// truncation error is below 2^-254 of a quadrant, so an operand keeps 128
+/// significant bits of r unless it lies within about 2^-126 of a multiple of
+/// pi/2, far closer than a 64-bit significand is expected to get.
+const PH_WINDOW_LIMBS: usize = 5;
+
+/// `count` bits of `limbs` (little-endian) ending just below bit `top`,
+/// left-justified in a u64. Bits below bit 0 read as zero.
+fn ph_bits(limbs: &[u64], top: i32, count: u32) -> u64 {
+    let mut v = 0u64;
+    for i in 1..=count as i32 {
+        let bit = top - i;
+        v <<= 1;
+        if bit >= 0 {
+            v |= (limbs[(bit / 64) as usize] >> (bit % 64)) & 1;
+        }
+    }
+    v << (64 - count)
+}
+
+/// Payne-Hanek reduction for |x| >= 1: multiply the 64-bit significand by the
+/// window of 2/pi that matters. Bits of 2/pi above the window only contribute
+/// multiples of 4 (whole turns), so even the largest operand needs no more
+/// working precision than the smallest.
+fn reduce_payne_hanek(x: FloatX80) -> (i64, Df) {
+    let ax = softfloat::abs(x);
+    let m = softfloat::getman(ax, &mut noflags()).mantissa;
+    let e = unbiased_exp(ax) - 63; // |x| = m * 2^e
+
+    // T = bits s+1..=s+W of 2/pi, s chosen so that every higher bit of 2/pi
+    // has weight 2^(e-i) >= 4 once multiplied by 2^e.
+    let s = (e - 2).max(0) as usize;
+    let word = s / 64;
+    let off = (s % 64) as u32;
+    let mut t = [0u64; PH_WINDOW_LIMBS]; // little-endian
+    for i in 0..PH_WINDOW_LIMBS {
+        let w = TWO_OVER_PI[word + i];
+        let next = TWO_OVER_PI[word + i + 1];
+        t[PH_WINDOW_LIMBS - 1 - i] = if off == 0 {
+            w
+        } else {
+            (w << off) | (next >> (64 - off))
+        };
+    }
+
+    // p = m * T. One spare limb keeps the two quadrant bits in range when
+    // e < 0 pushes the binary point above the product.
+    let mut p = [0u64; PH_WINDOW_LIMBS + 2];
+    let mut carry = 0u128;
+    for i in 0..PH_WINDOW_LIMBS {
+        let v = t[i] as u128 * m as u128 + carry;
+        p[i] = v as u64;
+        carry = v >> 64;
+    }
+    p[PH_WINDOW_LIMBS] = carry as u64;
+
+    // x * 2/pi = p * 2^(e - s - W): the binary point sits above bit `point`.
+    let point = (PH_WINDOW_LIMBS as i32 * 64) - (e - s as i32);
+    let bit = |n: i32| (p[(n / 64) as usize] >> (n % 64)) & 1;
+    let mut q = (bit(point) | (bit(point + 1) << 1)) as i64;
+
+    // Fraction below the binary point, as a signed distance to the nearest
+    // quadrant.
+    let w = (point as usize).div_ceil(64);
+    let mut frac = [0u64; PH_WINDOW_LIMBS + 2];
+    frac[..w].copy_from_slice(&p[..w]);
+    if point % 64 != 0 {
+        frac[w - 1] &= (1u64 << (point % 64)) - 1;
+    }
+    let negative = bit(point - 1) == 1;
+    if negative {
+        q += 1;
+        // frac = 2^point - frac
+        let mut borrow = 0u64;
+        for limb in frac.iter_mut().take(w) {
+            let (v, b1) = 0u64.overflowing_sub(*limb);
+            let (v, b2) = v.overflowing_sub(borrow);
+            *limb = v;
+            borrow = (b1 | b2) as u64;
+        }
+        if point % 64 != 0 {
+            frac[w - 1] &= (1u64 << (point % 64)) - 1;
+        }
+    }
+
+    // Normalise the fraction into a Df, then multiply by pi/2.
+    let top = frac.iter().enumerate().rev().find(|(_, l)| **l != 0);
+    let r = match top {
+        None => Df::from_x80(FloatX80::zero(false)),
+        Some((i, l)) => {
+            let msb = i as i32 * 64 + 64 - l.leading_zeros() as i32; // one past the top bit
+            let hi = ph_bits(&frac, msb, 64);
+            let lo = ph_bits(&frac, msb - 64, 64);
+            let limb = |v: u64, shift: i32| {
+                softfloat::scale(
+                    softfloat::from_u64(v, false),
+                    shift,
+                    RoundCtx::NEAREST_EXT,
+                    &mut noflags(),
+                )
+            };
+            let f = dd::add_x80(
+                Df::from_x80(limb(hi, msb - 64 - point)),
+                limb(lo, msb - 128 - point),
+            );
+            dd::mul(f, dd::consts().pi_2)
+        }
+    };
+    let r = if negative { r.neg() } else { r };
+    if x.sign() { (-q, r.neg()) } else { (q, r) }
 }
 
 /// sin(r) and cos(r) for |r| <= pi/4 via their Maclaurin series, in Df.
@@ -871,6 +990,68 @@ mod tests {
             // agreement with libm to ~f64 precision.
             assert!((s - x.sin()).abs() < 1e-14, "sin {x}");
             assert!((c - x.cos()).abs() < 1e-14, "cos {x}");
+        }
+    }
+
+    /// True when `got` is within one ULP of `want` (sign_exp, mantissa).
+    fn near(got: FloatX80, want: (u16, u64)) -> bool {
+        got.sign_exp == want.0 && got.mantissa.abs_diff(want.1) <= 1
+    }
+
+    #[test]
+    fn trig_large_arguments_match_references() {
+        // References: mpmath at 17000 bits, rounded to 64-bit extended.
+        // (operand, sin, cos, tan)
+        type W = (u16, u64);
+        let cases: [(FloatX80, W, W, W); 4] = [
+            (
+                fx(1e22),
+                (0xBFFE, 0xDA29D5BB5F9CB87D),
+                (0x3FFE, 0x85F167780E479C9A),
+                (0xBFFF, 0xD07BCE0DB592BBA5),
+            ),
+            (
+                fx(9223372036854775808.0), // 2^63
+                (0x3FFE, 0xFFFB6FEA16E2A218),
+                (0x3FF8, 0xC1551BAD9E19F383),
+                (0x4005, 0xA97A873ABCA0E600),
+            ),
+            (
+                fx(f64::MAX),
+                (0x3FF7, 0xA297E4C59A74B5B1),
+                (0xBFFE, 0xFFFF31767D5BA9E0),
+                (0xBFF7, 0xA29867F394A41DC7),
+            ),
+            (
+                FloatX80 {
+                    sign_exp: 0x7FFE,
+                    mantissa: u64::MAX,
+                },
+                (0x3FFE, 0xFDFD9D4B6D0E5F7C),
+                (0xBFFC, 0x800BBD0061D4F543),
+                (0xC001, 0xFDE654994CE86FDB),
+            ),
+        ];
+        for (x, s, c, t) in cases {
+            assert!(near(sin(x, rn(), &mut noflags()), s), "sin {x:?}");
+            assert!(near(cos(x, rn(), &mut noflags()), c), "cos {x:?}");
+            assert!(near(tan(x, rn(), &mut noflags()), t), "tan {x:?}");
+        }
+    }
+
+    #[test]
+    fn trig_results_stay_in_range() {
+        let mut e = 0;
+        while e < 16383 {
+            let x = FloatX80 {
+                sign_exp: 0x3FFF + e as u16,
+                mantissa: 0xC90F_DAA2_2168_C235 ^ (e as u64) << 7,
+            };
+            let (s, c) = sincos(x, rn(), &mut noflags());
+            assert!(s.to_f64().abs() <= 1.0 && c.to_f64().abs() <= 1.0, "{x:?}");
+            let sum = s.to_f64() * s.to_f64() + c.to_f64() * c.to_f64();
+            assert!((sum - 1.0).abs() < 1e-14, "sin^2+cos^2 at {x:?}");
+            e += 97;
         }
     }
 
