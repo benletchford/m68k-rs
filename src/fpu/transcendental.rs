@@ -506,10 +506,15 @@ fn sin_cos_df(x: FloatX80, f: &mut ExcFlags) -> Option<(Df, Df)> {
 
 fn sin_cos_x80(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> (FloatX80, FloatX80) {
     let (s, c) = sin_cos_df(x, f).unwrap();
-    (s.to_x80(ctx, f), c.to_x80(ctx, f))
+    // A Df -0 rounds to +0 (hi + lo), but sin(-0) must be -0.
+    let sin = if x.is_zero() { x } else { s.to_x80(ctx, f) };
+    (sin, c.to_x80(ctx, f))
 }
 
 fn sin(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if x.is_zero() {
+        return x; // sin(+-0) = +-0
+    }
     let (s, _) = sin_cos_df(x, f).unwrap();
     s.to_x80(ctx, f)
 }
@@ -1071,6 +1076,14 @@ mod tests {
         // Still in range, close to the top: e^11356 is about 2^16383.24.
         let e = exp(fx(11356.0), rn(), &mut noflags());
         assert_eq!(e.sign_exp, 0x7FFE);
+    }
+
+    #[test]
+    fn trig_signed_zero() {
+        let nz = FloatX80::zero(true);
+        assert!(sin(nz, rn(), &mut noflags()).sign());
+        assert!(sincos(nz, rn(), &mut noflags()).0.sign());
+        assert_eq!(cos(nz, rn(), &mut noflags()).to_f64(), 1.0);
     }
 
     #[test]
