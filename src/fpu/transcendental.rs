@@ -95,11 +95,17 @@ const EXP_RANGE_LIMIT: f64 = 11000.0;
 /// e^x * 2^shift for a large |x|: scale last, so that an overflow or underflow
 /// is rounded and reported as one.
 fn exp_scaled(x: FloatX80, shift: i32, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    exp_scaled_df(Df::from_x80(x), x.to_f64(), shift, ctx, f)
+}
+
+/// The same for e^y, with `v` about the value of `y`, which only matters if
+/// that is within the range.
+fn exp_scaled_df(y: Df, v: f64, shift: i32, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     // Far outside the range the value does not matter any more.
-    let v = x.to_f64().clamp(-20000.0, 20000.0);
+    let v = v.clamp(-20000.0, 20000.0);
     let k = (v * std::f64::consts::LOG2_E).round();
     let m = if v.abs() < 20000.0 {
-        let r = dd::sub(Df::from_x80(x), dd::mul_x80(dd::consts().ln2, fx(k)));
+        let r = dd::sub(y, dd::mul_x80(dd::consts().ln2, fx(k)));
         exp_reduced(r).to_x80(RoundCtx::NEAREST_EXT, &mut noflags())
     } else {
         one_x80()
@@ -138,6 +144,10 @@ fn exp2(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     if x.is_zero() {
         return one_x80();
     }
+    let v = x.to_f64() * std::f64::consts::LN_2;
+    if v.abs() > EXP_RANGE_LIMIT {
+        return exp_scaled_df(dd::mul_x80(dd::consts().ln2, x), v, 0, ctx, f);
+    }
     exp_dd(dd::mul_x80(dd::consts().ln2, x)).to_x80(ctx, f)
 }
 
@@ -150,6 +160,10 @@ fn exp10(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     }
     if x.is_zero() {
         return one_x80();
+    }
+    let v = x.to_f64() * std::f64::consts::LN_10;
+    if v.abs() > EXP_RANGE_LIMIT {
+        return exp_scaled_df(dd::mul_x80(dd::consts().ln10, x), v, 0, ctx, f);
     }
     exp_dd(dd::mul_x80(dd::consts().ln10, x)).to_x80(ctx, f)
 }
@@ -990,5 +1004,23 @@ mod tests {
         let mut f = ExcFlags::default();
         assert!(ln(fx(-1.0), rn(), &mut f).is_nan());
         assert!(f.has(ExcFlags::OPERR));
+    }
+
+    #[test]
+    fn exp2_and_exp10_at_the_limits_of_the_range() {
+        let c = RoundCtx::NEAREST_EXT;
+        let mut f = ExcFlags::default();
+        assert!(exp2(softfloat::scale(fx(1.0), 14, c, &mut f), c, &mut f).is_inf());
+        assert!(f.0 & ExcFlags::OVFL != 0);
+        let mut f = ExcFlags::default();
+        let big = softfloat::sub(softfloat::scale(fx(1.0), 14, c, &mut f), fx(1.0), c, &mut f);
+        let r = exp2(big, c, &mut f);
+        assert!(!r.is_nan() && !r.is_inf());
+        assert_eq!(r.sign_exp & 0x7FFF, 0x7FFE);
+        let mut f = ExcFlags::default();
+        assert!(exp10(fx(5000.0), c, &mut f).is_inf());
+        let mut f = ExcFlags::default();
+        assert!(exp10(fx(-5000.0), c, &mut f).is_zero());
+        assert!(f.0 & ExcFlags::UNFL != 0);
     }
 }

@@ -910,9 +910,12 @@ impl CpuCore {
     fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80) -> i32 {
         match opmode {
             0x00 | 0x40 | 0x44 => {
-                // FMOVE / FSMOVE / FDMOVE (lossless copy)
-                self.fpr[dst] = src;
-                self.fpu_set_cc(src);
+                // FMOVE / FSMOVE / FDMOVE
+                let ctx = self.fpu_ctx(opmode);
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::round_to_precision(src, ctx, &mut f);
+                self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x01 => {
@@ -943,14 +946,20 @@ impl CpuCore {
             }
             0x18 | 0x58 | 0x5C => {
                 // FABS / FSABS / FDABS
-                self.fpr[dst] = softfloat::abs(src);
+                let ctx = self.fpu_ctx(opmode);
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::abs(softfloat::round_to_precision(src, ctx, &mut f));
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x1A | 0x5A | 0x5E => {
                 // FNEG / FSNEG / FDNEG
-                self.fpr[dst] = softfloat::neg(src);
+                let ctx = self.fpu_ctx(opmode);
+                let mut f = ExcFlags::default();
+                self.fpr[dst] = softfloat::neg(softfloat::round_to_precision(src, ctx, &mut f));
                 self.fpu_set_cc(self.fpr[dst]);
+                self.fpu_commit(f);
                 4
             }
             0x20 | 0x60 | 0x64 => {
@@ -1077,14 +1086,26 @@ impl CpuCore {
                 // FSCALE - dst = dst * 2^trunc(src)
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = ExcFlags::default();
-                let n = softfloat::to_i64(
-                    src,
-                    RoundMode::Zero,
-                    i32::MIN as i64,
-                    i32::MAX as i64,
-                    &mut f,
-                ) as i32;
-                self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
+                if src.is_inf() {
+                    f.raise(ExcFlags::OPERR);
+                    self.fpr[dst] = FloatX80::default_nan();
+                } else if src.is_nan() {
+                    self.fpr[dst] = softfloat::scale(src, 0, ctx, &mut f);
+                } else {
+                    // A larger count overflows or underflows just the same.
+                    let n = if src.to_f64().abs() >= 2147483648.0 {
+                        if src.sign() { i32::MIN } else { i32::MAX }
+                    } else {
+                        softfloat::to_i64(
+                            src,
+                            RoundMode::Zero,
+                            i32::MIN as i64,
+                            i32::MAX as i64,
+                            &mut f,
+                        ) as i32
+                    };
+                    self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
+                }
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4
