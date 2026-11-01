@@ -239,11 +239,11 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     let integer_bit_set = (q >> (p - 1)) & 1 != 0;
     if !integer_bit_set {
         // Result is subnormal (or zero).
-        if q == 0 {
-            return FloatX80::zero(sign);
-        }
         if rem != 0 {
             f.raise(ExcFlags::UNFL);
+        }
+        if q == 0 {
+            return FloatX80::zero(sign);
         }
         let mantissa = (q as u64) << (64 - p);
         return FloatX80 {
@@ -305,8 +305,13 @@ pub fn add(a: FloatX80, b: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX8
         return if a.is_inf() { a } else { b };
     }
     if a.is_zero() && b.is_zero() {
-        // -0 only when both are -0, or in round-to-minus-infinity.
-        let sign = (a.sign() && b.sign()) || ctx.mode == RoundMode::NegInf;
+        // Zeros of one sign keep it. Opposite ones give +0, or -0 when
+        // rounding toward minus infinity.
+        let sign = if a.sign() == b.sign() {
+            a.sign()
+        } else {
+            ctx.mode == RoundMode::NegInf
+        };
         return FloatX80::zero(sign);
     }
     if a.is_zero() {
@@ -815,13 +820,22 @@ pub fn scale(a: FloatX80, n: i32, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
         return a;
     }
     let ua = unpack(a);
-    round_pack(
-        ua.sign,
-        ua.exp.saturating_add(n),
-        (ua.mant as u128) << 64,
-        ctx,
-        f,
-    )
+    // Far outside the range either way, which keeps the exponent in an i32.
+    let n = n.clamp(-100_000, 100_000);
+    round_pack(ua.sign, ua.exp + n, (ua.mant as u128) << 64, ctx, f)
+}
+
+/// FMOVE: `a` at the result precision. Rounding is all it does to a number,
+/// but it does round, with the flags that go with that.
+pub fn round_to_precision(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    if a.is_nan() {
+        return propagate_nan(a, a, f);
+    }
+    if a.is_inf() || a.is_zero() {
+        return a;
+    }
+    let ua = unpack(a);
+    round_pack(ua.sign, ua.exp, (ua.mant as u128) << 64, ctx, f)
 }
 
 /// FGETEXP: the unbiased exponent as an integer-valued extended number.
@@ -1049,6 +1063,54 @@ mod tests {
             round_to_int(x(0.6), RoundMode::Nearest, &mut f).to_f64(),
             1.0
         );
+    }
+
+    #[test]
+    fn zeros_of_one_sign_keep_it_when_rounding_down() {
+        let mut f = ExcFlags::default();
+        let down = RoundCtx {
+            prec: Precision::Extended,
+            mode: RoundMode::NegInf,
+        };
+        let p = FloatX80::zero(false);
+        let m = FloatX80::zero(true);
+        assert!(!add(p, p, down, &mut f).sign());
+        assert!(add(m, m, down, &mut f).sign());
+        assert!(add(p, m, down, &mut f).sign());
+        assert!(!add(p, m, RoundCtx::NEAREST_EXT, &mut f).sign());
+    }
+
+    #[test]
+    fn rounding_to_zero_underflows() {
+        let mut f = ExcFlags::default();
+        let r = scale(x(1.0), -20000, RoundCtx::NEAREST_EXT, &mut f);
+        assert!(r.is_zero());
+        assert!(f.0 & ExcFlags::UNFL != 0 && f.0 & ExcFlags::INEX2 != 0);
+    }
+
+    #[test]
+    fn moves_round_to_the_precision() {
+        let double = RoundCtx {
+            prec: Precision::Double,
+            mode: RoundMode::Nearest,
+        };
+        let third = div(
+            x(1.0),
+            x(3.0),
+            RoundCtx::NEAREST_EXT,
+            &mut ExcFlags::default(),
+        );
+        let mut f = ExcFlags::default();
+        let r = round_to_precision(third, double, &mut f);
+        assert_eq!(r.to_f64(), 1.0 / 3.0);
+        assert_eq!(r.mantissa & 0x7FF, 0);
+        assert!(f.0 & ExcFlags::INEX2 != 0);
+        let mut f = ExcFlags::default();
+        assert_eq!(
+            round_to_precision(third, RoundCtx::NEAREST_EXT, &mut f),
+            third
+        );
+        assert_eq!(f.0, 0);
     }
 
     #[test]
