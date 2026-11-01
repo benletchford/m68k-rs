@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.15.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.15.0...m68k-v0.15.1) (2026-11-01)
+
+
+### Bug Fixes
+
+* **fpu:** correct FSIN, FCOS and FTAN for large operands ([#227](https://github.com/benletchford/m68k-rs/issues/227)) ([b0e1c25](https://github.com/benletchford/m68k-rs/commit/b0e1c25e1d7c948c539df4c7a45e87ee193fdded))
+* **fpu:** report overflow and underflow in FETOX, FSINH and FCOSH ([#228](https://github.com/benletchford/m68k-rs/issues/228)) ([e15f0e3](https://github.com/benletchford/m68k-rs/commit/e15f0e3620bf51af33c0dab54990410d2cfc01c1))
+* **fpu:** round moves, keep the sign of zeros and report underflow ([#229](https://github.com/benletchford/m68k-rs/issues/229)) ([69dab47](https://github.com/benletchford/m68k-rs/commit/69dab47ecd276e71523e404d10b82aee96cd0b73))
+
 ## [0.15.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.14.7...m68k-v0.15.0) (2026-10-30)
 
 
