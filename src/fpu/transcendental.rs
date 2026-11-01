@@ -88,6 +88,30 @@ fn exp_dd(p: Df) -> Df {
     dd::mul_x80(exp_reduced(r), two_pow(ki))
 }
 
+/// Beyond this magnitude, e^x is too close to the limits of the extended range
+/// for `exp_dd`, whose 2^k overflows to infinity or vanishes.
+const EXP_RANGE_LIMIT: f64 = 11000.0;
+
+/// e^x * 2^shift for a large |x|: scale last, so that an overflow or underflow
+/// is rounded and reported as one.
+fn exp_scaled(x: FloatX80, shift: i32, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    // Far outside the range the value does not matter any more.
+    let v = x.to_f64().clamp(-20000.0, 20000.0);
+    let k = (v * std::f64::consts::LOG2_E).round();
+    let m = if v.abs() < 20000.0 {
+        let r = dd::sub(Df::from_x80(x), dd::mul_x80(dd::consts().ln2, fx(k)));
+        exp_reduced(r).to_x80(RoundCtx::NEAREST_EXT, &mut noflags())
+    } else {
+        one_x80()
+    };
+    let r = softfloat::scale(m, k as i32 + shift, ctx, f);
+    f.raise(ExcFlags::INEX2);
+    if r.is_zero() {
+        f.raise(ExcFlags::UNFL);
+    }
+    r
+}
+
 fn exp(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     if x.is_nan() {
         return nan_result(x, f);
@@ -97,6 +121,9 @@ fn exp(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     }
     if x.is_zero() {
         return one_x80();
+    }
+    if x.to_f64().abs() > EXP_RANGE_LIMIT {
+        return exp_scaled(x, 0, ctx, f);
     }
     exp_dd(Df::from_x80(x)).to_x80(ctx, f)
 }
@@ -494,6 +521,11 @@ fn sinh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     if x.is_inf() || x.is_zero() {
         return x; // sinh(+-inf)=+-inf, sinh(+-0)=+-0
     }
+    if x.to_f64().abs() > EXP_RANGE_LIMIT {
+        // sinh(x) = sign(x) * e^|x| / 2 this far out.
+        let r = exp_scaled(softfloat::abs(x), -1, ctx, f);
+        return if x.sign() { softfloat::neg(r) } else { r };
+    }
     let d = if x.to_f64().abs() <= 0.5 {
         // Series sum_{k>=0} x^(2k+1)/(2k+1)!.
         let xd = Df::from_x80(x);
@@ -526,6 +558,10 @@ fn cosh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
     }
     if x.is_zero() {
         return one_x80();
+    }
+    if x.to_f64().abs() > EXP_RANGE_LIMIT {
+        // cosh(x) = e^|x| / 2 this far out.
+        return exp_scaled(softfloat::abs(x), -1, ctx, f);
     }
     let e = exp_dd(Df::from_x80(x));
     dd::mul_x80(dd::add(e, dd::recip(e)), fx(0.5)).to_x80(ctx, f)
@@ -822,6 +858,24 @@ mod tests {
             assert!((s - x.sin()).abs() < 1e-14, "sin {x}");
             assert!((c - x.cos()).abs() < 1e-14, "cos {x}");
         }
+    }
+
+    #[test]
+    fn exp_family_at_the_limits_of_the_range() {
+        let mut f = ExcFlags::default();
+        for v in [11500.0, 20000.0, 1e300, f64::MAX] {
+            assert!(exp(fx(v), rn(), &mut f).is_inf(), "exp {v}");
+            assert!(sinh(fx(v), rn(), &mut f).is_inf(), "sinh {v}");
+            assert!(cosh(fx(v), rn(), &mut f).is_inf(), "cosh {v}");
+            assert!(sinh(fx(-v), rn(), &mut f).sign(), "sinh {}", -v);
+            assert!(exp(fx(-v), rn(), &mut f).is_zero(), "exp {}", -v);
+        }
+        assert_ne!(f.0 & ExcFlags::OVFL, 0);
+        assert_ne!(f.0 & ExcFlags::UNFL, 0);
+
+        // Still in range, close to the top: e^11356 is about 2^16383.24.
+        let e = exp(fx(11356.0), rn(), &mut noflags());
+        assert_eq!(e.sign_exp, 0x7FFE);
     }
 
     #[test]
