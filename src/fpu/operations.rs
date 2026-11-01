@@ -1116,8 +1116,10 @@ impl CpuCore {
                 let mut f = ExcFlags::default();
                 let cos_dst = (opmode & 7) as usize;
                 let (sin, cos) = transcendental::sincos(src, ctx, &mut f);
-                self.fpr[dst] = sin;
+                // Cosine first: with FPs == FPc the sine must win (M68000PM
+                // FSINCOS description).
                 self.fpr[cos_dst] = cos;
+                self.fpr[dst] = sin;
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4

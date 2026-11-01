@@ -12,6 +12,7 @@ mod operations;
 mod packed;
 mod softfloat;
 mod transcendental;
+mod two_over_pi;
 mod types;
 
 pub use types::*;
