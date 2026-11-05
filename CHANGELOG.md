@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.16.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.15.1...m68k-v0.16.0) (2026-11-05)
+
+
+### Features
+
+* **fpu:** add an opt-in 68040 unimplemented-instruction trap gate ([#232](https://github.com/benletchford/m68k-rs/issues/232)) ([ec68df4](https://github.com/benletchford/m68k-rs/commit/ec68df482bedb9c6bf50d0a4cb857d332137bafe))
+
+
+### Bug Fixes
+
+* **jit:** reclaim executable storage after trace eviction ([#196](https://github.com/benletchford/m68k-rs/issues/196)) ([1e2ffd0](https://github.com/benletchford/m68k-rs/commit/1e2ffd0d2a7fbea05d4202e2684669ca9c66ce6c))
+* **mmu:** keep 68030 ATC entries across RESET ([#231](https://github.com/benletchford/m68k-rs/issues/231)) ([5cd32cd](https://github.com/benletchford/m68k-rs/commit/5cd32cdbe1cc29240a5777e7b580c3018edb1f27))
+
 ## [0.15.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.15.0...m68k-v0.15.1) (2026-11-01)
 
 
