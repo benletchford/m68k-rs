@@ -696,12 +696,12 @@ fn host_pmmu_changes_take_effect_at_the_next_batch() {
     run_batches(&mut m.0, &mut m.1);
     assert_eq!(m.1.peek_long(phys(DATA2)), (20_000..40_000u32).sum::<u32>());
 
-    // Reset: translation off and the ATC empty, as the host sees it.
+    // Reset: translation off, as the host sees it. The ATC keeps its entries
+    // (MC68030UM 9.7.5), which cannot be reached with translation off.
     m.1.poke_long(0, STACK_TOP);
     m.1.poke_long(4, phys(CODE));
     m.0.reset(&mut m.1);
     assert!(!m.0.pmmu_enabled);
-    assert_eq!(m.0.atc_030.valid_entries(), 0);
     m.0.set_d(0, 40_000);
     m.0.set_a(0, 0x3_2000);
     m.0.set_d(7, 19_999);
