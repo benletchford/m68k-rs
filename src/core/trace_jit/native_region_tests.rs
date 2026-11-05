@@ -132,6 +132,7 @@ fn raw_state(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         trace_recording,
         oep060,
         emulate_unimplemented_060,
+        emulate_unimplemented_040,
         sst_m68000_compat,
     );
     fields.push(("window_present", (cpu.fm_ptr != 0).to_string()));

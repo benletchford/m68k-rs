@@ -664,8 +664,8 @@ impl CpuCore {
         self.exception_cycles(vector)
     }
 
-    /// 68060 "FP unimplemented instruction" exception: Line-F vector with
-    /// the six-word format $2 frame the 68060SP dispatches on (fmt/vector
+    /// 68040/68060 "FP unimplemented instruction" exception: Line-F vector with
+    /// the six-word format $2 frame the software package dispatches on (fmt/vector
     /// word $202C). The frame's PC is the NEXT instruction (every extension
     /// word must be consumed before calling this), the EA field holds the
     /// calculated operand address (0 when the operand is not in memory),
@@ -684,6 +684,25 @@ impl CpuCore {
         self.push_16(bus, old_sr);
         self.jump_vector(bus, vector::LINE_1111);
         self.exception_cycles(vector::LINE_1111)
+    }
+
+    /// 68040 unsupported data type on FMOVE to memory: a post-instruction
+    /// exception through vector 55 with the six-word format $3 frame, whose
+    /// PC is the next instruction and whose EA field is the destination
+    /// (M68040UM 9.6.2).
+    pub(crate) fn take_fp_unsupp_post_040<B: AddressBus>(&mut self, bus: &mut B, ea: u32) -> i32 {
+        self.fpiar = self.ppc;
+        let old_sr = self.get_sr();
+        self.set_s_flag(SFLAG_SET);
+        self.t1_flag = 0;
+        self.t0_flag = 0;
+        let vec_word = (vector::FP_UNSUPP_DATA_TYPE as u16) << 2;
+        self.push_32(bus, ea);
+        self.push_16(bus, 0x3000 | (vec_word & 0x0FFF));
+        self.push_32(bus, self.pc);
+        self.push_16(bus, old_sr);
+        self.jump_vector(bus, vector::FP_UNSUPP_DATA_TYPE);
+        self.exception_cycles(vector::FP_UNSUPP_DATA_TYPE)
     }
 
     /// 68060 "FPU disabled" exception (PCR.DFP set, or an LC/EC060): the

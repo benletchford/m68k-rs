@@ -933,3 +933,167 @@ fn lpstop_is_privileged_and_line_f_elsewhere() {
     step(&mut cpu, &mut bus);
     assert_eq!(cpu.pc, 0x0340, "LPSTOP is Line-F on the 68040");
 }
+
+// ============================================================================
+// 68040 unimplemented FPU gate (M68040UM 9.6)
+// ============================================================================
+
+/// A 68040 with faithful traps enabled and FP0 = 1.0, with vector 55 pointed
+/// at its own handler.
+fn setup_040_traps() -> (CpuCore, TestBus) {
+    let (mut cpu, mut bus) = setup_060();
+    cpu.set_cpu_type(CpuType::M68040);
+    cpu.emulate_unimplemented_040 = false;
+    bus.write_long_at(55 * 4, 0x0380);
+    cpu.fpr[0] = m68k::fpu::FloatX80::from_f64(1.0);
+    (cpu, bus)
+}
+
+fn run_fp(cpu: &mut CpuCore, bus: &mut TestBus, words: &[u16]) {
+    for (i, w) in words.iter().enumerate() {
+        bus.write_word_at(0x0200 + 2 * i as u32, *w);
+    }
+    cpu.pc = 0x0200;
+    cpu.dar[15] = 0x1000;
+    step(cpu, bus);
+}
+
+#[test]
+fn every_040_software_opmode_traps_with_a_format_2_frame() {
+    // M68040UM table 9-10, plus FLOG2 and every FSINCOS destination encoding.
+    let mut opmodes = vec![
+        0x01u16, 0x02, 0x03, 0x06, 0x08, 0x09, 0x0A, 0x0C, 0x0D, 0x0E, 0x0F, 0x10, 0x11, 0x12,
+        0x14, 0x15, 0x16, 0x19, 0x1C, 0x1D, 0x1E, 0x1F, 0x21, 0x25, 0x26,
+    ];
+    opmodes.extend(0x30..=0x37);
+    for opmode in opmodes {
+        let (mut cpu, mut bus) = setup_040_traps();
+        run_fp(&mut cpu, &mut bus, &[0xF200, 0x0080 | opmode]);
+        assert_eq!(cpu.fpr[1].to_f64(), 0.0, "{opmode:#x} must not execute");
+        assert_fp_unimp(&cpu, &mut bus, 0x0200, 0x0204, 0);
+    }
+}
+
+#[test]
+fn every_040_hardware_opmode_executes() {
+    // FMOVE, FSQRT, FABS, FNEG, FDIV, FADD, FMUL, FSGLDIV, FSGLMUL, FSUB,
+    // FCMP, FTST and the single/double rounding variants.
+    for opmode in [
+        0x00u16, 0x04, 0x18, 0x1A, 0x20, 0x22, 0x23, 0x24, 0x27, 0x28, 0x38, 0x3A, 0x40, 0x41,
+        0x44, 0x45, 0x58, 0x5A, 0x5C, 0x5E, 0x60, 0x62, 0x63, 0x64, 0x66, 0x67, 0x68, 0x6C,
+    ] {
+        let (mut cpu, mut bus) = setup_040_traps();
+        run_fp(&mut cpu, &mut bus, &[0xF200, 0x0080 | opmode]);
+        assert_eq!(cpu.pc, 0x0204, "{opmode:#x} executes in hardware");
+    }
+}
+
+#[test]
+fn fint_and_fsin_memory_source_trap_with_calculated_ea_on_68040() {
+    for opmode in [0x01u16, 0x0E] {
+        let (mut cpu, mut bus) = setup_040_traps();
+        cpu.dar[8] = 0x4000;
+        // FINT.L / FSIN.L (A0)+,FP0
+        run_fp(&mut cpu, &mut bus, &[0xF218, 0x4000 | opmode]);
+        assert_fp_unimp(&cpu, &mut bus, 0x0200, 0x0204, 0x4000);
+        assert_eq!(cpu.dar[8], 0x4004);
+    }
+}
+
+#[test]
+fn fmovecr_traps_on_68040_by_its_ea_field() {
+    let (mut cpu, mut bus) = setup_040_traps();
+    run_fp(&mut cpu, &mut bus, &[0xF200, 0x5C32]);
+    assert_fp_unimp(&cpu, &mut bus, 0x0200, 0x0204, 0);
+
+    // Non-zero <ea> field: format $0 with the instruction's own PC.
+    let (mut cpu, mut bus) = setup_040_traps();
+    run_fp(&mut cpu, &mut bus, &[0xF208, 0x5C32]);
+    let sp = cpu.dar[15];
+    assert_eq!(cpu.pc, 0x0340);
+    assert_eq!(bus.read_word(sp + 6), 0x002C);
+    assert_eq!(bus.read_long_at(sp + 2), 0x0200);
+}
+
+#[test]
+fn packed_operands_take_vector_55_on_68040() {
+    // FADD.P (A0),FP1: pre-instruction format $0 restarting the instruction.
+    let (mut cpu, mut bus) = setup_040_traps();
+    cpu.dar[8] = 0x4000;
+    run_fp(&mut cpu, &mut bus, &[0xF210, 0x4CA2]);
+    let sp = cpu.dar[15];
+    assert_eq!(cpu.pc, 0x0380);
+    assert_eq!(bus.read_word(sp + 6), 0x00DC);
+    assert_eq!(bus.read_long_at(sp + 2), 0x0200);
+
+    // FSIN.P (A0),FP1: the unimplemented instruction takes precedence.
+    let (mut cpu, mut bus) = setup_040_traps();
+    cpu.dar[8] = 0x4000;
+    run_fp(&mut cpu, &mut bus, &[0xF210, 0x4C8E]);
+    assert_fp_unimp(&cpu, &mut bus, 0x0200, 0x0204, 0x4000);
+
+    // FMOVE.P FP0,(A0){#0} and {D1}: post-instruction format $3 with EA.
+    for command in [0x6C00u16, 0x7C10] {
+        let (mut cpu, mut bus) = setup_040_traps();
+        cpu.dar[8] = 0x4000;
+        run_fp(&mut cpu, &mut bus, &[0xF210, command]);
+        let sp = cpu.dar[15];
+        assert_eq!(cpu.pc, 0x0380);
+        assert_eq!(bus.read_word(sp + 6), 0x30DC);
+        assert_eq!(bus.read_long_at(sp + 2), 0x0204);
+        assert_eq!(bus.read_long_at(sp + 8), 0x4000);
+        assert_eq!(bus.read_long_at(0x4000), 0, "memory untouched");
+    }
+}
+
+#[test]
+fn m68040_defaults_to_executing_fpu_software_instructions() {
+    let (mut cpu, mut bus) = setup_040_traps();
+    cpu = {
+        let mut fresh = CpuCore::new();
+        assert!(fresh.emulate_unimplemented_040, "default stays native");
+        fresh.set_cpu_type(CpuType::M68040);
+        fresh.set_sr(0x2700);
+        fresh.fpr = cpu.fpr;
+        fresh
+    };
+    run_fp(&mut cpu, &mut bus, &[0xF200, 0x008E]); // FSIN.X FP0,FP1
+    assert_eq!(cpu.pc, 0x0204);
+    assert!((cpu.fpr[1].to_f64() - 1.0f64.sin()).abs() < 1e-12);
+    run_fp(&mut cpu, &mut bus, &[0xF200, 0x5C32]); // FMOVECR #$32,FP0
+    assert_eq!(cpu.pc, 0x0204);
+    assert_eq!(cpu.fpr[0].to_f64(), 1.0);
+}
+
+#[test]
+fn the_040_flag_affects_only_the_68040() {
+    // The 060 gate keeps its own flag, and an FPU-less 040 stays Line-F.
+    let (mut cpu, mut bus) = setup_060();
+    cpu.emulate_unimplemented_040 = false;
+    cpu.emulate_unimplemented_060 = true;
+    run_fp(&mut cpu, &mut bus, &[0xF200, 0x0081]); // FINT is native on the 060
+    assert_eq!(cpu.pc, 0x0204);
+    run_fp(&mut cpu, &mut bus, &[0xF200, 0x008E]); // FSIN with the 060 hatch
+    assert_eq!(cpu.pc, 0x0204);
+
+    let (mut cpu, mut bus) = setup_060();
+    cpu.set_cpu_type(CpuType::M68LC040);
+    cpu.emulate_unimplemented_040 = false;
+    run_fp(&mut cpu, &mut bus, &[0xF200, 0x008E]);
+    let sp = cpu.dar[15];
+    assert_eq!(cpu.pc, 0x0340);
+    assert_eq!(bus.read_word(sp + 6), 0x002C);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn snapshot_without_the_040_flag_keeps_native_execution() {
+    let cpu = CpuCore::new();
+    let mut value = serde_json::to_value(&cpu).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .remove("emulate_unimplemented_040");
+    let restored: CpuCore = serde_json::from_value(value).unwrap();
+    assert!(restored.emulate_unimplemented_040);
+}
