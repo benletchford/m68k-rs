@@ -823,7 +823,9 @@ impl CpuCore {
         self.mmu_tt0 = 0;
         self.mmu_tt1 = 0;
         self.atc.flush_all();
-        self.atc_030.flush_all();
+        // RESET does not invalidate the 68030 ATC (MC68030UM 8.1.1 p. 8-5,
+        // 9.2.2, 9.7.5): the entries stay unreachable while translation is
+        // off, and software flushes them before enabling it again.
         self.prefetch_queue = [0; 2];
         self.prefetch_count = 0;
         self.consume_without_prefetch = false;

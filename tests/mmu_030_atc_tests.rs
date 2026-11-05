@@ -151,7 +151,9 @@ fn early_termination_descriptor_is_cached_one_page_at_a_time() {
     let root = 0x1_8000u32;
     bus.write_long(root, 0x0005_0001);
     cpu.mmu_crp_aptr = root;
-    cpu.mmu_tc = 0x80C8_4800; // E, PS 4 KB, IS 8, TIA 4, TIB 8
+    // E, PS 4 KB, IS 8, TIA 4, TIB 8: TIA indexes logical bits 23:20, so all
+    // three probes below, up to 0x000F_F000, use root entry 0.
+    cpu.mmu_tc = 0x80C8_4800;
     for logical in [0x0000_1234u32, 0x0000_1FFF, 0x000F_F000] {
         let walked = 0x0005_0000 + (logical & 0x000F_FFFF);
         assert_eq!(data(&mut cpu, &mut bus, logical), walked);
@@ -317,13 +319,45 @@ fn write_protected_page_hits_for_reads_and_faults_writes() {
 }
 
 #[test]
-fn reset_empties_the_atc() {
+fn reset_disables_translation_but_keeps_the_atc() {
+    // MC68030UM 9.7.5: "The assertion of RESET disables translations by
+    // clearing the E bits of the TC and TTx registers, but it does not flush
+    // the ATC."
     let mut bus = TestBus::new();
     let mut cpu = mmu_030(&mut bus);
-    data(&mut cpu, &mut bus, 0x3000);
-    assert_eq!(cpu.atc_030.valid_entries(), 1);
+    assert_eq!(data(&mut cpu, &mut bus, 0x5004), 0x5004);
+    cpu.mmu_tt0 = 0x0000_8000;
+    cpu.mmu_tt1 = 0x0000_8000;
     cpu.reset(&mut bus);
-    assert_eq!(cpu.atc_030.valid_entries(), 0);
+    assert_eq!(cpu.mmu_tc & 0x8000_0000, 0, "TC E cleared");
+    assert_eq!(cpu.mmu_tt0 & 0x8000, 0, "TT0 E cleared");
+    assert_eq!(cpu.mmu_tt1 & 0x8000, 0, "TT1 E cleared");
+    assert_eq!(cpu.atc_030.valid_entries(), 1, "entry survives RESET");
+}
+
+#[test]
+fn pmove_to_tc_after_reset_decides_whether_stale_entries_survive() {
+    let mut bus = TestBus::new();
+    let mut cpu = mmu_030(&mut bus);
+    assert_eq!(data(&mut cpu, &mut bus, 0x5004), 0x5004);
+    cpu.reset(&mut bus);
+    bus.map(5, 0x9);
+    cpu.set_sr(0x2700);
+
+    // With translation off the surviving entry is not consulted.
+    assert!(!cpu.pmmu_enabled);
+    assert_eq!(data(&mut cpu, &mut bus, 0x5004), 0x5004);
+
+    // PMOVEFD (A0),TC re-enables translation and keeps the stale entry.
+    bus.write_long(0x7000, TC);
+    cpu.set_a(0, 0x7000);
+    run(&mut cpu, &mut bus, &[0xF010, 0x4100]);
+    assert!(cpu.pmmu_enabled);
+    assert_eq!(data(&mut cpu, &mut bus, 0x5004), 0x5004, "FD kept it");
+
+    // PMOVE (A0),TC flushes it, so the edited descriptor takes effect.
+    run(&mut cpu, &mut bus, &[0xF010, 0x4000]);
+    assert_eq!(data(&mut cpu, &mut bus, 0x5004), 0x9004);
 }
 
 #[cfg(feature = "serde")]
