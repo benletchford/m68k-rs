@@ -35,6 +35,7 @@ jit = [
     "dep:cranelift-frontend",
     "dep:cranelift-jit",
     "dep:cranelift-module",
+    "dep:cranelift-native",
 ]
 # Serialize the complete architectural CPU state for deterministic save states.
 # Runtime-only decode, FastMem, and JIT caches are rebuilt after deserialization.
@@ -48,10 +49,15 @@ cranelift-codegen = { version = "0.132.0", optional = true }
 cranelift-frontend = { version = "0.132.0", optional = true }
 cranelift-jit = { version = "0.132.0", optional = true }
 cranelift-module = { version = "0.132.0", optional = true }
+cranelift-native = { version = "0.132.0", optional = true }
 
 [dev-dependencies]
 serde_json = "1.0"
 astro-float = { version = "0.9", default-features = false, features = ["std"] }
+
+[[example]]
+name = "jit-memory-churn"
+required-features = ["jit"]
 
 [[bench]]
 name = "microbench"

@@ -985,7 +985,7 @@ impl Drop for UnpublishedRegionModule {
 fn compile_private_snapshot(input: &RegionInput) -> Option<PrivateCompiledRegion> {
     // Match TraceJit::new_base's native target/settings policy. Signature checks
     // below fail closed if retained IR is ever captured from a different ABI.
-    let builder = JITBuilder::new(default_libcall_names()).ok()?;
+    let builder = super::code_memory::native_jit_builder()?;
     let mut owner = UnpublishedRegionModule(Some(JITModule::new(builder)));
     let mut frontend = FunctionBuilderContext::new();
     let (entry, inlined_calls) = compile_snapshot(owner.0.as_mut()?, &mut frontend, 0, input)?;

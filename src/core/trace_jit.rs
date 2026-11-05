@@ -4003,6 +4003,10 @@ impl TraceJit {
         }
         sig.returns.push(AbiParam::new(types::I64));
 
+        // Cranelift's function names and IDs are u32, so identities cannot be
+        // widened. Exhaustion at 2^31 compilations is permanent, not a
+        // recoverable failure: reusing an identity could publish a stale
+        // result, so compilation stays off for this TraceJit.
         let ordinal = self.next_func;
         self.next_func = self.next_func.checked_add(1)?;
         let ir_body_id = ordinal.checked_mul(2)?;

@@ -1,4 +1,7 @@
 //! Bounded diagnostic for replacing native traces at one guest address.
+//!
+//! Set JIT_CHURN_SAMPLE_SECS to pause before exit, so that an external tool
+//! can sample the final process memory.
 use m68k::{CpuCore, CpuType, core::memory::LinearMemoryBus};
 use std::time::Instant;
 
@@ -71,8 +74,7 @@ fn main() {
         cpu.d(1),
         cpu.get_ccr()
     );
-    // Give external process-memory tools a bounded opportunity to sample the final state.
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    sample_pause();
 }
 
 fn dense_cache(rounds: u32, traces: u32) {
@@ -110,5 +112,14 @@ fn dense_cache(rounds: u32, traces: u32) {
         cpu.d(1),
         cpu.get_ccr()
     );
-    std::thread::sleep(std::time::Duration::from_secs(3));
+    sample_pause();
+}
+
+fn sample_pause() {
+    if let Some(secs) = std::env::var("JIT_CHURN_SAMPLE_SECS")
+        .ok()
+        .and_then(|secs| secs.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+    }
 }

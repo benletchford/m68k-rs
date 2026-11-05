@@ -11,7 +11,40 @@ use std::rc::Rc;
 // Keep each compilation independently reclaimable. A trace body and its
 // checked entry remain together; unrelated traces cannot pin their storage.
 // Count attempts, not successes: failed compilation also leaves declarations.
+//
+// Trade-off: each module's memory takes at least one page per section holding
+// code or data, so a batch of one means every live trace costs at least a page.
+// That costs more with many live traces than larger batches do, in exchange for
+// precise reclamation. Measure a change to 2 or 4 with
+// examples/jit-memory-churn.rs: the mixed workload (`30000 128`) shows
+// reclamation and the dense workload (`30000 4096 dense`) shows the page floor,
+// both with M68K_NATIVE_REGIONS=off.
 const COMPILES_PER_MODULE: usize = 1;
+
+/// Build the host ISA once per process. Modules are created per compilation and
+/// from the region worker, and only need their own allocator and declarations.
+fn native_isa() -> Option<cranelift_codegen::isa::OwnedTargetIsa> {
+    use cranelift_codegen::settings::{self, Configurable};
+    use std::sync::OnceLock;
+
+    static ISA: OnceLock<Option<cranelift_codegen::isa::OwnedTargetIsa>> = OnceLock::new();
+    ISA.get_or_init(|| {
+        // The same settings as JITBuilder::new.
+        let mut flags = settings::builder();
+        flags.set("use_colocated_libcalls", "false").ok()?;
+        flags.set("is_pic", "false").ok()?;
+        cranelift_native::builder()
+            .ok()?
+            .finish(settings::Flags::new(flags))
+            .ok()
+    })
+    .clone()
+}
+
+/// A JITBuilder for the host that shares the process-wide ISA.
+pub(super) fn native_jit_builder() -> Option<JITBuilder> {
+    Some(JITBuilder::with_isa(native_isa()?, default_libcall_names()))
+}
 
 #[derive(Default)]
 pub(super) struct CodeLease {
@@ -39,9 +72,7 @@ pub(super) struct CodeModule {
 impl CodeModule {
     pub(super) fn new() -> Option<Self> {
         Some(Self {
-            module: Some(JITModule::new(
-                JITBuilder::new(default_libcall_names()).ok()?,
-            )),
+            module: Some(JITModule::new(native_jit_builder()?)),
             lease: Rc::new(CodeLease::default()),
             attempts: 0,
         })
@@ -103,6 +134,13 @@ mod tests {
             .collect();
         jit.compile_decoded_ops(&cpu, 0x100, CpuType::M68040, ops, Some(0x100))
             .unwrap()
+    }
+
+    #[test]
+    fn modules_share_one_native_isa() {
+        let first = native_isa().unwrap();
+        let second = native_isa().unwrap();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
     }
 
     #[test]
