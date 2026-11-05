@@ -58,6 +58,16 @@ fn fpu_060_traps_opmode(opmode: u16) -> bool {
     )
 }
 
+/// The FP opmodes the 68040 leaves to the M68040FPSP (M68040UM table 9-10,
+/// section 9.6.1): the 68060's list plus FINT and FINTRZ. FLOG2 is missing from
+/// that table but is emulated by the FPSP (Apple Technote HW 23) and is not
+/// among the 68040's native instructions. FMOVECR is gated separately by
+/// encoding. FSGLMUL/FSGLDIV and every rounded (FS/FD-prefixed) variant are in
+/// hardware.
+fn fpu_040_traps_opmode(opmode: u16) -> bool {
+    matches!(opmode, 0x01 | 0x03) || fpu_060_traps_opmode(opmode)
+}
+
 /// Truncate a finite operand's mantissa to its 24 most significant bits,
 /// the FSGLMUL input reduction (M68000PM 3-157). NaNs keep their payload
 /// and infinities their encoding.
@@ -136,6 +146,15 @@ impl CpuCore {
                     if self.trap_unimpl_060() {
                         return self.take_fp_unimp_060(bus, 0);
                     }
+                    if self.trap_unimpl_040() {
+                        // A non-zero <ea> field is a format $0 F-line
+                        // exception, which the FPSP's fline handler decodes.
+                        if opcode & 0x3F != 0 {
+                            return self
+                                .take_exception(bus, crate::core::exceptions::vector::LINE_1111);
+                        }
+                        return self.take_fp_unimp_060(bus, 0);
+                    }
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
                     self.fpr[dst] = softfloat::const_rom(opmode as usize);
@@ -161,6 +180,23 @@ impl CpuCore {
                     return self.take_exception(bus, vector);
                 }
 
+                if self.trap_unimpl_040() {
+                    if fpu_040_traps_opmode(opmode) {
+                        // Takes precedence over a packed source (M68040UM
+                        // 9.6.1); the handler detects that data type.
+                        let ea = self.fpu_060_trap_ea(bus, opcode, src_fmt);
+                        return self.take_fp_unimp_060(bus, ea);
+                    }
+                    if src_fmt == 3 {
+                        // Pre-instruction format $0 frame: the stacked PC
+                        // restarts the instruction (M68040UM 9.6.2).
+                        return self.take_exception(
+                            bus,
+                            crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE,
+                        );
+                    }
+                }
+
                 let Some(src) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
                 };
@@ -176,6 +212,12 @@ impl CpuCore {
                 if self.trap_unimpl_060() && (dst_fmt == 3 || dst_fmt == 7) {
                     return self
                         .take_exception(bus, crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE);
+                }
+
+                if self.trap_unimpl_040() && (dst_fmt == 3 || dst_fmt == 7) {
+                    let _w2 = self.read_imm_16(bus);
+                    let ea = self.fpu_060_trap_ea(bus, opcode, 3);
+                    return self.take_fp_unsupp_post_040(bus, ea);
                 }
 
                 // Packed-decimal k-factor: static (fmt 3) in w2 bits 6-0;
@@ -210,7 +252,7 @@ impl CpuCore {
 
                 if opmode == 0x17 {
                     // FMOVECR was dropped from 68060 silicon.
-                    if self.trap_unimpl_060() {
+                    if self.trap_unimpl_060() || self.trap_unimpl_040() {
                         return self.take_fp_unimp_060(bus, 0);
                     }
                     // FMOVECR - load constant from ROM. In this register-form
@@ -222,6 +264,9 @@ impl CpuCore {
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {
                     // Register-to-register form of an unimplemented FP
                     // instruction: no operand EA.
+                    return self.take_fp_unimp_060(bus, 0);
+                }
+                if self.trap_unimpl_040() && fpu_040_traps_opmode(opmode) {
                     return self.take_fp_unimp_060(bus, 0);
                 }
                 self.fpu_apply_op(opmode, dst, self.fpr[src])

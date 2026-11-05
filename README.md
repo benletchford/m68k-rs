@@ -386,6 +386,8 @@ between batches.
 | `M68060`   | Superscalar 68060 with FPU and MMU     |
 | `SCC68070` | Philips SCC68070 variant               |
 
+On `M68040`, the FPU instructions and packed-decimal operands the 68040 leaves to its software package execute natively by default. Set `cpu.emulate_unimplemented_040 = false` to take the hardware traps instead: vector 11 (format `$2`) for unimplemented instructions and vector 55 for packed-decimal operands. `FSAVE` does not yet write the 68040 unimplemented-instruction state frame, so Motorola's M68040FPSP cannot use these traps yet.
+
 ## Validation & Testing
 
 This emulator has been rigorously validated against multiple industry-standard test suites to ensure correctness:

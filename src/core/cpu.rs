@@ -33,6 +33,12 @@ pub const FC_SUPERVISOR_DATA: u32 = 5;
 /// Supervisor-program function code.
 pub const FC_SUPERVISOR_PROGRAM: u32 = 6;
 
+/// Default for [`CpuCore::emulate_unimplemented_040`], also used for snapshots
+/// that predate the field.
+fn emulate_unimplemented_040_default() -> bool {
+    true
+}
+
 /// The main CPU state structure.
 ///
 /// Public fields expose architectural registers and host-visible
@@ -430,6 +436,18 @@ pub struct CpuCore {
     /// OS-side 68060 software package. False = faithful traps.
     pub emulate_unimplemented_060: bool,
 
+    /// 68040 escape hatch: execute the FPU instructions and packed-decimal
+    /// operands the 040 leaves to its floating-point software package
+    /// natively instead of trapping. True by default, unlike the 060 flag,
+    /// because FSAVE does not yet produce the 040 unimplemented-instruction
+    /// state frame that the M68040FPSP reads. False = faithful traps, for a
+    /// host that supplies its own handler or wants the guest to see the trap.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default = "emulate_unimplemented_040_default")
+    )]
+    pub emulate_unimplemented_040: bool,
+
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
     pub sst_m68000_compat: bool,
@@ -650,6 +668,7 @@ impl CpuCore {
             decode_table: None,
             oep060: Default::default(),
             emulate_unimplemented_060: false,
+            emulate_unimplemented_040: emulate_unimplemented_040_default(),
             sst_m68000_compat: false,
             fpu_present: true,
         };
@@ -1382,6 +1401,13 @@ impl CpuCore {
     #[inline]
     pub(crate) fn trap_unimpl_060(&self) -> bool {
         self.cpu_type == CpuType::M68060 && !self.emulate_unimplemented_060
+    }
+
+    /// Whether an FPU instruction or data format the 68040 leaves to software
+    /// must trap rather than execute natively.
+    #[inline]
+    pub(crate) fn trap_unimpl_040(&self) -> bool {
+        self.cpu_type == CpuType::M68040 && !self.emulate_unimplemented_040
     }
 
     /// True for the 68060, which shares the 68040's MMU table format and
