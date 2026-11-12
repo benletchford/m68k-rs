@@ -164,3 +164,59 @@ fn plpar_of_a_dtt_matched_address_leaves_an_unchanged() {
     cpu.step_with_hle_handler(&mut bus, &mut hle);
     assert_eq!(cpu.dar[8], PHYS + 0x14, "translated through the tables");
 }
+
+/// Run `MOVE.L D1,(A0)` in user mode with A0 = `addr`; return the
+/// supervisor stack pointer after the step (the frame, if one was taken).
+fn user_write(cpu: &mut CpuCore, bus: &mut TestBus, addr: u32) -> u32 {
+    bus.write_long(0x8, 0x1800); // vector 2: access fault handler
+    bus.write_word(0x1000, 0x2081); // MOVE.L D1,(A0)
+    bus.write_word(0x1002, 0x4E71);
+    bus.write_word(0x1800, 0x4E71);
+    cpu.dar[15] = 0x9000; // SSP
+    cpu.set_sr(0x0000); // user mode
+    cpu.dar[15] = 0xA000; // USP
+    cpu.dar[8] = addr;
+    cpu.dar[1] = 0x1122_3344;
+    cpu.pc = 0x1000;
+    let mut hle = m68k::NoOpHleHandler;
+    cpu.step_with_hle_handler(bus, &mut hle);
+    cpu.dar[15]
+}
+
+#[test]
+fn write_through_a_write_protected_dtt_takes_an_access_fault() {
+    for model in MODELS {
+        let (mut cpu, mut bus) = build(model);
+        bus.write_long(LOGICAL + 0x50c, 0xAAAA_AAAA);
+        bus.write_long(PHYS + 0x50c, 0xBBBB_BBBB);
+        // DTT0: user accesses, W=1. Supervisor stack pushes do not match.
+        cpu.write_control_register(0x006, ttr(0x00, 0, 0, true));
+        let sp = user_write(&mut cpu, &mut bus, LOGICAL + 0x50c);
+        assert_eq!(cpu.pc, 0x1800, "{model:?}: vector 2 taken");
+        assert_eq!(bus.read_long(LOGICAL + 0x50c), 0xAAAA_AAAA, "{model:?}");
+        assert_eq!(bus.read_long(PHYS + 0x50c), 0xBBBB_BBBB, "{model:?}");
+        if model == CpuType::M68060 {
+            assert_eq!(bus.read_word(sp + 6), 0x4008, "060 format $4");
+            assert_eq!(bus.read_long(sp + 8), LOGICAL + 0x50c, "fault address");
+            let fslw = bus.read_long(sp + 12);
+            // RW = write, SIZE = long, TM = user data, TTR hit.
+            assert_eq!(fslw & !0x84, 0x0081_0008, "FSLW {fslw:#010x}");
+        } else {
+            assert_eq!(bus.read_word(sp + 6), 0x7008, "040 format 7");
+            assert_eq!(bus.read_long(sp + 20), LOGICAL + 0x50c, "fault address");
+            // SSW: write, long, TM = user data.
+            assert_eq!(bus.read_word(sp + 12) & 0x017f, 0x0001, "040 SSW");
+        }
+
+        // A read through the same register is transparent and does not fault.
+        cpu.set_sr(0x0700);
+        let r = translate_address(&mut cpu, &mut bus, LOGICAL + 0x50c, false, false, false);
+        assert_eq!(r, Ok(LOGICAL + 0x50c), "{model:?}");
+        // W=0: the write goes through untranslated.
+        cpu.set_sr(0x2700);
+        cpu.write_control_register(0x006, ttr(0x00, 0, 0, false));
+        user_write(&mut cpu, &mut bus, LOGICAL + 0x50c);
+        assert_eq!(cpu.pc, 0x1002, "{model:?}: no fault");
+        assert_eq!(bus.read_long(LOGICAL + 0x50c), 0x1122_3344, "{model:?}");
+    }
+}

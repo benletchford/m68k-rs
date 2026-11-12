@@ -3,6 +3,7 @@
 use crate::core::cpu::CpuCore;
 use crate::core::memory::{AddressBus, BusFaultKind};
 
+use super::ttr::TtHit;
 use super::{MmuFault, MmuFaultCause, MmuFaultKind, MmuResult};
 
 fn buserr(address: u32) -> MmuFault {
@@ -88,9 +89,18 @@ pub fn translate<B: AddressBus>(
     // CPU -- the same double bus fault real hardware takes.
 
     // Check Transparent Translation Registers first - they bypass page table walk.
-    if let Some(phys) = super::ttr::check_transparent_translation(cpu, logical, write, instruction)
-    {
-        return Ok(phys);
+    let fc = cpu
+        .mmu_fc_override
+        .unwrap_or_else(|| fc_030(supervisor, instruction));
+    match super::ttr::lookup(cpu, logical, fc, write) {
+        TtHit::Miss => {}
+        TtHit::Hit => return Ok(logical),
+        TtHit::WriteProtected => {
+            return Err(access_fault_cause(
+                logical,
+                MmuFaultCause::TransparentWriteProtect,
+            ));
+        }
     }
 
     // The 68040 page table is a fixed three-level format unrelated to the
@@ -460,13 +470,15 @@ pub(crate) fn probe_resident(
 ) -> Option<u32> {
     debug_assert_eq!(mmu, ResidentMmu::of(cpu), "stale ResidentMmu");
     debug_assert!(cpu.mmu_fc_override.is_none());
-    if mmu.tt
-        && let Some(phys) =
-            super::ttr::check_transparent_translation(cpu, logical, write, instruction)
-    {
-        return Some(phys);
-    }
     let supervisor = cpu.is_supervisor();
+    if mmu.tt {
+        match super::ttr::lookup(cpu, logical, fc_030(supervisor, instruction), write) {
+            TtHit::Miss => {}
+            TtHit::Hit => return Some(logical),
+            // The access faults: only the bus path raises it.
+            TtHit::WriteProtected => return None,
+        }
+    }
     match mmu.kind {
         RESIDENT_030 if mmu.shift != 0 => {
             let shift = u32::from(mmu.shift);

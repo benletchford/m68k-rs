@@ -93,6 +93,9 @@ pub mod fslw {
     pub const RE: u32 = 0x0000_0020;
     /// Bus error on write.
     pub const WE: u32 = 0x0000_0010;
+    /// Transparent translation register hit: a write through a
+    /// write-protected TTR.
+    pub const TTR: u32 = 0x0000_0008;
 }
 
 /// Compose the 68060 FSLW for an access error.
@@ -123,6 +126,9 @@ fn fslw_060(
         Some(MmuFaultCause::PageFault) => fslw::PF,
         Some(MmuFaultCause::WriteProtect) => fslw::WP,
         Some(MmuFaultCause::SupervisorProtect) => fslw::SP,
+        // MC68060UM 8.4.1 names a TTR bit for this fault; whether WP is
+        // also set is not stated, so only TTR is reported.
+        Some(MmuFaultCause::TransparentWriteProtect) => fslw::TTR,
         Some(MmuFaultCause::TableWalkBusError) => fslw::TWE,
         // A physical bus error on the access itself.
         Some(MmuFaultCause::AccessBusError) | None => {

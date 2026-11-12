@@ -7,7 +7,8 @@
 use crate::core::cpu::CpuCore;
 use crate::core::types::CpuType;
 
-/// TTR register format (68030/68040):
+/// TTR register format (68030/68040; see [`ttr_matches_040`] for the
+/// 68040/68060 privilege and protection fields):
 /// ```text
 /// `31:24` Base Address (compared against address bits `31:24`)
 /// `23:16` Address Mask (1 = ignore bit during comparison)
@@ -75,52 +76,57 @@ pub fn ttr_matches_040(ttr: u32, addr: u32, supervisor: bool) -> bool {
     }
 }
 
-/// Check if transparent translation applies for the given access.
-///
-/// For 68030: Checks TT0 and TT1.
-/// For 68040/68060: Checks ITT0/ITT1 for instruction accesses, DTT0/DTT1 for
-/// data. The 68060 registers have the 68040 layout (MC68060UM 4.1.3).
-///
-/// Returns `Some(physical_addr)` if transparent translation applies (identity mapping),
-/// or `None` if normal page table translation should be used.
-pub fn check_transparent_translation(
-    cpu: &CpuCore,
-    addr: u32,
-    write: bool,
-    instruction: bool,
-) -> Option<u32> {
-    // Determine function code based on access type and privilege level
-    let fc = compute_function_code(cpu, instruction);
+/// Outcome of the transparent-translation check for one access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TtHit {
+    /// No enabled register matches: the access goes through the tables.
+    Miss,
+    /// A register matches: the access is not translated.
+    Hit,
+    /// A 68040/68060 register matches a write and its W bit is set: the
+    /// access is not translated, and it takes an access fault instead of
+    /// being performed (MC68040UM 3.1.3, MC68060UM 4.1.3).
+    WriteProtected,
+}
 
+/// 68040/68060 TTR W (write protect, bit 2).
+const TTR_040_W: u32 = 0x0000_0004;
+
+/// The transparent-translation outcome for an access in function-code space
+/// `fc` (the access's own code, or the SFC/DFC of a MOVES, PTEST or PLPA).
+///
+/// The 68030 compares both TT registers against every access. The 68040 and
+/// 68060 qualify instruction fetches (FC 2/6) with ITT0/ITT1 and every other
+/// access with DTT0/DTT1, and a match on a write-protected register (W=1)
+/// write-protects the access. When both registers of a pair match, the
+/// first one's attributes apply.
+#[inline]
+pub(crate) fn lookup(cpu: &CpuCore, addr: u32, fc: u8, write: bool) -> TtHit {
     match cpu.cpu_type {
         CpuType::M68030 => {
             // 68030 has two shared TTRs for both instruction and data
-            if ttr_matches(cpu.mmu_tt0, addr, fc, write) {
-                return Some(addr);
-            }
-            if ttr_matches(cpu.mmu_tt1, addr, fc, write) {
-                return Some(addr);
+            if ttr_matches(cpu.mmu_tt0, addr, fc, write)
+                || ttr_matches(cpu.mmu_tt1, addr, fc, write)
+            {
+                return TtHit::Hit;
             }
         }
         CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => {
             // The 040/060 TTRs carry the S-field, not 030 FC base/mask; the
-            // access's privilege is FC2 (MOVES' SFC/DFC override included).
+            // access's privilege is FC2.
             let supervisor = (fc & 4) != 0;
-            if instruction {
-                // Instruction access: check ITT0, ITT1
-                if ttr_matches_040(cpu.itt0, addr, supervisor) {
-                    return Some(addr);
-                }
-                if ttr_matches_040(cpu.itt1, addr, supervisor) {
-                    return Some(addr);
-                }
+            let (r0, r1) = if fc & 3 == 2 {
+                (cpu.itt0, cpu.itt1)
             } else {
-                // Data access: check DTT0, DTT1
-                if ttr_matches_040(cpu.dtt0, addr, supervisor) {
-                    return Some(addr);
-                }
-                if ttr_matches_040(cpu.dtt1, addr, supervisor) {
-                    return Some(addr);
+                (cpu.dtt0, cpu.dtt1)
+            };
+            for ttr in [r0, r1] {
+                if ttr_matches_040(ttr, addr, supervisor) {
+                    return if write && ttr & TTR_040_W != 0 {
+                        TtHit::WriteProtected
+                    } else {
+                        TtHit::Hit
+                    };
                 }
             }
         }
@@ -128,8 +134,29 @@ pub fn check_transparent_translation(
             // Other CPUs don't have TTRs
         }
     }
+    TtHit::Miss
+}
 
-    None
+/// Check if transparent translation applies for the given access.
+///
+/// For 68030: Checks TT0 and TT1.
+/// For 68040/68060: Checks ITT0/ITT1 for instruction accesses, DTT0/DTT1 for
+/// data. The 68060 registers have the 68040 layout (MC68060UM 4.1.3).
+///
+/// Returns `Some(physical_addr)` if a register matches (identity mapping),
+/// or `None` if normal page table translation should be used. A match on a
+/// write-protected 68040/68060 register is reported as a match: the address
+/// translation path turns a write through it into an access fault.
+pub fn check_transparent_translation(
+    cpu: &CpuCore,
+    addr: u32,
+    write: bool,
+    instruction: bool,
+) -> Option<u32> {
+    match lookup(cpu, addr, compute_function_code(cpu, instruction), write) {
+        TtHit::Miss => None,
+        TtHit::Hit | TtHit::WriteProtected => Some(addr),
+    }
 }
 
 /// Whether any register [`check_transparent_translation`] consults for this
