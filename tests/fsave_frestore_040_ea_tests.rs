@@ -146,12 +146,12 @@ fn fsave_indirect_and_frestore_absolute_decode() {
 }
 
 /// A 68040 FSAVE after the FPU has been used writes the 040's own IDLE
-/// frame -- version $41, size byte $28, $2C bytes in total -- not the
-/// 68881 co-processor's $18-byte frame. Guests validate the size byte:
-/// Linux/m68k's sigreturn accepts only $00/$28/$60 from a 68040 and
-/// SIGSEGVs the process on anything else, which turned every signal
-/// handler return in Debian/m68k into a "PANIC: segmentation violation"
-/// loop in init.
+/// frame -- the single long $41000000, version $41 and size byte $00
+/// (M68040UM 9.7) -- not the 68881 co-processor's $18-byte frame. Guests
+/// validate the size byte: Linux/m68k's sigreturn accepts only
+/// $00/$28/$60 from a 68040 and SIGSEGVs the process on anything else,
+/// which turned every signal handler return in Debian/m68k into a
+/// "PANIC: segmentation violation" loop in init.
 #[test]
 fn fsave_040_idle_frame_has_040_version_and_size() {
     let (mut cpu, mut bus) = setup_040();
@@ -171,27 +171,32 @@ fn fsave_040_idle_frame_has_040_version_and_size() {
     assert!(matches!(r, StepResult::Ok { .. }), "FSAVE: {r:?}");
 
     let header = bus.read_long_at(0x5008);
-    assert_eq!(header >> 24, 0x41, "68040 FPU frame version");
-    assert_eq!((header >> 16) & 0xFF, 0x28, "68040 IDLE frame size byte");
+    assert_eq!(
+        header, 0x4100_0000,
+        "68040 IDLE frame: version $41, size $00"
+    );
 
     let r = step(&mut cpu, &mut bus);
     assert!(matches!(r, StepResult::Ok { .. }), "FRESTORE: {r:?}");
 }
 
-/// FRESTORE (A7)+ of a 68040 IDLE frame advances the stack pointer by the
-/// whole $2C-byte frame, the size the frame's own size byte declares.
+/// FRESTORE (A7)+ advances the stack pointer by the whole frame, the size
+/// its own size byte declares: four bytes for the IDLE frame, $64 for a
+/// BUSY frame (size $60).
 #[test]
 fn frestore_postincrement_advances_by_the_040_frame_size() {
-    let (mut cpu, mut bus) = setup_040();
+    for (header, size) in [(0x4100_0000u32, 0u32), (0x4160_0000, 0x60)] {
+        let (mut cpu, mut bus) = setup_040();
 
-    bus.write_long_at(0x5000, 0x4128_0000); // 040 IDLE frame header
-    bus.write_word_at(0x0200, 0xF35F); // FRESTORE (A7)+
+        bus.write_long_at(0x5000, header);
+        bus.write_word_at(0x0200, 0xF35F); // FRESTORE (A7)+
 
-    let r = step(&mut cpu, &mut bus);
-    assert!(matches!(r, StepResult::Ok { .. }), "FRESTORE (A7)+: {r:?}");
-    assert_eq!(
-        cpu.dar[15],
-        0x5000 + 4 + 0x28,
-        "header + state bytes popped"
-    );
+        let r = step(&mut cpu, &mut bus);
+        assert!(matches!(r, StepResult::Ok { .. }), "FRESTORE (A7)+: {r:?}");
+        assert_eq!(
+            cpu.dar[15],
+            0x5000 + 4 + size,
+            "header + state bytes popped"
+        );
+    }
 }

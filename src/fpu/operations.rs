@@ -785,41 +785,52 @@ impl CpuCore {
     /// (MC68060UM, appendix D, FRESTORE). Firmware must hide the 060 FPU
     /// from operating systems that construct earlier FPUs' four-byte frames
     /// until their 68060 support library installs compatible task contexts.
+    /// The frame format byte (bits 15-8 of the first long) must be $00
+    /// (NULL), $60 (IDLE) or $E0 (EXCP); any other value takes a format
+    /// error exception with the address register unchanged (M68060UM 6.7).
     fn exec_frestore_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
-        match ea_mode {
-            2 | 3 => {
-                let addr = self.a(ea_reg);
-                let header = self.read_32(bus, addr);
-                let _ = self.read_32(bus, addr.wrapping_add(4));
-                let _ = self.read_32(bus, addr.wrapping_add(8));
-                let null_frame = (header & 0x0000_FF00) == 0;
-                if ea_mode == 3 {
-                    self.set_a(ea_reg, addr.wrapping_add(12));
-                }
-                if null_frame {
-                    self.do_frestore_null();
-                } else {
-                    self.fpu_just_reset = false;
-                }
-                8
-            }
+        let addr = match ea_mode {
+            2 | 3 => self.a(ea_reg),
             // Remaining control modes, plus PC-relative (the frame is a
-            // source operand): read the header at the resolved address,
-            // no register update.
+            // source operand): no register update.
             _ => match self.fpu_frame_control_ea(bus, ea_mode, ea_reg, true) {
-                Some(addr) => {
-                    let header = self.read_32(bus, addr);
-                    let _ = self.read_32(bus, addr.wrapping_add(4));
-                    let _ = self.read_32(bus, addr.wrapping_add(8));
-                    if (header & 0x0000_FF00) == 0 {
-                        self.do_frestore_null();
-                    } else {
-                        self.fpu_just_reset = false;
-                    }
-                    8
-                }
-                None => 0,
+                Some(addr) => addr,
+                None => return 0,
             },
+        };
+        let header = self.read_32(bus, addr);
+        if !matches!((header >> 8) & 0xFF, 0x00 | 0x60 | 0xE0) {
+            return self.take_exception(bus, crate::core::exceptions::vector::FORMAT_ERROR);
+        }
+        let _ = self.read_32(bus, addr.wrapping_add(4));
+        let _ = self.read_32(bus, addr.wrapping_add(8));
+        if ea_mode == 3 {
+            self.set_a(ea_reg, addr.wrapping_add(12));
+        }
+        if (header & 0x0000_FF00) == 0 {
+            self.do_frestore_null();
+        } else {
+            self.fpu_just_reset = false;
+        }
+        8
+    }
+
+    /// Whether a non-NULL 6888x/68040 state-frame header (version byte,
+    /// size byte) is one this FPU family accepts. A 6888x checks the
+    /// version against its own and the size against its IDLE and BUSY
+    /// frames (MC68881/MC68882UM 6.4.2). The crate has one 6888x model,
+    /// which saves the 68881's frames, so it accepts the sizes of both
+    /// parts: $18/$B4 (68881) and $38/$D4 (68882). The 68040 accepts
+    /// version $41 (or $40) with its IDLE ($00), UNIMP ($30; $28 for
+    /// version $40) and BUSY ($60) sizes (M68040UM 9.8). Anything else is
+    /// a format error.
+    fn fpu_frame_header_valid(&self, header: u32) -> bool {
+        let version = header >> 24;
+        let size = (header >> 16) & 0xFF;
+        if self.is_040() {
+            matches!(version, 0x40 | 0x41) && matches!(size, 0x00 | 0x28 | 0x30 | 0x60)
+        } else {
+            version == FPU_6888X_VERSION >> 24 && matches!(size, 0x18 | 0x38 | 0xB4 | 0xD4)
         }
     }
 
@@ -827,55 +838,38 @@ impl CpuCore {
         if self.is_060() {
             return self.exec_frestore_060(bus, ea_mode, ea_reg);
         }
-        match ea_mode {
-            2 => {
-                // (An)
-                let addr = self.a(ea_reg);
-                let header = self.read_32(bus, addr);
-                if (header & 0xFF00_0000) == 0 {
-                    self.do_frestore_null();
-                } else {
-                    self.fpu_just_reset = false;
-                }
-                8
-            }
-            3 => {
-                // (An)+
-                let addr = self.a(ea_reg);
-                self.set_a(ea_reg, addr.wrapping_add(4));
-                let header = self.read_32(bus, addr);
-
-                if (header & 0xFF00_0000) == 0 {
-                    self.do_frestore_null();
-                } else {
-                    self.fpu_just_reset = false;
-
-                    // The frame's size byte counts the state bytes after the
-                    // header long ($18 6888x idle, $38 unimp, $B4 busy, $28
-                    // 68040 idle, $60 68040 busy); the postincrement covers
-                    // header plus state. (EA macro already did +4.)
-                    let extra = (header >> 16) & 0x00FF;
-                    self.set_a(ea_reg, self.a(ea_reg).wrapping_add(extra));
-                }
-                8
-            }
+        let addr = match ea_mode {
+            2 | 3 => self.a(ea_reg),
             // Remaining control modes, plus PC-relative (the frame is a
-            // source operand): read the header at the resolved address,
-            // no register update. Linux/m68k's Amiga bootstrap resets the
-            // FPU with FRESTORE d16(sp) before jumping to the kernel.
+            // source operand): no register update. Linux/m68k's Amiga
+            // bootstrap resets the FPU with FRESTORE d16(sp) before jumping
+            // to the kernel.
             _ => match self.fpu_frame_control_ea(bus, ea_mode, ea_reg, true) {
-                Some(addr) => {
-                    let header = self.read_32(bus, addr);
-                    if (header & 0xFF00_0000) == 0 {
-                        self.do_frestore_null();
-                    } else {
-                        self.fpu_just_reset = false;
-                    }
-                    8
-                }
-                None => 0,
+                Some(addr) => addr,
+                None => return 0,
             },
+        };
+        let header = self.read_32(bus, addr);
+        if (header & 0xFF00_0000) == 0 {
+            if ea_mode == 3 {
+                self.set_a(ea_reg, addr.wrapping_add(4));
+            }
+            self.do_frestore_null();
+            return 8;
         }
+        if !self.fpu_frame_header_valid(header) {
+            // Format error: the frame is not restored and the address
+            // register is not updated; the stacked PC restarts FRESTORE.
+            return self.take_exception(bus, crate::core::exceptions::vector::FORMAT_ERROR);
+        }
+        self.fpu_just_reset = false;
+        if ea_mode == 3 {
+            // The frame's size byte counts the state bytes after the header
+            // long; the postincrement covers header plus state.
+            let size = (header >> 16) & 0x00FF;
+            self.set_a(ea_reg, addr.wrapping_add(4 + size));
+        }
+        8
     }
 
     fn do_frestore_null(&mut self) {
@@ -1589,19 +1583,20 @@ impl CpuCore {
     }
 }
 
-/// The FSAVE IDLE frame is CPU-specific: the 68040's on-chip FPU saves a
-/// version-$41 frame with size byte $28 ($2C bytes in total), while the
-/// 68881 co-processor of 020/030 systems saves the $18-byte IDLE frame.
-/// The size byte matters to guests: Linux/m68k validates a signal frame's
-/// saved FPU state against the per-CPU size set ($00/$28/$60 on the 040)
-/// before FRESTOREing it, and kills the process with SIGSEGV on any other
-/// value -- a 68881 frame from a 68040 FSAVE turns every signal-handler
-/// return into a fault.
+/// Version byte of the 6888x state frames this FPU saves (in bits 31-24).
+const FPU_6888X_VERSION: u32 = 0x1F00_0000;
+
+/// The FSAVE IDLE frame is CPU-specific: the 68040's on-chip FPU saves the
+/// four-byte frame $41000000 (version $41, size $00; M68040UM 9.7), while
+/// the 68881 coprocessor of 020/030 systems saves the $18-byte IDLE frame
+/// (MC68881/MC68882UM 6.4.2). The size byte matters to guests: Linux/m68k
+/// validates a signal frame's saved FPU state against the per-CPU size set
+/// ($00/$28/$60 on the 040) before FRESTOREing it.
 fn fsave_idle_frame(cpu: &CpuCore) -> (u32, u32, u32) {
     if cpu.is_040() {
-        (0x4128_0000, 11, 0) // header, total longs, last long
+        (0x4100_0000, 1, 0) // header, total longs, last long
     } else {
-        (0x1F18_0000, 7, 0x7000_0000)
+        (FPU_6888X_VERSION | 0x0018_0000, 7, 0x7000_0000)
     }
 }
 
@@ -1612,6 +1607,10 @@ pub(crate) fn fsave_extra_longs(cpu: &CpuCore) -> u32 {
 
 fn perform_fsave<B: AddressBus>(bus: &mut B, cpu: &mut CpuCore, addr: u32, inc: bool) {
     let (header, longs, last) = fsave_idle_frame(cpu);
+    if longs == 1 {
+        cpu.write_32(bus, addr, header);
+        return;
+    }
     if inc {
         cpu.write_32(bus, addr, header);
         for i in 1..longs - 1 {

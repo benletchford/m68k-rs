@@ -508,6 +508,47 @@ fn rounded_opmodes_are_f_line_on_a_6888x() {
 }
 
 #[test]
+fn frestore_of_an_invalid_frame_is_a_format_error() {
+    for cpu in ALL_FPUS {
+        for (name, opcode) in [("(A0)", 0xF350u16), ("(A0)+", 0xF358)] {
+            let mut m = Machine::new(cpu);
+            m.cpu.fpcr = 0x0010;
+            for i in 0..4 {
+                m.bus
+                    .write_long(DATA + 4 * i, if i == 0 { 0x5A5A_5A5A } else { 0 });
+            }
+            m.cpu.dar[8] = DATA;
+            m.run(&[opcode]);
+            assert_eq!(m.vector(), Some(14), "{cpu:?} FRESTORE {name}");
+            let (_, pc, fv) = m.frame();
+            assert_eq!(pc, CODE, "{cpu:?} {name}: restarts FRESTORE");
+            assert_eq!(fv, 14 * 4, "{cpu:?} {name}: format $0");
+            assert_eq!(m.cpu.dar[8], DATA, "{cpu:?} {name}: A0 not updated");
+            assert_eq!(m.cpu.fpcr, 0x0010, "{cpu:?} {name}: FPU state kept");
+        }
+    }
+}
+
+#[test]
+fn fsave_idle_frames_round_trip_through_frestore() {
+    // (cpu, IDLE header, frame bytes)
+    for (cpu, header, size) in [
+        (CpuType::M68030, 0x1F18_0000u32, 0x1Cu32),
+        (CpuType::M68040, 0x4100_0000, 4),
+        (CpuType::M68060, 0x0000_6000, 12),
+    ] {
+        let mut m = Machine::new(cpu);
+        m.cpu.dar[8] = DATA + 0x100;
+        // FMOVE.L #1,FP0 (leave the NULL state), FSAVE -(A0),
+        // FRESTORE (A0)+.
+        m.run(&[0xF23C, 0x4000, 0, 1, 0xF320, 0xF358]);
+        assert_eq!(m.vector(), None, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 0x100 - size), header, "{cpu:?}");
+        assert_eq!(m.cpu.dar[8], DATA + 0x100, "{cpu:?}: (A0)+ pops the frame");
+    }
+}
+
+#[test]
 fn fmod_and_frem_signal_a_signaling_nan_source_under_a_quiet_nan_destination() {
     // The destination NaN is the result, but the signaling NaN in the
     // source still raises SNAN (MC68881/MC68882UM 4.6.4). FMOD and FREM
