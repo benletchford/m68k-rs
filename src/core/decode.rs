@@ -377,6 +377,9 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         if fpu_disabled_060 {
             return cpu.take_fp_disabled_060(bus);
         }
+        if let Some(cycles) = cpu.fpu_take_pending_exception(bus) {
+            return cycles;
+        }
         let w2 = cpu.read_imm_16(bus);
         let cond = (w2 & 0x3F) as u8;
         if ea_mode == 1 {
@@ -409,19 +412,30 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
 
     // FBcc.W: 1111 0010 10cc cccc (0xF280-0xF2BF)
     // FBcc.L: 1111 0010 11cc cccc (0xF2C0-0xF2FF)
-    if (opcode & 0xFF80) == 0xF280 && fpu_disabled_060 {
-        return cpu.take_fp_disabled_060(bus);
+    if (opcode & 0xFF80) == 0xF280 {
+        if fpu_disabled_060 {
+            return cpu.take_fp_disabled_060(bus);
+        }
+        if let Some(cycles) = cpu.fpu_take_pending_exception(bus) {
+            return cycles;
+        }
     }
     if (opcode & 0xFFC0) == 0xF280 {
         // FBcc.W - 16-bit displacement
         let cond = (opcode & 0x3F) as u8;
         let disp = cpu.read_imm_16(bus) as i16 as i32;
+        if let Some(cycles) = cpu.fpu_bsun_exception(bus, cond) {
+            return cycles;
+        }
         return cpu.exec_fbcc(cond, disp);
     }
     if (opcode & 0xFFC0) == 0xF2C0 {
         // FBcc.L - 32-bit displacement
         let cond = (opcode & 0x3F) as u8;
         let disp = cpu.read_imm_32(bus) as i32;
+        if let Some(cycles) = cpu.fpu_bsun_exception(bus, cond) {
+            return cycles;
+        }
         return cpu.exec_fbcc(cond, disp);
     }
 
@@ -1321,9 +1335,12 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                                     // 68020/68030 coprocessor mid-instruction
                                     // frame (10 words): discard the
                                     // instruction address and the four
-                                    // internal words. This core never stacks
-                                    // it, so there is no coprocessor state
-                                    // to resume; the frame is only accepted.
+                                    // internal words (for an FMOVE out, the
+                                    // destination address). The core stacks
+                                    // it for an enabled 6888x FMOVE-out
+                                    // exception after the move has completed,
+                                    // so there is no coprocessor state to
+                                    // resume.
                                     let sr = cpu.pull_16(bus);
                                     cpu.pc = cpu.pull_32(bus);
                                     let _ = cpu.pull_16(bus); // format word

@@ -168,6 +168,17 @@ impl CpuCore {
         let w2 = self.read_16(bus, self.pc);
         let subop = (w2 >> 13) & 0x7;
 
+        // An exception the previous FPU operation left unreported is
+        // taken now, before this instruction does anything. The moves of
+        // the system control registers and FMOVEM do not report it
+        // (MC68881/MC68882UM 4.6, "FMOVE system control register" and
+        // "FMOVEM"): a handler uses them to read and repair the registers.
+        if !matches!(subop, 0x4..=0x7)
+            && let Some(cycles) = self.fpu_take_pending_exception(bus)
+        {
+            return cycles;
+        }
+
         // Executing any general FPU instruction takes the 6888x out of
         // its reset NULL state (FSAVE then produces a real frame).
         self.fpu_just_reset = false;
@@ -208,12 +219,13 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
+                    self.fpiar = self.ppc;
                     let ctx = self.fpu_ctx(0);
                     let mut f = ExcFlags::default();
                     self.fpr[dst] = softfloat::fmovecr(opmode as usize, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
                     self.fpu_commit(f);
-                    return 4;
+                    return self.fpu_hold_exception(4);
                 }
 
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {
@@ -251,10 +263,11 @@ impl CpuCore {
                     }
                 }
 
+                self.fpiar = self.ppc;
                 let Some((src, src_flags)) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
                 };
-                self.fpu_apply_op(opmode, dst, src, src_flags)
+                self.fpu_general_op(opmode, dst, src, src_flags)
             }
             0x3 => {
                 // FMOVE FP, <ea> - move FP register to memory/integer register
@@ -289,11 +302,24 @@ impl CpuCore {
                 let ea_mode = (ea >> 3) & 7;
                 let ea_reg = (ea & 7) as usize;
 
-                if self.fpu_write_dest(bus, ea_mode, ea_reg, dst_fmt, kfactor, self.fpr[src]) {
-                    4
-                } else {
-                    0
+                self.fpiar = self.ppc;
+                let Some(dest) =
+                    self.fpu_write_dest(bus, ea_mode, ea_reg, dst_fmt, kfactor, self.fpr[src])
+                else {
+                    return 0;
+                };
+                // An enabled exception of the conversion is signalled by
+                // the 6888x during the instruction, once the destination
+                // is written: the 68020/030 stacks the mid-instruction
+                // frame with the destination address. The 68040/68060
+                // move-out exception reporting is not modelled; they
+                // complete.
+                if self.fpu_is_6888x()
+                    && let Some(vector) = self.fpu_enabled_exception(0x7F)
+                {
+                    return self.take_fp_mid_instruction_exception(bus, vector, dest);
                 }
+                4
             }
             0x0 => {
                 // FP register-to-register operations (FMOVE FPm,FPn, FADD, FSUB, FMUL, FDIV, FCMP, etc.)
@@ -315,12 +341,13 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
+                    self.fpiar = self.ppc;
                     let ctx = self.fpu_ctx(0);
                     let mut f = ExcFlags::default();
                     self.fpr[dst] = softfloat::fmovecr(src, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
                     self.fpu_commit(f);
-                    return 4;
+                    return self.fpu_hold_exception(4);
                 }
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {
                     // Register-to-register form of an unimplemented FP
@@ -330,7 +357,8 @@ impl CpuCore {
                 if self.trap_unimpl_040() && fpu_040_traps_opmode(opmode) {
                     return self.take_fp_unimp_060(bus, 0);
                 }
-                self.fpu_apply_op(opmode, dst, self.fpr[src], ExcFlags::default())
+                self.fpiar = self.ppc;
+                self.fpu_general_op(opmode, dst, self.fpr[src], ExcFlags::default())
             }
             0x6 | 0x7 => {
                 // FMOVEM - move multiple FP registers to/from memory
@@ -528,6 +556,91 @@ impl CpuCore {
         }
     }
 
+    /// The highest-priority exception of `mask` (an FPSR exception-byte
+    /// mask) that the instruction just raised with its FPCR enable bit set,
+    /// as its vector: BSUN, SNAN, OPERR, OVFL, UNFL, DZ, then INEX2/INEX1
+    /// sharing vector 49 (MC68881/MC68882UM 6.1 and 6.1.9, M68040UM 9.7,
+    /// M68060UM 6.5). An overflow whose own exception is disabled takes
+    /// the inexact exception when INEX2 is enabled, whether or not INEX2
+    /// is set (MC68881/MC68882UM 6.1.7 and 6.1.10, M68040UM 9.7.7).
+    fn fpu_enabled_exception(&self, mask: u32) -> Option<u32> {
+        use crate::core::exceptions::vector;
+        let raised = self.fpsr >> 8;
+        let inexact_on_overflow = (raised & 0x10) >> 3;
+        let pending = (raised | inexact_on_overflow) & (self.fpcr >> 8) & mask;
+        [
+            (0x80, vector::FP_BSUN),
+            (0x40, vector::FP_SNAN),
+            (0x20, vector::FP_OPERR),
+            (0x10, vector::FP_OVFL),
+            (0x08, vector::FP_UNFL),
+            (0x04, vector::FP_DZ),
+            (0x03, vector::FP_INEX),
+        ]
+        .into_iter()
+        .find(|&(bit, _)| pending & bit != 0)
+        .map(|(_, v)| v)
+    }
+
+    /// Hold an enabled arithmetic exception of the operation that just
+    /// completed (`cycles` != 0) for the next FPU instruction. The FPSR
+    /// exception and accrued bytes are already updated and FPIAR holds
+    /// the operation's address. The 6888x does not interrupt the main
+    /// processor here: integer instructions keep running, and the
+    /// exception is reported when the next FPU instruction starts
+    /// (MC68881/MC68882UM 6.1). See [`Self::fpu_take_pending_exception`].
+    ///
+    /// 6888x only. The 68040 and 68060 report these exceptions the same
+    /// way, but their handlers read the operands from state frames that
+    /// are not saved yet, so their enabled arithmetic exceptions are not
+    /// taken: the instruction completes with the disabled result.
+    fn fpu_hold_exception(&mut self, cycles: i32) -> i32 {
+        if cycles != 0
+            && self.fpu_is_6888x()
+            && let Some(vector) = self.fpu_enabled_exception(0x7F)
+        {
+            self.fpu_exception_pending = vector as u8;
+        }
+        cycles
+    }
+
+    /// Report the exception a previous FPU operation left pending, as a
+    /// pre-instruction exception of the FPU instruction now starting:
+    /// that instruction does not execute, and the format $0 frame's PC
+    /// restarts it after the handler returns. Called by the arithmetic,
+    /// FMOVE and conditional FPU instructions; FMOVEM, the moves of the
+    /// control registers, FSAVE and FRESTORE do not report it. `None` =
+    /// nothing pending, the instruction proceeds.
+    pub(crate) fn fpu_take_pending_exception<B: AddressBus>(&mut self, bus: &mut B) -> Option<i32> {
+        let vector = std::mem::take(&mut self.fpu_exception_pending);
+        (vector != 0).then(|| self.take_exception(bus, u32::from(vector)))
+    }
+
+    /// Run a general operation into FP register `dst` and hold its
+    /// enabled exception. On a 6888x an enabled SNAN, OPERR or DZ stops
+    /// the operation before it stores a result: the FP data registers
+    /// keep their values, so the handler still finds the operands. An
+    /// enabled OVFL, UNFL or INEX stores the result the disabled case
+    /// stores (MC68881/MC68882UM 6.1.2 to 6.1.7).
+    fn fpu_general_op(
+        &mut self,
+        opmode: u16,
+        dst: usize,
+        src: FloatX80,
+        src_flags: ExcFlags,
+    ) -> i32 {
+        const SNAN_OPERR_DZ: u32 = 0x64;
+        let registers = self.fpr;
+        let cycles = self.fpu_apply_op(opmode, dst, src, src_flags);
+        if cycles != 0
+            && self.fpu_is_6888x()
+            && (self.fpsr >> 8) & (self.fpcr >> 8) & SNAN_OPERR_DZ != 0
+        {
+            self.fpr = registers;
+        }
+        self.fpu_hold_exception(cycles)
+    }
+
     /// The FSxxx/FDxxx opmodes ($40-$7F: FSMOVE, FDADD, FSSQRT, ...) exist
     /// only on the 68040 and 68060 (M68040UM 9.4, M68000PRM 4.3). On a
     /// 6888x they are illegal coprocessor commands, which the 68020/030
@@ -535,6 +648,29 @@ impl CpuCore {
     /// (MC68881/MC68882UM 7.4.2, MC68020UM 10.4.2).
     fn fpu_6888x_illegal_opmode(&self, opmode: u16) -> bool {
         self.fpu_is_6888x() && opmode & 0x40 != 0
+    }
+
+    /// The BSUN exception of a conditional instruction: an IEEE-nonaware
+    /// predicate ($10-$1F) with the NAN condition code set raises BSUN (see
+    /// [`Self::fpu_condition`]); with BSUN enabled in FPCR the instruction
+    /// does not execute and takes vector 48 as a pre-instruction exception,
+    /// format $0 with the stacked PC restarting it (MC68881/MC68882UM 6.1.1,
+    /// M68040UM 9.5.1, M68060UM 6.5.1). The handler must clear NAN or the
+    /// enable before returning. `None` = the instruction proceeds.
+    pub(crate) fn fpu_bsun_exception<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        condition: u8,
+    ) -> Option<i32> {
+        const FPCC_NAN: u32 = 0x0100_0000;
+        if condition & 0x10 == 0 || self.fpsr & FPCC_NAN == 0 {
+            return None;
+        }
+        self.fpsr |= 0x0000_8080; // BSUN, accrued IOP
+        if self.fpcr & 0x8000 == 0 {
+            return None;
+        }
+        Some(self.take_exception(bus, crate::core::exceptions::vector::FP_BSUN))
     }
 
     /// FBcc - FPU conditional branch.
@@ -564,6 +700,9 @@ impl CpuCore {
         ea_reg: usize,
         condition: u8,
     ) -> i32 {
+        if let Some(cycles) = self.fpu_bsun_exception(bus, condition) {
+            return cycles;
+        }
         let value = if self.fpu_condition(condition) {
             0xFFu8
         } else {
@@ -588,6 +727,9 @@ impl CpuCore {
     pub fn exec_fdbcc<B: AddressBus>(&mut self, bus: &mut B, reg: usize, condition: u8) -> i32 {
         let disp_base = self.pc;
         let disp = self.read_imm_16(bus) as i16 as i32;
+        if let Some(cycles) = self.fpu_bsun_exception(bus, condition) {
+            return cycles;
+        }
         if !self.fpu_condition(condition) {
             let count = (self.d(reg) as u16).wrapping_sub(1);
             self.set_d(reg, (self.d(reg) & 0xFFFF_0000) | u32::from(count));
@@ -609,6 +751,9 @@ impl CpuCore {
     ) -> i32 {
         for _ in 0..imm_words {
             let _ = self.read_imm_16(bus);
+        }
+        if let Some(cycles) = self.fpu_bsun_exception(bus, condition) {
+            return cycles;
         }
         if self.fpu_condition(condition) {
             // FTRAPcc takes the TRAPcc/TRAPV exception vector (7).
@@ -733,9 +878,6 @@ impl CpuCore {
     /// NULL (MC68060UM, section 6.7, pp. 6-35–6-36; appendix D, FSAVE).
     /// The four-byte
     /// NULL frame used by earlier FPUs does not apply to the 68060.
-    /// The EXCP frame ($E0, carrying pending-
-    /// exception operands) is not modeled: the softfloat FPU completes
-    /// every operation before retiring.
     fn exec_fsave_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
         let header = if self.fpu_just_reset {
             0x0000_0000
@@ -788,6 +930,8 @@ impl CpuCore {
     /// The frame format byte (bits 15-8 of the first long) must be $00
     /// (NULL), $60 (IDLE) or $E0 (EXCP); any other value takes a format
     /// error exception with the address register unchanged (M68060UM 6.7).
+    /// The exception an EXCP frame carries is not held: the 68060's
+    /// arithmetic exceptions are not taken yet.
     fn exec_frestore_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
         let addr = match ea_mode {
             2 | 3 => self.a(ea_reg),
@@ -863,16 +1007,30 @@ impl CpuCore {
             return self.take_exception(bus, crate::core::exceptions::vector::FORMAT_ERROR);
         }
         self.fpu_just_reset = false;
+        // The frame's size byte counts the state bytes after the header
+        // long.
+        let size = (header >> 16) & 0x00FF;
+        // A 6888x IDLE frame ends with the BIU flags, whose bit 27 is
+        // clear while an exception is unreported: restoring such a frame
+        // makes the enabled exception in FPSR pending again
+        // (MC68881/MC68882UM 6.4.2). Every other frame leaves none.
+        self.fpu_exception_pending = 0;
+        if self.fpu_is_6888x()
+            && matches!(size, 0x18 | 0x38)
+            && self.read_32(bus, addr.wrapping_add(size)) & BIU_NO_EXCEPTION_PENDING == 0
+            && let Some(vector) = self.fpu_enabled_exception(0x7F)
+        {
+            self.fpu_exception_pending = vector as u8;
+        }
         if ea_mode == 3 {
-            // The frame's size byte counts the state bytes after the header
-            // long; the postincrement covers header plus state.
-            let size = (header >> 16) & 0x00FF;
+            // The postincrement covers header plus state.
             self.set_a(ea_reg, addr.wrapping_add(4 + size));
         }
         8
     }
 
     fn do_frestore_null(&mut self) {
+        self.fpu_exception_pending = 0;
         self.fpcr = 0;
         self.fpsr = 0;
         self.fpiar = 0;
@@ -1463,8 +1621,9 @@ impl CpuCore {
 
     /// Write `value` to the FMOVE destination in `fmt`. Integer formats
     /// round per FPCR and saturate; packed-decimal formats 3 and 7 honor
-    /// their static or dynamic k-factor. Returns false if the format/EA
-    /// combination is invalid.
+    /// their static or dynamic k-factor. Returns the address written (0
+    /// for a data register), or `None` if the format/EA combination is
+    /// invalid.
     fn fpu_write_dest<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -1473,17 +1632,19 @@ impl CpuCore {
         fmt: u16,
         kfactor: i8,
         value: FloatX80,
-    ) -> bool {
+    ) -> Option<u32> {
         let bytes: u32 = match fmt {
             6 => 1,
             4 => 2,
             0 | 1 => 4,
             5 => 8,
             2 | 3 | 7 => 12, // extended and packed-decimal (static/dynamic k)
-            _ => return false,
+            _ => return None,
         };
-        let Some(ea) = self.fpu_ea(bus, ea_mode, ea_reg, bytes) else {
-            return false;
+        let ea = self.fpu_ea(bus, ea_mode, ea_reg, bytes)?;
+        let address = match ea {
+            FpuEa::Memory(addr) => addr,
+            _ => 0,
         };
         let value = canonical_zero(value);
         // Integer, single and double results are rounded once, straight
@@ -1579,24 +1740,36 @@ impl CpuCore {
         if written {
             self.fpu_commit(f);
         }
-        written
+        written.then_some(address)
     }
 }
 
 /// Version byte of the 6888x state frames this FPU saves (in bits 31-24).
 const FPU_6888X_VERSION: u32 = 0x1F00_0000;
 
+/// Bit 27 of the BIU flags, the last long of a 6888x IDLE frame: set when
+/// no exception is waiting to be reported, clear while one is
+/// (MC68881/MC68882UM 6.4.2). An exception handler sets it in the frame it
+/// saved before restoring it.
+const BIU_NO_EXCEPTION_PENDING: u32 = 0x0800_0000;
+
 /// The FSAVE IDLE frame is CPU-specific: the 68040's on-chip FPU saves the
 /// four-byte frame $41000000 (version $41, size $00; M68040UM 9.7), while
 /// the 68881 coprocessor of 020/030 systems saves the $18-byte IDLE frame
-/// (MC68881/MC68882UM 6.4.2). The size byte matters to guests: Linux/m68k
+/// (MC68881/MC68882UM 6.4.2), whose BIU flags say whether an exception is
+/// still unreported. The size byte matters to guests: Linux/m68k
 /// validates a signal frame's saved FPU state against the per-CPU size set
 /// ($00/$28/$60 on the 040) before FRESTOREing it.
 fn fsave_idle_frame(cpu: &CpuCore) -> (u32, u32, u32) {
     if cpu.is_040() {
         (0x4100_0000, 1, 0) // header, total longs, last long
     } else {
-        (FPU_6888X_VERSION | 0x0018_0000, 7, 0x7000_0000)
+        let biu = if cpu.fpu_exception_pending == 0 {
+            0x7000_0000 | BIU_NO_EXCEPTION_PENDING
+        } else {
+            0x7000_0000
+        };
+        (FPU_6888X_VERSION | 0x0018_0000, 7, biu)
     }
 }
 
@@ -1605,8 +1778,13 @@ pub(crate) fn fsave_extra_longs(cpu: &CpuCore) -> u32 {
     fsave_idle_frame(cpu).1 - 1
 }
 
+/// Write the IDLE frame. The state it saves includes an exception that is
+/// still unreported, which is therefore no longer pending in the FPU: the
+/// 6888x frame records it, and FRESTORE of that frame brings it back. The
+/// 68040 frames that carry one are not modelled, so there it is dropped.
 fn perform_fsave<B: AddressBus>(bus: &mut B, cpu: &mut CpuCore, addr: u32, inc: bool) {
     let (header, longs, last) = fsave_idle_frame(cpu);
+    cpu.fpu_exception_pending = 0;
     if longs == 1 {
         cpu.write_32(bus, addr, header);
         return;

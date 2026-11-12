@@ -216,6 +216,15 @@ pub struct CpuCore {
     pub is_pre_68020: bool,
     /// FPU just reset
     pub fpu_just_reset: bool,
+    /// Vector (48-54) of an enabled FPU arithmetic exception that an FPU
+    /// operation raised and that has not been reported yet; 0 when none.
+    /// The FPU holds it until the next FPU instruction and reports it as
+    /// a pre-instruction exception of that instruction (MC68881/MC68882UM
+    /// 6.1 and 6.2, M68040UM 9.5, M68060UM 6.5). FSAVE and FRESTORE do
+    /// not report it: FSAVE moves it into the state frame, and FRESTORE
+    /// loads it from one.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) fpu_exception_pending: u8,
     /// Whether a floating-point unit is fitted. On the 68020/030 it says
     /// whether an external 68881/68882 is attached; when false, cpID-1
     /// F-line operations raise Line-F. The 040 models FPU absence through
@@ -642,6 +651,7 @@ impl CpuCore {
             // A real 6888x comes out of reset in the NULL state: FSAVE
             // writes a NULL frame until the first FPU instruction runs.
             fpu_just_reset: true,
+            fpu_exception_pending: 0,
             reset_cycles: 0,
             cyc_bcc_notake_b: -2,
             cyc_bcc_notake_w: 2,
@@ -821,6 +831,8 @@ impl CpuCore {
     pub fn pulse_reset(&mut self) {
         self.clear_execution_pipeline_state();
         self.stopped = 0;
+        // Reset also resets the FPU, which drops an unreported exception.
+        self.fpu_exception_pending = 0;
         self.t1_flag = 0;
         self.t0_flag = 0;
         self.m_flag = 0;
