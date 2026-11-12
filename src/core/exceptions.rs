@@ -65,6 +65,9 @@ pub mod vector {
 /// 68060 fault status long word (FSLW) bits, as consumed by OS fault
 /// handlers (bit names per MC68060UM Table 8-9 / Linux asm/traps.h).
 pub mod fslw {
+    /// Misaligned access: the fault is on the second or a later part of an
+    /// operand split into several bus cycles.
+    pub const MA: u32 = 0x0800_0000;
     /// Read access.
     pub const RW_R: u32 = 0x0100_0000;
     /// Write access.
@@ -456,7 +459,10 @@ impl CpuCore {
                 // fault address long at +$08 and the fault status long word
                 // (FSLW) at +$0C. The instruction has been rolled back, so
                 // RTE restarts it (same demand-paging model as the 040).
-                let fslw = fslw_060(write, instruction, size, fc, cause);
+                let mut fslw = fslw_060(write, instruction, size, fc, cause);
+                if self.mmu_misaligned_tail {
+                    fslw |= fslw::MA;
+                }
                 let fmt_vec = 0x4000 | ((vector::BUS_ERROR as u16) << 2);
                 self.push_32(bus, fslw);
                 self.push_32(bus, address);
@@ -490,7 +496,10 @@ impl CpuCore {
                     2 => 0x0040, // word
                     _ => 0x0000, // long
                 };
-                let ssw = rw | atc | sz | (fc & 0x7); // TM = function code
+                // MA (bit 11): the fault is on a later part of an operand
+                // split into several bus cycles.
+                let ma = if self.mmu_misaligned_tail { 0x0800 } else { 0 };
+                let ssw = rw | ma | atc | sz | (fc & 0x7); // TM = function code
                 let fmt_vec = 0x7000 | ((vector::BUS_ERROR as u16) << 2);
                 // A normal faulted write is reported in writeback slot 3 (V
                 // bit, size and TM in WB3S; address and data in WB3A/WB3D),

@@ -116,6 +116,7 @@ fn raw_state(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         atc_030,
         pending_fault_cause,
         mmu_fc_override,
+        mmu_misaligned_tail,
         mmu_read_override,
         mmu_write_suppress,
         pending_fault_wdata,
