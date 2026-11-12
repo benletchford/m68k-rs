@@ -320,18 +320,14 @@ impl CpuCore {
         // calculating quotient and remainder. Preserve X; N/Z are not
         // defined for divide overflow on this processor.
         if dst == i32::MIN && src == -1 {
+            // The quotient (+2^31) does not fit 16 bits: an overflow like
+            // any other, on every model. V is set, C cleared and the
+            // destination register is left unchanged.
+            self.v_flag = 0x80;
+            self.c_flag = 0;
             if m68000 {
-                self.v_flag = 0x80;
                 self.n_flag = 0x80;
                 self.not_z_flag = 1; // Z = 0
-                self.c_flag = 0;
-            } else {
-                // Preserve the historical behavior for other CPU models.
-                self.set_d(dst_reg, 0);
-                self.not_z_flag = 0;
-                self.n_flag = 0;
-                self.v_flag = 0;
-                self.c_flag = 0;
             }
             return cycles;
         }

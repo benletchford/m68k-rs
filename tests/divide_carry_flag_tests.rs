@@ -135,3 +135,24 @@ fn long_divide_overflow_clears_carry() {
         assert_ne!(sr & SR_X, 0, "{cpu_type:?}: X kept");
     }
 }
+
+#[test]
+fn most_negative_dividend_by_minus_one_overflows_on_every_model() {
+    // DIVS.W D1,D0 with D0 = $80000000 and D1 = -1: the quotient is +2^31,
+    // far outside 16 bits. V is set, C cleared, D0 left unchanged.
+    for cpu_type in WORD_MODELS {
+        let (mut cpu, mut bus) = setup(cpu_type, &[0x81c1, 0x4e71, 0x4e71]);
+        cpu.set_d(0, 0x8000_0000);
+        cpu.set_d(1, 0x0000_ffff);
+        cpu.set_sr(0x2700 | SR_X | SR_C);
+
+        step(&mut cpu, &mut bus);
+
+        let sr = cpu.get_sr();
+        assert_eq!(cpu.pc, PC + 2, "{cpu_type:?}: no trap");
+        assert_eq!(cpu.d(0), 0x8000_0000, "{cpu_type:?}: D0 unchanged");
+        assert_ne!(sr & SR_V, 0, "{cpu_type:?}: V set");
+        assert_eq!(sr & SR_C, 0, "{cpu_type:?}: C cleared");
+        assert_ne!(sr & SR_X, 0, "{cpu_type:?}: X kept");
+    }
+}
