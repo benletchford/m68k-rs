@@ -1033,19 +1033,22 @@ impl CpuCore {
                 4
             }
             0x18 | 0x58 | 0x5C => {
-                // FABS / FSABS / FDABS
+                // FABS / FSABS / FDABS: the absolute value, then rounded to
+                // the precision (M68000PRM FABS). The order matters under
+                // RM/RP, which round a negative source the other way.
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = src_flags;
-                self.fpr[dst] = softfloat::abs(softfloat::round_to_precision(src, ctx, &mut f));
+                self.fpr[dst] = softfloat::round_to_precision(softfloat::abs(src), ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4
             }
             0x1A | 0x5A | 0x5E => {
-                // FNEG / FSNEG / FDNEG
+                // FNEG / FSNEG / FDNEG: the negation, then rounded to the
+                // precision (M68000PRM FNEG), as for FABS.
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = src_flags;
-                self.fpr[dst] = softfloat::neg(softfloat::round_to_precision(src, ctx, &mut f));
+                self.fpr[dst] = softfloat::round_to_precision(softfloat::neg(src), ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4

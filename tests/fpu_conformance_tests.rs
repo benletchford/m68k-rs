@@ -53,6 +53,8 @@ const CC_NAN: u32 = 0x0100_0000;
 const EXC_SNAN: u32 = 0x4000;
 /// FPSR accrued-exception bits.
 const AEXC_IOP: u32 = 0x0080;
+const AEXC_INEX: u32 = 0x0008;
+const EXC_INEX2: u32 = 0x0200;
 
 struct Machine {
     cpu: CpuCore,
@@ -160,10 +162,16 @@ fn fmovem_control_list_masks_each_register() {
 /// Run `FOP FP1,FP0` (register form, `opmode`) with FP1 = `src`, FP0 =
 /// `dst` and FPSR cleared.
 fn reg_op(cpu: CpuType, opmode: u16, src: (u16, u64), dst: (u16, u64)) -> Machine {
+    reg_op_fpcr(cpu, opmode, src, dst, 0)
+}
+
+/// `reg_op` with FPCR = `fpcr`.
+fn reg_op_fpcr(cpu: CpuType, opmode: u16, src: (u16, u64), dst: (u16, u64), fpcr: u32) -> Machine {
     let mut m = Machine::new(cpu);
     m.cpu.fpr[1] = x80(src.0, src.1);
     m.cpu.fpr[0] = x80(dst.0, dst.1);
     m.cpu.fpsr = 0;
+    m.cpu.fpcr = fpcr;
     m.run(&[0xF200, 0x0400 | opmode]);
     m
 }
@@ -283,4 +291,28 @@ fn nan_operand_keeps_its_sign_and_wins_over_other_rules() {
     let m = reg_op(CpuType::M68030, 0x26, qnan, zero);
     assert_eq!(bits(m.cpu.fpr[0]), qnan);
     assert_eq!(m.cpu.fpsr, CC_NAN);
+}
+
+#[test]
+fn fabs_and_fneg_round_the_result_not_the_operand() {
+    // -sqrt(2) and +sqrt(2) in extended; rounded to single toward minus
+    // infinity |-sqrt(2)| is $B504F3 (truncated), not $B504F4.
+    let neg_root2 = (0xBFFF, 0xB504_F333_F9DE_6484);
+    let pos_root2 = (0x3FFF, 0xB504_F333_F9DE_6484);
+    let trunc = 0xB504_F300_0000_0000;
+    for cpu in [CpuType::M68040, CpuType::M68060] {
+        // FSABS / FSNEG under RM / RP.
+        let m = reg_op_fpcr(cpu, 0x58, neg_root2, (0, 0), 0x20);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x3FFF, trunc), "{cpu:?} FSABS RM");
+        assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} FSABS RM");
+        let m = reg_op_fpcr(cpu, 0x5A, pos_root2, (0, 0), 0x30);
+        assert_eq!(bits(m.cpu.fpr[0]), (0xBFFF, trunc), "{cpu:?} FSNEG RP");
+    }
+    // FABS / FNEG with FPCR single precision on every FPU.
+    for cpu in ALL_FPUS {
+        let m = reg_op_fpcr(cpu, 0x18, neg_root2, (0, 0), 0x60);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x3FFF, trunc), "{cpu:?} FABS RM.S");
+        let m = reg_op_fpcr(cpu, 0x1A, pos_root2, (0, 0), 0x70);
+        assert_eq!(bits(m.cpu.fpr[0]), (0xBFFF, trunc), "{cpu:?} FNEG RP.S");
+    }
 }
