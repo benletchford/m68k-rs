@@ -858,3 +858,64 @@ fn translate_040<B: AddressBus>(
     );
     Ok(phys_page | (logical & page_mask))
 }
+
+/// 68040 PTESTR/PTESTW: search for `logical` in function-code space `fc`
+/// (from DFC) as a read or a write and return the MMUSR the search leaves
+/// (MC68040UM 3.5, M68000PRM PTEST):
+///
+/// - a transparent-translation hit (ITTn for FC 2/6, DTTn otherwise): T and
+///   R only;
+/// - a resident page: the physical address (bits 31-12) and the G, U1/U0,
+///   S, CM and M fields of the page descriptor, W accumulated along the
+///   path, and R. Protection does not stop the search: a write-protected
+///   page tested with PTESTW, or a supervisor-only page tested from a user
+///   space, still reports R with W or S;
+/// - an invalid descriptor anywhere on the path: zero;
+/// - a bus error during the search: B.
+///
+/// The search is a table search like any other: it sets the history bits
+/// as an access of that direction would and loads the ATC entry.
+pub(crate) fn ptest_040<B: AddressBus>(
+    cpu: &mut CpuCore,
+    bus: &mut B,
+    logical: u32,
+    fc: u8,
+    write: bool,
+) -> u32 {
+    const MMUSR_B: u32 = 0x0000_0800;
+    const MMUSR_T: u32 = 0x0000_0002;
+    const MMUSR_R: u32 = 0x0000_0001;
+    /// G, U1, U0, S and CM: copied from the page descriptor.
+    const DESC_FIELDS: u32 = 0x0000_07E0;
+    if !cpu.pmmu_enabled || !cpu.has_pmmu {
+        // Translation disabled: the address is its own physical address.
+        return (logical & 0xFFFF_F000) | MMUSR_R;
+    }
+    if super::ttr::lookup(cpu, logical, fc, false) != TtHit::Miss {
+        return MMUSR_T | MMUSR_R;
+    }
+    let supervisor = fc & 4 != 0;
+    let page_bits = if cpu.mmu_tc & 0x0000_4000 != 0 {
+        13
+    } else {
+        12
+    };
+    match walk_040(cpu, bus, logical, write, supervisor, page_bits) {
+        Ok(walk) => {
+            let d = walk.page_desc;
+            let page_mask = (1u32 << page_bits) - 1;
+            cpu.atc.insert_entry(
+                logical >> page_bits,
+                supervisor,
+                d & !page_mask,
+                walk.write_protected,
+                d & S_040 != 0,
+                d & M_040 != 0,
+            );
+            let w = if walk.write_protected { W_040 } else { 0 };
+            (d & 0xFFFF_F000) | (d & (DESC_FIELDS | M_040)) | w | MMUSR_R
+        }
+        Err(f) if f.kind == MmuFaultKind::BusError => MMUSR_B,
+        Err(_) => 0,
+    }
+}
