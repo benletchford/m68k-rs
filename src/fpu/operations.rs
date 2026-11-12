@@ -191,8 +191,11 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
-                    self.fpr[dst] = softfloat::const_rom(opmode as usize);
+                    let ctx = self.fpu_ctx(0);
+                    let mut f = ExcFlags::default();
+                    self.fpr[dst] = softfloat::fmovecr(opmode as usize, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
+                    self.fpu_commit(f);
                     return 4;
                 }
 
@@ -291,8 +294,11 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
-                    self.fpr[dst] = softfloat::const_rom(src);
+                    let ctx = self.fpu_ctx(0);
+                    let mut f = ExcFlags::default();
+                    self.fpr[dst] = softfloat::fmovecr(src, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
+                    self.fpu_commit(f);
                     return 4;
                 }
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {

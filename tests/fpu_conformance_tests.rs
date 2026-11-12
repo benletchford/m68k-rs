@@ -334,3 +334,47 @@ fn fcmp_of_equal_infinities_sets_the_infinity_sign() {
         assert_eq!(bits(m.cpu.fpr[0]), ninf, "{cpu:?}");
     }
 }
+
+/// FMOVECR #offset,FP0 on a 6888x under FPCR `fpcr`.
+fn fmovecr(offset: u16, fpcr: u32) -> Machine {
+    let mut m = Machine::new(CpuType::M68030);
+    m.cpu.fpcr = fpcr;
+    m.cpu.fpsr = 0;
+    m.run(&[0xF200, 0x5C00 | offset]);
+    m
+}
+
+#[test]
+fn fmovecr_rounds_the_rom_constant_and_reports_inexact() {
+    let inex = EXC_INEX2 | AEXC_INEX;
+    // pi under each rounding mode, then at single and double precision.
+    for (fpcr, mant) in [
+        (0x00, 0xC90F_DAA2_2168_C235),
+        (0x10, 0xC90F_DAA2_2168_C234),
+        (0x20, 0xC90F_DAA2_2168_C234),
+        (0x30, 0xC90F_DAA2_2168_C235),
+        (0x40, 0xC90F_DB00_0000_0000),
+        (0x80, 0xC90F_DAA2_2168_C000),
+    ] {
+        let m = fmovecr(0x00, fpcr);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x4000, mant), "pi fpcr {fpcr:#x}");
+        assert_eq!(m.cpu.fpsr, inex, "pi fpcr {fpcr:#x}");
+    }
+    // 10^256 in RN is the correctly rounded value, inexact.
+    let m = fmovecr(0x3B, 0);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4351, 0xAA7E_EBFB_9DF9_DE8E));
+    assert_eq!(m.cpu.fpsr, inex);
+    // 10^16 is exact in extended, but not in single.
+    let m = fmovecr(0x37, 0);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4034, 0x8E1B_C9BF_0400_0000));
+    assert_eq!(m.cpu.fpsr, 0);
+    let m = fmovecr(0x37, 0x40);
+    assert_eq!(m.cpu.fpsr, inex);
+    // e under RP is one ulp above its RN pattern.
+    let m = fmovecr(0x0C, 0x30);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4000, 0xADF8_5458_A2BB_4A9B));
+    // An offset with no constant is an exact +0.0.
+    let m = fmovecr(0x0F, 0);
+    assert_eq!(bits(m.cpu.fpr[0]), (0, 0));
+    assert_eq!(m.cpu.fpsr, CC_Z);
+}
