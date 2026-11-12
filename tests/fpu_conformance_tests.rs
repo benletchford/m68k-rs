@@ -48,6 +48,8 @@ const STACK: u32 = 0x8000;
 const NO_EXCEPTION: u32 = 0xFFFF_FFFF;
 
 /// FPSR condition codes.
+const CC_N: u32 = 0x0800_0000;
+const CC_Z: u32 = 0x0400_0000;
 const CC_NAN: u32 = 0x0100_0000;
 /// FPSR exception-status bits.
 const EXC_SNAN: u32 = 0x4000;
@@ -314,5 +316,21 @@ fn fabs_and_fneg_round_the_result_not_the_operand() {
         assert_eq!(bits(m.cpu.fpr[0]), (0x3FFF, trunc), "{cpu:?} FABS RM.S");
         let m = reg_op_fpcr(cpu, 0x1A, pos_root2, (0, 0), 0x70);
         assert_eq!(bits(m.cpu.fpr[0]), (0xBFFF, trunc), "{cpu:?} FNEG RP.S");
+    }
+}
+
+#[test]
+fn fcmp_of_equal_infinities_sets_the_infinity_sign() {
+    let pinf = (0x7FFF, 0);
+    let ninf = (0xFFFF, 0);
+    for cpu in ALL_FPUS {
+        let m = reg_op(cpu, 0x38, ninf, ninf);
+        assert_eq!(m.cpu.fpsr, CC_N | CC_Z, "{cpu:?} -inf vs -inf");
+        let m = reg_op(cpu, 0x38, pinf, pinf);
+        assert_eq!(m.cpu.fpsr, CC_Z, "{cpu:?} +inf vs +inf");
+        let m = reg_op(cpu, 0x38, pinf, ninf);
+        assert_eq!(m.cpu.fpsr, CC_N, "{cpu:?} -inf vs +inf");
+        // The destination is not written.
+        assert_eq!(bits(m.cpu.fpr[0]), ninf, "{cpu:?}");
     }
 }

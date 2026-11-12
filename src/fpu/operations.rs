@@ -1129,6 +1129,13 @@ impl CpuCore {
                 let mut f = src_flags;
                 let cmp = softfloat::compare(self.fpr[dst], src, &mut f);
                 self.fpu_set_cc_cmp(cmp);
+                // Two equal infinities compare equal with the infinity's
+                // sign: -inf vs -inf sets N as well as Z (M68000PRM FCMP,
+                // operation table).
+                let d = self.fpr[dst];
+                if cmp == FpCmp::Equal && d.is_inf() && src.is_inf() && d.sign() {
+                    self.fpsr |= 0x0800_0000;
+                }
                 self.fpu_commit(f);
                 4
             }
