@@ -37,11 +37,11 @@ fn two_pow(k: i32) -> FloatX80 {
     )
 }
 
-/// Result for a NaN operand: quiet it and signal SNAN/OPERR if it was signaling.
+/// Result for a NaN operand: quiet it and signal SNAN (only) if it was
+/// signaling (MC68881/MC68882UM 4.6.4).
 fn nan_result(x: FloatX80, f: &mut ExcFlags) -> FloatX80 {
     if x.is_signaling_nan() {
         f.raise(ExcFlags::SNAN);
-        f.raise(ExcFlags::OPERR);
     }
     x.quiet()
 }

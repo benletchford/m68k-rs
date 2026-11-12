@@ -267,10 +267,15 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
 
 // ============================== NaN handling ==============================
 
+/// NaN operand rule (MC68881/MC68882UM 4.6.4, M68040UM 9.5.2): the result
+/// is the destination NaN if the destination is one, else the source NaN,
+/// returned quiet. A signaling NaN operand raises SNAN only: the 6888x
+/// splits IEEE invalid-operation into SNAN and OPERR, and OPERR is for
+/// operations that are invalid on non-NaN operands (inf - inf, 0 * inf,
+/// sqrt(-x), ...).
 fn propagate_nan(a: FloatX80, b: FloatX80, f: &mut ExcFlags) -> FloatX80 {
     if a.is_signaling_nan() || b.is_signaling_nan() {
         f.raise(ExcFlags::SNAN);
-        f.raise(ExcFlags::OPERR);
     }
     if a.is_nan() { a.quiet() } else { b.quiet() }
 }
@@ -731,9 +736,9 @@ fn cmp_mag(a: FloatX80, b: FloatX80) -> core::cmp::Ordering {
 
 pub fn compare(a: FloatX80, b: FloatX80, f: &mut ExcFlags) -> FpCmp {
     if a.is_nan() || b.is_nan() {
+        // A signaling NaN raises SNAN (not OPERR), as for arithmetic.
         if a.is_signaling_nan() || b.is_signaling_nan() {
             f.raise(ExcFlags::SNAN);
-            f.raise(ExcFlags::OPERR);
         }
         return FpCmp::Unordered;
     }

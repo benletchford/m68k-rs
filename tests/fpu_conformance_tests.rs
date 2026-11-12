@@ -8,6 +8,7 @@ use m68k::NoOpHleHandler;
 use m68k::core::cpu::CpuCore;
 use m68k::core::memory::AddressBus;
 use m68k::core::types::CpuType;
+use m68k::fpu::FloatX80;
 
 struct FlatBus {
     mem: Vec<u8>,
@@ -45,6 +46,13 @@ const STACK: u32 = 0x8000;
 /// D7 before the program runs; every exception handler overwrites it with
 /// its vector number.
 const NO_EXCEPTION: u32 = 0xFFFF_FFFF;
+
+/// FPSR condition codes.
+const CC_NAN: u32 = 0x0100_0000;
+/// FPSR exception-status bits.
+const EXC_SNAN: u32 = 0x4000;
+/// FPSR accrued-exception bits.
+const AEXC_IOP: u32 = 0x0080;
 
 struct Machine {
     cpu: CpuCore,
@@ -97,6 +105,18 @@ impl Machine {
     }
 }
 
+fn x80(sign_exp: u16, mantissa: u64) -> FloatX80 {
+    FloatX80 { sign_exp, mantissa }
+}
+
+fn bits(v: FloatX80) -> (u16, u64) {
+    (v.sign_exp, v.mantissa)
+}
+
+/// Extended signaling NaN (quiet bit 62 clear) and its quieted form.
+const SNAN_X: (u16, u64) = (0x7FFF, 0xA000_0000_0000_0000);
+const SNAN_X_QUIET: (u16, u64) = (0x7FFF, 0xE000_0000_0000_0000);
+
 const ALL_FPUS: [CpuType; 3] = [CpuType::M68030, CpuType::M68040, CpuType::M68060];
 
 #[test]
@@ -135,4 +155,44 @@ fn fmovem_control_list_masks_each_register() {
     assert_eq!(m.cpu.fpcr, 0x0000_FFF0);
     assert_eq!(m.cpu.fpsr, 0x0FFF_FFF8);
     assert_eq!(m.cpu.fpiar, 0xFFFF_FFFF);
+}
+
+/// Run `FOP FP1,FP0` (register form, `opmode`) with FP1 = `src`, FP0 =
+/// `dst` and FPSR cleared.
+fn reg_op(cpu: CpuType, opmode: u16, src: (u16, u64), dst: (u16, u64)) -> Machine {
+    let mut m = Machine::new(cpu);
+    m.cpu.fpr[1] = x80(src.0, src.1);
+    m.cpu.fpr[0] = x80(dst.0, dst.1);
+    m.cpu.fpsr = 0;
+    m.run(&[0xF200, 0x0400 | opmode]);
+    m
+}
+
+#[test]
+fn signaling_nan_operand_raises_snan_but_not_operr() {
+    // An SNaN operand is an SNAN exception, not an operand error; the
+    // result is the NaN made quiet (MC68881/MC68882UM 4.6.4).
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    for cpu in ALL_FPUS {
+        // FMOVE, FADD, FMUL, FDIV, FSQRT, FCMP.
+        for opmode in [0x00, 0x22, 0x23, 0x20, 0x04, 0x38] {
+            let m = reg_op(cpu, opmode, SNAN_X, one);
+            assert_eq!(
+                m.cpu.fpsr,
+                CC_NAN | EXC_SNAN | AEXC_IOP,
+                "{cpu:?} opmode {opmode:#x}"
+            );
+            if opmode != 0x38 {
+                assert_eq!(
+                    bits(m.cpu.fpr[0]),
+                    SNAN_X_QUIET,
+                    "{cpu:?} opmode {opmode:#x}"
+                );
+            }
+        }
+        // A signaling NaN destination is quieted and wins.
+        let m = reg_op(cpu, 0x22, one, SNAN_X);
+        assert_eq!(m.cpu.fpsr, CC_NAN | EXC_SNAN | AEXC_IOP, "{cpu:?}");
+        assert_eq!(bits(m.cpu.fpr[0]), SNAN_X_QUIET, "{cpu:?}");
+    }
 }
