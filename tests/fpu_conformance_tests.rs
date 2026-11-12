@@ -455,3 +455,31 @@ fn ieee_nonaware_predicates_signal_bsun_on_unordered() {
         }
     }
 }
+
+#[test]
+fn fmod_and_frem_signal_a_signaling_nan_source_under_a_quiet_nan_destination() {
+    // The destination NaN is the result, but the signaling NaN in the
+    // source still raises SNAN (MC68881/MC68882UM 4.6.4). FMOD and FREM
+    // are 6888x hardware instructions.
+    let qnan = (0x7FFF, 0xC000_0000_0000_0000);
+    for opmode in [0x21, 0x25] {
+        let m = reg_op(CpuType::M68030, opmode, SNAN_X, qnan);
+        assert_eq!(
+            m.cpu.fpsr & (CC_NAN | EXC_SNAN | AEXC_IOP),
+            CC_NAN | EXC_SNAN | AEXC_IOP,
+            "opmode {opmode:#x}"
+        );
+        assert_eq!(bits(m.cpu.fpr[0]), qnan, "opmode {opmode:#x}");
+    }
+}
+
+#[test]
+fn fscale_truncates_its_scale_factor_without_reporting_inexact() {
+    // FSCALE by 2.7 scales by 2: the truncation of the scale factor is
+    // not an inexact result, and 1.0 * 2^2 is exact.
+    let two_point_seven = (0x4000, 0xACCC_CCCC_CCCC_CCCD);
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let m = reg_op(CpuType::M68030, 0x26, two_point_seven, one);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4001, 0x8000_0000_0000_0000));
+    assert_eq!(m.cpu.fpsr, 0, "no INEX2, no accrued inexact");
+}

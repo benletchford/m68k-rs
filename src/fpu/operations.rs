@@ -1215,12 +1215,15 @@ impl CpuCore {
                     let n = if src.to_f64().abs() >= 2147483648.0 {
                         if src.sign() { i32::MIN } else { i32::MAX }
                     } else {
+                        // The scale factor is truncated to an integer
+                        // without reporting it: only the scaled result's
+                        // own rounding can be inexact.
                         softfloat::to_i64(
                             src,
                             RoundMode::Zero,
                             i32::MIN as i64,
                             i32::MAX as i64,
-                            &mut f,
+                            &mut ExcFlags::default(),
                         ) as i32
                     };
                     self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
