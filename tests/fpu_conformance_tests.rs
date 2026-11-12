@@ -52,6 +52,7 @@ const CC_N: u32 = 0x0800_0000;
 const CC_Z: u32 = 0x0400_0000;
 const CC_NAN: u32 = 0x0100_0000;
 /// FPSR exception-status bits.
+const EXC_BSUN: u32 = 0x8000;
 const EXC_SNAN: u32 = 0x4000;
 /// FPSR accrued-exception bits.
 const AEXC_IOP: u32 = 0x0080;
@@ -413,5 +414,44 @@ fn packed_decimal_conversions_report_inexact() {
         m.run(&[0xF210, 0x6C06]);
         assert_eq!(m.bus.read_long(DATA + 4), 0x2345_6000, "{cpu:?}");
         assert_eq!(m.cpu.fpsr, 0, "{cpu:?} exact out");
+    }
+}
+
+/// A conditional instruction's encoding for a predicate.
+type PredicateForm = (&'static str, fn(u16) -> Vec<u16>);
+
+#[test]
+fn ieee_nonaware_predicates_signal_bsun_on_unordered() {
+    // FBcc.W *+4, FScc D0, FDBcc D0,*+4 and FTRAPcc for every predicate,
+    // with each condition code an operation can produce.
+    let forms: [PredicateForm; 4] = [
+        ("FBcc", |p| vec![0xF280 | p, 0x0002]),
+        ("FScc", |p| vec![0xF240, p]),
+        ("FDBcc", |p| vec![0xF248, p, 0x0002]),
+        ("FTRAPcc", |p| vec![0xF27C, p]),
+    ];
+    for cpu in ALL_FPUS {
+        for (name, code) in forms {
+            // FScc/FDBcc/FTRAPcc are left to the 68060 software package.
+            if cpu == CpuType::M68060 && name != "FBcc" {
+                continue;
+            }
+            for p in 0..32u16 {
+                for cc in [0, CC_NAN, CC_Z, CC_N, CC_N | CC_NAN] {
+                    let mut m = Machine::new(cpu);
+                    m.cpu.fpsr = cc;
+                    m.run(&code(p));
+                    let want = if p & 0x10 != 0 && cc & CC_NAN != 0 {
+                        cc | EXC_BSUN | AEXC_IOP
+                    } else {
+                        cc
+                    };
+                    assert_eq!(
+                        m.cpu.fpsr, want,
+                        "{cpu:?} {name} predicate {p:#x} cc {cc:#x}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -953,12 +953,15 @@ impl CpuCore {
         self.fpsr |= aexc;
     }
 
-    /// Evaluate a 6888x conditional predicate against FPSR.
+    /// Evaluate an FBcc/FScc/FDBcc/FTRAPcc conditional predicate against
+    /// FPSR.
     ///
-    /// Signaling predicates (condition bit 4 set) currently evaluate like
-    /// their non-signaling counterparts; this helper does not set BSUN when
-    /// the unordered condition is present.
-    fn fpu_condition(&self, condition: u8) -> bool {
+    /// The IEEE-nonaware predicates ($10-$1F) test the same condition as
+    /// their aware counterparts ($00-$0F), but with the NAN condition code
+    /// set they also signal a branch/set on unordered: BSUN in the
+    /// exception byte and IOP in the accrued byte, the rest of FPSR
+    /// unchanged (MC68881/MC68882UM 4.5.1 and table 4-3, M68000PRM 3.6.2).
+    fn fpu_condition(&mut self, condition: u8) -> bool {
         const FPCC_N: u32 = 0x0800_0000;
         const FPCC_Z: u32 = 0x0400_0000;
         const FPCC_NAN: u32 = 0x0100_0000;
@@ -966,6 +969,10 @@ impl CpuCore {
         let n = (self.fpsr & FPCC_N) != 0;
         let z = (self.fpsr & FPCC_Z) != 0;
         let nan = (self.fpsr & FPCC_NAN) != 0;
+
+        if condition & 0x10 != 0 && nan {
+            self.fpsr |= 0x0000_8080; // BSUN, accrued IOP
+        }
 
         match condition & 0x0F {
             0x0 => false,            // F
