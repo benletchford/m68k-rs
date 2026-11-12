@@ -26,6 +26,10 @@ struct AtcEntry {
     write_protected: bool,
     /// Supervisor-only page (S): a user access must fault, not hit.
     supervisor_only: bool,
+    /// The page descriptor's M bit was set when the entry was loaded. A
+    /// write through an entry without it misses, so the table search sets
+    /// M in the descriptor in memory (MC68040UM 3.2.3, MC68060UM 4.2.3).
+    modified: bool,
 }
 
 /// A direct-mapped address translation cache.
@@ -58,19 +62,22 @@ impl Atc {
     /// permissions the access would violate (a write to a write-protected page,
     /// or a user access to a supervisor page) returns `None` so the caller
     /// re-walks and raises the fault -- the permission check is never bypassed.
+    /// A write through an entry whose page was not yet modified misses too,
+    /// so the caller's table search sets the descriptor's M bit.
     #[inline]
     pub fn lookup(&self, page_frame: u32, supervisor: bool, write: bool) -> Option<u32> {
         let e = &self.entries[Self::index(page_frame)];
         if !e.valid || e.tag != Self::tag(page_frame, supervisor) {
             return None;
         }
-        if (write && e.write_protected) || (!supervisor && e.supervisor_only) {
+        if (write && (e.write_protected || !e.modified)) || (!supervisor && e.supervisor_only) {
             return None;
         }
         Some(e.phys_page)
     }
 
-    /// Record a freshly-walked translation and its protection bits.
+    /// Record a freshly-walked translation and its protection bits, for a
+    /// page whose descriptor already has M set (writes hit the entry).
     #[inline]
     pub fn insert(
         &mut self,
@@ -80,12 +87,35 @@ impl Atc {
         write_protected: bool,
         supervisor_only: bool,
     ) {
+        self.insert_entry(
+            page_frame,
+            supervisor,
+            phys_page,
+            write_protected,
+            supervisor_only,
+            true,
+        );
+    }
+
+    /// Record a freshly-walked translation, its protection bits and whether
+    /// its page descriptor's M bit is set.
+    #[inline]
+    pub fn insert_entry(
+        &mut self,
+        page_frame: u32,
+        supervisor: bool,
+        phys_page: u32,
+        write_protected: bool,
+        supervisor_only: bool,
+        modified: bool,
+    ) {
         self.entries[Self::index(page_frame)] = AtcEntry {
             valid: true,
             tag: Self::tag(page_frame, supervisor),
             phys_page,
             write_protected,
             supervisor_only,
+            modified,
         };
     }
 
@@ -340,6 +370,16 @@ impl Atc030 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_misses_an_entry_whose_page_is_not_modified() {
+        let mut atc = Atc::default();
+        atc.insert_entry(0x10, true, 0x8000, false, false, false);
+        assert_eq!(atc.lookup(0x10, true, false), Some(0x8000));
+        assert_eq!(atc.lookup(0x10, true, true), None);
+        atc.insert_entry(0x10, true, 0x8000, false, false, true);
+        assert_eq!(atc.lookup(0x10, true, true), Some(0x8000));
+    }
 
     #[test]
     fn hit_after_insert_miss_after_flush() {

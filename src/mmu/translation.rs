@@ -660,6 +660,124 @@ pub(crate) fn ptest_030<B: AddressBus>(
     (sr, w.desc_addr)
 }
 
+/// 68040/68060 descriptor U (used) bit, in every descriptor level.
+const U_040: u32 = 0x0000_0008;
+/// 68040/68060 page descriptor M (modified) bit.
+const M_040: u32 = 0x0000_0010;
+/// 68040/68060 W (write protect) bit, in every descriptor level.
+const W_040: u32 = 0x0000_0004;
+/// 68040/68060 page descriptor S (supervisor only) bit.
+const S_040: u32 = 0x0000_0080;
+
+/// Set history bits in the descriptor `desc` read from `at`, writing it
+/// back only when that changes it (the processor's locked read-modify-write
+/// of the descriptor). Returns the descriptor as it now stands in memory.
+#[inline]
+fn set_history<B: AddressBus>(bus: &mut B, at: u32, desc: u32, bits: u32) -> MmuResult<u32> {
+    let updated = desc | bits;
+    if updated != desc {
+        bus.try_write_long(at, updated).map_err(|f| {
+            if matches!(f.kind, BusFaultKind::BusError) {
+                buserr(f.address)
+            } else {
+                buserr(at)
+            }
+        })?;
+    }
+    Ok(updated)
+}
+
+/// A completed 68040/68060 table search that ended on a resident page.
+struct Walk040 {
+    /// The page descriptor (the target of an indirect descriptor), with the
+    /// history bits the search set.
+    page_desc: u32,
+    /// W accumulated across the root, pointer and page descriptors.
+    write_protected: bool,
+}
+
+/// The 68040/68060 table search for `logical`: root, pointer and page
+/// descriptor (or an indirect descriptor and the page descriptor it names),
+/// as described on [`translate_040`].
+///
+/// The search updates the history bits in memory as it goes (MC68040UM
+/// 3.2.2-3.2.3, MC68060UM 4.2.2-4.2.3): U in every valid root and pointer
+/// descriptor it uses and in the resident page descriptor, and M in that
+/// page descriptor for a write that is neither write protected (W anywhere
+/// on the path) nor a user access to a supervisor-only page. U is set
+/// before the protection check, so a search that then faults on protection
+/// still marks the page used. An invalid descriptor is left unchanged (its
+/// other bits belong to the operating system), and so is an indirect
+/// descriptor: the history goes to the page descriptor it names.
+fn walk_040<B: AddressBus>(
+    cpu: &CpuCore,
+    bus: &mut B,
+    logical: u32,
+    write: bool,
+    supervisor: bool,
+    page_bits: u32,
+) -> MmuResult<Walk040> {
+    let invalid = |cause: MmuFaultCause| Err(access_fault_cause(logical, cause));
+    // Root pointer: SRP in supervisor mode, URP (stored in mmu_crp_aptr) in user
+    // mode. The 128-entry root table is 512-byte aligned.
+    let root = if supervisor {
+        cpu.mmu_srp_aptr
+    } else {
+        cpu.mmu_crp_aptr
+    };
+
+    // Level 1: root table, indexed by logical[31:25] (128 x 4 bytes).
+    let root_at = (root & 0xFFFF_FE00).wrapping_add(((logical >> 25) & 0x7F) * 4);
+    let mut root_desc = read_u32_phys(bus, root_at)?;
+    if root_desc & 3 < 2 {
+        return invalid(MmuFaultCause::PointerA);
+    }
+    root_desc = set_history(bus, root_at, root_desc, U_040)?;
+
+    // Level 2: pointer table (512-byte aligned), indexed by logical[24:18].
+    let ptr_at = (root_desc & 0xFFFF_FE00).wrapping_add(((logical >> 18) & 0x7F) * 4);
+    let mut ptr_desc = read_u32_phys(bus, ptr_at)?;
+    if ptr_desc & 3 < 2 {
+        return invalid(MmuFaultCause::PointerB);
+    }
+    ptr_desc = set_history(bus, ptr_at, ptr_desc, U_040)?;
+
+    // Level 3: page table. With 4 KB pages it has 64 entries (256-byte aligned,
+    // indexed by logical[17:12]); with 8 KB pages, 32 entries (128-byte aligned,
+    // indexed by logical[17:13]).
+    let (page_table_mask, page_idx) = if page_bits == 13 {
+        (0xFFFF_FF80u32, (logical >> 13) & 0x1F)
+    } else {
+        (0xFFFF_FF00u32, (logical >> 12) & 0x3F)
+    };
+    let mut page_at = (ptr_desc & page_table_mask).wrapping_add(page_idx * 4);
+    let mut page_desc = read_u32_phys(bus, page_at)?;
+
+    // PDT: 0 invalid, 2 indirect (the descriptor points to the real page
+    // descriptor), 1/3 resident.
+    let was_indirect = page_desc & 3 == 2;
+    if was_indirect {
+        page_at = page_desc & 0xFFFF_FFFC;
+        page_desc = read_u32_phys(bus, page_at)?;
+    }
+    if page_desc & 3 == 0 {
+        return invalid(if was_indirect {
+            MmuFaultCause::Indirect
+        } else {
+            MmuFaultCause::PageFault
+        });
+    }
+
+    let write_protected = (root_desc | ptr_desc | page_desc) & W_040 != 0;
+    let may_modify = write && !write_protected && (supervisor || page_desc & S_040 == 0);
+    let history = if may_modify { U_040 | M_040 } else { U_040 };
+    page_desc = set_history(bus, page_at, page_desc, history)?;
+    Ok(Walk040 {
+        page_desc,
+        write_protected,
+    })
+}
+
 /// Perform 68040 PMMU translation.
 ///
 /// The 68040 uses a fixed three-level table (root -> pointer -> page) with
@@ -677,7 +795,8 @@ pub(crate) fn ptest_030<B: AddressBus>(
 /// that must keep executing across an MMU enable covers itself with the
 /// transparent translation registers, which are checked before the walk.
 /// Resident pages additionally enforce the W (write-protect) and S
-/// (supervisor-only) descriptor bits.
+/// (supervisor-only) descriptor bits, and the search sets the U and M
+/// history bits in the descriptors (see [`walk_040`]).
 fn translate_040<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
@@ -686,11 +805,6 @@ fn translate_040<B: AddressBus>(
     supervisor: bool,
     _instruction: bool,
 ) -> MmuResult<u32> {
-    // Invalid-descriptor outcome: an access fault whose cause records which
-    // walk level held the invalid descriptor (the 68060 FSLW reports it).
-    let invalid = |logical: u32, cause: MmuFaultCause| -> MmuResult<u32> {
-        Err(access_fault_cause(logical, cause))
-    };
     // Page size: TC bit 14 (P) selects 8 KB, else 4 KB.
     let page_bits = if cpu.mmu_tc & 0x0000_4000 != 0 {
         13
@@ -701,71 +815,22 @@ fn translate_040<B: AddressBus>(
 
     // ATC fast path: a recent walk for this page avoids the descriptor fetches.
     // A cached entry the access would violate (write to a write-protected page,
-    // user access to a supervisor page) misses here, so we re-walk and fault.
+    // user access to a supervisor page) misses here, so we re-walk and fault;
+    // so does a write through an entry whose M bit is clear, which re-walks
+    // to set M in the page descriptor (MC68040UM 3.2.3, MC68060UM 4.2.3).
     let page_frame = logical >> page_bits;
     if let Some(phys_page) = cpu.atc.lookup(page_frame, supervisor, write) {
         return Ok(phys_page | (logical & page_mask));
     }
 
-    // Root pointer: SRP in supervisor mode, URP (stored in mmu_crp_aptr) in user
-    // mode. The 128-entry root table is 512-byte aligned.
-    let root = if supervisor {
-        cpu.mmu_srp_aptr
-    } else {
-        cpu.mmu_crp_aptr
-    };
+    let walk = walk_040(cpu, bus, logical, write, supervisor, page_bits)?;
+    let page_desc = walk.page_desc;
 
-    // Level 1: root table, indexed by logical[31:25] (128 x 4 bytes).
-    let root_idx = (logical >> 25) & 0x7F;
-    let root_desc = read_u32_phys(bus, (root & 0xFFFF_FE00).wrapping_add(root_idx * 4))?;
-    if root_desc & 3 < 2 {
-        // UDT invalid: data faults, fetch falls back
-        return invalid(logical, MmuFaultCause::PointerA);
-    }
-
-    // Level 2: pointer table (512-byte aligned), indexed by logical[24:18].
-    let ptr_table = root_desc & 0xFFFF_FE00;
-    let ptr_idx = (logical >> 18) & 0x7F;
-    let ptr_desc = read_u32_phys(bus, ptr_table.wrapping_add(ptr_idx * 4))?;
-    if ptr_desc & 3 < 2 {
-        // UDT invalid: data faults, fetch falls back
-        return invalid(logical, MmuFaultCause::PointerB);
-    }
-
-    // Level 3: page table. With 4 KB pages it has 64 entries (256-byte aligned,
-    // indexed by logical[17:12]); with 8 KB pages, 32 entries (128-byte aligned,
-    // indexed by logical[17:13]).
-    let (page_table_mask, page_idx) = if page_bits == 13 {
-        (0xFFFF_FF80u32, (logical >> 13) & 0x1F)
-    } else {
-        (0xFFFF_FF00u32, (logical >> 12) & 0x3F)
-    };
-    let page_table = ptr_desc & page_table_mask;
-    let mut page_desc = read_u32_phys(bus, page_table.wrapping_add(page_idx * 4))?;
-
-    // PDT: 0 invalid, 2 indirect (the descriptor points to the real page
-    // descriptor), 1/3 resident.
-    let was_indirect = page_desc & 3 == 2;
-    if was_indirect {
-        page_desc = read_u32_phys(bus, page_desc & 0xFFFF_FFFC)?;
-    }
-    if page_desc & 3 == 0 {
-        // PDT invalid: data faults, fetch falls back
-        return invalid(
-            logical,
-            if was_indirect {
-                MmuFaultCause::Indirect
-            } else {
-                MmuFaultCause::PageFault
-            },
-        );
-    }
-
-    // Protection bits: W (write-protect, bit 2) accumulates across the table and
-    // page descriptors; S (supervisor-only, bit 7) lives on the page descriptor.
+    // Protection: W (write-protect) accumulates across the table and page
+    // descriptors; S (supervisor-only) lives on the page descriptor.
     // A violating access faults (resumable on the 040, vector 2 / format 7).
-    let write_protected = (root_desc | ptr_desc | page_desc) & 0x0000_0004 != 0;
-    let supervisor_only = page_desc & 0x0000_0080 != 0;
+    let write_protected = walk.write_protected;
+    let supervisor_only = page_desc & S_040 != 0;
     if write && write_protected {
         return Err(access_fault_cause(logical, MmuFaultCause::WriteProtect));
     }
@@ -780,13 +845,16 @@ fn translate_040<B: AddressBus>(
     // Cache only real resident translations -- never the identity fallbacks
     // above, so a page that is later given a valid mapping (after PFLUSH) is not
     // masked by a stale identity entry. The protection bits ride along so a
-    // later violating access to the same page is caught on the ATC path too.
-    cpu.atc.insert(
+    // later violating access to the same page is caught on the ATC path too,
+    // and so does M: a write through an entry loaded while M was clear
+    // misses and searches the tables again to set it.
+    cpu.atc.insert_entry(
         page_frame,
         supervisor,
         phys_page,
         write_protected,
         supervisor_only,
+        page_desc & M_040 != 0,
     );
     Ok(phys_page | (logical & page_mask))
 }
