@@ -1180,11 +1180,13 @@ impl CpuCore {
                 // FSCALE - dst = dst * 2^trunc(src)
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = src_flags;
-                if src.is_inf() {
+                if self.fpr[dst].is_nan() || src.is_nan() {
+                    // The NaN operand rule comes first (the destination
+                    // NaN wins), ahead of the infinite-count OPERR.
+                    self.fpr[dst] = softfloat::propagate_nan(self.fpr[dst], src, &mut f);
+                } else if src.is_inf() {
                     f.raise(ExcFlags::OPERR);
                     self.fpr[dst] = FloatX80::default_nan();
-                } else if src.is_nan() {
-                    self.fpr[dst] = softfloat::scale(src, 0, ctx, &mut f);
                 } else {
                     // A larger count overflows or underflows just the same.
                     let n = if src.to_f64().abs() >= 2147483648.0 {

@@ -273,7 +273,7 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
 /// splits IEEE invalid-operation into SNAN and OPERR, and OPERR is for
 /// operations that are invalid on non-NaN operands (inf - inf, 0 * inf,
 /// sqrt(-x), ...).
-fn propagate_nan(a: FloatX80, b: FloatX80, f: &mut ExcFlags) -> FloatX80 {
+pub fn propagate_nan(a: FloatX80, b: FloatX80, f: &mut ExcFlags) -> FloatX80 {
     if a.is_signaling_nan() || b.is_signaling_nan() {
         f.raise(ExcFlags::SNAN);
     }
@@ -377,6 +377,11 @@ fn b_exp_hi(x: FloatX80) -> (i32, u128) {
 }
 
 pub fn sub(a: FloatX80, b: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    // The NaN operand rule applies before the subtrahend is negated: a NaN
+    // comes out with its own sign.
+    if a.is_nan() || b.is_nan() {
+        return propagate_nan(a, b, f);
+    }
     add(a, neg(b), ctx, f)
 }
 

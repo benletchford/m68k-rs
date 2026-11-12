@@ -259,3 +259,28 @@ fn fmove_x_out_quiets_a_signaling_nan_and_rebuilds_the_exception_byte() {
         assert_eq!(m.cpu.fpsr, CC_NAN | AEXC_IOP, "{cpu:?}");
     }
 }
+
+#[test]
+fn nan_operand_keeps_its_sign_and_wins_over_other_rules() {
+    let zero = (0x0000, 0);
+    let qnan = (0x7FFF, 0xC000_0000_0000_0000);
+    let inf = (0x7FFF, 0);
+    for cpu in ALL_FPUS {
+        // FSUB: dst - src with a NaN src is that NaN, not its negation.
+        let m = reg_op(cpu, 0x28, qnan, zero);
+        assert_eq!(bits(m.cpu.fpr[0]), qnan, "{cpu:?} FSUB");
+        assert_eq!(m.cpu.fpsr, CC_NAN, "{cpu:?} FSUB");
+    }
+    // FSCALE (6888x; the 040/060 leave it to their software packages): a
+    // NaN destination is returned ahead of the infinite-count OPERR, and a
+    // NaN count is returned too.
+    let m = reg_op(CpuType::M68030, 0x26, inf, SNAN_X);
+    assert_eq!(bits(m.cpu.fpr[0]), SNAN_X_QUIET);
+    assert_eq!(m.cpu.fpsr, CC_NAN | EXC_SNAN | AEXC_IOP);
+    let m = reg_op(CpuType::M68030, 0x26, SNAN_X, qnan);
+    assert_eq!(bits(m.cpu.fpr[0]), qnan);
+    assert_eq!(m.cpu.fpsr, CC_NAN | EXC_SNAN | AEXC_IOP);
+    let m = reg_op(CpuType::M68030, 0x26, qnan, zero);
+    assert_eq!(bits(m.cpu.fpr[0]), qnan);
+    assert_eq!(m.cpu.fpsr, CC_NAN);
+}
