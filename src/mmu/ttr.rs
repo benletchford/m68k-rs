@@ -1,6 +1,7 @@
 //! Transparent Translation Register (TTR) handling.
 //!
-//! Implements TTR matching for 68030 (TT0/TT1) and 68040 (ITT0/ITT1, DTT0/DTT1).
+//! Implements TTR matching for 68030 (TT0/TT1) and the 68040/68060
+//! (ITT0/ITT1, DTT0/DTT1).
 //! TTRs allow certain address ranges to bypass page table translation.
 
 use crate::core::cpu::CpuCore;
@@ -77,7 +78,8 @@ pub fn ttr_matches_040(ttr: u32, addr: u32, supervisor: bool) -> bool {
 /// Check if transparent translation applies for the given access.
 ///
 /// For 68030: Checks TT0 and TT1.
-/// For 68040: Checks ITT0/ITT1 for instruction accesses, DTT0/DTT1 for data.
+/// For 68040/68060: Checks ITT0/ITT1 for instruction accesses, DTT0/DTT1 for
+/// data. The 68060 registers have the 68040 layout (MC68060UM 4.1.3).
 ///
 /// Returns `Some(physical_addr)` if transparent translation applies (identity mapping),
 /// or `None` if normal page table translation should be used.
@@ -100,8 +102,8 @@ pub fn check_transparent_translation(
                 return Some(addr);
             }
         }
-        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => {
-            // The 040 TTRs carry the S-field, not 030 FC base/mask; the
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => {
+            // The 040/060 TTRs carry the S-field, not 030 FC base/mask; the
             // access's privilege is FC2 (MOVES' SFC/DFC override included).
             let supervisor = (fc & 4) != 0;
             if instruction {
@@ -136,7 +138,7 @@ pub(crate) fn any_transparent_translation(cpu: &CpuCore) -> bool {
     let enabled = |ttr: u32| ttr & TTR_ENABLE != 0;
     match cpu.cpu_type {
         CpuType::M68030 => enabled(cpu.mmu_tt0) || enabled(cpu.mmu_tt1),
-        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 => {
+        CpuType::M68EC040 | CpuType::M68LC040 | CpuType::M68040 | CpuType::M68060 => {
             enabled(cpu.itt0) || enabled(cpu.itt1) || enabled(cpu.dtt0) || enabled(cpu.dtt1)
         }
         _ => false,
