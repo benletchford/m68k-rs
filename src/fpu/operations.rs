@@ -14,6 +14,13 @@ use crate::core::memory::AddressBus;
 use crate::core::types::Size;
 use crate::fpu::FloatX80;
 
+/// FPCR bits that exist: the exception-enable byte (15-8) and the mode
+/// control byte's rounding precision and mode (7-4).
+const FPCR_IMPLEMENTED: u32 = 0x0000_FFF0;
+/// FPSR bits that exist: condition codes (27-24), quotient (23-16),
+/// exception status (15-8) and the accrued exceptions (7-3).
+const FPSR_IMPLEMENTED: u32 = 0x0FFF_FFF8;
+
 /// Where a resolved FPU operand lives.
 enum FpuEa {
     /// Data register (formats of 4 bytes or fewer only).
@@ -401,11 +408,17 @@ impl CpuCore {
                     _ => return 0,
                 }
                 let mut next = values.iter();
+                // Unused control-register bits are not implemented: FPCR
+                // keeps only its exception-enable and mode-control bytes
+                // (15-4), FPSR only its condition-code, quotient, exception
+                // and accrued-exception bytes (27-3); the rest read back as
+                // zero (MC68881/MC68882UM 1.5.1-1.5.2, M68040UM 9.2,
+                // M68060UM 6.1.1-6.1.2).
                 if ctrl_sel & 0x4 != 0 {
-                    self.fpcr = *next.next().unwrap();
+                    self.fpcr = *next.next().unwrap() & FPCR_IMPLEMENTED;
                 }
                 if ctrl_sel & 0x2 != 0 {
-                    self.fpsr = *next.next().unwrap();
+                    self.fpsr = *next.next().unwrap() & FPSR_IMPLEMENTED;
                 }
                 if ctrl_sel & 0x1 != 0 {
                     self.fpiar = *next.next().unwrap();
