@@ -1389,7 +1389,7 @@ impl CpuCore {
                     let w0 = self.read_imm_32(bus);
                     let w1 = self.read_imm_32(bus);
                     let w2 = self.read_imm_32(bus);
-                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default())
+                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut f)
                 }
                 _ => return None,
             },
@@ -1413,7 +1413,7 @@ impl CpuCore {
                     let w0 = self.read_32(bus, addr);
                     let w1 = self.read_32(bus, addr.wrapping_add(4));
                     let w2 = self.read_32(bus, addr.wrapping_add(8));
-                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default())
+                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut f)
                 }
                 _ => return None,
             },
@@ -1524,12 +1524,12 @@ impl CpuCore {
                 }
                 3 | 7 => {
                     // Packed decimal (static or dynamic k-factor).
-                    let bytes = packed::to_packed(value, kfactor, &mut ExcFlags::default());
+                    let bytes = packed::to_packed(value, kfactor, &mut f);
                     for (i, chunk) in bytes.chunks(4).enumerate() {
                         let w = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         self.write_32(bus, addr.wrapping_add(4 * i as u32), w);
                     }
-                    return true;
+                    true
                 }
                 _ => false,
             },

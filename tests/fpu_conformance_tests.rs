@@ -57,6 +57,7 @@ const EXC_SNAN: u32 = 0x4000;
 const AEXC_IOP: u32 = 0x0080;
 const AEXC_INEX: u32 = 0x0008;
 const EXC_INEX2: u32 = 0x0200;
+const EXC_INEX1: u32 = 0x0100;
 
 struct Machine {
     cpu: CpuCore,
@@ -377,4 +378,40 @@ fn fmovecr_rounds_the_rom_constant_and_reports_inexact() {
     let m = fmovecr(0x0F, 0);
     assert_eq!(bits(m.cpu.fpr[0]), (0, 0));
     assert_eq!(m.cpu.fpsr, CC_Z);
+}
+
+#[test]
+fn packed_decimal_conversions_report_inexact() {
+    // The 68040 runs packed decimal natively here only with its
+    // unimplemented-instruction emulation on (the default).
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        // FMOVE.P (A0),FP0 of 1E-1: inexact decimal input, INEX1.
+        let mut m = Machine::new(cpu);
+        m.bus.write_long(DATA, 0x4001_0001);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x4C00]);
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0x3FFB, 0xCCCC_CCCC_CCCC_CCCD),
+            "{cpu:?}"
+        );
+        assert_eq!(m.cpu.fpsr, EXC_INEX1 | AEXC_INEX, "{cpu:?} in");
+
+        // FMOVE.P FP0,(A0){#3} of 123456: 1.23E5, inexact, INEX2.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x400F, 0xF120_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6C03]);
+        assert_eq!(m.bus.read_long(DATA), 0x0005_0001, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x2300_0000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} out");
+
+        // An exact conversion raises nothing: 123456 with k = 6.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x400F, 0xF120_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6C06]);
+        assert_eq!(m.bus.read_long(DATA + 4), 0x2345_6000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, 0, "{cpu:?} exact out");
+    }
 }
