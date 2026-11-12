@@ -788,14 +788,21 @@ fn tracked_window_stores_reach_the_bus_at_physical_frames() {
     let mut tracked = machine(true, Mmu::Mc68030 { tc: TC_030 }, &program, &setup);
     run_batches(&mut tracked.0, &mut tracked.1);
     assert_same("tracked", &reference, &tracked);
-    assert_eq!(tracked.1.writes.len(), 20_000, "every store took the bus");
+    let (stores, others): (Vec<u32>, Vec<u32>) = tracked
+        .1
+        .writes
+        .iter()
+        .partition(|&&at| at == phys(DATA) || at == phys(DATA2));
+    assert_eq!(
+        stores.len(),
+        20_000,
+        "every store took the bus at its physical frame"
+    );
+    // The table searches that load the two pages write the used and
+    // modified bits back into their descriptors, through the bus as well.
     assert!(
-        tracked
-            .1
-            .writes
-            .iter()
-            .all(|&at| at == phys(DATA) || at == phys(DATA2)),
-        "stores at the physical frames"
+        others.iter().all(|&at| (TABLE..phys(DATA)).contains(&at)),
+        "the only other writes are descriptor history updates: {others:x?}"
     );
     assert_eq!(reference.1.copies, 0, "no notifications under translation");
     assert_eq!(tracked.1.copies, 0, "none from the tracked window either");
@@ -822,6 +829,11 @@ fn replacement_setup(cpu: &mut CpuCore, bus: &mut Bus) {
     bus.poke_long(phys(DATA2), 0xC0C0_0001);
     bus.poke_long(0x2_4000, 0xA1A1_0002);
     bus.poke_long(0x2_5000, 0xC1C1_0003);
+    // DATA's page is already modified (M set), so the loop's writes hit
+    // the entry stage 0's read loaded. With M clear the first write would
+    // search the tables again to set it, reloading the entry and changing
+    // the load order the expectations below are written against.
+    bus.map_030(TABLE, DATA, phys(DATA), 0x10);
 }
 
 /// Before the last stage the host remaps DATA and DATA2 to new frames
@@ -913,15 +925,24 @@ fn atc_replacement_order_ignores_the_trace_cache_with_code_outside_the_window() 
 /// a read loop loads the page's ATC entry with M clear, and the write that
 /// follows it still searches the tables and sets M in the page descriptor.
 #[test]
-fn history_bits_match_the_interpreter_040() {
+fn history_bits_match_the_interpreter() {
     // loop: MOVE.L (A2),D3 ; ADD.L D3,D4 ; DBRA D7,loop ; MOVE.L D4,(A2)
     let program = [0x2612, 0xD883, 0x51CF, 0xFFFA, 0x2484, ALINE];
-    let (_, batched) = compare("040 history", Mmu::Mc68040, &program, &|cpu, bus| {
-        cpu.set_a(2, DATA2);
-        cpu.set_d(7, 999);
-        bus.poke_long(phys(DATA2), 3);
-    });
-    let desc = batched.1.peek_long(PAGE_040 + (DATA2 >> 12) * 4);
-    assert_eq!(desc & 0x18, 0x18, "U and M in {desc:#010x}");
-    assert_eq!(batched.1.peek_long(phys(DATA2)), 3000);
+    for (label, mmu, desc_at) in [
+        ("040", Mmu::Mc68040, PAGE_040 + (DATA2 >> 12) * 4),
+        (
+            "030",
+            Mmu::Mc68030 { tc: TC_030 },
+            TABLE + (DATA2 >> 12) * 4,
+        ),
+    ] {
+        let (_, batched) = compare(label, mmu, &program, &|cpu, bus| {
+            cpu.set_a(2, DATA2);
+            cpu.set_d(7, 999);
+            bus.poke_long(phys(DATA2), 3);
+        });
+        let desc = batched.1.peek_long(desc_at);
+        assert_eq!(desc & 0x18, 0x18, "{label}: U and M in {desc:#010x}");
+        assert_eq!(batched.1.peek_long(phys(DATA2)), 3000, "{label}");
+    }
 }

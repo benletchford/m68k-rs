@@ -1,6 +1,6 @@
 //! 68030 PMMU behaviour against a three-level table (TIA=8, TIB=6, TIC=6,
 //! 4 KB pages; MC68030UM section 9): transparent translation through
-//! TT0/TT1.
+//! TT0/TT1, and the history bits the table search writes back.
 
 use m68k::core::cpu::CpuCore;
 use m68k::core::memory::AddressBus;
@@ -147,4 +147,172 @@ fn tt_address_mask_and_enable() {
     assert_eq!(xlate(&mut cpu, &mut bus, 5, false), TABLE);
     cpu.mmu_tt0 = tt(0, 0, false, true, 5, 0) & !0x8000; // E = 0
     assert_eq!(xlate(&mut cpu, &mut bus, 5, false), TABLE);
+}
+
+const U: u32 = 0x08;
+const M: u32 = 0x10;
+const WP: u32 = 0x04;
+const DESC: u32 = TC_TABLE + (LOGICAL >> 12) * 4;
+
+fn read(cpu: &mut CpuCore, bus: &mut TestBus, addr: u32, supervisor: bool) -> Result<u32, ()> {
+    cpu.set_sr(if supervisor { 0x2700 } else { 0x0700 });
+    let r = translate_address(cpu, bus, addr, false, supervisor, false).map_err(|_| ());
+    cpu.set_sr(0x2700);
+    r
+}
+
+fn write(cpu: &mut CpuCore, bus: &mut TestBus, addr: u32, supervisor: bool) -> Result<u32, ()> {
+    cpu.set_sr(if supervisor { 0x2700 } else { 0x0700 });
+    let r = translate_address(cpu, bus, addr, true, supervisor, false).map_err(|_| ());
+    cpu.set_sr(0x2700);
+    r
+}
+
+/// Execute one PMMU instruction (`F010` = `(A0)`, plus its extension word)
+/// at $1000 in supervisor mode with A0 = `a0`.
+fn pmmu_op(cpu: &mut CpuCore, bus: &mut TestBus, ext: u16, a0: u32) {
+    bus.write_word(0x1000, 0xF010);
+    bus.write_word(0x1002, ext);
+    bus.write_word(0x1004, 0x4E71);
+    cpu.set_a(0, a0);
+    cpu.pc = 0x1000;
+    let mut hle = m68k::NoOpHleHandler;
+    cpu.step_with_hle_handler(bus, &mut hle);
+    assert_eq!(cpu.pc, 0x1004, "PMMU instruction executes");
+}
+
+#[test]
+fn a_read_sets_used_in_every_level_and_leaves_modified_clear() {
+    let (mut cpu, mut bus) = build();
+    assert_eq!(read(&mut cpu, &mut bus, LOGICAL + 4, true), Ok(PHYS + 4));
+    assert_eq!(bus.read_long(TA), TB | U | 2, "level A");
+    assert_eq!(bus.read_long(TB), TC_TABLE | U | 2, "level B");
+    assert_eq!(bus.read_long(DESC), PHYS | U | 1, "page: U, M clear");
+}
+
+#[test]
+fn an_early_termination_descriptor_is_marked_used() {
+    let (mut cpu, mut bus) = build();
+    assert_eq!(read(&mut cpu, &mut bus, 0x0300_0010, true), Ok(0x0300_0010));
+    assert_eq!(bus.read_long(TA + 3 * 4), 0x0300_0000 | U | 1);
+    write(&mut cpu, &mut bus, 0x0400_0010, true).unwrap();
+    assert_eq!(bus.read_long(TA + 4 * 4), 0x0400_0000 | U | M | 1);
+}
+
+#[test]
+fn a_write_sets_used_and_modified() {
+    let (mut cpu, mut bus) = build();
+    assert_eq!(write(&mut cpu, &mut bus, LOGICAL + 8, true), Ok(PHYS + 8));
+    assert_eq!(bus.read_long(DESC), PHYS | U | M | 1);
+}
+
+#[test]
+fn a_write_after_a_read_sets_modified_through_the_atc_entry() {
+    let (mut cpu, mut bus) = build();
+    read(&mut cpu, &mut bus, LOGICAL + 4, true).unwrap();
+    assert_eq!(bus.read_long(DESC) & M, 0);
+    // The read's ATC entry has M clear: the write searches the tables.
+    write(&mut cpu, &mut bus, LOGICAL + 8, true).unwrap();
+    assert_eq!(bus.read_long(DESC), PHYS | U | M | 1);
+    // Now the entry is modified and serves writes without a search.
+    bus.write_long(DESC, PHYS | U | 1);
+    write(&mut cpu, &mut bus, LOGICAL + 12, true).unwrap();
+    assert_eq!(bus.read_long(DESC), PHYS | U | 1, "ATC hit");
+}
+
+#[test]
+fn an_indirect_descriptor_is_left_unchanged_and_its_target_updated() {
+    let (mut cpu, mut bus) = build();
+    let target = 0x3000;
+    bus.write_long(target, PHYS | 1);
+    bus.write_long(DESC, target | 2); // DT=2 at the last level: indirect
+    assert_eq!(
+        read(&mut cpu, &mut bus, LOGICAL + 0x300, true),
+        Ok(PHYS + 0x300)
+    );
+    assert_eq!(bus.read_long(DESC), target | 2);
+    assert_eq!(bus.read_long(target), PHYS | U | 1);
+}
+
+#[test]
+fn write_protection_sets_used_but_not_modified() {
+    let (mut cpu, mut bus) = build();
+    bus.write_long(DESC, PHYS | WP | 1);
+    assert!(write(&mut cpu, &mut bus, LOGICAL, true).is_err());
+    assert_eq!(bus.read_long(DESC), PHYS | WP | U | 1);
+
+    // WP in a table descriptor protects the pages below it.
+    let (mut cpu, mut bus) = build();
+    bus.write_long(TB, TC_TABLE | WP | 2);
+    assert!(write(&mut cpu, &mut bus, LOGICAL, true).is_err());
+    assert_eq!(bus.read_long(TB), TC_TABLE | WP | U | 2);
+    assert_eq!(bus.read_long(DESC), PHYS | U | 1);
+}
+
+#[test]
+fn invalid_descriptors_are_not_updated() {
+    let (mut cpu, mut bus) = build();
+    bus.write_long(DESC, 0x494E_5600); // DT=0, OS-owned bits
+    assert!(read(&mut cpu, &mut bus, LOGICAL, true).is_err());
+    assert_eq!(bus.read_long(DESC), 0x494E_5600);
+    assert_eq!(bus.read_long(TB), TC_TABLE | U | 2, "level B was used");
+}
+
+#[test]
+fn long_format_descriptors_take_the_bits_in_their_first_long() {
+    let (mut cpu, mut bus) = build();
+    // Level B entry 0 as a long-format table: two long descriptors at $3000,
+    // the second-level index 0 pointing (long) at a long page table at $3100.
+    let tb_long = 0x3000;
+    let tc_long = 0x3100;
+    bus.write_long(TA, tb_long | 3);
+    bus.write_long(tb_long, 0x7FFF_FC00 | 3);
+    bus.write_long(tb_long + 4, tc_long);
+    for i in 0..64u32 {
+        bus.write_long(tc_long + i * 8, 0x7FFF_FC00 | 1);
+        bus.write_long(tc_long + i * 8 + 4, i << 12);
+    }
+    let page = tc_long + (LOGICAL >> 12) * 8;
+    bus.write_long(page + 4, PHYS);
+    assert_eq!(write(&mut cpu, &mut bus, LOGICAL + 4, true), Ok(PHYS + 4));
+    assert_eq!(bus.read_long(tb_long), 0x7FFF_FC00 | U | 3);
+    assert_eq!(
+        bus.read_long(tb_long + 4),
+        tc_long,
+        "address long untouched"
+    );
+    assert_eq!(bus.read_long(page), 0x7FFF_FC00 | U | M | 1);
+    assert_eq!(bus.read_long(page + 4), PHYS);
+
+    // A supervisor-only (S=1) page denies a user access: no update.
+    let s_page = tc_long + 0x11 * 8;
+    bus.write_long(s_page, 0x7FFF_FC00 | 0x100 | 1);
+    assert!(read(&mut cpu, &mut bus, 0x0001_1000, false).is_err());
+    assert_eq!(bus.read_long(s_page), 0x7FFF_FC00 | 0x100 | 1);
+    assert!(read(&mut cpu, &mut bus, 0x0001_1000, true).is_ok());
+    assert_eq!(bus.read_long(s_page), 0x7FFF_FC00 | 0x100 | U | 1);
+}
+
+#[test]
+fn ptest_changes_no_descriptor() {
+    let (mut cpu, mut bus) = build();
+    pmmu_op(&mut cpu, &mut bus, 0x9E15, LOGICAL); // PTESTR #5,(A0),#7
+    pmmu_op(&mut cpu, &mut bus, 0x9C15, LOGICAL); // PTESTW #5,(A0),#7
+    // (Level A and B entry 0 also map the code page, whose instruction
+    // fetches mark them used; the tested page's descriptor is its own.)
+    assert_eq!(bus.read_long(DESC), PHYS | 1);
+}
+
+#[test]
+fn pload_updates_history_as_its_direction() {
+    let (mut cpu, mut bus) = build();
+    pmmu_op(&mut cpu, &mut bus, 0x2215, LOGICAL); // PLOADR #5,(A0)
+    assert_eq!(bus.read_long(DESC), PHYS | U | 1);
+    let (mut cpu, mut bus) = build();
+    pmmu_op(&mut cpu, &mut bus, 0x2015, LOGICAL); // PLOADW #5,(A0)
+    assert_eq!(bus.read_long(DESC), PHYS | U | M | 1);
+    // The PLOADW entry is modified: a write hits it without a search.
+    bus.write_long(DESC, PHYS | 1);
+    write(&mut cpu, &mut bus, LOGICAL, true).unwrap();
+    assert_eq!(bus.read_long(DESC), PHYS | 1);
 }
