@@ -1534,6 +1534,61 @@ fn load_state_68000(cpu: &mut CpuCore, state: &BinState) {
     cpu.prefetch_count = 2;
 }
 
+/// Check the seven-word group 0 frame of an address-error fixture.
+///
+/// The register and flag side effects of a faulted instruction depend on
+/// bus-cycle ordering this core does not reproduce, so they stay unchecked.
+/// The frame itself is architectural: when the core raised the fault within
+/// the instruction and built its frame where the fixture did, the function
+/// code, R/W and I/N bits of the status word, the 32-bit access address and
+/// the stacked PC must match the hardware trace. (Fixtures whose fault the
+/// core raises one step later -- a jump to an odd address faults on the next
+/// opcode fetch here -- and the few whose frame position depends on a
+/// partially updated A7 are skipped by the stack-pointer comparison.)
+fn check_address_error_frame_68000(
+    expected: &BinState,
+    cpu: &CpuCore,
+    bus: &mut SparseBus,
+    ctx: &str,
+) -> Result<(), String> {
+    let exp_ssp = reg(expected, "ssp");
+    let got_ssp = if cpu.is_supervisor() {
+        cpu.sp()
+    } else {
+        cpu.sp[SFLAG_SET as usize]
+    };
+    if exp_ssp != got_ssp {
+        return Ok(());
+    }
+    let expected_word = |offset: u32| -> Option<u16> {
+        let addr = exp_ssp.wrapping_add(offset) & 0x00ff_ffff;
+        let byte = |a: u32| expected.ram.iter().find(|(x, _)| *x == a).map(|(_, b)| *b);
+        Some(((byte(addr)? as u16) << 8) | byte(addr + 1)? as u16)
+    };
+    let mut got_word = |offset: u32| bus.read_word(exp_ssp.wrapping_add(offset) & 0x00ff_ffff);
+    let fields: [(&str, u32, u16); 5] = [
+        ("status word (R/W, I/N, FC)", 0, 0x001f),
+        ("access address high", 2, 0xffff),
+        ("access address low", 4, 0xffff),
+        ("stacked PC high", 10, 0xffff),
+        ("stacked PC low", 12, 0xffff),
+    ];
+    for (name, offset, mask) in fields {
+        let Some(exp) = expected_word(offset) else {
+            return Ok(());
+        };
+        let got = got_word(offset);
+        if exp & mask != got & mask {
+            return Err(format!(
+                "{ctx}: address-error frame {name} mismatch (got={:#06X} expected={:#06X})",
+                got & mask,
+                exp & mask
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn check_state_68000(
     expected: &BinState,
     cpu: &CpuCore,
@@ -1545,16 +1600,16 @@ fn check_state_68000(
     // If the fixture includes bus-level address-error cycles, it is asserting bus/prefetch-
     // accurate behavior (including exactly when the fault occurs). m68k is not bus/prefetch-
     // accurate, so we skip these cases entirely.
-    if has_addr_error_txn {
-        let _ = (expected, cpu, bus, ctx, opcode);
-        return Ok(());
-    }
     fn get_ssp(cpu: &CpuCore) -> u32 {
         if cpu.is_supervisor() {
             cpu.sp()
         } else {
             cpu.sp[SFLAG_SET as usize]
         }
+    }
+    if has_addr_error_txn {
+        let _ = opcode;
+        return check_address_error_frame_68000(expected, cpu, bus, ctx);
     }
 
     fn sr_mask_for_opcode(opcode: u16) -> u16 {

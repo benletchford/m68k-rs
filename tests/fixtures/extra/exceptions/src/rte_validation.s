@@ -15,8 +15,10 @@ run_test:
     /* Test 2: RTE from Address Error - 14-byte frame on 68000 */
     lea addr_handler, %a1
     move.l %a1, 0x0C        | Install at vector 3 (Address Error)
+    lea after_addr_error, %a6
     move.w 0x1001, %d1      | Trigger Address Error
-    
+after_addr_error:
+
     cmp.l #2, %d0
     bne TEST_FAIL
     
@@ -28,11 +30,16 @@ trap_handler:
 
 addr_handler:
     move.l #2, %d0
-    
-    /* 68000 Address Error frame (14 bytes) - pop and return manually */
-    move.l (%sp), %a0       | Get return PC
-    addq.l #4, %a0          | Skip faulting instruction
-    move.w 4(%sp), %d7      | Get SR
-    lea 14(%sp), %sp        | Pop 14-byte frame
-    move.w %d7, %sr         | Restore SR
-    jmp (%a0)               | Return
+
+    /* 68000 group 0 frame (14 bytes): status word (SP+0), access address
+       (SP+2), instruction register (SP+6), SR (SP+8), PC (SP+10). The
+       stacked PC is only loosely defined (2 to 10 bytes past the opcode),
+       so resume at the continuation address the test left in A6: replace
+       the frame with a three-word one and RTE. */
+    cmp.l #0x1001, 2(%sp)   | Access address is the odd operand address
+    bne TEST_FAIL
+    move.w 8(%sp), %d7      | Stacked SR
+    lea 14(%sp), %sp        | Pop the group 0 frame
+    move.l %a6, -(%sp)      | Continuation PC
+    move.w %d7, -(%sp)      | SR
+    rte

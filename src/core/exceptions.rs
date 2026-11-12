@@ -136,6 +136,74 @@ fn fslw_060(
     w
 }
 
+/// Compose the 68010 special status word for a faulted bus cycle
+/// (M68010UM figure 5-8): IF (bit 13) marks an instruction fetch, DF (bit
+/// 12) a data read, RW (bit 8) a read cycle, BY (bit 9) a byte transfer,
+/// and bits 2-0 hold the function code. A write sets neither fetch bit.
+fn ssw_010(fc: u16, write: bool, instruction: bool, size: u32) -> u16 {
+    let mut ssw = fc & 7;
+    if !write {
+        ssw |= 0x0100;
+        ssw |= if instruction { 0x2000 } else { 0x1000 };
+    }
+    if size == 1 {
+        ssw |= 0x0200;
+    }
+    ssw
+}
+
+/// Whether a 68000 instruction's memory operand is a long (as opposed to
+/// a word); byte operands cannot raise an address error.
+fn operand_is_long_68000(opcode: u16) -> bool {
+    match opcode >> 12 {
+        1 | 3 => false,
+        2 => true,
+        // ADDA/SUBA/CMPA select the size with bit 8.
+        0x9 | 0xB | 0xD if opcode & 0x00C0 == 0x00C0 => opcode & 0x0100 != 0,
+        // CHK, MOVE to/from SR/CCR, DIVU/DIVS, MULU/MULS: word operands.
+        _ if opcode & 0xF1C0 == 0x4180 || opcode & 0x00C0 == 0x00C0 => false,
+        _ => opcode & 0x00C0 == 0x0080,
+    }
+}
+
+/// Offset from the next unread instruction word to the PC a 68000 group 0
+/// frame stacks for a faulted data access of `opcode`.
+fn group0_pc_adjust_68000(opcode: u16, write: bool) -> i32 {
+    let mode = (opcode >> 3) & 7;
+    let line = opcode >> 12;
+    // MOVEM (not EXT, which shares the encoding with a register mode) and
+    // UNLK prefetch the next word before the first transfer.
+    if (opcode & 0xFB80 == 0x4880 && mode != 0) || opcode & 0xFFF8 == 0x4E58 {
+        return 2;
+    }
+    // ADDX/SUBX -(Ay),-(Ax) and CMPM (Ay)+,(Ax)+.
+    if matches!(opcode & 0xF138, 0x9108 | 0xB108 | 0xD108) && opcode & 0x00C0 != 0x00C0 {
+        return 2;
+    }
+    if (1..=3).contains(&line) && write {
+        // MOVE to memory: the destination mode decides.
+        let dst_mode = (opcode >> 6) & 7;
+        let dst_reg = (opcode >> 9) & 7;
+        let src_is_memory = mode >= 2 && !(mode == 7 && (opcode & 7) == 4);
+        return match (dst_mode, dst_reg) {
+            (2..=4, _) => 2,
+            // An absolute long destination after a memory source has not
+            // fetched its second address word yet.
+            (7, 1) if src_is_memory => -2,
+            _ => 0,
+        };
+    }
+    match mode {
+        // -(An): a word operand is fetched after the next prefetch.
+        4 if !operand_is_long_68000(opcode) => 2,
+        // d16(An), d8(An,Xn) and their PC-relative forms: the extension
+        // word is still the prefetch address when the operand cycle starts.
+        5 | 6 => -2,
+        7 if matches!(opcode & 7, 2 | 3) => -2,
+        _ => 0,
+    }
+}
+
 /// Function code bits for exception stack frames.
 pub mod fc {
     /// User-data address space.
@@ -184,6 +252,195 @@ impl CpuCore {
         self.write_16(bus, sp.wrapping_add(4), (stacked_pc & 0xFFFF) as u16);
         self.write_16(bus, sp, sr);
         self.write_16(bus, sp.wrapping_add(2), (stacked_pc >> 16) as u16);
+    }
+
+    /// Push the 68000's seven-word group 0 (bus error / address error) frame.
+    ///
+    /// Layout from the new stack pointer upwards (M68000UM figure 6-7):
+    /// status word, access address, instruction register, status register,
+    /// program counter. The status word holds the function code in bits
+    /// 2-0, I/N in bit 3 (0 = the fault interrupted an instruction, 1 = it
+    /// interrupted exception processing) and R/W in bit 4 (1 = read); its
+    /// upper bits are undefined and carry the instruction register on real
+    /// parts. The bus order matches the hardware: the SR/PC part is written
+    /// first in the same order as the three-word frame, then IR, the access
+    /// address and the status word.
+    ///
+    /// The writes are raw bus cycles (no alignment check): a misaligned
+    /// supervisor stack must not raise a second address error from here.
+    #[allow(clippy::too_many_arguments)]
+    fn push_group0_frame_68000<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        fc: u16,
+        write: bool,
+        in_exception: bool,
+        address: u32,
+        old_sr: u16,
+        stacked_pc: u32,
+    ) {
+        let ir = self.ir as u16;
+        let mut status = (ir & !0x001F) | (fc & 7);
+        if !write {
+            status |= 0x0010;
+        }
+        if in_exception {
+            status |= 0x0008;
+        }
+        let sp = self.dar[15].wrapping_sub(14);
+        self.dar[15] = sp;
+        let mut put = |offset: u32, value: u16| {
+            bus.write_word(self.address(sp.wrapping_add(offset)), value);
+        };
+        put(12, (stacked_pc & 0xFFFF) as u16);
+        put(8, old_sr);
+        put(10, (stacked_pc >> 16) as u16);
+        put(6, ir);
+        put(4, (address & 0xFFFF) as u16);
+        put(0, status);
+        put(2, (address >> 16) as u16);
+    }
+
+    /// The PC a 68000 group 0 frame stacks: the processor's prefetch
+    /// address at the time of the fault. M68000UM 6.3.9.1 only promises
+    /// "2 to 10 bytes" past the opcode; where it lands depends on how far
+    /// the instruction's microcode had advanced the prefetch when the bus
+    /// cycle was attempted, which differs per addressing mode. The offsets
+    /// below are the ones the SingleStepTests 68000 traces record.
+    fn group0_stacked_pc_68000(&self, write: bool, instruction: bool) -> u32 {
+        if instruction {
+            // A faulted instruction fetch stacks the address it fetched from.
+            return self.pc;
+        }
+        let lowest = self.ppc.wrapping_add(2);
+        let pc = if self.pc.wrapping_sub(lowest) <= 8 {
+            self.pc
+        } else {
+            lowest
+        };
+        pc.wrapping_add_signed(group0_pc_adjust_68000(self.ir as u16, write))
+    }
+
+    /// Push the 68010 format $8 bus/address error frame (29 words). Only
+    /// the fields a handler can use are filled in: the special status word
+    /// and the fault address. The data and instruction input buffers are
+    /// zero and the sixteen internal words are not written, so RTE restarts
+    /// the instruction from the stacked PC instead of continuing it.
+    ///
+    /// Layout from the new stack pointer upwards: SR, PC, format/vector,
+    /// special status word (+$08), fault address (+$0A), unused, data
+    /// output buffer (+$10), unused, data input buffer (+$14), unused,
+    /// instruction input buffer (+$18), internal (+$1A..+$39).
+    fn push_fault_frame_010<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u32,
+        old_sr: u16,
+        ssw: u16,
+        address: u32,
+    ) {
+        for _ in 0..8 {
+            self.fake_push_32_raw();
+        }
+        self.push_16_raw(bus, 0); // instruction input buffer
+        self.fake_push_16_raw();
+        self.push_16_raw(bus, 0); // data input buffer
+        self.fake_push_16_raw();
+        self.push_16_raw(bus, 0); // data output buffer
+        self.fake_push_16_raw();
+        self.push_32_raw(bus, address); // fault address
+        self.push_16_raw(bus, ssw); // special status word
+        self.push_16_raw(bus, 0x8000 | ((vector as u16) << 2));
+        self.push_32_raw(bus, self.ppc);
+        self.push_16_raw(bus, old_sr);
+    }
+
+    /// Push the 68020/68030 long bus-cycle fault frame (format $B) for a
+    /// bus error or an address error.
+    #[allow(clippy::too_many_arguments)]
+    fn push_fault_frame_030<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u32,
+        old_sr: u16,
+        fc: u16,
+        address: u32,
+        write: bool,
+        instruction: bool,
+        size: u32,
+        fault_wdata: u32,
+    ) {
+        // 68020/68030 long bus-cycle fault frame (format $B, 46
+        // words, M68030UM 8.2). Real silicon dumps pipeline state
+        // here and RTE *continues* the faulted instruction, with the
+        // handler able to rerun or complete the data cycle through
+        // the DF bit and the data input/output buffers. This core
+        // rolls the faulting instruction back instead and stacks its
+        // PC, so RTE restarts it from scratch: the pipeline dump and
+        // writeback buffers are left zero, and a handler that
+        // clears DF to suppress the rerun is not honoured (the
+        // restart re-issues the access; harmless for memory, the
+        // documented gap for side-effecting hardware registers).
+        //
+        // The special status word at +$0A is what a page-fault
+        // handler (mmu.library, VMM, Enforcer) actually parses:
+        // DF (bit 8) marks a faulted data cycle with its address in
+        // the long at +$10, RW (bit 6) the direction, SIZ (bits 5:4,
+        // 01 byte / 10 word / 00 long) the width, and FC2:0 the
+        // address space. An instruction-fetch fault instead reports
+        // a stage-B rerun (FB|RB, bits 14/12) with the fetch address
+        // in the stage B address long at +$24, the shape real
+        // handlers use to demand-page code.
+        let data_fault = !instruction;
+        let mut ssw: u16 = fc & 0x7;
+        if data_fault {
+            ssw |= 0x0100; // DF: rerun data cycle
+            if !write {
+                ssw |= 0x0040; // RW: read
+            }
+            // SIZ 11 is the three-byte transfer the 68020/68030 bus
+            // performs for a dynamically sized access or a bit-field
+            // operand spanning three bytes.
+            ssw |= match size {
+                1 => 0x0010, // SIZ 01: byte
+                2 => 0x0020, // SIZ 10: word
+                3 => 0x0030, // SIZ 11: three byte
+                _ => 0x0000, // SIZ 00: long
+            };
+        } else {
+            ssw |= 0x4000 | 0x1000; // FB|RB: rerun instruction stage B
+        }
+        let fmt_vec = 0xB000 | ((vector as u16) << 2);
+        // Pushed high address -> low: internal words +$38..$5A (18
+        // words), version word +$36, internal +$30..$34 (3 words),
+        // data input buffer +$2C, internal +$28/$2A, stage B address
+        // +$24, internal +$1C..$22 (4 words), data output buffer
+        // +$18, internal +$14/$16, data fault address +$10, stage B
+        // and C pipe words +$0E/$0C, SSW +$0A, internal +$08.
+        for _ in 0..9 {
+            self.push_32(bus, 0); // +$38..$5A
+        }
+        self.push_16(bus, 0); // +$36 version/internal
+        for _ in 0..3 {
+            self.push_16(bus, 0); // +$30..$34
+        }
+        self.push_32(bus, 0); // +$2C data input buffer
+        self.push_32(bus, 0); // +$28/$2A internal
+        self.push_32(bus, if data_fault { 0 } else { address }); // +$24 stage B address
+        self.push_32(bus, 0); // +$20/$22 internal
+        self.push_32(bus, 0); // +$1C/$1E internal
+        // +$18 data output buffer: the value of a faulted write, so
+        // a handler can complete the write itself (clear DF).
+        self.push_32(bus, if write { fault_wdata } else { 0 });
+        self.push_32(bus, 0); // +$14/$16 internal
+        self.push_32(bus, if data_fault { address } else { 0 }); // +$10 data fault address
+        self.push_16(bus, 0); // +$0E pipe stage B
+        self.push_16(bus, 0); // +$0C pipe stage C
+        self.push_16(bus, ssw); // +$0A special status word
+        self.push_16(bus, 0); // +$08 internal
+        self.push_16(bus, fmt_vec); // +$06 format/vector
+        self.push_32(bus, self.ppc); // +$02 restart PC
+        self.push_16(bus, old_sr); // +$00 SR
     }
 
     /// Process TRAP #n instruction.
@@ -266,7 +523,9 @@ impl CpuCore {
 
     /// Process address error exception.
     ///
-    /// 68000 pushes additional info: access address, instruction register, status.
+    /// The 68000 stacks its seven-word group 0 frame, the 68010 format $8,
+    /// the 68020/68030 the format $B bus fault frame and the 68040/68060 the
+    /// six-word format $2 frame.
     pub fn exception_address_error<B: AddressBus>(
         &mut self,
         bus: &mut B,
@@ -295,69 +554,62 @@ impl CpuCore {
         } else {
             fc::USER_DATA
         };
-        let status_word = fc | if write { 0 } else { 0x10 } | if instruction { 0 } else { 0x08 };
-
         match self.cpu_type {
             CpuType::M68000 => {
-                // 68000 address error frame (14 bytes):
-                // Push: PC (4), SR (2), IR (2), Access Address (4), Status Word (2)
-                //
-                // Use raw bus writes (no alignment/address-error checks) to avoid recursive
-                // address-error exceptions if the stack pointer is itself misaligned.
-                self.push_16_raw(bus, status_word);
-                self.push_32_raw(bus, address);
-                self.push_16_raw(bus, self.ir as u16);
-                self.push_16_raw(bus, old_sr);
-                self.push_32_raw(bus, self.ppc);
+                // I/N is set when the fault interrupted exception processing
+                // (an odd vector, for example) rather than an instruction.
+                let in_exception = self.exception_processing;
+                let stacked_pc = self.group0_stacked_pc_68000(write, instruction);
+                // A PC-relative operand is read from program space.
+                let ir = self.ir as u16;
+                let pc_relative = (ir >> 3) & 7 == 7 && matches!(ir & 7, 2 | 3);
+                let fc = if !write && !instruction && pc_relative {
+                    fc + 1
+                } else {
+                    fc
+                };
+                self.push_group0_frame_68000(
+                    bus,
+                    fc,
+                    write,
+                    in_exception,
+                    address,
+                    old_sr,
+                    stacked_pc,
+                );
             }
             CpuType::M68010 | CpuType::SCC68070 => {
-                // 68010 uses the "format 8" (0x8) bus/address error stack frame (29 words).
-                // We intentionally mirror Musashi's placeholder implementation here: most internal
-                // words are zero/undefined and we primarily preserve the format/vector word, PC, SR.
-                //
-                // Layout (from Musashi m68kcpu.h m68ki_stack_frame_1000):
-                // - lots of internal words (mostly not written)
-                // - fault address (long) = 0
-                // - special status word = 0
-                // - format/vector word = 0x8000 | (vector<<2)
-                // - stacked PC (long)
-                // - stacked SR (word)
-                for _ in 0..8 {
-                    self.fake_push_32_raw();
-                }
-                self.push_16_raw(bus, 0); // instruction input buffer
-                self.fake_push_16_raw();
-                self.push_16_raw(bus, 0); // data input buffer
-                self.fake_push_16_raw();
-                self.push_16_raw(bus, 0); // data output buffer
-                self.fake_push_16_raw();
-                self.push_32_raw(bus, 0); // fault address
-                self.push_16_raw(bus, 0); // special status word
-                self.push_16_raw(bus, 0x8000 | ((vector::ADDRESS_ERROR as u16) << 2));
-                self.push_32_raw(bus, self.ppc);
-                self.push_16_raw(bus, old_sr);
+                let ssw = ssw_010(fc, write, instruction, 2);
+                self.push_fault_frame_010(bus, vector::ADDRESS_ERROR, old_sr, ssw, address);
             }
-            _ if self.is_040() => {
+            _ if self.is_040() || self.is_060() => {
                 // An odd instruction prefetch uses the six-word format-$2
-                // address-error frame (MC68040UM 8.2.2, 8.4.3), not the
-                // format-$7 access-error frame used for bus and ATC faults.
-                // The extra longword contains the referenced address with A0
-                // cleared, while the stacked PC identifies the instruction
-                // that caused the address error.
+                // address-error frame (MC68040UM 8.2.2, 8.4.3; MC68060UM
+                // 8.2.2), not the access-error frame used for bus and ATC
+                // faults. The extra longword contains the referenced address
+                // with A0 cleared, while the stacked PC identifies the
+                // instruction that caused the address error.
                 self.push_32_raw(bus, address & !1);
                 self.push_16_raw(bus, 0x2000 | ((vector::ADDRESS_ERROR as u16) << 2));
                 self.push_32_raw(bus, self.ppc);
                 self.push_16_raw(bus, old_sr);
-                let _ = status_word;
             }
             _ => {
-                // TODO: 68020/68030/68060 address error stack frames are not
-                // yet implemented. Use a minimal format-0-like frame to avoid
-                // totally losing control flow, but this is not architecturally accurate.
-                self.push_16_raw(bus, (vector::ADDRESS_ERROR as u16) << 2);
-                self.push_32_raw(bus, self.ppc);
-                self.push_16_raw(bus, old_sr);
-                let _ = (status_word, address); // currently unused in this fallback
+                // 68020/68030: an address error stacks the same bus fault
+                // frame as a bus error (M68020UM 6.1.2, M68030UM 8.1.2).
+                // Only an instruction fetch can be misaligned on these
+                // parts, so this is always the stage-B rerun shape.
+                self.push_fault_frame_030(
+                    bus,
+                    vector::ADDRESS_ERROR,
+                    old_sr,
+                    fc,
+                    address,
+                    false,
+                    true,
+                    2,
+                    0,
+                );
             }
         }
 
@@ -416,34 +668,17 @@ impl CpuCore {
                 }
             }
         };
-        let status_word = fc | if write { 0 } else { 0x10 } | if instruction { 0 } else { 0x08 };
-
         match self.cpu_type {
             CpuType::M68000 => {
-                // 68000 bus error frame (same as address error)
-                self.push_16_raw(bus, status_word);
-                self.push_32_raw(bus, address);
-                self.push_16_raw(bus, self.ir as u16);
-                self.push_16_raw(bus, old_sr);
-                self.push_32_raw(bus, self.ppc);
+                // The 68000 bus error frame is the address error's. A bus
+                // error during exception processing is a double fault and
+                // never reaches this point, so I/N is always clear.
+                let stacked_pc = self.group0_stacked_pc_68000(write, instruction);
+                self.push_group0_frame_68000(bus, fc, write, false, address, old_sr, stacked_pc);
             }
             CpuType::M68010 | CpuType::SCC68070 => {
-                // 68010 format 8 (0x8) bus error frame (placeholder, matching Musashi).
-                for _ in 0..8 {
-                    self.fake_push_32_raw();
-                }
-                self.push_16_raw(bus, 0); // instruction input buffer
-                self.fake_push_16_raw();
-                self.push_16_raw(bus, 0); // data input buffer
-                self.fake_push_16_raw();
-                self.push_16_raw(bus, 0); // data output buffer
-                self.fake_push_16_raw();
-                self.push_32_raw(bus, 0); // fault address
-                self.push_16_raw(bus, 0); // special status word
-                self.push_16_raw(bus, 0x8000 | ((vector::BUS_ERROR as u16) << 2));
-                self.push_32_raw(bus, self.ppc);
-                self.push_16_raw(bus, old_sr);
-                let _ = (status_word, address); // currently unused in this placeholder
+                let ssw = ssw_010(fc, write, instruction, size);
+                self.push_fault_frame_010(bus, vector::BUS_ERROR, old_sr, ssw, address);
             }
             _ if self.is_060() => {
                 // 68060 access-error stack frame (format $4, 8 words): the
@@ -457,7 +692,6 @@ impl CpuCore {
                 self.push_16(bus, fmt_vec);
                 self.push_32(bus, self.ppc); // restart PC
                 self.push_16(bus, old_sr);
-                let _ = status_word;
             }
             _ if self.is_040() => {
                 // 68040 access-error stack frame (format 7, 30 words). The
@@ -521,77 +755,17 @@ impl CpuCore {
                 self.push_16(bus, old_sr);
             }
             _ => {
-                // 68020/68030 long bus-cycle fault frame (format $B, 46
-                // words, M68030UM 8.2). Real silicon dumps pipeline state
-                // here and RTE *continues* the faulted instruction, with the
-                // handler able to rerun or complete the data cycle through
-                // the DF bit and the data input/output buffers. This core
-                // rolls the faulting instruction back instead and stacks its
-                // PC, so RTE restarts it from scratch: the pipeline dump and
-                // writeback buffers are left zero, and a handler that
-                // clears DF to suppress the rerun is not honoured (the
-                // restart re-issues the access; harmless for memory, the
-                // documented gap for side-effecting hardware registers).
-                //
-                // The special status word at +$0A is what a page-fault
-                // handler (mmu.library, VMM, Enforcer) actually parses:
-                // DF (bit 8) marks a faulted data cycle with its address in
-                // the long at +$10, RW (bit 6) the direction, SIZ (bits 5:4,
-                // 01 byte / 10 word / 00 long) the width, and FC2:0 the
-                // address space. An instruction-fetch fault instead reports
-                // a stage-B rerun (FB|RB, bits 14/12) with the fetch address
-                // in the stage B address long at +$24, the shape real
-                // handlers use to demand-page code.
-                let data_fault = !instruction;
-                let mut ssw: u16 = fc & 0x7;
-                if data_fault {
-                    ssw |= 0x0100; // DF: rerun data cycle
-                    if !write {
-                        ssw |= 0x0040; // RW: read
-                    }
-                    // SIZ 11 is the three-byte transfer the 68020/68030 bus
-                    // performs for a dynamically sized access or a bit-field
-                    // operand spanning three bytes.
-                    ssw |= match size {
-                        1 => 0x0010, // SIZ 01: byte
-                        2 => 0x0020, // SIZ 10: word
-                        3 => 0x0030, // SIZ 11: three byte
-                        _ => 0x0000, // SIZ 00: long
-                    };
-                } else {
-                    ssw |= 0x4000 | 0x1000; // FB|RB: rerun instruction stage B
-                }
-                let fmt_vec = 0xB000 | ((vector::BUS_ERROR as u16) << 2);
-                // Pushed high address -> low: internal words +$38..$5A (18
-                // words), version word +$36, internal +$30..$34 (3 words),
-                // data input buffer +$2C, internal +$28/$2A, stage B address
-                // +$24, internal +$1C..$22 (4 words), data output buffer
-                // +$18, internal +$14/$16, data fault address +$10, stage B
-                // and C pipe words +$0E/$0C, SSW +$0A, internal +$08.
-                for _ in 0..9 {
-                    self.push_32(bus, 0); // +$38..$5A
-                }
-                self.push_16(bus, 0); // +$36 version/internal
-                for _ in 0..3 {
-                    self.push_16(bus, 0); // +$30..$34
-                }
-                self.push_32(bus, 0); // +$2C data input buffer
-                self.push_32(bus, 0); // +$28/$2A internal
-                self.push_32(bus, if data_fault { 0 } else { address }); // +$24 stage B address
-                self.push_32(bus, 0); // +$20/$22 internal
-                self.push_32(bus, 0); // +$1C/$1E internal
-                // +$18 data output buffer: the value of a faulted write, so
-                // a handler can complete the write itself (clear DF).
-                self.push_32(bus, if write { fault_wdata } else { 0 });
-                self.push_32(bus, 0); // +$14/$16 internal
-                self.push_32(bus, if data_fault { address } else { 0 }); // +$10 data fault address
-                self.push_16(bus, 0); // +$0E pipe stage B
-                self.push_16(bus, 0); // +$0C pipe stage C
-                self.push_16(bus, ssw); // +$0A special status word
-                self.push_16(bus, 0); // +$08 internal
-                self.push_16(bus, fmt_vec); // +$06 format/vector
-                self.push_32(bus, self.ppc); // +$02 restart PC
-                self.push_16(bus, old_sr); // +$00 SR
+                self.push_fault_frame_030(
+                    bus,
+                    vector::BUS_ERROR,
+                    old_sr,
+                    fc,
+                    address,
+                    write,
+                    instruction,
+                    size,
+                    fault_wdata,
+                );
             }
         }
 
