@@ -1425,6 +1425,13 @@ impl CpuCore {
         self.cpu_type == CpuType::M68040 && !self.emulate_unimplemented_040
     }
 
+    /// Whether the FPU is an MC68881/MC68882 coprocessor (on a 68020/030
+    /// coprocessor interface) rather than the 68040/68060 on-chip unit.
+    #[inline]
+    pub(crate) fn fpu_is_6888x(&self) -> bool {
+        !self.is_040() && !self.is_060()
+    }
+
     /// True for the 68060, which shares the 68040's MMU table format and
     /// TC enable bit but drops PTEST/PMOVE and adds PLPA.
     #[inline]

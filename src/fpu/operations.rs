@@ -183,6 +183,12 @@ impl CpuCore {
                 let dst = ((w2 >> 7) & 7) as usize;
                 let opmode = w2 & 0x7f;
 
+                // The single/double-rounded opmodes are 68040/68060
+                // additions; FMOVECR (format 7) carries a ROM offset there.
+                if src_fmt != 7 && self.fpu_6888x_illegal_opmode(opmode) {
+                    return 0;
+                }
+
                 // Consume w2 now that we're committed.
                 let _w2 = self.read_imm_16(bus);
 
@@ -294,6 +300,10 @@ impl CpuCore {
                 let src = ((w2 >> 10) & 7) as usize;
                 let dst = ((w2 >> 7) & 7) as usize;
                 let opmode = w2 & 0x7f;
+
+                if self.fpu_6888x_illegal_opmode(opmode) {
+                    return 0;
+                }
 
                 // Consume w2
                 let _ = self.read_imm_16(bus);
@@ -516,6 +526,15 @@ impl CpuCore {
             }
             _ => 0,
         }
+    }
+
+    /// The FSxxx/FDxxx opmodes ($40-$7F: FSMOVE, FDADD, FSSQRT, ...) exist
+    /// only on the 68040 and 68060 (M68040UM 9.4, M68000PRM 4.3). On a
+    /// 6888x they are illegal coprocessor commands, which the 68020/030
+    /// takes as an F-line exception with the format $0 frame
+    /// (MC68881/MC68882UM 7.4.2, MC68020UM 10.4.2).
+    fn fpu_6888x_illegal_opmode(&self, opmode: u16) -> bool {
+        self.fpu_is_6888x() && opmode & 0x40 != 0
     }
 
     /// FBcc - FPU conditional branch.

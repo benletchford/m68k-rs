@@ -109,6 +109,22 @@ impl Machine {
         }
         panic!("program did not reach STOP");
     }
+
+    /// The vector of the exception the program took, if any.
+    fn vector(&self) -> Option<u32> {
+        (self.cpu.dar[7] != NO_EXCEPTION).then_some(self.cpu.dar[7])
+    }
+
+    /// The stacked (SR, PC, format/vector word) of the last exception,
+    /// read at the stub's SSP.
+    fn frame(&mut self) -> (u16, u32, u16) {
+        let sp = self.cpu.dar[15];
+        (
+            self.bus.read_word(sp),
+            self.bus.read_long(sp + 2),
+            self.bus.read_word(sp + 6),
+        )
+    }
 }
 
 fn x80(sign_exp: u16, mantissa: u64) -> FloatX80 {
@@ -453,6 +469,41 @@ fn ieee_nonaware_predicates_signal_bsun_on_unordered() {
                 }
             }
         }
+    }
+}
+
+#[test]
+fn rounded_opmodes_are_f_line_on_a_6888x() {
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    // FSADD, FDMUL, FSSQRT, FDMOVE (register and memory source forms).
+    for opmode in [0x62u16, 0x67, 0x41, 0x44] {
+        let mut m = Machine::new(CpuType::M68030);
+        m.cpu.fpr[0] = x80(one.0, one.1);
+        m.cpu.fpr[1] = x80(one.0, one.1);
+        m.run(&[0xF200, 0x0400 | opmode]);
+        assert_eq!(m.vector(), Some(11), "opmode {opmode:#x}");
+        let (_, pc, fv) = m.frame();
+        assert_eq!(
+            pc, CODE,
+            "opmode {opmode:#x}: the frame restarts the instruction"
+        );
+        assert_eq!(fv, 0x002C, "opmode {opmode:#x}: format $0, vector 11");
+        assert_eq!(bits(m.cpu.fpr[0]), one, "opmode {opmode:#x}: FP0 unchanged");
+
+        // FSADD.L #1,FP0 etc.: the immediate form is F-line too.
+        let mut m = Machine::new(CpuType::M68030);
+        m.run(&[0xF23C, 0x4000 | opmode, 0x0000, 0x0001]);
+        assert_eq!(m.vector(), Some(11), "opmode {opmode:#x} #imm");
+    }
+    // The 68040 and 68060 execute them.
+    for cpu in [CpuType::M68040, CpuType::M68060] {
+        let m = reg_op(cpu, 0x62, one, one);
+        assert_eq!(m.vector(), None, "{cpu:?}");
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0x4000, 0x8000_0000_0000_0000),
+            "{cpu:?}"
+        );
     }
 }
 
