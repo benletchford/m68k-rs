@@ -101,7 +101,7 @@ fn mmu_030(bus: &mut TestBus) -> CpuCore {
     cpu.reset(bus);
     cpu.set_sr(0x2700);
     cpu.mmu_crp_aptr = TABLE;
-    cpu.mmu_crp_limit = 2; // DT = 2: short-format table
+    cpu.mmu_crp_limit = 0x8000_0002; // lower limit 0, DT = 2: short-format table
     cpu.mmu_tc = TC;
     cpu.pmmu_enabled = true;
     bus.table_reads = 0;
@@ -228,7 +228,7 @@ fn pflusha_and_pmove_flush_but_pmovefd_does_not() {
     assert_eq!(data(&mut cpu, &mut bus, 0x5004), 0xB004);
 
     // So does a PMOVE to CRP.
-    bus.write_long(0x7008, 2);
+    bus.write_long(0x7008, 0x8000_0002); // lower limit 0, short table
     bus.write_long(0x700C, TABLE);
     cpu.set_a(0, 0x7008);
     bus.map(5, 0xC);
@@ -248,7 +248,7 @@ fn pmove_flush_follows_its_operand_fetch() {
         let phys = if page == 7 { 0xD } else { page };
         bus.write_long(new_root + page * 4, (phys << 12) | 1);
     }
-    bus.write_long(0x7008, 2);
+    bus.write_long(0x7008, 0x8000_0002); // lower limit 0, short table
     bus.write_long(0x700C, new_root);
     cpu.set_a(0, 0x7008);
     run(&mut cpu, &mut bus, &[0xF010, 0x4C00]);

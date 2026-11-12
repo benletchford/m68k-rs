@@ -135,6 +135,9 @@ struct Desc030 {
     /// format, its first long for long format), at `at`.
     status: u32,
     at: u32,
+    /// Long format only: the limit on the index into the next table, as
+    /// (lower limit, limit) from L/U (bit 31) and LIMIT (bits 30-16).
+    limit: Option<(bool, u32)>,
 }
 
 fn read_desc_030<B: AddressBus>(
@@ -154,6 +157,7 @@ fn read_desc_030<B: AddressBus>(
             sup: hi & 0x0000_0100 != 0,
             status: hi,
             at,
+            limit: Some((hi & 0x8000_0000 != 0, (hi >> 16) & 0x7FFF)),
         })
     } else {
         let at = base.wrapping_add(index * 4);
@@ -165,7 +169,19 @@ fn read_desc_030<B: AddressBus>(
             sup: false,
             status: e,
             at,
+            limit: None,
         })
+    }
+}
+
+/// Whether `index` lies outside a 68030 limit: below it for a lower limit
+/// (L/U=1), above it for an upper limit (L/U=0) (MC68030UM 9.5.1.2).
+#[inline]
+fn limit_violated(limit: Option<(bool, u32)>, index: u32) -> bool {
+    match limit {
+        Some((true, limit)) => index < limit,
+        Some((false, limit)) => index > limit,
+        None => false,
     }
 }
 
@@ -177,6 +193,9 @@ enum Walk030End {
     /// An invalid (DT=0) descriptor, or an indirect descriptor whose target
     /// is not a page descriptor (`indirect` tells the two apart).
     Invalid { indirect: bool },
+    /// The index into the next table is outside the limit of the root
+    /// pointer or of the long-format descriptor pointing to it.
+    Limit,
     /// The level limit stopped the walk on a valid table pointer (PTEST
     /// with a level operand; a full walk never ends here).
     LevelStop,
@@ -220,17 +239,20 @@ struct Walk030 {
 /// subtree to supervisor accesses. `max_levels` bounds how many descriptors
 /// are fetched (PTEST's level operand); `u32::MAX` walks to completion.
 ///
+/// The root pointer and every long-format table or early-termination
+/// descriptor carry a limit on the index into the table below them; an
+/// index outside it ends the walk (MC68030UM 9.5.1.2).
+///
 /// `history` is `Some(write)` for a search made for an access or a PLOAD,
 /// which sets the history bits in the descriptors it uses (MC68030UM
 /// 9.5.3): U in each valid table descriptor and in the page descriptor, and
 /// M in the page descriptor for a write that no descriptor on the path
 /// write-protects. An indirect descriptor is not updated (its target page
-/// descriptor is), nor is an invalid one, or any descriptor once a
-/// long-format S bit has denied a user access the subtree. PTEST passes
-/// `None`: it changes no descriptor.
+/// descriptor is), nor is an invalid one, one whose limit the walk
+/// violates, or any descriptor once a long-format S bit has denied a user
+/// access the subtree. PTEST passes `None`: it changes no descriptor.
 ///
-/// Not modelled: CRP/long-descriptor limit checks, and the DT=1
-/// page-descriptor root.
+/// Not modelled: the DT=1 page-descriptor root.
 fn walk_030<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -308,6 +330,13 @@ fn walk_030<B: AddressBus>(
         }
     };
 
+    // The root pointer's limit bounds the first table's index.
+    let root_limit_field = Some((root_limit & 0x8000_0000 != 0, (root_limit >> 16) & 0x7FFF));
+    if limit_violated(root_limit_field, index_at(0, consumed)) {
+        w.end = Walk030End::Limit;
+        return w;
+    }
+
     // Sets history bits in a fetched descriptor, unless this search makes
     // no history updates or a supervisor-only subtree denied the access.
     let update = |bus: &mut B, d: &Desc030, bits: u32, sup_denied: bool| -> MmuResult<u32> {
@@ -348,6 +377,12 @@ fn walk_030<B: AddressBus>(
             1 => {
                 w.wp |= d.wp;
                 w.sup |= d.sup;
+                // A long early-termination descriptor's limit bounds the
+                // index the next level would have used.
+                if li + 1 < n && limit_violated(d.limit, index_at(li + 1, consumed)) {
+                    w.end = Walk030End::Limit;
+                    return w;
+                }
                 let status = match update(bus, &d, page_bits(w.wp), w.sup && !supervisor) {
                     Ok(s) => s,
                     Err(f) => {
@@ -367,6 +402,10 @@ fn walk_030<B: AddressBus>(
                     // Pointer to the next table level.
                     w.wp |= d.wp;
                     w.sup |= d.sup;
+                    if limit_violated(d.limit, index_at(li + 1, consumed)) {
+                        w.end = Walk030End::Limit;
+                        return w;
+                    }
                     if let Err(f) = update(bus, &d, U_030, w.sup && !supervisor) {
                         w.end = Walk030End::BusErr { at: f.address };
                         return w;
@@ -650,7 +689,9 @@ fn translate_030<B: AddressBus>(
             }
             Ok(phys)
         }
-        Walk030End::Invalid { indirect: false } => Err(access_fault(logical)),
+        // A limit violation is an access fault like an invalid
+        // descriptor (MC68030UM 9.5.1.2).
+        Walk030End::Invalid { indirect: false } | Walk030End::Limit => Err(access_fault(logical)),
         Walk030End::Invalid { indirect: true } => {
             Err(access_fault_cause(logical, MmuFaultCause::Indirect))
         }
@@ -713,7 +754,8 @@ pub(crate) fn pload_030<B: AddressBus>(
 /// Returns the MMUSR and the physical address of the last descriptor
 /// examined (handed back through PTEST's A bit; mmu.library's lazy fault
 /// handler locates the shared descriptor slot to materialize with exactly
-/// this). The L (limit) and M (modified) bits are not modelled.
+/// this). L (bit 14, with I) reports a limit violation. The M (modified)
+/// bit is not modelled.
 pub(crate) fn ptest_030<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -740,6 +782,7 @@ pub(crate) fn ptest_030<B: AddressBus>(
     match w.end {
         Walk030End::Page { .. } | Walk030End::LevelStop => {}
         Walk030End::Invalid { .. } => sr |= 0x0400, // I
+        Walk030End::Limit => sr |= 0x4400,          // L and I
         Walk030End::BusErr { .. } | Walk030End::Config => sr |= 0x8000, // B
     }
     (sr, w.desc_addr)

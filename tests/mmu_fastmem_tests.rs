@@ -231,9 +231,9 @@ fn machine(
             bus.tables_030(TABLE2);
             cpu.set_cpu_type(CpuType::M68030);
             cpu.mmu_crp_aptr = TABLE;
-            cpu.mmu_crp_limit = 2;
+            cpu.mmu_crp_limit = 0x8000_0002; // lower limit 0, short tables
             cpu.mmu_srp_aptr = TABLE2;
-            cpu.mmu_srp_limit = 2;
+            cpu.mmu_srp_limit = 0x8000_0002;
             cpu.mmu_tc = tc;
         }
         Mmu::Mc68040 => {
@@ -593,7 +593,7 @@ fn pmove_root_pointer_switches_the_window_030() {
         &|cpu, bus| {
             loop_setup(cpu, bus);
             cpu.set_a(3, 0x2_6000);
-            bus.poke_long(0x2_6000, 2); // limit/DT: short table
+            bus.poke_long(0x2_6000, 0x8000_0002); // lower limit 0, short table
             bus.poke_long(0x2_6004, TABLE2);
             bus.map_030(TABLE2, DATA, 0x2_2000, 0);
         },

@@ -1,6 +1,7 @@
 //! 68030 PMMU behaviour against a three-level table (TIA=8, TIB=6, TIC=6,
 //! 4 KB pages; MC68030UM section 9): transparent translation through
-//! TT0/TT1, and the history bits the table search writes back.
+//! TT0/TT1, the history bits the table search writes back, and the
+//! root-pointer and long-descriptor limits.
 
 use m68k::core::cpu::CpuCore;
 use m68k::core::memory::AddressBus;
@@ -315,4 +316,92 @@ fn pload_updates_history_as_its_direction() {
     bus.write_long(DESC, PHYS | 1);
     write(&mut cpu, &mut bus, LOGICAL, true).unwrap();
     assert_eq!(bus.read_long(DESC), PHYS | 1);
+}
+
+/// PTESTR #5,(A0),#7: the MMUSR.
+fn ptest7(cpu: &mut CpuCore, bus: &mut TestBus, addr: u32) -> u32 {
+    pmmu_op(cpu, bus, 0x9E15, addr);
+    cpu.mmu_sr
+}
+
+const MMUSR_L: u32 = 0x4000;
+const MMUSR_I: u32 = 0x0400;
+
+#[test]
+fn root_pointer_limit_bounds_the_level_a_index() {
+    let (mut cpu, mut bus) = build();
+    cpu.mmu_crp_limit = 2; // L/U = 0, LIMIT = 0: index 0 only
+    assert_eq!(read(&mut cpu, &mut bus, LOGICAL, true), Ok(PHYS));
+    assert!(read(&mut cpu, &mut bus, 0x0300_0010, true).is_err());
+    assert_eq!(bus.read_long(TA + 3 * 4), 0x0300_0000 | 1, "not fetched");
+    assert_eq!(
+        ptest7(&mut cpu, &mut bus, 0x0300_0010) & 0xC400,
+        MMUSR_L | MMUSR_I
+    );
+    assert_eq!(ptest7(&mut cpu, &mut bus, LOGICAL) & 0xC400, 0);
+
+    // L/U = 1, LIMIT = 3: indexes below 3 are out of bounds.
+    cpu.mmu_crp_limit = 0x8003_0002;
+    cpu.atc_030.flush_all();
+    assert!(read(&mut cpu, &mut bus, 0x0300_0010, true).is_ok());
+    assert!(read(&mut cpu, &mut bus, 0x0200_0010, true).is_err());
+}
+
+/// Level A entry 0 points (short) at a long-format level B table whose
+/// entry 0, with `b0` in its first long, points at a long page table.
+/// Returns the level B descriptor's address.
+fn long_tables(bus: &mut TestBus, b0: u32) -> u32 {
+    let tb_long = 0x3000;
+    let tc_long = 0x3100;
+    bus.write_long(TA, tb_long | 3);
+    bus.write_long(tb_long, b0);
+    bus.write_long(tb_long + 4, tc_long);
+    for i in 0..64u32 {
+        bus.write_long(tc_long + i * 8, 0x7FFF_FC00 | 1);
+        bus.write_long(tc_long + i * 8 + 4, i << 12);
+    }
+    tb_long
+}
+
+#[test]
+fn long_table_descriptor_limit_bounds_the_next_index() {
+    // Upper limit $10: level C indexes up to $10 translate.
+    let (mut cpu, mut bus) = build();
+    long_tables(&mut bus, (0x10 << 16) | 0xFC00 | 3);
+    assert_eq!(read(&mut cpu, &mut bus, 0x0001_0010, true), Ok(0x0001_0010));
+    assert!(read(&mut cpu, &mut bus, 0x0001_1010, true).is_err());
+    assert_eq!(
+        ptest7(&mut cpu, &mut bus, 0x0001_1010) & 0xC400,
+        MMUSR_L | MMUSR_I
+    );
+    assert_eq!(ptest7(&mut cpu, &mut bus, 0x0001_0010) & 0xC400, 0);
+
+    // A descriptor whose limit the walk violates is not marked used.
+    let (mut cpu, mut bus) = build();
+    let b = long_tables(&mut bus, (0x10 << 16) | 0xFC00 | 3);
+    assert!(read(&mut cpu, &mut bus, 0x0003_0000, true).is_err());
+    assert_eq!(bus.read_long(b) & U, 0);
+
+    // Lower limit $10: indexes below $10 are out of bounds.
+    let (mut cpu, mut bus) = build();
+    long_tables(&mut bus, 0x8000_0000 | (0x10 << 16) | 0xFC00 | 3);
+    assert!(read(&mut cpu, &mut bus, 0x0001_0010, true).is_ok());
+    assert!(read(&mut cpu, &mut bus, 0x0000_F010, true).is_err());
+}
+
+#[test]
+fn long_early_termination_limit_bounds_the_next_index() {
+    let (mut cpu, mut bus) = build();
+    // Level B entry 0: a long early-termination page descriptor for
+    // $00000000-$0003FFFF with upper limit 31 on the level C index.
+    let tb_long = 0x3000;
+    bus.write_long(TA, tb_long | 3);
+    bus.write_long(tb_long, (31 << 16) | 0xFC00 | 1);
+    bus.write_long(tb_long + 4, 0);
+    assert_eq!(read(&mut cpu, &mut bus, 0x0000_0100, true), Ok(0x0000_0100));
+    assert!(read(&mut cpu, &mut bus, 0x0003_E100, true).is_err());
+    assert_eq!(
+        ptest7(&mut cpu, &mut bus, 0x0003_E100) & 0xC400,
+        MMUSR_L | MMUSR_I
+    );
 }

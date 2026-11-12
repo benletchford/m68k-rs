@@ -26158,7 +26158,7 @@ mod translated_window_tests {
         cpu.set_sr(0x2700);
         cpu.set_a(7, 0x7F00);
         cpu.mmu_crp_aptr = TABLE;
-        cpu.mmu_crp_limit = 2;
+        cpu.mmu_crp_limit = 0x8000_0002; // lower limit 0, short tables
         cpu.mmu_tc = 0x80C8_C000;
         cpu.pmmu_enabled = true;
         cpu.set_a(0, DATA);

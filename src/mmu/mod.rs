@@ -11,9 +11,9 @@
 //! Table-walk bus errors and protection failures retain enough cause detail
 //! for generation-specific exception frames. The 68040/68060 table search
 //! and the 68030 table search for an access or a PLOAD write the U (used)
-//! and M (modified) history bits back to their descriptors. 68030
-//! root-descriptor limit checks, and a DT=1 page descriptor directly in the
-//! 68030 root pointer are not modeled.
+//! and M (modified) history bits back to their descriptors, and the 68030
+//! enforces the root-pointer and long-descriptor limits. A DT=1 page
+//! descriptor directly in the 68030 root pointer is not modeled.
 
 pub mod atc;
 mod translation;
