@@ -1246,16 +1246,24 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                                     cpu.set_sr(sr);
                                     return 20;
                                 }
-                                1 => {
+                                1 if !cpu.is_060() => {
                                     // Throwaway (format 1): discard PC+format, restore SR, then loop.
+                                    // The 68060 has no master stack and never
+                                    // stacks this frame; RTE rejects it there
+                                    // (M68060UM 8.2.7: formats 0, 2, 3 and 4).
                                     let sr = cpu.pull_16(bus);
                                     // fake pull 32-bit PC + 16-bit format word
                                     cpu.dar[15] = cpu.dar[15].wrapping_add(4 + 2);
                                     cpu.set_sr(sr);
                                     continue;
                                 }
-                                2 => {
-                                    // Trap (format 2): discard format + address long.
+                                2 | 3 if format == 2 || cpu.is_040() || cpu.is_060() => {
+                                    // Six-word frames: format 2 (instruction
+                                    // traps, discard the instruction address)
+                                    // and the 68040/68060 format 3
+                                    // (floating-point post-instruction
+                                    // exceptions, discard the effective
+                                    // address; M68040UM 8.4.4).
                                     let sr = cpu.pull_16(bus);
                                     cpu.pc = cpu.pull_32(bus);
                                     let _ = cpu.pull_16(bus); // format word
@@ -1263,9 +1271,18 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                                     cpu.set_sr(sr);
                                     return 20;
                                 }
-                                4 if cpu.is_060() => {
-                                    // 68060 access-error / FP-disabled frame
-                                    // (8 words): discard EA and FSLW.
+                                4 if cpu.is_060()
+                                    || matches!(
+                                        cpu.cpu_type,
+                                        CpuType::M68EC040 | CpuType::M68LC040
+                                    ) =>
+                                {
+                                    // Eight-word format 4: the 68060
+                                    // access-error / FP-disabled frame and
+                                    // the 68LC040/68EC040 unimplemented
+                                    // floating-point frame. Discard the
+                                    // effective address and the second long
+                                    // (FSLW or faulted instruction PC).
                                     let sr = cpu.pull_16(bus);
                                     cpu.pc = cpu.pull_32(bus);
                                     let _ = cpu.pull_16(bus); // format word
@@ -1299,6 +1316,27 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                                     cpu.pc = cpu.pull_32(bus);
                                     let _ = cpu.pull_16(bus); // format word
                                     cpu.dar[15] = cpu.dar[15].wrapping_add(52);
+                                    cpu.set_sr(sr);
+                                    return 20;
+                                }
+                                9 if matches!(
+                                    cpu.cpu_type,
+                                    CpuType::M68EC020
+                                        | CpuType::M68020
+                                        | CpuType::M68EC030
+                                        | CpuType::M68030
+                                ) =>
+                                {
+                                    // 68020/68030 coprocessor mid-instruction
+                                    // frame (10 words): discard the
+                                    // instruction address and the four
+                                    // internal words. This core never stacks
+                                    // it, so there is no coprocessor state
+                                    // to resume; the frame is only accepted.
+                                    let sr = cpu.pull_16(bus);
+                                    cpu.pc = cpu.pull_32(bus);
+                                    let _ = cpu.pull_16(bus); // format word
+                                    cpu.dar[15] = cpu.dar[15].wrapping_add(12);
                                     cpu.set_sr(sr);
                                     return 20;
                                 }
