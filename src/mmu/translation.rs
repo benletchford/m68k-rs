@@ -744,18 +744,26 @@ pub(crate) fn pload_030<B: AddressBus>(
     }
 }
 
-/// 68030 PTEST: walk the tables for `logical` in the `fc` address space,
-/// fetching at most `level` descriptors (level 0 tests only transparent
-/// translation), and compose the 16-bit MMUSR: B (bit 15, bus error during
-/// search), S (bit 13, supervisor-only mapping probed from a user space),
-/// W (bit 11, write-protect accumulated along the walk -- reported for
-/// reads too), I (bit 10, invalid translation), T (bit 6, transparent-
-/// translation hit, level 0 only), N (bits 2:0, descriptors fetched).
+/// 68030 PTEST: compose the 16-bit MMUSR for `logical` in the `fc` address
+/// space (MC68030UM 9.6.3, M68000PRM PTEST).
+///
+/// Level 0 searches the ATC only (and the TT registers): T (bit 6) for a
+/// transparent-translation match; otherwise I (bit 10) when no entry holds
+/// the page, else W (bit 11) and M (bit 9) from the entry.
+///
+/// Levels 1-7 walk the tables, fetching at most `level` descriptors: B
+/// (bit 15, bus error during the search), L (bit 14, limit violation, with
+/// I), S (bit 13, supervisor-only mapping probed from a user space), W
+/// (write-protect accumulated along the walk, reported for reads too), I
+/// (invalid translation), M (the page descriptor's modified bit), N (bits
+/// 2:0, descriptors fetched). The walk changes no descriptor and loads no
+/// ATC entry.
+///
 /// Returns the MMUSR and the physical address of the last descriptor
 /// examined (handed back through PTEST's A bit; mmu.library's lazy fault
 /// handler locates the shared descriptor slot to materialize with exactly
-/// this). L (bit 14, with I) reports a limit violation. The M (modified)
-/// bit is not modelled.
+/// this). Not modelled: the B bit of a level-0 search, which comes from
+/// ATC entries for invalid translations this cache does not keep.
 pub(crate) fn ptest_030<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -766,9 +774,20 @@ pub(crate) fn ptest_030<B: AddressBus>(
 ) -> (u16, u32) {
     if level == 0 {
         let fc8 = fc as u8;
-        let t = super::ttr::ttr_matches(cpu.mmu_tt0, logical, fc8, write)
-            || super::ttr::ttr_matches(cpu.mmu_tt1, logical, fc8, write);
-        return (if t { 0x0040 } else { 0 }, 0);
+        if super::ttr::ttr_matches(cpu.mmu_tt0, logical, fc8, write)
+            || super::ttr::ttr_matches(cpu.mmu_tt1, logical, fc8, write)
+        {
+            return (0x0040, 0); // T
+        }
+        let entry = page_shift_030(cpu.mmu_tc)
+            .and_then(|shift| cpu.atc_030.status(fc8, logical >> shift, shift));
+        let sr = match entry {
+            None => 0x0400, // I: no ATC entry for the page
+            Some((wp, modified)) => {
+                (if wp { 0x0800 } else { 0 }) | if modified { 0x0200 } else { 0 }
+            }
+        };
+        return (sr, 0);
     }
     let w = walk_030(cpu, bus, logical, fc, level, None);
     let n = (w.levels & 7) as u16;
@@ -780,7 +799,12 @@ pub(crate) fn ptest_030<B: AddressBus>(
         sr |= 0x2000; // S: supervisor-only mapping probed from user space
     }
     match w.end {
-        Walk030End::Page { .. } | Walk030End::LevelStop => {}
+        Walk030End::Page { .. } => {
+            if w.modified {
+                sr |= 0x0200; // M
+            }
+        }
+        Walk030End::LevelStop => {}
         Walk030End::Invalid { .. } => sr |= 0x0400, // I
         Walk030End::Limit => sr |= 0x4400,          // L and I
         Walk030End::BusErr { .. } | Walk030End::Config => sr |= 0x8000, // B

@@ -405,3 +405,40 @@ fn long_early_termination_limit_bounds_the_next_index() {
         MMUSR_L | MMUSR_I
     );
 }
+
+const MMUSR_W: u32 = 0x0800;
+const MMUSR_M: u32 = 0x0200;
+
+/// PTESTR #5,(A0),#0: the ATC search's MMUSR.
+fn ptest0(cpu: &mut CpuCore, bus: &mut TestBus, addr: u32) -> u32 {
+    pmmu_op(cpu, bus, 0x8215, addr);
+    cpu.mmu_sr
+}
+
+#[test]
+fn ptest_level_0_searches_the_atc() {
+    let (mut cpu, mut bus) = build();
+    pmmu_op(&mut cpu, &mut bus, 0x2400, 0); // PFLUSHA
+    assert_eq!(ptest0(&mut cpu, &mut bus, LOGICAL), MMUSR_I, "no entry");
+    pmmu_op(&mut cpu, &mut bus, 0x2215, LOGICAL); // PLOADR #5,(A0)
+    assert_eq!(ptest0(&mut cpu, &mut bus, LOGICAL), 0, "loaded");
+    // The entry covers the whole page, not just its first byte.
+    assert_eq!(ptest0(&mut cpu, &mut bus, LOGICAL + 0x234), 0);
+    // Entries are tagged by FC: FC 1 has none (PTESTR #1,(A0),#0).
+    pmmu_op(&mut cpu, &mut bus, 0x8211, LOGICAL);
+    assert_eq!(cpu.mmu_sr, MMUSR_I);
+    // A write leaves a modified entry; a WP page's entry reports W.
+    write(&mut cpu, &mut bus, LOGICAL, true).unwrap();
+    assert_eq!(ptest0(&mut cpu, &mut bus, LOGICAL), MMUSR_M);
+    bus.write_long(TC_TABLE + 0x20 * 4, 0x0002_0000 | WP | 1);
+    read(&mut cpu, &mut bus, 0x0002_0000, true).unwrap();
+    assert_eq!(ptest0(&mut cpu, &mut bus, 0x0002_0000), MMUSR_W);
+}
+
+#[test]
+fn ptest_reports_the_page_descriptors_modified_bit() {
+    let (mut cpu, mut bus) = build();
+    assert_eq!(ptest7(&mut cpu, &mut bus, LOGICAL), 3, "clean page: N = 3");
+    bus.write_long(DESC, PHYS | U | M | 1);
+    assert_eq!(ptest7(&mut cpu, &mut bus, LOGICAL), MMUSR_M | 3);
+}

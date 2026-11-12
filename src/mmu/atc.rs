@@ -307,6 +307,19 @@ impl Atc030 {
         Some(e.phys_page & !ATC_030_M)
     }
 
+    /// The (write-protected, modified) status of the entry for `page` in
+    /// `fc`, or `None` without one: what a PTEST of level 0 reports. It
+    /// records no use.
+    pub fn status(&self, fc: u8, page: u32, shift: u32) -> Option<(bool, bool)> {
+        if u32::from(self.shift) != shift {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|e| e.valid && e.page == page && e.fc == fc)
+            .map(|e| (e.write_protected, e.phys_page & ATC_030_M != 0))
+    }
+
     /// Record a table search's translation, replacing an invalid entry or
     /// else the least recently used one, for a page whose descriptor
     /// already has M set (writes hit the entry).
@@ -561,8 +574,11 @@ mod tests {
         assert_eq!(atc.lookup(5, 0x10, SHIFT, false), Some(0x0008_0000));
         assert_eq!(atc.lookup(5, 0x10, SHIFT, true), None);
         assert_eq!(atc.probe(5, 0x10, SHIFT, true), None);
+        assert_eq!(atc.status(5, 0x10, SHIFT), Some((false, false)));
         atc.insert_entry(5, 0x10, SHIFT, 0x0008_0000, false, true);
         assert_eq!(atc.lookup(5, 0x10, SHIFT, true), Some(0x0008_0000));
         assert_eq!(atc.probe(5, 0x10, SHIFT, true), Some(0x0008_0000));
+        assert_eq!(atc.status(5, 0x10, SHIFT), Some((false, true)));
+        assert_eq!(atc.status(1, 0x10, SHIFT), None);
     }
 }
