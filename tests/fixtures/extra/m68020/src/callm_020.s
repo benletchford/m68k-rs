@@ -1,16 +1,17 @@
 .include "entry.s"
 /* Test: CALLM Execution (68020) */
-/* Verifies CALLM executes without Line-F on 68020 */
+/* Verifies CALLM executes on the 68020 and is an illegal instruction */
+/* (vector 4) on the models that dropped it (68030 and later) */
 
-.set FLINE_VEC, 0x2C
+.set ILLEGAL_VEC, 0x10
 
 run_test:
     clr.l %d0                   | Status: 0 = Success
     
-    /* Setup Line-F Handler to catch missing instruction on 68040 */
-    move.l FLINE_VEC, %d7
-    lea fline_handler, %a0
-    move.l %a0, FLINE_VEC
+    /* Setup illegal-instruction handler to catch the missing instruction on 68040 */
+    move.l ILLEGAL_VEC, %d7
+    lea illegal_handler, %a0
+    move.l %a0, ILLEGAL_VEC
     
     /* Create a dummy Module Descriptor on stack */
     /* Descriptor: */
@@ -34,7 +35,7 @@ run_test:
     
     /* We use CALLM #0, (A2) */
     /* Expected behavior on 020: Jumps to module_entry */
-    /* Expected behavior on 040: Line-F Trap */
+    /* Expected behavior on 040: illegal instruction */
     
     callm #0, (%a2)
     
@@ -83,12 +84,12 @@ module_entry:
     /* Returns to instruction after CALLM */
     rts                         | Should not be reached logic-wise, but RTM returns to caller
 
-fline_handler:
-    move.l #1, %d0              | Mark Line-F occurred
+illegal_handler:
+    move.l #1, %d0              | Mark illegal instruction occurred
     addq.l #4, 2(%sp)           | Skip instruction (roughly, might be more for CALLM with extension words? CALLM is 4 bytes minimum)
     rte
 
 finish_test:
     add.l #32, %sp              | Cleanup descriptor
-    move.l %d7, FLINE_VEC
+    move.l %d7, ILLEGAL_VEC
     rts

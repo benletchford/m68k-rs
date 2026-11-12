@@ -85,7 +85,10 @@ fn test_callm_68020() {
 #[test]
 fn test_callm_68040() {
     let binary = include_bytes!("fixtures/extra/m68020/bin/callm_020.bin");
-    // 68040: CALLM -> Line-F Trap -> D0=1
+    // 68040: CALLM is unimplemented -> illegal instruction -> D0=1
     let d0 = run_test_inspect(CpuType::M68040, binary, 2000);
-    assert_eq!(d0, 1, "68040 should trigger Line-F on CALLM (D0=1)");
+    assert_eq!(
+        d0, 1,
+        "68040 should take an illegal instruction on CALLM (D0=1)"
+    );
 }

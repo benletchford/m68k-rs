@@ -598,37 +598,21 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         return cpu.exec_moves(bus, opcode);
     }
 
-    // 68020-only CALLM/RTM instructions
+    // 68020-only CALLM/RTM instructions. The 68030 and later dropped the
+    // module instructions: the encodings are unimplemented there and take
+    // the illegal-instruction exception (vector 4), as on the 68000/68010.
     // CALLM: 0000 0110 11 mmm rrr (0x06C0-0x06FF)
     // RTM:   0000 0110 1100 xrrr  (0x06C0-0x06CF, where x=0 for Dn, x=1 for An)
     // RTM is a subset of CALLM's encoding; we check RTM first (mode=1, reg<8)
     if (opcode & 0xFFF0) == 0x06C0 {
-        if !matches!(
-            cpu.cpu_type,
-            CpuType::M68EC020
-                | CpuType::M68020
-                | CpuType::M68EC030
-                | CpuType::M68030
-                | CpuType::M68EC040
-                | CpuType::M68LC040
-                | CpuType::M68040
-        ) {
+        if !matches!(cpu.cpu_type, CpuType::M68EC020 | CpuType::M68020) {
             return illegal_instruction(cpu, bus);
         }
         // RTM Dn/An - mode 1, reg 0-7 with x bit
         return cpu.exec_rtm(bus, opcode);
     }
     if (opcode & 0xFFC0) == 0x06C0 {
-        if !matches!(
-            cpu.cpu_type,
-            CpuType::M68EC020
-                | CpuType::M68020
-                | CpuType::M68EC030
-                | CpuType::M68030
-                | CpuType::M68EC040
-                | CpuType::M68LC040
-                | CpuType::M68040
-        ) {
+        if !matches!(cpu.cpu_type, CpuType::M68EC020 | CpuType::M68020) {
             return illegal_instruction(cpu, bus);
         }
         // The module descriptor is addressed by a control mode only.
