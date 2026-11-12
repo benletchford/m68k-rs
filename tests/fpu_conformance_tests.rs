@@ -196,3 +196,66 @@ fn signaling_nan_operand_raises_snan_but_not_operr() {
         assert_eq!(bits(m.cpu.fpr[0]), SNAN_X_QUIET, "{cpu:?}");
     }
 }
+
+#[test]
+fn single_and_double_signaling_nan_sources_raise_snan() {
+    for cpu in ALL_FPUS {
+        // FMOVE.S (A0),FP0 with $7F800001.
+        let mut m = Machine::new(cpu);
+        m.bus.write_long(DATA, 0x7F80_0001);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x4400]);
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0x7FFF, 0xC000_0100_0000_0000),
+            "{cpu:?}"
+        );
+        assert_eq!(m.cpu.fpsr, CC_NAN | EXC_SNAN | AEXC_IOP, "{cpu:?} .S");
+
+        // FMOVE.D (A0),FP0 with $7FF00000_00000001.
+        let mut m = Machine::new(cpu);
+        m.bus.write_long(DATA, 0x7FF0_0000);
+        m.bus.write_long(DATA + 4, 0x0000_0001);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x5400]);
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0x7FFF, 0xC000_0000_0000_0800),
+            "{cpu:?}"
+        );
+        assert_eq!(m.cpu.fpsr, CC_NAN | EXC_SNAN | AEXC_IOP, "{cpu:?} .D");
+
+        // A quiet single NaN converts without an exception.
+        let mut m = Machine::new(cpu);
+        m.bus.write_long(DATA, 0x7FC0_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x4400]);
+        assert_eq!(m.cpu.fpsr, CC_NAN, "{cpu:?} quiet .S");
+    }
+}
+
+#[test]
+fn fmove_x_out_quiets_a_signaling_nan_and_rebuilds_the_exception_byte() {
+    for cpu in ALL_FPUS {
+        // FMOVE.X FP0,(A0) of an SNaN: SNAN set, quiet NaN stored, the
+        // condition codes untouched.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(SNAN_X.0, SNAN_X.1);
+        m.cpu.fpsr = 0;
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6800]);
+        assert_eq!(m.bus.read_long(DATA), 0x7FFF_0000, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0xE000_0000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, EXC_SNAN | AEXC_IOP, "{cpu:?}");
+
+        // A quiet NaN goes out unchanged; the previous instruction's
+        // exception byte is cleared, the accrued byte and CC stay.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(SNAN_X_QUIET.0, SNAN_X_QUIET.1);
+        m.cpu.fpsr = CC_NAN | EXC_SNAN | AEXC_IOP;
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6800]);
+        assert_eq!(m.bus.read_long(DATA + 4), 0xE000_0000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, CC_NAN | AEXC_IOP, "{cpu:?}");
+    }
+}
