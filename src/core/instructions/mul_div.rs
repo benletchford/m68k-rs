@@ -222,6 +222,9 @@ impl CpuCore {
             if m68000 {
                 self.internal_cycles(8);
             }
+            // The divider never runs, but C is cleared before the frame is
+            // stacked (M68000PRM DIVU: "C - always cleared").
+            self.c_flag = 0;
             return self.exception_zero_divide(bus);
         }
 
@@ -244,12 +247,13 @@ impl CpuCore {
 
         // Check for overflow (quotient must fit in 16 bits)
         if quotient >= 0x10000 {
+            // V set and C cleared on every model; N and Z are undefined.
             self.v_flag = 0x80;
+            self.c_flag = 0;
             if self.sst_m68000_compat {
                 // SingleStepTests/MAME fixtures expect deterministic N/Z on overflow.
                 self.n_flag = 0x80;
                 self.not_z_flag = 1; // Z=0
-                self.c_flag = 0;
             }
             return cycles;
         }
@@ -289,6 +293,9 @@ impl CpuCore {
             if m68000 {
                 self.internal_cycles(8);
             }
+            // The divider never runs, but C is cleared before the frame is
+            // stacked (M68000PRM DIVS: "C - always cleared").
+            self.c_flag = 0;
             return self.exception_zero_divide(bus);
         }
 
@@ -334,12 +341,13 @@ impl CpuCore {
 
         // Check for overflow (quotient must fit in signed 16 bits: -32768 to 32767)
         if !(-32768..=32767).contains(&quotient) {
+            // V set and C cleared on every model; N and Z are undefined.
             self.v_flag = 0x80;
+            self.c_flag = 0;
             if self.sst_m68000_compat {
                 // SingleStepTests/MAME fixtures expect deterministic N/Z on overflow.
                 self.n_flag = 0x80;
                 self.not_z_flag = 1; // Z=0
-                self.c_flag = 0;
             }
             return cycles;
         }

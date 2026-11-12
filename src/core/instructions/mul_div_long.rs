@@ -38,6 +38,9 @@ impl CpuCore {
 
         let divisor_u32 = self.read_ea(bus, mode, Size::Long);
         if divisor_u32 == 0 {
+            // C is cleared before the zero-divide frame is stacked
+            // (M68000PRM DIVS/DIVU: "C - always cleared").
+            self.c_flag = 0;
             return self.exception_zero_divide(bus);
         }
 
