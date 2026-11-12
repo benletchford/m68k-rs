@@ -204,6 +204,7 @@ impl CpuCore {
     /// exception (M68020UM table 6-5), so a handler can decode or skip it.
     pub(crate) fn take_group2_exception<B: AddressBus>(&mut self, bus: &mut B, vector: u32) -> i32 {
         let old_sr = self.get_sr();
+        self.settle_pending_trace(vector);
 
         // Enter supervisor, clear trace.
         self.set_s_flag(SFLAG_SET);
@@ -624,6 +625,7 @@ impl CpuCore {
         self.internal_cycles(4);
 
         let old_sr = self.get_sr();
+        self.settle_pending_trace(vector);
 
         // Match Musashi `m68ki_init_exception`: enter supervisor mode but do not modify M.
         self.set_s_flag(SFLAG_SET);
@@ -739,6 +741,29 @@ impl CpuCore {
             vector::LINE_1010 | vector::LINE_1111 => 34,
             24..=31 => 44, // Autovector interrupts
             _ => 34,       // TRAPs and user vectors
+        }
+    }
+
+    /// Decide whether the trace pending for the current instruction survives
+    /// the exception it is taking through `vector`.
+    ///
+    /// An instruction that completes by trapping (zero divide, CHK/CHK2,
+    /// TRAPV/TRAPcc, TRAP #n) is still traced on the 68000 through 68030:
+    /// the trace exception is processed right after the trap's, so its
+    /// handler runs first with the trap handler's address stacked
+    /// (M68000UM 6.3.8, M68020UM 6.1.8). An instruction that did not
+    /// execute (illegal, line A/F, privilege violation, format error) is
+    /// not traced on any model, and the 68040 and 68060 do not report a
+    /// trace pending together with an instruction trap at all (M68040UM
+    /// 8.3, M68060UM 8.2.6).
+    ///
+    /// The trace decision reads the trace bits of [`CpuCore::sr_save`], so
+    /// a cancelled trace clears them there.
+    fn settle_pending_trace(&mut self, vector: u32) {
+        let instruction_trap = matches!(vector, vector::ZERO_DIVIDE | vector::CHK | vector::TRAPV)
+            || (vector::TRAP_BASE..vector::TRAP_BASE + 16).contains(&vector);
+        if !instruction_trap || self.is_040() || self.is_060() {
+            self.sr_save &= !0xC000;
         }
     }
 
