@@ -508,7 +508,7 @@ fn transparent_translation_wins_over_the_atc_030() {
             bus.map_030(TABLE, 0x2_4000, 0x3_0000, 0);
             bus.poke_long(0x3_0000, 0xBBBB);
             bus.poke_long(0x2_4000, 2);
-            bus.poke_long(0x2_5000, 0x0000_8500); // E, FC = 5, FC mask 0
+            bus.poke_long(0x2_5000, 0x0000_8150); // E, RWM, FC = 5, FC mask 0
         },
     );
     assert_eq!(batched.0.d(1), 0xBBBB, "page-table translation first");
