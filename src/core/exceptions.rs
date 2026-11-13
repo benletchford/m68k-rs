@@ -108,6 +108,7 @@ fn fslw_060(
     size: u32,
     fc: u16,
     cause: Option<crate::mmu::MmuFaultCause>,
+    transparent: bool,
 ) -> u32 {
     use crate::mmu::MmuFaultCause;
     let mut w = if write { fslw::RW_W } else { fslw::RW_R };
@@ -127,11 +128,12 @@ fn fslw_060(
         Some(MmuFaultCause::PointerB) => fslw::PTB,
         Some(MmuFaultCause::Indirect) => fslw::IL,
         Some(MmuFaultCause::PageFault) => fslw::PF,
+        // A write-protected transparent translation register: MC68060UM
+        // 8.4.1 names a TTR bit for this fault; whether WP is also set is
+        // not stated, so only TTR is reported.
+        Some(MmuFaultCause::WriteProtect) if transparent => fslw::TTR,
         Some(MmuFaultCause::WriteProtect) => fslw::WP,
         Some(MmuFaultCause::SupervisorProtect) => fslw::SP,
-        // MC68060UM 8.4.1 names a TTR bit for this fault; whether WP is
-        // also set is not stated, so only TTR is reported.
-        Some(MmuFaultCause::TransparentWriteProtect) => fslw::TTR,
         Some(MmuFaultCause::TableWalkBusError) => fslw::TWE,
         // A physical bus error on the access itself.
         Some(MmuFaultCause::AccessBusError) | None => {
@@ -386,6 +388,8 @@ impl CpuCore {
         size: u32,
         cause: Option<crate::mmu::MmuFaultCause>,
     ) -> i32 {
+        // Read before the frame pushes below translate their own addresses.
+        let transparent = std::mem::take(&mut self.pending_fault_transparent);
         let old_sr = self.get_sr();
         let was_supervisor = (old_sr & 0x2000) != 0;
         // The faulted write's data, captured before any frame push: the
@@ -459,7 +463,7 @@ impl CpuCore {
                 // fault address long at +$08 and the fault status long word
                 // (FSLW) at +$0C. The instruction has been rolled back, so
                 // RTE restarts it (same demand-paging model as the 040).
-                let mut fslw = fslw_060(write, instruction, size, fc, cause);
+                let mut fslw = fslw_060(write, instruction, size, fc, cause, transparent);
                 if self.mmu_misaligned_tail {
                     fslw |= fslw::MA;
                 }

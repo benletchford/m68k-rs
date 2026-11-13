@@ -66,6 +66,9 @@ pub fn translate<B: AddressBus>(
     supervisor: bool,
     instruction: bool,
 ) -> MmuResult<u32> {
+    // Only the translation that just failed may leave this set.
+    cpu.pending_fault_transparent = false;
+
     // If MMU not enabled, identity-map.
     if !cpu.pmmu_enabled || !cpu.has_pmmu {
         return Ok(logical);
@@ -96,10 +99,10 @@ pub fn translate<B: AddressBus>(
         TtHit::Miss => {}
         TtHit::Hit => return Ok(logical),
         TtHit::WriteProtected => {
-            return Err(access_fault_cause(
-                logical,
-                MmuFaultCause::TransparentWriteProtect,
-            ));
+            // The public cause is the ordinary write-protect one; the
+            // 68060 frame builder reads this flag to report TTR in the FSLW.
+            cpu.pending_fault_transparent = true;
+            return Err(access_fault_cause(logical, MmuFaultCause::WriteProtect));
         }
     }
 

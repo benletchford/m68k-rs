@@ -53,13 +53,11 @@ pub enum MmuFaultCause {
     Indirect,
     /// Invalid page descriptor.
     PageFault,
-    /// Write to a write-protected page.
+    /// Write to a write-protected page, or through a write-protected
+    /// 68040/68060 transparent translation register (TTR W=1).
     WriteProtect,
     /// User access to a supervisor-only page.
     SupervisorProtect,
-    /// Write through a write-protected 68040/68060 transparent translation
-    /// register (TTR W=1).
-    TransparentWriteProtect,
     /// Physical bus error while walking the tables.
     TableWalkBusError,
     /// Physical bus error on the access itself.

@@ -313,6 +313,12 @@ pub struct CpuCore {
     /// physical bus errors leave it None. Transient within one exception.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) pending_fault_cause: Option<crate::mmu::MmuFaultCause>,
+    /// The translation that just failed hit a write-protected transparent
+    /// translation register. The public cause stays `WriteProtect`; the
+    /// 68060 frame builder reports the FSLW's TTR bit from this. Cleared
+    /// at the start of every translation.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) pending_fault_transparent: bool,
     /// Function code forced for the current data access: MOVES reads and
     /// writes carry SFC/DFC instead of the CPU-state-derived code, and the
     /// MMU translates in that address space (the 68030 FCL table level and
@@ -665,6 +671,7 @@ impl CpuCore {
             atc: crate::mmu::Atc::default(),
             atc_030: crate::mmu::Atc030::default(),
             pending_fault_cause: None,
+            pending_fault_transparent: false,
             mmu_fc_override: None,
             mmu_misaligned_tail: false,
             mmu_read_override: None,
