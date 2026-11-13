@@ -9,9 +9,11 @@
 //! address-translation cache.
 //!
 //! Table-walk bus errors and protection failures retain enough cause detail
-//! for generation-specific exception frames. Used/modified descriptor
-//! write-back, 68030 root-descriptor limit checks, and a DT=1 page descriptor
-//! directly in the 68030 root pointer are not modeled.
+//! for generation-specific exception frames. The 68040/68060 table search
+//! writes the U (used) and M (modified) history bits back to its
+//! descriptors. 68030 used/modified descriptor write-back, 68030
+//! root-descriptor limit checks, and a DT=1 page descriptor directly in the
+//! 68030 root pointer are not modeled.
 
 pub mod atc;
 mod translation;
@@ -22,7 +24,7 @@ use crate::core::memory::AddressBus;
 
 pub use atc::{Atc, Atc030};
 pub use translation::translate;
-pub(crate) use translation::{ResidentMmu, pload_030, probe_resident, ptest_030};
+pub(crate) use translation::{ResidentMmu, pload_030, probe_resident, ptest_030, ptest_040};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Architectural class of an MMU operation or translation fault.
@@ -51,7 +53,8 @@ pub enum MmuFaultCause {
     Indirect,
     /// Invalid page descriptor.
     PageFault,
-    /// Write to a write-protected page.
+    /// Write to a write-protected page, or through a write-protected
+    /// 68040/68060 transparent translation register (TTR W=1).
     WriteProtect,
     /// User access to a supervisor-only page.
     SupervisorProtect,

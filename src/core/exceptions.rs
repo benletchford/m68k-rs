@@ -65,6 +65,9 @@ pub mod vector {
 /// 68060 fault status long word (FSLW) bits, as consumed by OS fault
 /// handlers (bit names per MC68060UM Table 8-9 / Linux asm/traps.h).
 pub mod fslw {
+    /// Misaligned access: the fault is on the second or a later part of an
+    /// operand split into several bus cycles.
+    pub const MA: u32 = 0x0800_0000;
     /// Read access.
     pub const RW_R: u32 = 0x0100_0000;
     /// Write access.
@@ -93,6 +96,9 @@ pub mod fslw {
     pub const RE: u32 = 0x0000_0020;
     /// Bus error on write.
     pub const WE: u32 = 0x0000_0010;
+    /// Transparent translation register hit: a write through a
+    /// write-protected TTR.
+    pub const TTR: u32 = 0x0000_0008;
 }
 
 /// Compose the 68060 FSLW for an access error.
@@ -102,6 +108,7 @@ fn fslw_060(
     size: u32,
     fc: u16,
     cause: Option<crate::mmu::MmuFaultCause>,
+    transparent: bool,
 ) -> u32 {
     use crate::mmu::MmuFaultCause;
     let mut w = if write { fslw::RW_W } else { fslw::RW_R };
@@ -121,6 +128,10 @@ fn fslw_060(
         Some(MmuFaultCause::PointerB) => fslw::PTB,
         Some(MmuFaultCause::Indirect) => fslw::IL,
         Some(MmuFaultCause::PageFault) => fslw::PF,
+        // A write-protected transparent translation register: MC68060UM
+        // 8.4.1 names a TTR bit for this fault; whether WP is also set is
+        // not stated, so only TTR is reported.
+        Some(MmuFaultCause::WriteProtect) if transparent => fslw::TTR,
         Some(MmuFaultCause::WriteProtect) => fslw::WP,
         Some(MmuFaultCause::SupervisorProtect) => fslw::SP,
         Some(MmuFaultCause::TableWalkBusError) => fslw::TWE,
@@ -630,6 +641,8 @@ impl CpuCore {
         size: u32,
         cause: Option<crate::mmu::MmuFaultCause>,
     ) -> i32 {
+        // Read before the frame pushes below translate their own addresses.
+        let transparent = std::mem::take(&mut self.pending_fault_transparent);
         let old_sr = self.get_sr();
         let was_supervisor = (old_sr & 0x2000) != 0;
         // The faulted write's data, captured before any frame push: the
@@ -686,7 +699,10 @@ impl CpuCore {
                 // fault address long at +$08 and the fault status long word
                 // (FSLW) at +$0C. The instruction has been rolled back, so
                 // RTE restarts it (same demand-paging model as the 040).
-                let fslw = fslw_060(write, instruction, size, fc, cause);
+                let mut fslw = fslw_060(write, instruction, size, fc, cause, transparent);
+                if self.mmu_misaligned_tail {
+                    fslw |= fslw::MA;
+                }
                 let fmt_vec = 0x4000 | ((vector::BUS_ERROR as u16) << 2);
                 self.push_32(bus, fslw);
                 self.push_32(bus, address);
@@ -719,7 +735,10 @@ impl CpuCore {
                     2 => 0x0040, // word
                     _ => 0x0000, // long
                 };
-                let ssw = rw | atc | sz | (fc & 0x7); // TM = function code
+                // MA (bit 11): the fault is on a later part of an operand
+                // split into several bus cycles.
+                let ma = if self.mmu_misaligned_tail { 0x0800 } else { 0 };
+                let ssw = rw | ma | atc | sz | (fc & 0x7); // TM = function code
                 let fmt_vec = 0x7000 | ((vector::BUS_ERROR as u16) << 2);
                 // A normal faulted write is reported in writeback slot 3 (V
                 // bit, size and TM in WB3S; address and data in WB3A/WB3D),

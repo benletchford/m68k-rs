@@ -307,22 +307,13 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             return FLINE_TRAP_SENTINEL;
         }
         if cpu.is_040() && (opcode & 0x0040) != 0 {
-            // PTEST: walk the page for An and report it in MMUSR. We model the
-            // physical-address and resident (R) bits, enough for an OS to tell a
-            // mapped page from an invalid one; the cache-mode / used / modified
-            // attribute bits are not yet filled in. The address space under
-            // test comes from DFC (how an OS PTESTs user mappings from
-            // supervisor mode), carried by the same override MOVES uses.
+            // PTESTR/PTESTW (An): search the tables for An in the address
+            // space DFC names (how an OS tests user mappings from supervisor
+            // mode) and report the result in MMUSR (MC68040UM 3.5).
             let read = (opcode & 0x0020) != 0;
             let addr = cpu.dar[8 + (opcode & 7) as usize];
             let fc = (cpu.dfc & 7) as u8;
-            cpu.mmu_fc_override = Some(fc);
-            cpu.mmu_sr =
-                match crate::mmu::translate_address(cpu, bus, addr, !read, (fc & 4) != 0, false) {
-                    Ok(phys) => (phys & 0xFFFF_F000) | 0x0000_0001, // R = resident
-                    Err(_) => 0,                                    // not resident
-                };
-            cpu.mmu_fc_override = None;
+            cpu.mmu_sr = crate::mmu::ptest_040(cpu, bus, addr, fc, !read);
             cpu.trace_t0_68040_sync();
             return 4;
         }

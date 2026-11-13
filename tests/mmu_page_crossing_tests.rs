@@ -230,3 +230,65 @@ fn page_crossing_bsr_long_displacement_fetches_each_word_translated() {
         "return address pushed past the whole 6-byte instruction"
     );
 }
+
+/// Run one instruction at `CODE` whose access crosses into an invalid page
+/// and return the access-error frame address (the supervisor stack).
+fn fault_frame(model: CpuType, opcode: u16, a0: u32, invalid_page: u32) -> (TestBus, u32) {
+    let mut bus = TestBus::new(0x10000);
+    let mut cpu = user_mode_040_two_pages(&mut bus);
+    cpu.set_cpu_type(model);
+    cpu.mmu_crp_aptr = ROOT_TABLE;
+    cpu.mmu_srp_aptr = ROOT_TABLE;
+    cpu.mmu_tc = 0x0000_8000;
+    cpu.pmmu_enabled = true;
+    cpu.set_sr(0x2700);
+    cpu.set_a(7, SSP);
+    cpu.set_sr(0x0000);
+    cpu.set_a(7, USP);
+    cpu.pc = CODE;
+    bus.write_long(PAGE_TABLE + invalid_page * 4, 0); // PDT = invalid
+    bus.write_long(8, 0x0200); // vector 2
+    bus.write_word(0x0200, 0x4E71);
+    cpu.set_a(0, a0);
+    bus.write_word(CODE, opcode);
+    let _ = cpu.step(&mut bus);
+    assert_eq!(cpu.pc, 0x0200, "{model:?}: access fault taken");
+    let sp = cpu.a(7);
+    (bus, sp)
+}
+
+/// MA: 68040 SSW bit 11 / 68060 FSLW bit 27.
+fn ma_bit(model: CpuType, bus: &mut TestBus, sp: u32) -> bool {
+    if model == CpuType::M68060 {
+        assert_eq!(bus.read_word(sp + 6), 0x4008);
+        bus.read_long(sp + 12) & 0x0800_0000 != 0
+    } else {
+        assert_eq!(bus.read_word(sp + 6), 0x7008);
+        bus.read_word(sp + 12) & 0x0800 != 0
+    }
+}
+
+/// An access fault on the second or a later bus cycle of an operand split at
+/// a page boundary reports MA; one on its first cycle, or on an access that
+/// is not split, does not (MC68040UM 8.4.6, MC68060UM 8.4.1).
+#[test]
+fn fault_on_the_second_part_of_a_split_access_sets_ma() {
+    for model in [CpuType::M68040, CpuType::M68060] {
+        for (opcode, a0, what) in [
+            (0x2010, LO_LOG + 0xFFE, "MOVE.L (A0),D0"),
+            (0x2080, LO_LOG + 0xFFE, "MOVE.L D0,(A0)"),
+            (0x3010, LO_LOG + 0xFFF, "MOVE.W (A0),D0"),
+            (0x2010, LO_LOG + 0xFFD, "MOVE.L (A0),D0 at -3"),
+            (0x2010, LO_LOG + 0xFFF, "MOVE.L (A0),D0 at -1"),
+        ] {
+            let (mut bus, sp) = fault_frame(model, opcode, a0, 6);
+            assert!(ma_bit(model, &mut bus, sp), "{model:?} {what}: MA");
+        }
+        // The first page faults: the first cycle, MA clear.
+        let (mut bus, sp) = fault_frame(model, 0x2010, LO_LOG + 0xFFE, 5);
+        assert!(!ma_bit(model, &mut bus, sp), "{model:?}: first part");
+        // An aligned access on the invalid page.
+        let (mut bus, sp) = fault_frame(model, 0x2010, 0x6000, 6);
+        assert!(!ma_bit(model, &mut bus, sp), "{model:?}: not split");
+    }
+}

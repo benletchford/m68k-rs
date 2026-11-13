@@ -908,3 +908,20 @@ fn atc_replacement_order_ignores_the_trace_cache_with_code_outside_the_window() 
         bus.map_030(TABLE, CODE, 0xB000, 0);
     });
 }
+
+/// The table search's history bits come out the same through the window:
+/// a read loop loads the page's ATC entry with M clear, and the write that
+/// follows it still searches the tables and sets M in the page descriptor.
+#[test]
+fn history_bits_match_the_interpreter_040() {
+    // loop: MOVE.L (A2),D3 ; ADD.L D3,D4 ; DBRA D7,loop ; MOVE.L D4,(A2)
+    let program = [0x2612, 0xD883, 0x51CF, 0xFFFA, 0x2484, ALINE];
+    let (_, batched) = compare("040 history", Mmu::Mc68040, &program, &|cpu, bus| {
+        cpu.set_a(2, DATA2);
+        cpu.set_d(7, 999);
+        bus.poke_long(phys(DATA2), 3);
+    });
+    let desc = batched.1.peek_long(PAGE_040 + (DATA2 >> 12) * 4);
+    assert_eq!(desc & 0x18, 0x18, "U and M in {desc:#010x}");
+    assert_eq!(batched.1.peek_long(phys(DATA2)), 3000);
+}

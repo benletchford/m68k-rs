@@ -313,6 +313,12 @@ pub struct CpuCore {
     /// physical bus errors leave it None. Transient within one exception.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) pending_fault_cause: Option<crate::mmu::MmuFaultCause>,
+    /// The translation that just failed hit a write-protected transparent
+    /// translation register. The public cause stays `WriteProtect`; the
+    /// 68060 frame builder reports the FSLW's TTR bit from this. Cleared
+    /// at the start of every translation.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) pending_fault_transparent: bool,
     /// Function code forced for the current data access: MOVES reads and
     /// writes carry SFC/DFC instead of the CPU-state-derived code, and the
     /// MMU translates in that address space (the 68030 FCL table level and
@@ -320,6 +326,13 @@ pub struct CpuCore {
     /// SRP). None for ordinary accesses; transient within one instruction.
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) mmu_fc_override: Option<u8>,
+    /// Set while the second or a later bus cycle of an operand that a page
+    /// boundary splits is in progress, so an access fault taken on it
+    /// reports MA (68040 SSW bit 11, 68060 FSLW bit 27: the fault is on a
+    /// later part of a misaligned access; MC68040UM 8.4.6, MC68060UM 8.4.1).
+    /// Transient within one access.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) mmu_misaligned_tail: bool,
     /// One-shot faulted-read completion, from an RTE of a 68030 bus-fault
     /// frame whose handler cleared the SSW DF bit and supplied the result
     /// in the data input buffer: (logical address, value). Real silicon
@@ -658,7 +671,9 @@ impl CpuCore {
             atc: crate::mmu::Atc::default(),
             atc_030: crate::mmu::Atc030::default(),
             pending_fault_cause: None,
+            pending_fault_transparent: false,
             mmu_fc_override: None,
+            mmu_misaligned_tail: false,
             mmu_read_override: None,
             mmu_write_suppress: None,
             pending_fault_wdata: 0,
@@ -1611,6 +1626,18 @@ impl CpuCore {
         }
     }
 
+    /// Run the second or a later bus cycle of an operand split at a page
+    /// boundary: an access fault it takes reports MA (see
+    /// `mmu_misaligned_tail`).
+    #[inline]
+    fn misaligned_tail<T>(&mut self, cycle: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = self.mmu_misaligned_tail;
+        self.mmu_misaligned_tail = true;
+        let v = cycle(self);
+        self.mmu_misaligned_tail = outer;
+        v
+    }
+
     /// Read byte from memory (data space).
     #[inline]
     pub fn read_8<B: AddressBus>(&mut self, bus: &mut B, addr: u32) -> u8 {
@@ -1686,7 +1713,7 @@ impl CpuCore {
                 if self.faulted() {
                     return 0;
                 }
-                let lo = self.read_8(bus, addr.wrapping_add(1)) as u16;
+                let lo = self.misaligned_tail(|cpu| cpu.read_8(bus, addr.wrapping_add(1))) as u16;
                 return (hi << 8) | lo;
             }
         }
@@ -1757,7 +1784,7 @@ impl CpuCore {
                 if self.faulted() {
                     return 0;
                 }
-                let lo = self.read_16(bus, addr.wrapping_add(2)) as u32;
+                let lo = self.misaligned_tail(|cpu| cpu.read_16(bus, addr.wrapping_add(2))) as u32;
                 return (hi << 16) | lo;
             }
         }
@@ -1823,7 +1850,7 @@ impl CpuCore {
                 if self.faulted() {
                     return 0;
                 }
-                let lo = self.read_8(bus, addr.wrapping_add(2)) as u32;
+                let lo = self.misaligned_tail(|cpu| cpu.read_8(bus, addr.wrapping_add(2))) as u32;
                 return (hi << 8) | lo;
             }
         }
@@ -1934,7 +1961,7 @@ impl CpuCore {
                 if self.faulted() {
                     return;
                 }
-                self.write_8(bus, addr.wrapping_add(1), value as u8);
+                self.misaligned_tail(|cpu| cpu.write_8(bus, addr.wrapping_add(1), value as u8));
                 return;
             }
         }
@@ -1992,7 +2019,7 @@ impl CpuCore {
                 if self.faulted() {
                     return;
                 }
-                self.write_8(bus, addr.wrapping_add(2), value as u8);
+                self.misaligned_tail(|cpu| cpu.write_8(bus, addr.wrapping_add(2), value as u8));
                 return;
             }
         }
@@ -2056,7 +2083,7 @@ impl CpuCore {
                 if self.faulted() {
                     return;
                 }
-                self.write_16(bus, addr.wrapping_add(2), value as u16);
+                self.misaligned_tail(|cpu| cpu.write_16(bus, addr.wrapping_add(2), value as u16));
                 return;
             }
         }
