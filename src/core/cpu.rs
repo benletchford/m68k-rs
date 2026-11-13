@@ -1665,13 +1665,16 @@ impl CpuCore {
         }
         // Part E.2: report internal clocks elapsed before this bus access.
         self.flush_sync(bus);
+        let logical_addr = addr;
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
             CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
         ) && (addr & 1) != 0
         {
-            self.trigger_address_error(bus, addr, false, false);
+            // The frame holds the full 32-bit address the instruction
+            // computed, not the 24 bits that reach the address bus.
+            self.trigger_address_error(bus, logical_addr, false, false);
             return 0;
         }
         if self.has_pmmu && self.pmmu_enabled {
@@ -1732,13 +1735,16 @@ impl CpuCore {
         }
         // Part E.2: report internal clocks elapsed before this bus access.
         self.flush_sync(bus);
+        let logical_addr = addr;
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
             CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
         ) && (addr & 1) != 0
         {
-            self.trigger_address_error(bus, addr, false, false);
+            // The frame holds the full 32-bit address the instruction
+            // computed, not the 24 bits that reach the address bus.
+            self.trigger_address_error(bus, logical_addr, false, false);
             return 0;
         }
         if self.has_pmmu && self.pmmu_enabled {
@@ -1907,13 +1913,16 @@ impl CpuCore {
         }
         // Part E.2: report internal clocks elapsed before this bus access.
         self.flush_sync(bus);
+        let logical_addr = addr;
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
             CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
         ) && (addr & 1) != 0
         {
-            self.trigger_address_error(bus, addr, true, false);
+            // The frame holds the full 32-bit address the instruction
+            // computed, not the 24 bits that reach the address bus.
+            self.trigger_address_error(bus, logical_addr, true, false);
             return;
         }
         if self.has_pmmu && self.pmmu_enabled {
@@ -2026,13 +2035,16 @@ impl CpuCore {
         }
         // Part E.2: report internal clocks elapsed before this bus access.
         self.flush_sync(bus);
+        let logical_addr = addr;
         let mut addr = self.address(addr);
         if matches!(
             self.cpu_type,
             CpuType::M68000 | CpuType::M68010 | CpuType::SCC68070
         ) && (addr & 1) != 0
         {
-            self.trigger_address_error(bus, addr, true, false);
+            // The frame holds the full 32-bit address the instruction
+            // computed, not the 24 bits that reach the address bus.
+            self.trigger_address_error(bus, logical_addr, true, false);
             return;
         }
         if self.has_pmmu && self.pmmu_enabled {
