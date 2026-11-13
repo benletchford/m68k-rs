@@ -627,10 +627,10 @@ fn overflow_takes_the_inexact_exception_when_only_inex2_is_enabled() {
 }
 
 #[test]
-fn the_68040_and_68060_do_not_take_enabled_arithmetic_exceptions() {
-    // Their handlers work from the state frame FSAVE gives them, which
-    // is not modelled for these exceptions, so the exception is not
-    // delivered: the instruction completes with the disabled result.
+fn the_68060_does_not_take_enabled_arithmetic_exceptions() {
+    // Its handlers work from the EXCP state frame FSAVE gives them, which
+    // is not modelled, so the exception is not delivered: the instruction
+    // completes with the disabled result.
     let one = (0x3FFF, 0x8000_0000_0000_0000);
     let two = (0x4000, 0x8000_0000_0000_0000);
     let max = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
@@ -639,19 +639,49 @@ fn the_68040_and_68060_do_not_take_enabled_arithmetic_exceptions() {
         ("DZ", 0x20, (0, 0), one, 0x0400),   // FDIV 1 / 0
         ("SNAN", 0x22, SNAN_X, one, 0x4000), // FADD SNaN + 1
     ];
-    for cpu in [CpuType::M68040, CpuType::M68060] {
-        for (name, opmode, src, dst, enable) in cases {
-            let disabled = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, 0, 0);
-            let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
-            assert_eq!(m.vector(), None, "{cpu:?} {name}");
-            assert_ne!(m.cpu.fpsr & enable, 0, "{cpu:?} {name}: FPSR bit");
-            assert_eq!(
-                bits(m.cpu.fpr[0]),
-                bits(disabled.cpu.fpr[0]),
-                "{cpu:?} {name}: the disabled result"
-            );
-        }
+    let cpu = CpuType::M68060;
+    for (name, opmode, src, dst, enable) in cases {
+        let disabled = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, 0, 0);
+        let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
+        assert_eq!(m.vector(), None, "{name}");
+        assert_ne!(m.cpu.fpsr & enable, 0, "{name}: FPSR bit");
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            bits(disabled.cpu.fpr[0]),
+            "{name}: the disabled result"
+        );
     }
+}
+
+#[test]
+fn the_68040_holds_enabled_arithmetic_exceptions_for_the_next_fpu_instruction() {
+    // As on the 6888x: integer instructions in between run, the next
+    // floating-point instruction takes the exception with a format $0
+    // frame that restarts it, and an operand exception leaves the
+    // destination register alone (M68040UM 9.7).
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let two = (0x4000, 0x8000_0000_0000_0000);
+    let max = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+    let cpu = CpuType::M68040;
+    let mut m = exc_run(cpu, &[0xF200, 0x0422, 0x7007], SNAN_X, one, 0x4000, 0);
+    assert_eq!(m.vector(), Some(54));
+    assert_eq!(m.cpu.dar[0], 7, "MOVEQ between FADD and FNOP ran");
+    assert_eq!(bits(m.cpu.fpr[0]), one, "FP0 kept");
+    let (_, pc, fv) = m.frame();
+    assert_eq!(pc, CODE + 6, "PC restarts the FNOP");
+    assert_eq!(fv, 54 * 4, "format $0");
+    assert_eq!(m.cpu.fpiar, CODE);
+
+    // The maintainer-style probe: an enabled overflow, then FSAVE in the
+    // handler's place, gets the busy frame and not the idle one.
+    let mut m = Machine::new(cpu);
+    m.cpu.fpr[1] = x80(two.0, two.1);
+    m.cpu.fpr[0] = x80(max.0, max.1);
+    m.cpu.fpcr = 0x1000;
+    m.cpu.dar[8] = DATA + 0x100;
+    m.run(&[0xF200, 0x0423, 0xF320]); // FMUL FP1,FP0 ; FSAVE -(A0)
+    assert_eq!(m.vector(), None, "FSAVE does not report it");
+    assert_eq!(m.bus.read_long(DATA + 0x100 - 0x64), 0x4160_0000);
 }
 
 #[test]

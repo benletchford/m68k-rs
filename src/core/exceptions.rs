@@ -936,6 +936,34 @@ impl CpuCore {
         self.exception_cycles(vector)
     }
 
+    /// A 68040 floating-point exception whose handler finishes the
+    /// instruction itself: the four-word format $0 frame with the address
+    /// of the next instruction as the stacked PC (M68040UM 9.6.2).
+    pub(crate) fn take_fp_exception_past_instruction<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u32,
+    ) -> i32 {
+        if self.exception_processing {
+            self.stopped = 1;
+            self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            return 0;
+        }
+        self.exception_processing = true;
+        self.internal_cycles(4);
+        let old_sr = self.get_sr();
+        self.settle_pending_trace(vector);
+        self.set_s_flag(SFLAG_SET);
+        self.t1_flag = 0;
+        self.t0_flag = 0;
+        self.push_16(bus, (vector as u16) << 2);
+        self.push_32(bus, self.pc);
+        self.push_16(bus, old_sr);
+        self.jump_vector(bus, vector);
+        self.exception_processing = false;
+        self.exception_cycles(vector)
+    }
+
     /// 68040 unsupported data type on FMOVE to memory: a post-instruction
     /// exception through vector 55 with the six-word format $3 frame, whose
     /// PC is the next instruction and whose EA field is the destination

@@ -380,6 +380,11 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         if let Some(cycles) = cpu.fpu_take_pending_exception(bus) {
             return cycles;
         }
+        // A 68040 exception still held in the FPU's state is taken by the
+        // next conditional instruction, before it executes.
+        if let Some(cycles) = cpu.fpu_040_pre_instruction(bus) {
+            return cycles;
+        }
         let w2 = cpu.read_imm_16(bus);
         let cond = (w2 & 0x3F) as u8;
         if ea_mode == 1 {
@@ -419,6 +424,12 @@ fn dispatch_group_f<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         if let Some(cycles) = cpu.fpu_take_pending_exception(bus) {
             return cycles;
         }
+    }
+    // FBcc, FNOP included, likewise reports a held 68040 exception.
+    if (opcode & 0xFF80) == 0xF280
+        && let Some(cycles) = cpu.fpu_040_pre_instruction(bus)
+    {
+        return cycles;
     }
     if (opcode & 0xFFC0) == 0xF280 {
         // FBcc.W - 16-bit displacement

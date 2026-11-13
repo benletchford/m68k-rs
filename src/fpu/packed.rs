@@ -328,7 +328,7 @@ mod tests {
         bytes[3] = 0x01; // D0 = 1
         let v = from_packed(bytes, &mut f);
         assert_eq!((v.sign_exp, v.mantissa), (0x3FFB, 0xCCCC_CCCC_CCCC_CCCD));
-        assert_eq!(f, ExcFlags(ExcFlags::INEX1));
+        assert_eq!(f.0, ExcFlags::INEX1);
         // 1.5E1 is exact.
         let mut f = ExcFlags::default();
         let mut bytes = [0u8; 12];
