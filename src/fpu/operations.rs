@@ -14,6 +14,13 @@ use crate::core::memory::AddressBus;
 use crate::core::types::Size;
 use crate::fpu::FloatX80;
 
+/// FPCR bits that exist: the exception-enable byte (15-8) and the mode
+/// control byte's rounding precision and mode (7-4).
+const FPCR_IMPLEMENTED: u32 = 0x0000_FFF0;
+/// FPSR bits that exist: condition codes (27-24), quotient (23-16),
+/// exception status (15-8) and the accrued exceptions (7-3).
+const FPSR_IMPLEMENTED: u32 = 0x0FFF_FFF8;
+
 /// Where a resolved FPU operand lives.
 enum FpuEa {
     /// Data register (formats of 4 bytes or fewer only).
@@ -94,6 +101,33 @@ fn words_to_bytes(w0: u32, w1: u32, w2: u32) -> [u8; 12] {
     b[4..8].copy_from_slice(&w1.to_be_bytes());
     b[8..12].copy_from_slice(&w2.to_be_bytes());
     b
+}
+
+/// Widen a binary32 operand to extended. A signaling NaN raises SNAN and
+/// is converted quiet with its payload kept (MC68881/MC68882UM 4.6.4); every
+/// other value is exact in extended.
+fn single_to_x80(bits: u32, f: &mut ExcFlags) -> FloatX80 {
+    let frac = bits & 0x007F_FFFF;
+    if (bits >> 23) & 0xFF == 0xFF && frac != 0 {
+        if frac & 0x0040_0000 == 0 {
+            f.raise(ExcFlags::SNAN);
+        }
+        return FloatX80 {
+            sign_exp: (((bits >> 31) as u16) << 15) | 0x7FFF,
+            mantissa: 0xC000_0000_0000_0000 | (u64::from(frac) << 40),
+        };
+    }
+    FloatX80::from_f64(f64::from(f32::from_bits(bits)))
+}
+
+/// Widen a binary64 operand to extended, raising SNAN for a signaling NaN
+/// (converted quiet, payload kept).
+fn double_to_x80(bits: u64, f: &mut ExcFlags) -> FloatX80 {
+    if (bits >> 52) & 0x7FF == 0x7FF && bits & 0x000F_FFFF_FFFF_FFFF != 0 && bits & (1 << 51) == 0 {
+        f.raise(ExcFlags::SNAN);
+    }
+    // from_f64 reads the bit pattern: NaNs come out quiet with the payload.
+    FloatX80::from_f64(f64::from_bits(bits))
 }
 
 impl CpuCore {
@@ -197,10 +231,10 @@ impl CpuCore {
                     }
                 }
 
-                let Some(src) = self.fpu_read_source(bus, opcode, src_fmt) else {
+                let Some((src, src_flags)) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
                 };
-                self.fpu_apply_op(opmode, dst, src)
+                self.fpu_apply_op(opmode, dst, src, src_flags)
             }
             0x3 => {
                 // FMOVE FP, <ea> - move FP register to memory/integer register
@@ -269,7 +303,7 @@ impl CpuCore {
                 if self.trap_unimpl_040() && fpu_040_traps_opmode(opmode) {
                     return self.take_fp_unimp_060(bus, 0);
                 }
-                self.fpu_apply_op(opmode, dst, self.fpr[src])
+                self.fpu_apply_op(opmode, dst, self.fpr[src], ExcFlags::default())
             }
             0x6 | 0x7 => {
                 // FMOVEM - move multiple FP registers to/from memory
@@ -401,11 +435,17 @@ impl CpuCore {
                     _ => return 0,
                 }
                 let mut next = values.iter();
+                // Unused control-register bits are not implemented: FPCR
+                // keeps only its exception-enable and mode-control bytes
+                // (15-4), FPSR only its condition-code, quotient, exception
+                // and accrued-exception bytes (27-3); the rest read back as
+                // zero (MC68881/MC68882UM 1.5.1-1.5.2, M68040UM 9.2,
+                // M68060UM 6.1.1-6.1.2).
                 if ctrl_sel & 0x4 != 0 {
-                    self.fpcr = *next.next().unwrap();
+                    self.fpcr = *next.next().unwrap() & FPCR_IMPLEMENTED;
                 }
                 if ctrl_sel & 0x2 != 0 {
-                    self.fpsr = *next.next().unwrap();
+                    self.fpsr = *next.next().unwrap() & FPSR_IMPLEMENTED;
                 }
                 if ctrl_sel & 0x1 != 0 {
                     self.fpiar = *next.next().unwrap();
@@ -946,18 +986,21 @@ impl CpuCore {
     /// `<ea>`/immediate operand). This is the single dispatch table shared by
     /// the register-source (`subop 0x0`) and memory/immediate-source (`subop
     /// 0x2`) paths so the two cannot drift apart. FMOVECR has no source
-    /// operand and is handled by the callers.
+    /// operand and is handled by the callers. `src_flags` carries the
+    /// exceptions raised converting the source to extended (SNAN for a
+    /// single or double signaling NaN, INEX1 for packed decimal), which
+    /// count as this instruction's.
     ///
     /// Arithmetic is evaluated by the extended-precision softfloat and
     /// transcendental engines. The 6888x single/double
     /// rounding-precision variants (FSxxx/FDxxx) select their specified
     /// result precision before the value is written back.
-    fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80) -> i32 {
+    fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80, src_flags: ExcFlags) -> i32 {
         match opmode {
             0x00 | 0x40 | 0x44 => {
                 // FMOVE / FSMOVE / FDMOVE
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::round_to_precision(src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -966,7 +1009,7 @@ impl CpuCore {
             0x01 => {
                 // FINT - round to integer using the FPCR rounding mode
                 let mode = RoundMode::from_fpcr(self.fpcr);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::round_to_int(src, mode, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -974,7 +1017,7 @@ impl CpuCore {
             }
             0x03 => {
                 // FINTRZ - round to integer toward zero
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::round_to_int(src, RoundMode::Zero, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -983,7 +1026,7 @@ impl CpuCore {
             0x04 | 0x41 | 0x45 => {
                 // FSQRT / FSSQRT / FDSQRT
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::sqrt(src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -992,7 +1035,7 @@ impl CpuCore {
             0x18 | 0x58 | 0x5C => {
                 // FABS / FSABS / FDABS
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::abs(softfloat::round_to_precision(src, ctx, &mut f));
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1001,7 +1044,7 @@ impl CpuCore {
             0x1A | 0x5A | 0x5E => {
                 // FNEG / FSNEG / FDNEG
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::neg(softfloat::round_to_precision(src, ctx, &mut f));
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1010,7 +1053,7 @@ impl CpuCore {
             0x20 | 0x60 | 0x64 => {
                 // FDIV / FSDIV / FDDIV - dst = dst / src
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::div(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1019,7 +1062,7 @@ impl CpuCore {
             0x22 | 0x62 | 0x66 => {
                 // FADD / FSADD / FDADD
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::add(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1028,7 +1071,7 @@ impl CpuCore {
             0x23 | 0x63 | 0x67 => {
                 // FMUL / FSMUL / FDMUL
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::mul(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1046,7 +1089,7 @@ impl CpuCore {
                     mode: RoundMode::from_fpcr(self.fpcr),
                     prec: Precision::Single,
                 };
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::div(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1061,7 +1104,7 @@ impl CpuCore {
                     mode: RoundMode::from_fpcr(self.fpcr),
                     prec: Precision::Single,
                 };
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 let a = sgl_truncate(self.fpr[dst]);
                 let b = sgl_truncate(src);
                 self.fpr[dst] = softfloat::mul(a, b, ctx, &mut f);
@@ -1072,7 +1115,7 @@ impl CpuCore {
             0x28 | 0x68 | 0x6C => {
                 // FSUB / FSSUB / FDSUB
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::sub(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1080,20 +1123,26 @@ impl CpuCore {
             }
             0x38 => {
                 // FCMP - ordered compare of dst with src, set condition codes only
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 let cmp = softfloat::compare(self.fpr[dst], src, &mut f);
                 self.fpu_set_cc_cmp(cmp);
                 self.fpu_commit(f);
                 4
             }
             0x3A => {
-                // FTST - test src, set condition codes only (no dst write)
+                // FTST - test src, set condition codes only (no dst write).
+                // A signaling NaN operand raises SNAN like any operation.
+                let mut f = src_flags;
+                if src.is_signaling_nan() {
+                    f.raise(ExcFlags::SNAN);
+                }
                 self.fpu_set_cc(src);
+                self.fpu_commit(f);
                 4
             }
             0x1E => {
                 // FGETEXP - extract the unbiased exponent
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::getexp(src, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1101,7 +1150,7 @@ impl CpuCore {
             }
             0x1F => {
                 // FGETMAN - extract the mantissa as a value in [1, 2)
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 self.fpr[dst] = softfloat::getman(src, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
@@ -1109,7 +1158,7 @@ impl CpuCore {
             }
             0x21 => {
                 // FMOD - exact remainder, truncated quotient.
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 let rem = transcendental::remainder(self.fpr[dst], src, false, &mut f);
                 self.fpr[dst] = rem.value;
                 self.fpu_set_cc(self.fpr[dst]);
@@ -1119,7 +1168,7 @@ impl CpuCore {
             }
             0x25 => {
                 // FREM - exact IEEE remainder, round-to-nearest quotient.
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 let rem = transcendental::remainder(self.fpr[dst], src, true, &mut f);
                 self.fpr[dst] = rem.value;
                 self.fpu_set_cc(self.fpr[dst]);
@@ -1130,12 +1179,14 @@ impl CpuCore {
             0x26 => {
                 // FSCALE - dst = dst * 2^trunc(src)
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
-                if src.is_inf() {
+                let mut f = src_flags;
+                if self.fpr[dst].is_nan() || src.is_nan() {
+                    // The NaN operand rule comes first (the destination
+                    // NaN wins), ahead of the infinite-count OPERR.
+                    self.fpr[dst] = softfloat::propagate_nan(self.fpr[dst], src, &mut f);
+                } else if src.is_inf() {
                     f.raise(ExcFlags::OPERR);
                     self.fpr[dst] = FloatX80::default_nan();
-                } else if src.is_nan() {
-                    self.fpr[dst] = softfloat::scale(src, 0, ctx, &mut f);
                 } else {
                     // A larger count overflows or underflows just the same.
                     let n = if src.to_f64().abs() >= 2147483648.0 {
@@ -1158,7 +1209,7 @@ impl CpuCore {
             0x30..=0x37 => {
                 // FSINCOS - sin to FPn, cos to the FPc named by opmode bits 2-0.
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 let cos_dst = (opmode & 7) as usize;
                 let (sin, cos) = transcendental::sincos(src, ctx, &mut f);
                 // Cosine first: with FPs == FPc the sine must win (M68000PM
@@ -1172,7 +1223,7 @@ impl CpuCore {
             _ => {
                 // The transcendentals (FSIN/FCOS/FETOX/FLOGN/...).
                 let ctx = self.fpu_ctx(opmode);
-                let mut f = ExcFlags::default();
+                let mut f = src_flags;
                 if let Some(r) = transcendental::eval_unary(opmode, src, ctx, &mut f) {
                     self.fpr[dst] = r;
                     self.fpu_set_cc(self.fpr[dst]);
@@ -1269,16 +1320,17 @@ impl CpuCore {
     }
 
     /// Read the ALU/FMOVE source operand in `fmt` (0=long, 1=single,
-    /// 2=extended, 4=word, 6=byte, 5=double) as an extended value. The
-    /// extended format (2) is read losslessly. Integer, binary32, and
-    /// binary64 inputs are widened exactly to the extended register format;
-    /// packed decimal (3) is decoded by the packed-decimal engine.
+    /// 2=extended, 4=word, 6=byte, 5=double) as an extended value, with the
+    /// exceptions its conversion raised. The extended format (2) is read
+    /// losslessly. Integer, binary32, and binary64 inputs are widened
+    /// exactly to the extended register format; packed decimal (3) is
+    /// decoded by the packed-decimal engine.
     fn fpu_read_source<B: AddressBus>(
         &mut self,
         bus: &mut B,
         opcode: u16,
         fmt: u16,
-    ) -> Option<FloatX80> {
+    ) -> Option<(FloatX80, ExcFlags)> {
         let ea_mode = ((opcode >> 3) & 7) as u8;
         let ea_reg = (opcode & 7) as usize;
         let bytes: u32 = match fmt {
@@ -1289,78 +1341,68 @@ impl CpuCore {
             2 | 3 => 12, // extended and packed-decimal are 12 bytes
             _ => return None,
         };
-        match self.fpu_ea(bus, ea_mode, ea_reg, bytes)? {
+        let mut f = ExcFlags::default();
+        let value = match self.fpu_ea(bus, ea_mode, ea_reg, bytes)? {
             FpuEa::DataReg(r) => {
                 let v = self.d(r);
                 match fmt {
-                    0 => Some(FloatX80::from_f64(v as i32 as f64)),
-                    1 => Some(FloatX80::from_f64(f32::from_bits(v) as f64)),
-                    4 => Some(FloatX80::from_f64(v as u16 as i16 as f64)),
-                    6 => Some(FloatX80::from_f64(v as u8 as i8 as f64)),
-                    _ => None, // 8/12-byte operands cannot live in Dn
+                    0 => FloatX80::from_f64(v as i32 as f64),
+                    1 => single_to_x80(v, &mut f),
+                    4 => FloatX80::from_f64(v as u16 as i16 as f64),
+                    6 => FloatX80::from_f64(v as u8 as i8 as f64),
+                    _ => return None, // 8/12-byte operands cannot live in Dn
                 }
             }
             FpuEa::Immediate => match fmt {
-                0 => Some(FloatX80::from_f64(self.read_imm_32(bus) as i32 as f64)),
-                1 => Some(FloatX80::from_f64(
-                    f32::from_bits(self.read_imm_32(bus)) as f64
-                )),
-                4 => Some(FloatX80::from_f64(self.read_imm_16(bus) as i16 as f64)),
-                6 => Some(FloatX80::from_f64(
-                    (self.read_imm_16(bus) & 0xFF) as u8 as i8 as f64,
-                )),
+                0 => FloatX80::from_f64(self.read_imm_32(bus) as i32 as f64),
+                1 => single_to_x80(self.read_imm_32(bus), &mut f),
+                4 => FloatX80::from_f64(self.read_imm_16(bus) as i16 as f64),
+                6 => FloatX80::from_f64((self.read_imm_16(bus) & 0xFF) as u8 as i8 as f64),
                 5 => {
                     let hi = self.read_imm_32(bus) as u64;
                     let lo = self.read_imm_32(bus) as u64;
-                    Some(FloatX80::from_f64(f64::from_bits((hi << 32) | lo)))
+                    double_to_x80((hi << 32) | lo, &mut f)
                 }
                 2 => {
                     let exp_word = (self.read_imm_32(bus) >> 16) as u16;
                     let hi = self.read_imm_32(bus) as u64;
                     let lo = self.read_imm_32(bus) as u64;
-                    Some(FloatX80::from_extended(exp_word, (hi << 32) | lo))
+                    FloatX80::from_extended(exp_word, (hi << 32) | lo)
                 }
                 3 => {
                     let w0 = self.read_imm_32(bus);
                     let w1 = self.read_imm_32(bus);
                     let w2 = self.read_imm_32(bus);
-                    Some(packed::from_packed(
-                        words_to_bytes(w0, w1, w2),
-                        &mut ExcFlags::default(),
-                    ))
+                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default())
                 }
-                _ => None,
+                _ => return None,
             },
             FpuEa::Memory(addr) => match fmt {
-                0 => Some(FloatX80::from_f64(self.read_32(bus, addr) as i32 as f64)),
-                1 => Some(FloatX80::from_f64(
-                    f32::from_bits(self.read_32(bus, addr)) as f64
-                )),
-                4 => Some(FloatX80::from_f64(self.read_16(bus, addr) as i16 as f64)),
-                6 => Some(FloatX80::from_f64(self.read_8(bus, addr) as i8 as f64)),
+                0 => FloatX80::from_f64(self.read_32(bus, addr) as i32 as f64),
+                1 => single_to_x80(self.read_32(bus, addr), &mut f),
+                4 => FloatX80::from_f64(self.read_16(bus, addr) as i16 as f64),
+                6 => FloatX80::from_f64(self.read_8(bus, addr) as i8 as f64),
                 5 => {
                     let hi = self.read_32(bus, addr) as u64;
                     let lo = self.read_32(bus, addr.wrapping_add(4)) as u64;
-                    Some(FloatX80::from_f64(f64::from_bits((hi << 32) | lo)))
+                    double_to_x80((hi << 32) | lo, &mut f)
                 }
                 2 => {
                     let exp_word = self.read_16(bus, addr);
                     let hi = self.read_32(bus, addr.wrapping_add(4)) as u64;
                     let lo = self.read_32(bus, addr.wrapping_add(8)) as u64;
-                    Some(FloatX80::from_extended(exp_word, (hi << 32) | lo))
+                    FloatX80::from_extended(exp_word, (hi << 32) | lo)
                 }
                 3 => {
                     let w0 = self.read_32(bus, addr);
                     let w1 = self.read_32(bus, addr.wrapping_add(4));
                     let w2 = self.read_32(bus, addr.wrapping_add(8));
-                    Some(packed::from_packed(
-                        words_to_bytes(w0, w1, w2),
-                        &mut ExcFlags::default(),
-                    ))
+                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default())
                 }
-                _ => None,
+                _ => return None,
             },
-        }
+        };
+        Some((value, f))
     }
 
     /// Write `value` to the FMOVE destination in `fmt`. Integer formats
@@ -1448,11 +1490,21 @@ impl CpuCore {
                     true
                 }
                 2 => {
+                    // Not rounded, but a signaling NaN is stored quiet and
+                    // raises SNAN like the other formats (MC68881/MC68882UM
+                    // 4.6.4); the exception byte is rebuilt as for any
+                    // FMOVE out.
+                    let value = if value.is_signaling_nan() {
+                        f.raise(ExcFlags::SNAN);
+                        value.quiet()
+                    } else {
+                        value
+                    };
                     let (exp_word, mantissa) = value.to_extended();
                     self.write_32(bus, addr, (exp_word as u32) << 16);
                     self.write_32(bus, addr.wrapping_add(4), (mantissa >> 32) as u32);
                     self.write_32(bus, addr.wrapping_add(8), mantissa as u32);
-                    return true;
+                    true
                 }
                 3 | 7 => {
                     // Packed decimal (static or dynamic k-factor).

@@ -37,11 +37,11 @@ fn two_pow(k: i32) -> FloatX80 {
     )
 }
 
-/// Result for a NaN operand: quiet it and signal SNAN/OPERR if it was signaling.
+/// Result for a NaN operand: quiet it and signal SNAN (only) if it was
+/// signaling (MC68881/MC68882UM 4.6.4).
 fn nan_result(x: FloatX80, f: &mut ExcFlags) -> FloatX80 {
     if x.is_signaling_nan() {
         f.raise(ExcFlags::SNAN);
-        f.raise(ExcFlags::OPERR);
     }
     x.quiet()
 }
@@ -810,11 +810,10 @@ pub fn remainder(dst: FloatX80, src: FloatX80, ieee: bool, f: &mut ExcFlags) -> 
         quotient: 0,
         quotient_sign: false,
     };
-    if dst.is_nan() {
-        return none(nan_result(dst, f));
-    }
-    if src.is_nan() {
-        return none(nan_result(src, f));
+    if dst.is_nan() || src.is_nan() {
+        // The destination NaN is the result when both are NaNs, but a
+        // signaling NaN in either operand raises SNAN.
+        return none(softfloat::propagate_nan(dst, src, f));
     }
     let quotient_sign = dst.sign() ^ src.sign();
     if dst.is_inf() || src.is_zero() {
@@ -1139,6 +1138,30 @@ mod tests {
         let mut f = ExcFlags::default();
         assert!(atanh(fx(1.0), rn(), &mut f).is_inf());
         assert!(f.has(ExcFlags::DZ));
+    }
+
+    #[test]
+    fn remainder_signals_a_signaling_nan_in_either_operand() {
+        let snan = FloatX80 {
+            sign_exp: 0x7fff,
+            mantissa: 0xa000_0000_0000_0000,
+        };
+        let qnan = FloatX80 {
+            sign_exp: 0x7fff,
+            mantissa: 0xc000_0000_0000_0000,
+        };
+        for ieee in [false, true] {
+            // Destination quiet NaN, source signaling NaN: the result is
+            // the destination NaN and SNAN is still raised.
+            let mut f = ExcFlags::default();
+            let r = remainder(qnan, snan, ieee, &mut f);
+            assert_eq!(r.value.mantissa, qnan.mantissa);
+            assert!(f.has(ExcFlags::SNAN));
+            let mut f = ExcFlags::default();
+            let r = remainder(snan, qnan, ieee, &mut f);
+            assert_eq!(r.value.mantissa, 0xe000_0000_0000_0000);
+            assert!(f.has(ExcFlags::SNAN));
+        }
     }
 
     #[test]
