@@ -1,6 +1,7 @@
 //! CALLM and RTM instructions (68020 only).
 //!
-//! These instructions were introduced in the 68020 but removed in the 68030+.
+//! These instructions were introduced in the 68020 but removed in the 68030+,
+//! where their encodings take the illegal-instruction exception.
 //! They implement a modular calling convention with automatic module state management.
 
 use crate::core::cpu::CpuCore;
@@ -16,9 +17,12 @@ impl CpuCore {
     ///
     /// Encoding: 0000 0110 11 mmm rrr + extension word (argument count)
     pub fn exec_callm<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
-        // CALLM is 68020-only; on other CPUs it should trigger Line-F or Illegal
-        if self.cpu_type != CpuType::M68020 {
-            return self.take_exception(bus, 11); // Line-F
+        // CALLM exists on the 68020 and 68EC020 only; everywhere else the
+        // encoding is an illegal instruction (the decoder already rejects
+        // it, this guards direct callers).
+        if !matches!(self.cpu_type, CpuType::M68020 | CpuType::M68EC020) {
+            self.pc = self.ppc;
+            return self.take_exception(bus, 4);
         }
 
         // Read argument count from extension word (bits 7-0)
@@ -72,9 +76,10 @@ impl CpuCore {
     /// Encoding: 0000 0110 1100 xrrr
     /// Where x=0 for Dn, x=1 for An (register containing module data pointer)
     pub fn exec_rtm<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
-        // RTM is 68020-only
-        if self.cpu_type != CpuType::M68020 {
-            return self.take_exception(bus, 11); // Line-F
+        // RTM exists on the 68020 and 68EC020 only (see exec_callm).
+        if !matches!(self.cpu_type, CpuType::M68020 | CpuType::M68EC020) {
+            self.pc = self.ppc;
+            return self.take_exception(bus, 4);
         }
 
         // Pop the frame marker (simplified)

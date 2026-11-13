@@ -1,22 +1,23 @@
 .include "entry.s"
 /* Test: CALLM/RTM Module Instructions */
-/* These are 68020-only instructions, emulated as illegal on 68030/040 */
-/* Expected: F-line exception (illegal instruction) on 68040 */
+/* These are 68020-only instructions: the 68030 and later do not implement */
+/* them, so the encodings take the illegal-instruction exception there. */
+/* Expected: illegal instruction (vector 4) on 68040 */
 
-.set FLINE_VEC, 0x2C           | Vector 11: Line-F Emulator
+.set ILLEGAL_VEC, 0x10         | Vector 4: Illegal Instruction
 
 run_test:
-    /* Save original Line-F vector */
-    mov.l FLINE_VEC, %a5
+    /* Save original illegal-instruction vector */
+    mov.l ILLEGAL_VEC, %a5
     
     /* Install our handler */
-    lea fline_handler, %a0
-    mov.l %a0, FLINE_VEC
+    lea illegal_handler, %a0
+    mov.l %a0, ILLEGAL_VEC
     
-    clr.l %d6                   | Counter: how many F-line exceptions?
+    clr.l %d6                   | Counter: how many illegal exceptions?
     
     /* =================================================================== */
-    /* Test 1: CALLM should trigger F-line exception on 68040 */
+    /* Test 1: CALLM should trigger an illegal instruction on 68040 */
     /* =================================================================== */
     /* CALLM is encoded as 0x06C0-0x06FF range */
     /* On 68040, this is an unimplemented instruction */
@@ -28,7 +29,7 @@ run_test:
     bne TEST_FAIL
     
     /* =================================================================== */
-    /* Test 2: RTM should trigger F-line exception on 68040 */
+    /* Test 2: RTM should trigger an illegal instruction on 68040 */
     /* =================================================================== */
     /* RTM is encoded as 0x06C0 with register field */
     
@@ -38,11 +39,11 @@ run_test:
     bne TEST_FAIL
     
     /* Restore original vector */
-    mov.l %a5, FLINE_VEC
+    mov.l %a5, ILLEGAL_VEC
     
     rts
 
-fline_handler:
+illegal_handler:
     addq.l #1, %d6
     | Check if CALLM (0x06C0-0x06C7) or RTM (0x06C8-0x06CF)
     | CALLM has extension word (4 bytes), RTM is 2 bytes
