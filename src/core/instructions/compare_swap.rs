@@ -72,8 +72,9 @@ impl CpuCore {
         };
         let dc_val = self.d(dc);
 
-        // Flags are set as if CMP.<size> mem, Dc (i.e. Dc - mem).
-        self.exec_cmp(size, mem, dc_val);
+        // Flags are set as for CMP.<size> Dc,<ea>: the destination operand
+        // minus the compare register (M68000PRM CAS: "<ea> - Dc -> cc").
+        self.exec_cmp(size, dc_val, mem);
 
         if (dc_val & size.mask()) == (mem & size.mask()) {
             // Compare succeeded: write update register to memory.
@@ -121,10 +122,13 @@ impl CpuCore {
         let dc1_val = self.d(dc1);
         let dc2_val = self.d(dc2);
 
-        // Compare first operand; if equal, compare second operand.
-        self.exec_cmp(size, mem1, dc1_val);
+        // Compare the first operand; if equal, compare the second. Each
+        // compare is destination minus compare register (M68000PRM CAS2:
+        // "destination 1 - compare 1 -> cc; if Z, destination 2 -
+        // compare 2 -> cc"), so the flags come from the pair that differed.
+        self.exec_cmp(size, dc1_val, mem1);
         if (dc1_val & size.mask()) == (mem1 & size.mask()) {
-            self.exec_cmp(size, mem2, dc2_val);
+            self.exec_cmp(size, dc2_val, mem2);
         }
 
         if (dc1_val & size.mask()) == (mem1 & size.mask())
