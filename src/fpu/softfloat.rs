@@ -520,49 +520,227 @@ pub fn sqrt(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
 
 // ============================== constant ROM =============================
 
-/// 10^n in extended precision (exponentiation by squaring).
-fn pow10_x80(n: u32) -> FloatX80 {
-    let mut result = from_u64(1, false);
-    let mut base = from_u64(10, false);
-    let mut e = n;
-    let mut f = ExcFlags::default();
-    while e != 0 {
-        if e & 1 != 0 {
-            result = mul(result, base, RoundCtx::NEAREST_EXT, &mut f);
-        }
-        e >>= 1;
-        if e != 0 {
-            base = mul(base, base, RoundCtx::NEAREST_EXT, &mut f);
-        }
-    }
-    result
+/// One FMOVECR ROM constant: its sign/exponent word, the mantissa
+/// delivered under RN, under RZ and RM, and under RP, and whether the
+/// value is inexact (sets INEX2).
+struct RomConstant {
+    sign_exp: u16,
+    rn: u64,
+    rzrm: u64,
+    rp: u64,
+    inexact: bool,
 }
 
-/// FMOVECR on-chip constant ROM. The irrational constants use the exact
-/// 80-bit MC68881 ROM bit patterns; the powers of ten are computed in
-/// extended precision (so 10^512..10^4096 are finite, unlike an f64 ROM).
-pub fn const_rom(offset: usize) -> FloatX80 {
-    let bits = |se: u16, m: u64| FloatX80 {
-        sign_exp: se,
-        mantissa: m,
-    };
-    match offset {
-        0x00 => bits(0x4000, 0xC90F_DAA2_2168_C235), // pi
-        0x0B => bits(0x3FFD, 0x9A20_9A84_FBCF_F799), // log10(2)
-        0x0C => bits(0x4000, 0xADF8_5458_A2BB_4A9A), // e
-        0x0D => bits(0x3FFF, 0xB8AA_3B29_5C17_F0BC), // log2(e)
-        0x0E => bits(0x3FFD, 0xDE5B_D8A9_3728_7195), // log10(e)
-        0x0F => FloatX80::zero(false),               // 0.0
-        0x30 => bits(0x3FFE, 0xB172_17F7_D1CF_79AC), // ln(2)
-        0x31 => bits(0x4000, 0x935D_8DDD_AAA8_AC17), // ln(10)
-        0x32 => bits(0x3FFF, 0x8000_0000_0000_0000), // 1.0 (10^0)
-        // 10^1, 10^2, 10^4, 10^8, ... 10^4096.
-        0x33..=0x3F => {
-            const EXPS: [u32; 13] = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096];
-            pow10_x80(EXPS[offset - 0x33])
-        }
-        _ => FloatX80::zero(false),
+const fn rom(sign_exp: u16, rn: u64, rzrm: u64, rp: u64, inexact: bool) -> RomConstant {
+    RomConstant {
+        sign_exp,
+        rn,
+        rzrm,
+        rp,
+        inexact,
     }
+}
+
+/// The MC68881/MC68882 constant ROM as Motorola's M68040 FPSP reproduces it
+/// for the 68040 (smovecr.sa, tables PIRN..BIGRP in get_op.sa): every
+/// constant comes in an RN, an RZ/RM and an RP extended pattern, and the
+/// FPSP reports INEX2 for the same set the 6888x does. Note the ROM's RN
+/// patterns for log10(2) and e are the truncated values, and log10(e) is
+/// delivered without INEX2.
+fn rom_constant(offset: usize) -> Option<&'static RomConstant> {
+    const PI: RomConstant = rom(
+        0x4000,
+        0xC90F_DAA2_2168_C235,
+        0xC90F_DAA2_2168_C234,
+        0xC90F_DAA2_2168_C235,
+        true,
+    );
+    // $0B-$0E: log10(2), e, log2(e), log10(e).
+    const SMALL: [RomConstant; 4] = [
+        rom(
+            0x3FFD,
+            0x9A20_9A84_FBCF_F798,
+            0x9A20_9A84_FBCF_F798,
+            0x9A20_9A84_FBCF_F799,
+            true,
+        ),
+        rom(
+            0x4000,
+            0xADF8_5458_A2BB_4A9A,
+            0xADF8_5458_A2BB_4A9A,
+            0xADF8_5458_A2BB_4A9B,
+            true,
+        ),
+        rom(
+            0x3FFF,
+            0xB8AA_3B29_5C17_F0BC,
+            0xB8AA_3B29_5C17_F0BB,
+            0xB8AA_3B29_5C17_F0BC,
+            true,
+        ),
+        rom(
+            0x3FFD,
+            0xDE5B_D8A9_3728_7195,
+            0xDE5B_D8A9_3728_7195,
+            0xDE5B_D8A9_3728_7195,
+            false,
+        ),
+    ];
+    // $30-$3F: ln(2), ln(10), 10^0, 10^1, 10^2, 10^4, ..., 10^4096.
+    const BIG: [RomConstant; 16] = [
+        rom(
+            0x3FFE,
+            0xB172_17F7_D1CF_79AC,
+            0xB172_17F7_D1CF_79AB,
+            0xB172_17F7_D1CF_79AC,
+            true,
+        ),
+        rom(
+            0x4000,
+            0x935D_8DDD_AAA8_AC17,
+            0x935D_8DDD_AAA8_AC16,
+            0x935D_8DDD_AAA8_AC17,
+            true,
+        ),
+        rom(
+            0x3FFF,
+            0x8000_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            0x8000_0000_0000_0000,
+            false,
+        ),
+        rom(
+            0x4002,
+            0xA000_0000_0000_0000,
+            0xA000_0000_0000_0000,
+            0xA000_0000_0000_0000,
+            false,
+        ),
+        rom(
+            0x4005,
+            0xC800_0000_0000_0000,
+            0xC800_0000_0000_0000,
+            0xC800_0000_0000_0000,
+            false,
+        ),
+        rom(
+            0x400C,
+            0x9C40_0000_0000_0000,
+            0x9C40_0000_0000_0000,
+            0x9C40_0000_0000_0000,
+            false,
+        ),
+        rom(
+            0x4019,
+            0xBEBC_2000_0000_0000,
+            0xBEBC_2000_0000_0000,
+            0xBEBC_2000_0000_0000,
+            false,
+        ),
+        rom(
+            0x4034,
+            0x8E1B_C9BF_0400_0000,
+            0x8E1B_C9BF_0400_0000,
+            0x8E1B_C9BF_0400_0000,
+            false,
+        ),
+        rom(
+            0x4069,
+            0x9DC5_ADA8_2B70_B59E,
+            0x9DC5_ADA8_2B70_B59D,
+            0x9DC5_ADA8_2B70_B59E,
+            true,
+        ),
+        rom(
+            0x40D3,
+            0xC278_1F49_FFCF_A6D5,
+            0xC278_1F49_FFCF_A6D5,
+            0xC278_1F49_FFCF_A6D6,
+            true,
+        ),
+        rom(
+            0x41A8,
+            0x93BA_47C9_80E9_8CE0,
+            0x93BA_47C9_80E9_8CDF,
+            0x93BA_47C9_80E9_8CE0,
+            true,
+        ),
+        rom(
+            0x4351,
+            0xAA7E_EBFB_9DF9_DE8E,
+            0xAA7E_EBFB_9DF9_DE8D,
+            0xAA7E_EBFB_9DF9_DE8E,
+            true,
+        ),
+        rom(
+            0x46A3,
+            0xE319_A0AE_A60E_91C7,
+            0xE319_A0AE_A60E_91C6,
+            0xE319_A0AE_A60E_91C7,
+            true,
+        ),
+        rom(
+            0x4D48,
+            0xC976_7586_8175_0C17,
+            0xC976_7586_8175_0C17,
+            0xC976_7586_8175_0C18,
+            true,
+        ),
+        rom(
+            0x5A92,
+            0x9E8B_3B5D_C53D_5DE5,
+            0x9E8B_3B5D_C53D_5DE5,
+            0x9E8B_3B5D_C53D_5DE6,
+            true,
+        ),
+        rom(
+            0x7525,
+            0xC460_5202_8A20_979B,
+            0xC460_5202_8A20_979A,
+            0xC460_5202_8A20_979B,
+            true,
+        ),
+    ];
+    match offset {
+        0x00 => Some(&PI),
+        0x0B..=0x0E => Some(&SMALL[offset - 0x0B]),
+        0x30..=0x3F => Some(&BIG[offset - 0x30]),
+        _ => None,
+    }
+}
+
+/// FMOVECR: the constant at ROM `offset`, as delivered under the FPCR
+/// rounding mode and precision of `ctx`. The mode picks one of the ROM's
+/// three patterns, which a single or double precision then rounds in that
+/// mode; INEX2 is set for an inexact constant or a precision rounding that
+/// discards bits. Offsets with no constant ($01-$0A, $0F, $10-$2F, $40+)
+/// return +0.0 exactly (M68000PRM FMOVECR, M68040 FPSP smovecr.sa).
+pub fn fmovecr(offset: usize, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    let Some(c) = rom_constant(offset) else {
+        return FloatX80::zero(false);
+    };
+    let mantissa = match ctx.mode {
+        RoundMode::Nearest => c.rn,
+        RoundMode::Zero | RoundMode::NegInf => c.rzrm,
+        RoundMode::PosInf => c.rp,
+    };
+    if c.inexact {
+        f.raise(ExcFlags::INEX2);
+    }
+    round_to_precision(
+        FloatX80 {
+            sign_exp: c.sign_exp,
+            mantissa,
+        },
+        ctx,
+        f,
+    )
+}
+
+/// The FMOVECR constant at `offset` as delivered in RN, extended precision.
+#[cfg(test)]
+pub fn const_rom(offset: usize) -> FloatX80 {
+    fmovecr(offset, RoundCtx::NEAREST_EXT, &mut ExcFlags::default())
 }
 
 // ============================== int <-> x80 ==============================

@@ -50,7 +50,19 @@ fn mul_pow10(x: FloatX80, p: i32, f: &mut ExcFlags) -> FloatX80 {
 }
 
 /// Decode a packed-decimal real (12 bytes, big-endian) into an extended value.
+/// A conversion that is not exact raises INEX1, the inexact-decimal-input
+/// exception (MC68881/MC68882UM 6.1.8, M68000PRM FMOVE): INEX2 is reserved
+/// for the rounding of the operation's own result.
 pub fn from_packed(bytes: [u8; 12], f: &mut ExcFlags) -> FloatX80 {
+    let mut g = ExcFlags::default();
+    let value = decode_packed(bytes, &mut g);
+    if g.has(ExcFlags::INEX2) {
+        f.raise(ExcFlags::INEX1);
+    }
+    value
+}
+
+fn decode_packed(bytes: [u8; 12], f: &mut ExcFlags) -> FloatX80 {
     let w0 = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     let w1 = u32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
     let w2 = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
@@ -129,14 +141,14 @@ fn pack_value(sign_m: bool, exp: i32, digits: &[u8; 17]) -> [u8; 12] {
 }
 
 /// Round the 17 digits to `sig` significant digits (1..=17), propagating any
-/// carry into the exponent; raises INEX1 if nonzero digits are discarded.
+/// carry into the exponent; raises INEX2 if nonzero digits are discarded.
 fn round_to_sig(digits: &mut [u8; 17], exp: &mut i32, sig: usize, f: &mut ExcFlags) {
     let sig = sig.clamp(1, 17);
     if sig >= 17 {
         return;
     }
     if digits[sig..].iter().any(|&d| d != 0) {
-        f.raise(ExcFlags::INEX1);
+        f.raise(ExcFlags::INEX2);
     }
     let round_up = digits[sig] >= 5;
     for d in digits[sig..].iter_mut() {
@@ -167,7 +179,9 @@ fn round_to_sig(digits: &mut [u8; 17], exp: &mut i32, sig: usize, f: &mut ExcFla
 
 /// Encode an extended value as a packed-decimal real. `k` is the FMOVE
 /// k-factor: k > 0 selects k significant digits (1..17); k <= 0 selects -k
-/// digits to the right of the decimal point.
+/// digits to the right of the decimal point. A decimal string that is not
+/// exactly the value raises INEX2, as for any inexact FMOVE out (M68000PRM
+/// FMOVE; INEX1 is only for decimal input).
 pub fn to_packed(x: FloatX80, k: i8, f: &mut ExcFlags) -> [u8; 12] {
     let sign = x.sign();
     if x.is_nan() {
@@ -181,10 +195,17 @@ pub fn to_packed(x: FloatX80, k: i8, f: &mut ExcFlags) -> [u8; 12] {
     }
 
     // Leading decimal exponent estimate, then scale to a 17-digit integer.
+    // Only inexactness of the scaling reaches the caller: an intermediate
+    // power of ten out of the extended range is not an exception of the
+    // conversion.
     let mag = softfloat::abs(x);
     let e10 = mag.to_f64().abs().log10().floor() as i32;
-    let scaled = mul_pow10(mag, 16 - e10, f);
-    let mut intval = softfloat::to_i64(scaled, RoundMode::Nearest, 0, i64::MAX, f) as u64;
+    let mut g = ExcFlags::default();
+    let scaled = mul_pow10(mag, 16 - e10, &mut g);
+    let mut intval = softfloat::to_i64(scaled, RoundMode::Nearest, 0, i64::MAX, &mut g) as u64;
+    if g.has(ExcFlags::INEX2) {
+        f.raise(ExcFlags::INEX2);
+    }
     let mut exp = e10;
 
     // Correct the estimate so intval has exactly 17 digits [10^16, 10^17).
@@ -291,8 +312,30 @@ mod tests {
         // 123.456 with k=4 significant digits -> 123.5.
         let mut f = ExcFlags::default();
         let p = to_packed(FloatX80::from_f64(123.456), 4, &mut f);
+        assert!(f.has(ExcFlags::INEX2));
+        assert!(!f.has(ExcFlags::INEX1));
         let back = from_packed(p, &mut f).to_f64();
         assert!((back - 123.5).abs() < 1e-9, "got {back}");
-        assert!(f.has(ExcFlags::INEX1));
+    }
+
+    #[test]
+    fn inexact_decimal_input_raises_inex1_only() {
+        // 1E-1 (D0 = 1, SE, exponent 1) has no exact binary value.
+        let mut f = ExcFlags::default();
+        let mut bytes = [0u8; 12];
+        bytes[0] = 0x40; // SE
+        bytes[1] = 0x01; // e0 = 1
+        bytes[3] = 0x01; // D0 = 1
+        let v = from_packed(bytes, &mut f);
+        assert_eq!((v.sign_exp, v.mantissa), (0x3FFB, 0xCCCC_CCCC_CCCC_CCCD));
+        assert_eq!(f, ExcFlags(ExcFlags::INEX1));
+        // 1.5E1 is exact.
+        let mut f = ExcFlags::default();
+        let mut bytes = [0u8; 12];
+        bytes[1] = 0x01;
+        bytes[3] = 0x01;
+        bytes[4] = 0x50;
+        from_packed(bytes, &mut f);
+        assert_eq!(f, ExcFlags::default());
     }
 }

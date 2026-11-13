@@ -48,11 +48,17 @@ const STACK: u32 = 0x8000;
 const NO_EXCEPTION: u32 = 0xFFFF_FFFF;
 
 /// FPSR condition codes.
+const CC_N: u32 = 0x0800_0000;
+const CC_Z: u32 = 0x0400_0000;
 const CC_NAN: u32 = 0x0100_0000;
 /// FPSR exception-status bits.
+const EXC_BSUN: u32 = 0x8000;
 const EXC_SNAN: u32 = 0x4000;
 /// FPSR accrued-exception bits.
 const AEXC_IOP: u32 = 0x0080;
+const AEXC_INEX: u32 = 0x0008;
+const EXC_INEX2: u32 = 0x0200;
+const EXC_INEX1: u32 = 0x0100;
 
 struct Machine {
     cpu: CpuCore,
@@ -160,10 +166,16 @@ fn fmovem_control_list_masks_each_register() {
 /// Run `FOP FP1,FP0` (register form, `opmode`) with FP1 = `src`, FP0 =
 /// `dst` and FPSR cleared.
 fn reg_op(cpu: CpuType, opmode: u16, src: (u16, u64), dst: (u16, u64)) -> Machine {
+    reg_op_fpcr(cpu, opmode, src, dst, 0)
+}
+
+/// `reg_op` with FPCR = `fpcr`.
+fn reg_op_fpcr(cpu: CpuType, opmode: u16, src: (u16, u64), dst: (u16, u64), fpcr: u32) -> Machine {
     let mut m = Machine::new(cpu);
     m.cpu.fpr[1] = x80(src.0, src.1);
     m.cpu.fpr[0] = x80(dst.0, dst.1);
     m.cpu.fpsr = 0;
+    m.cpu.fpcr = fpcr;
     m.run(&[0xF200, 0x0400 | opmode]);
     m
 }
@@ -283,4 +295,191 @@ fn nan_operand_keeps_its_sign_and_wins_over_other_rules() {
     let m = reg_op(CpuType::M68030, 0x26, qnan, zero);
     assert_eq!(bits(m.cpu.fpr[0]), qnan);
     assert_eq!(m.cpu.fpsr, CC_NAN);
+}
+
+#[test]
+fn fabs_and_fneg_round_the_result_not_the_operand() {
+    // -sqrt(2) and +sqrt(2) in extended; rounded to single toward minus
+    // infinity |-sqrt(2)| is $B504F3 (truncated), not $B504F4.
+    let neg_root2 = (0xBFFF, 0xB504_F333_F9DE_6484);
+    let pos_root2 = (0x3FFF, 0xB504_F333_F9DE_6484);
+    let trunc = 0xB504_F300_0000_0000;
+    for cpu in [CpuType::M68040, CpuType::M68060] {
+        // FSABS / FSNEG under RM / RP.
+        let m = reg_op_fpcr(cpu, 0x58, neg_root2, (0, 0), 0x20);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x3FFF, trunc), "{cpu:?} FSABS RM");
+        assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} FSABS RM");
+        let m = reg_op_fpcr(cpu, 0x5A, pos_root2, (0, 0), 0x30);
+        assert_eq!(bits(m.cpu.fpr[0]), (0xBFFF, trunc), "{cpu:?} FSNEG RP");
+    }
+    // FABS / FNEG with FPCR single precision on every FPU.
+    for cpu in ALL_FPUS {
+        let m = reg_op_fpcr(cpu, 0x18, neg_root2, (0, 0), 0x60);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x3FFF, trunc), "{cpu:?} FABS RM.S");
+        let m = reg_op_fpcr(cpu, 0x1A, pos_root2, (0, 0), 0x70);
+        assert_eq!(bits(m.cpu.fpr[0]), (0xBFFF, trunc), "{cpu:?} FNEG RP.S");
+    }
+}
+
+#[test]
+fn fcmp_of_equal_infinities_sets_the_infinity_sign() {
+    let pinf = (0x7FFF, 0);
+    let ninf = (0xFFFF, 0);
+    for cpu in ALL_FPUS {
+        let m = reg_op(cpu, 0x38, ninf, ninf);
+        assert_eq!(m.cpu.fpsr, CC_N | CC_Z, "{cpu:?} -inf vs -inf");
+        let m = reg_op(cpu, 0x38, pinf, pinf);
+        assert_eq!(m.cpu.fpsr, CC_Z, "{cpu:?} +inf vs +inf");
+        let m = reg_op(cpu, 0x38, pinf, ninf);
+        assert_eq!(m.cpu.fpsr, CC_N, "{cpu:?} -inf vs +inf");
+        // The destination is not written.
+        assert_eq!(bits(m.cpu.fpr[0]), ninf, "{cpu:?}");
+    }
+}
+
+/// FMOVECR #offset,FP0 on a 6888x under FPCR `fpcr`.
+fn fmovecr(offset: u16, fpcr: u32) -> Machine {
+    let mut m = Machine::new(CpuType::M68030);
+    m.cpu.fpcr = fpcr;
+    m.cpu.fpsr = 0;
+    m.run(&[0xF200, 0x5C00 | offset]);
+    m
+}
+
+#[test]
+fn fmovecr_rounds_the_rom_constant_and_reports_inexact() {
+    let inex = EXC_INEX2 | AEXC_INEX;
+    // pi under each rounding mode, then at single and double precision.
+    for (fpcr, mant) in [
+        (0x00, 0xC90F_DAA2_2168_C235),
+        (0x10, 0xC90F_DAA2_2168_C234),
+        (0x20, 0xC90F_DAA2_2168_C234),
+        (0x30, 0xC90F_DAA2_2168_C235),
+        (0x40, 0xC90F_DB00_0000_0000),
+        (0x80, 0xC90F_DAA2_2168_C000),
+    ] {
+        let m = fmovecr(0x00, fpcr);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x4000, mant), "pi fpcr {fpcr:#x}");
+        assert_eq!(m.cpu.fpsr, inex, "pi fpcr {fpcr:#x}");
+    }
+    // 10^256 in RN is the correctly rounded value, inexact.
+    let m = fmovecr(0x3B, 0);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4351, 0xAA7E_EBFB_9DF9_DE8E));
+    assert_eq!(m.cpu.fpsr, inex);
+    // 10^16 is exact in extended, but not in single.
+    let m = fmovecr(0x37, 0);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4034, 0x8E1B_C9BF_0400_0000));
+    assert_eq!(m.cpu.fpsr, 0);
+    let m = fmovecr(0x37, 0x40);
+    assert_eq!(m.cpu.fpsr, inex);
+    // e under RP is one ulp above its RN pattern.
+    let m = fmovecr(0x0C, 0x30);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4000, 0xADF8_5458_A2BB_4A9B));
+    // An offset with no constant is an exact +0.0.
+    let m = fmovecr(0x0F, 0);
+    assert_eq!(bits(m.cpu.fpr[0]), (0, 0));
+    assert_eq!(m.cpu.fpsr, CC_Z);
+}
+
+#[test]
+fn packed_decimal_conversions_report_inexact() {
+    // The 68040 runs packed decimal natively here only with its
+    // unimplemented-instruction emulation on (the default).
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        // FMOVE.P (A0),FP0 of 1E-1: inexact decimal input, INEX1.
+        let mut m = Machine::new(cpu);
+        m.bus.write_long(DATA, 0x4001_0001);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x4C00]);
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0x3FFB, 0xCCCC_CCCC_CCCC_CCCD),
+            "{cpu:?}"
+        );
+        assert_eq!(m.cpu.fpsr, EXC_INEX1 | AEXC_INEX, "{cpu:?} in");
+
+        // FMOVE.P FP0,(A0){#3} of 123456: 1.23E5, inexact, INEX2.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x400F, 0xF120_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6C03]);
+        assert_eq!(m.bus.read_long(DATA), 0x0005_0001, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x2300_0000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} out");
+
+        // An exact conversion raises nothing: 123456 with k = 6.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x400F, 0xF120_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6C06]);
+        assert_eq!(m.bus.read_long(DATA + 4), 0x2345_6000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr, 0, "{cpu:?} exact out");
+    }
+}
+
+/// A conditional instruction's encoding for a predicate.
+type PredicateForm = (&'static str, fn(u16) -> Vec<u16>);
+
+#[test]
+fn ieee_nonaware_predicates_signal_bsun_on_unordered() {
+    // FBcc.W *+4, FScc D0, FDBcc D0,*+4 and FTRAPcc for every predicate,
+    // with each condition code an operation can produce.
+    let forms: [PredicateForm; 4] = [
+        ("FBcc", |p| vec![0xF280 | p, 0x0002]),
+        ("FScc", |p| vec![0xF240, p]),
+        ("FDBcc", |p| vec![0xF248, p, 0x0002]),
+        ("FTRAPcc", |p| vec![0xF27C, p]),
+    ];
+    for cpu in ALL_FPUS {
+        for (name, code) in forms {
+            // FScc/FDBcc/FTRAPcc are left to the 68060 software package.
+            if cpu == CpuType::M68060 && name != "FBcc" {
+                continue;
+            }
+            for p in 0..32u16 {
+                for cc in [0, CC_NAN, CC_Z, CC_N, CC_N | CC_NAN] {
+                    let mut m = Machine::new(cpu);
+                    m.cpu.fpsr = cc;
+                    m.run(&code(p));
+                    let want = if p & 0x10 != 0 && cc & CC_NAN != 0 {
+                        cc | EXC_BSUN | AEXC_IOP
+                    } else {
+                        cc
+                    };
+                    assert_eq!(
+                        m.cpu.fpsr, want,
+                        "{cpu:?} {name} predicate {p:#x} cc {cc:#x}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn fmod_and_frem_signal_a_signaling_nan_source_under_a_quiet_nan_destination() {
+    // The destination NaN is the result, but the signaling NaN in the
+    // source still raises SNAN (MC68881/MC68882UM 4.6.4). FMOD and FREM
+    // are 6888x hardware instructions.
+    let qnan = (0x7FFF, 0xC000_0000_0000_0000);
+    for opmode in [0x21, 0x25] {
+        let m = reg_op(CpuType::M68030, opmode, SNAN_X, qnan);
+        assert_eq!(
+            m.cpu.fpsr & (CC_NAN | EXC_SNAN | AEXC_IOP),
+            CC_NAN | EXC_SNAN | AEXC_IOP,
+            "opmode {opmode:#x}"
+        );
+        assert_eq!(bits(m.cpu.fpr[0]), qnan, "opmode {opmode:#x}");
+    }
+}
+
+#[test]
+fn fscale_truncates_its_scale_factor_without_reporting_inexact() {
+    // FSCALE by 2.7 scales by 2: the truncation of the scale factor is
+    // not an inexact result, and 1.0 * 2^2 is exact.
+    let two_point_seven = (0x4000, 0xACCC_CCCC_CCCC_CCCD);
+    let one = (0x3FFF, 0x8000_0000_0000_0000);
+    let m = reg_op(CpuType::M68030, 0x26, two_point_seven, one);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x4001, 0x8000_0000_0000_0000));
+    assert_eq!(m.cpu.fpsr, 0, "no INEX2, no accrued inexact");
 }

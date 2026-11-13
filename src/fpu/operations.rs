@@ -191,8 +191,11 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
-                    self.fpr[dst] = softfloat::const_rom(opmode as usize);
+                    let ctx = self.fpu_ctx(0);
+                    let mut f = ExcFlags::default();
+                    self.fpr[dst] = softfloat::fmovecr(opmode as usize, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
+                    self.fpu_commit(f);
                     return 4;
                 }
 
@@ -291,8 +294,11 @@ impl CpuCore {
                     }
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
-                    self.fpr[dst] = softfloat::const_rom(src);
+                    let ctx = self.fpu_ctx(0);
+                    let mut f = ExcFlags::default();
+                    self.fpr[dst] = softfloat::fmovecr(src, ctx, &mut f);
                     self.fpu_set_cc(self.fpr[dst]);
+                    self.fpu_commit(f);
                     return 4;
                 }
                 if self.trap_unimpl_060() && fpu_060_traps_opmode(opmode) {
@@ -947,12 +953,15 @@ impl CpuCore {
         self.fpsr |= aexc;
     }
 
-    /// Evaluate a 6888x conditional predicate against FPSR.
+    /// Evaluate an FBcc/FScc/FDBcc/FTRAPcc conditional predicate against
+    /// FPSR.
     ///
-    /// Signaling predicates (condition bit 4 set) currently evaluate like
-    /// their non-signaling counterparts; this helper does not set BSUN when
-    /// the unordered condition is present.
-    fn fpu_condition(&self, condition: u8) -> bool {
+    /// The IEEE-nonaware predicates ($10-$1F) test the same condition as
+    /// their aware counterparts ($00-$0F), but with the NAN condition code
+    /// set they also signal a branch/set on unordered: BSUN in the
+    /// exception byte and IOP in the accrued byte, the rest of FPSR
+    /// unchanged (MC68881/MC68882UM 4.5.1 and table 4-3, M68000PRM 3.6.2).
+    fn fpu_condition(&mut self, condition: u8) -> bool {
         const FPCC_N: u32 = 0x0800_0000;
         const FPCC_Z: u32 = 0x0400_0000;
         const FPCC_NAN: u32 = 0x0100_0000;
@@ -960,6 +969,10 @@ impl CpuCore {
         let n = (self.fpsr & FPCC_N) != 0;
         let z = (self.fpsr & FPCC_Z) != 0;
         let nan = (self.fpsr & FPCC_NAN) != 0;
+
+        if condition & 0x10 != 0 && nan {
+            self.fpsr |= 0x0000_8080; // BSUN, accrued IOP
+        }
 
         match condition & 0x0F {
             0x0 => false,            // F
@@ -1033,19 +1046,22 @@ impl CpuCore {
                 4
             }
             0x18 | 0x58 | 0x5C => {
-                // FABS / FSABS / FDABS
+                // FABS / FSABS / FDABS: the absolute value, then rounded to
+                // the precision (M68000PRM FABS). The order matters under
+                // RM/RP, which round a negative source the other way.
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = src_flags;
-                self.fpr[dst] = softfloat::abs(softfloat::round_to_precision(src, ctx, &mut f));
+                self.fpr[dst] = softfloat::round_to_precision(softfloat::abs(src), ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4
             }
             0x1A | 0x5A | 0x5E => {
-                // FNEG / FSNEG / FDNEG
+                // FNEG / FSNEG / FDNEG: the negation, then rounded to the
+                // precision (M68000PRM FNEG), as for FABS.
                 let ctx = self.fpu_ctx(opmode);
                 let mut f = src_flags;
-                self.fpr[dst] = softfloat::neg(softfloat::round_to_precision(src, ctx, &mut f));
+                self.fpr[dst] = softfloat::round_to_precision(softfloat::neg(src), ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4
@@ -1126,6 +1142,13 @@ impl CpuCore {
                 let mut f = src_flags;
                 let cmp = softfloat::compare(self.fpr[dst], src, &mut f);
                 self.fpu_set_cc_cmp(cmp);
+                // Two equal infinities compare equal with the infinity's
+                // sign: -inf vs -inf sets N as well as Z (M68000PRM FCMP,
+                // operation table).
+                let d = self.fpr[dst];
+                if cmp == FpCmp::Equal && d.is_inf() && src.is_inf() && d.sign() {
+                    self.fpsr |= 0x0800_0000;
+                }
                 self.fpu_commit(f);
                 4
             }
@@ -1192,12 +1215,15 @@ impl CpuCore {
                     let n = if src.to_f64().abs() >= 2147483648.0 {
                         if src.sign() { i32::MIN } else { i32::MAX }
                     } else {
+                        // The scale factor is truncated to an integer
+                        // without reporting it: only the scaled result's
+                        // own rounding can be inexact.
                         softfloat::to_i64(
                             src,
                             RoundMode::Zero,
                             i32::MIN as i64,
                             i32::MAX as i64,
-                            &mut f,
+                            &mut ExcFlags::default(),
                         ) as i32
                     };
                     self.fpr[dst] = softfloat::scale(self.fpr[dst], n, ctx, &mut f);
@@ -1373,7 +1399,7 @@ impl CpuCore {
                     let w0 = self.read_imm_32(bus);
                     let w1 = self.read_imm_32(bus);
                     let w2 = self.read_imm_32(bus);
-                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default())
+                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut f)
                 }
                 _ => return None,
             },
@@ -1397,7 +1423,7 @@ impl CpuCore {
                     let w0 = self.read_32(bus, addr);
                     let w1 = self.read_32(bus, addr.wrapping_add(4));
                     let w2 = self.read_32(bus, addr.wrapping_add(8));
-                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut ExcFlags::default())
+                    packed::from_packed(words_to_bytes(w0, w1, w2), &mut f)
                 }
                 _ => return None,
             },
@@ -1508,12 +1534,12 @@ impl CpuCore {
                 }
                 3 | 7 => {
                     // Packed decimal (static or dynamic k-factor).
-                    let bytes = packed::to_packed(value, kfactor, &mut ExcFlags::default());
+                    let bytes = packed::to_packed(value, kfactor, &mut f);
                     for (i, chunk) in bytes.chunks(4).enumerate() {
                         let w = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
                         self.write_32(bus, addr.wrapping_add(4 * i as u32), w);
                     }
-                    return true;
+                    true
                 }
                 _ => false,
             },
