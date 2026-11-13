@@ -141,6 +141,16 @@ unchanged. Timing-aware hosts must implement this hook; its default is a
 no-op for functional buses. Exception dispatch releases either sample hold
 through `AddressBus::ipl_release_sample`.
 
+`AddressBus::sync` is part of that precise 68000/68010 path only: the 68020
+and later models never call it. Hosts that model instruction-cache misses on
+those CPUs report residency instead. The 68020/68030 tables choose their cache
+or non-cache case from `AddressBus::instruction_fetches_were_cached`. The
+68040 model prices every instruction as a cache hit and adds
+`AddressBus::instruction_fetch_stall_cycles`, the extra clocks the host's
+memory system charged for that instruction's fetches (reset them in
+`AddressBus::begin_instruction_fetches`). The default of zero keeps the
+cache-hit costs, so the miss penalty stays the host's policy.
+
 ### High-Level Emulation (HLE)
 
 Intercept traps for OS emulation or debugger integration with CPU/bus access:

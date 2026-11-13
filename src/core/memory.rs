@@ -150,6 +150,14 @@ pub trait AddressBus {
     /// the core performed since its previous access. The access itself then
     /// takes the standard 4 CPU clocks of a 68000 bus cycle.
     ///
+    /// Only the precise 68000/68010 path calls this: it fires when
+    /// [`CpuCore::prefetch_enabled`](super::cpu::CpuCore::prefetch_enabled)
+    /// is true (precise bus timing on a 68000 or 68010). The 68020 and later
+    /// models never call it; a host modelling their memory latency can use
+    /// [`instruction_fetch_stall_cycles`](Self::instruction_fetch_stall_cycles)
+    /// for the 68040 instruction stream, or account for latency in its own
+    /// run loop.
+    ///
     /// Hosts that emulate surrounding hardware (DMA, video beam) advance it
     /// by `cpu_clocks` here so every access lands at the hardware-exact
     /// moment. The default is a no-op, so buses that only need functional
@@ -308,6 +316,33 @@ pub trait AddressBus {
     /// buses without a cache model default to the most recent fetch result.
     fn instruction_fetches_were_cached(&self) -> bool {
         self.last_fetch_was_cached()
+    }
+
+    /// Extra CPU clocks that the instruction-stream fetches since
+    /// [`begin_instruction_fetches`](Self::begin_instruction_fetches) stalled
+    /// beyond an instruction-cache hit, such as line fills for cache misses.
+    ///
+    /// The 68040 timing model prices every instruction as if its whole fetch
+    /// stream hit the instruction cache, and adds this value to the
+    /// instruction's cycle count. The penalty policy stays with the host,
+    /// which knows its memory system: the core neither infers a line-fill
+    /// cost nor charges per opcode, so stalls from extension and immediate
+    /// words (including those crossing a cache line) are included when the
+    /// host reports them. Reset the accumulator in `begin_instruction_fetches`.
+    ///
+    /// The value is read once per instruction that completes normally through
+    /// the cycle-accounted entry points ([`CpuCore::execute`](super::cpu::CpuCore::execute),
+    /// [`CpuCore::step`](super::cpu::CpuCore::step) and the `run_for_cycles`
+    /// family). [`CpuCore::run_batch`](super::cpu::CpuCore::run_batch) does not
+    /// keep cycle accounting and never reads it. Other CPU models ignore it:
+    /// the 68020/68030 tables already select their cache or non-cache case
+    /// from [`instruction_fetches_were_cached`](Self::instruction_fetches_were_cached),
+    /// and the 68060 model gates pairing and branch folding on
+    /// [`last_fetch_was_cached`](Self::last_fetch_was_cached).
+    ///
+    /// The default of zero keeps the cache-hit costs.
+    fn instruction_fetch_stall_cycles(&self) -> u32 {
+        0
     }
 
     /// Synchronize the embedder during [`CpuCore::run_batch`](super::cpu::CpuCore::run_batch).
