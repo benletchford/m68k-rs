@@ -88,6 +88,17 @@ fn sgl_truncate(v: FloatX80) -> FloatX80 {
     }
 }
 
+/// A zero mantissa is a zero whatever the exponent field holds (see
+/// [`FloatX80::is_zero`]); give such an operand the zero exponent the
+/// arithmetic returns and stores.
+fn canonical_zero(v: FloatX80) -> FloatX80 {
+    if v.is_zero() {
+        FloatX80::zero(v.sign())
+    } else {
+        v
+    }
+}
+
 /// Sign-extend a 7-bit FMOVE k-factor to i8.
 fn sign_extend7(v: u16) -> i8 {
     let raw = (v & 0x7F) as i16;
@@ -1009,6 +1020,12 @@ impl CpuCore {
     /// rounding-precision variants (FSxxx/FDxxx) select their specified
     /// result precision before the value is written back.
     fn fpu_apply_op(&mut self, opmode: u16, dst: usize, src: FloatX80, src_flags: ExcFlags) -> i32 {
+        // Operands that are zeros with a nonzero exponent field compute as
+        // zeros. FCMP and FTST do not write the destination register.
+        let src = canonical_zero(src);
+        if !matches!(opmode, 0x38 | 0x3A) {
+            self.fpr[dst] = canonical_zero(self.fpr[dst]);
+        }
         match opmode {
             0x00 | 0x40 | 0x44 => {
                 // FMOVE / FSMOVE / FDMOVE
@@ -1140,12 +1157,12 @@ impl CpuCore {
             0x38 => {
                 // FCMP - ordered compare of dst with src, set condition codes only
                 let mut f = src_flags;
-                let cmp = softfloat::compare(self.fpr[dst], src, &mut f);
+                let d = canonical_zero(self.fpr[dst]);
+                let cmp = softfloat::compare(d, src, &mut f);
                 self.fpu_set_cc_cmp(cmp);
                 // Two equal infinities compare equal with the infinity's
                 // sign: -inf vs -inf sets N as well as Z (M68000PRM FCMP,
                 // operation table).
-                let d = self.fpr[dst];
                 if cmp == FpCmp::Equal && d.is_inf() && src.is_inf() && d.sign() {
                     self.fpsr |= 0x0800_0000;
                 }
@@ -1455,6 +1472,7 @@ impl CpuCore {
         let Some(ea) = self.fpu_ea(bus, ea_mode, ea_reg, bytes) else {
             return false;
         };
+        let value = canonical_zero(value);
         // Integer, single and double results are rounded once, straight
         // from the extended value, by the FPCR rounding mode, and report
         // their exceptions in FPSR like an arithmetic result.
