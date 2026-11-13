@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.16.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.16.0...m68k-v0.16.1) (2026-11-13)
+
+
+### Bug Fixes
+
+* **cpu:** compute CAS flags as destination minus compare ([8ebf1a3](https://github.com/benletchford/m68k-rs/commit/8ebf1a3bd94aae55844b6c1dc1e6064ef456bc36))
+* **cpu:** correct divide carry flags and signed overflow ([3f7b75b](https://github.com/benletchford/m68k-rs/commit/3f7b75b2cecaabf7ce68152965434b2ce0aada5e))
+* **cpu:** correct exception tracing and supported stack frames ([a8ebeaf](https://github.com/benletchford/m68k-rs/commit/a8ebeaf03f3a37d1c969708ca42cec2912f4e4d1))
+* **cpu:** stack hardware address-error frames for each model ([4c66ee1](https://github.com/benletchford/m68k-rs/commit/4c66ee1ec73355f485355446507c9d1912a72534))
+* **fpu:** preserve NaN payloads and mask reserved control bits ([90d2eea](https://github.com/benletchford/m68k-rs/commit/90d2eea9554ca49b6480551df589e8047e8a276f))
+
 ## [0.16.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.15.1...m68k-v0.16.0) (2026-11-05)
 
 
