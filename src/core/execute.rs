@@ -187,11 +187,14 @@ impl CpuCore {
             } else {
                 opcode_fetch_cached
             };
+            let fetch_stall = bus.instruction_fetch_stall_cycles();
 
             // Auto-take all trap exceptions, extract cycles
             use crate::core::types::InternalStepResult;
             let cycles = match result {
-                InternalStepResult::Ok { cycles } => self.finalize_cycles(cycles, fetch_cached),
+                InternalStepResult::Ok { cycles } => {
+                    self.finalize_cycles(cycles, fetch_cached, fetch_stall)
+                }
                 InternalStepResult::AlineTrap { .. } => self.take_aline_exception(bus),
                 InternalStepResult::FlineTrap { .. } => self.take_fline_exception(bus),
                 InternalStepResult::TrapInstruction { trap_num } => {
@@ -1043,6 +1046,7 @@ impl CpuCore {
         } else {
             opcode_fetch_cached
         };
+        let fetch_stall = bus.instruction_fetch_stall_cycles();
 
         if !matches!(result, InternalStepResult::Ok { .. }) {
             self.clear_execution_pipeline_state();
@@ -1050,7 +1054,7 @@ impl CpuCore {
 
         let res = match result {
             InternalStepResult::Ok { cycles } => StepResult::Ok {
-                cycles: self.finalize_cycles(cycles, fetch_cached),
+                cycles: self.finalize_cycles(cycles, fetch_cached, fetch_stall),
             },
             InternalStepResult::AlineTrap { opcode } => StepResult::AlineTrap { opcode },
             InternalStepResult::FlineTrap { opcode } => StepResult::FlineTrap { opcode },
@@ -1195,6 +1199,7 @@ impl CpuCore {
         } else {
             opcode_fetch_cached
         };
+        let fetch_stall = bus.instruction_fetch_stall_cycles();
 
         // A surfaced or HLE-handled trap still represents an architectural
         // execution boundary. Clear timing state before invoking callbacks,
@@ -1205,7 +1210,9 @@ impl CpuCore {
 
         // Handle trap results via callbacks, fallback to exception if not handled
         let cycles = match result {
-            InternalStepResult::Ok { cycles } => self.finalize_cycles(cycles, fetch_cached),
+            InternalStepResult::Ok { cycles } => {
+                self.finalize_cycles(cycles, fetch_cached, fetch_stall)
+            }
             InternalStepResult::AlineTrap { opcode } => {
                 if !handler.handle_aline(self, bus, opcode) {
                     self.take_aline_exception(bus)

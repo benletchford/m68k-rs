@@ -1021,15 +1021,15 @@ mod tests {
         let mut cpu = CpuCore::new();
         cpu.ir = 0x4E71; // NOP
         cpu.set_cpu_type(CpuType::M68EC020);
-        assert_eq!(cpu.finalize_cycles(4, true), 2);
+        assert_eq!(cpu.finalize_cycles(4, true, 0), 2);
         cpu.set_cpu_type(CpuType::M68020);
-        assert_eq!(cpu.finalize_cycles(4, false), 3);
+        assert_eq!(cpu.finalize_cycles(4, false, 0), 3);
         // The 030 shares the 020 integer core and now runs the same
         // tables (real-hardware calibration: Copperline accelprobe).
         cpu.set_cpu_type(CpuType::M68030);
-        assert_eq!(cpu.finalize_cycles(4, true), 2);
+        assert_eq!(cpu.finalize_cycles(4, true, 0), 2);
         // The 040 runs its own single-issue pipeline model.
         cpu.set_cpu_type(CpuType::M68040);
-        assert_eq!(cpu.finalize_cycles(4, true), 1);
+        assert_eq!(cpu.finalize_cycles(4, true, 0), 1);
     }
 }

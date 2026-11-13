@@ -751,8 +751,17 @@ impl CpuCore {
     /// the mid-30s per loop -- where the legacy scaler billed the calls
     /// ~1.7x high. The 68040 has its own single-issue pipeline model
     /// (`timing_040.rs`).
+    ///
+    /// `fetch_stall` is the host-reported instruction-fetch stall
+    /// ([`AddressBus::instruction_fetch_stall_cycles`](crate::AddressBus::instruction_fetch_stall_cycles));
+    /// only the 68040 model, whose costs assume a cached fetch stream, adds it.
     #[inline]
-    pub(crate) fn finalize_cycles(&mut self, raw: i32, fetch_cached: bool) -> i32 {
+    pub(crate) fn finalize_cycles(
+        &mut self,
+        raw: i32,
+        fetch_cached: bool,
+        fetch_stall: u32,
+    ) -> i32 {
         match self.cpu_type {
             super::types::CpuType::M68EC020
             | super::types::CpuType::M68020
@@ -760,7 +769,9 @@ impl CpuCore {
             | super::types::CpuType::M68030 => self.cycles_020(raw, fetch_cached),
             super::types::CpuType::M68EC040
             | super::types::CpuType::M68LC040
-            | super::types::CpuType::M68040 => self.cycles_040(raw),
+            | super::types::CpuType::M68040 => self
+                .cycles_040(raw)
+                .saturating_add(i32::try_from(fetch_stall).unwrap_or(i32::MAX)),
             super::types::CpuType::M68060 => self.cycles_060(raw, fetch_cached),
             _ => self.scale_cycles_for_cpu_type(raw),
         }
