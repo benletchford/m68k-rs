@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.17.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.16.1...m68k-v0.17.0) (2026-11-14)
+
+
+### Features
+
+* **timing:** let hosts charge 68040 instruction-fetch stalls ([1ec050f](https://github.com/benletchford/m68k-rs/commit/1ec050f252a06d4e6f26146772443680f51e526a))
+
+
+### Bug Fixes
+
+* **fpu:** correct rounding, condition codes and inexact reporting ([cd721d5](https://github.com/benletchford/m68k-rs/commit/cd721d5fd87bd3d599342d0cc8f81e8888e5909d))
+* **fpu:** treat a zero mantissa as zero whatever the exponent ([#244](https://github.com/benletchford/m68k-rs/issues/244)) ([a523916](https://github.com/benletchford/m68k-rs/commit/a5239168229b9459041bd44950f1a53f81be246e))
+* **mmu:** model 68030 TT fields, history bits, table limits and PTEST level 0 ([#241](https://github.com/benletchford/m68k-rs/issues/241)) ([6c1cd21](https://github.com/benletchford/m68k-rs/commit/6c1cd21224fee848f575eb7415e6ca9067cce4f3))
+* **mmu:** model 68040/68060 TTR matching, history bits, PTEST MMUSR and MA ([1d66497](https://github.com/benletchford/m68k-rs/commit/1d66497d7117b833bab4f4ce3927087576e5e697))
+
 ## [0.16.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.16.0...m68k-v0.16.1) (2026-11-13)
 
 
