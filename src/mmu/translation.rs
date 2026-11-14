@@ -115,6 +115,12 @@ pub fn translate<B: AddressBus>(
     translate_030(cpu, bus, logical, write, supervisor, instruction)
 }
 
+/// 68030 descriptor U (used) bit: bit 3 of a short descriptor and of the
+/// first long of a long descriptor.
+const U_030: u32 = 0x0000_0008;
+/// 68030 page descriptor M (modified) bit, next to U.
+const M_030: u32 = 0x0000_0010;
+
 /// One fetched 68030 table descriptor, normalized across the short (4-byte)
 /// and long (8-byte) formats. `field` is the address long (the whole
 /// descriptor for short format, the second long for long format); `wp` is
@@ -125,6 +131,13 @@ struct Desc030 {
     field: u32,
     wp: bool,
     sup: bool,
+    /// The long holding the status bits (the descriptor itself for short
+    /// format, its first long for long format), at `at`.
+    status: u32,
+    at: u32,
+    /// Long format only: the limit on the index into the next table, as
+    /// (lower limit, limit) from L/U (bit 31) and LIMIT (bits 30-16).
+    limit: Option<(bool, u32)>,
 }
 
 fn read_desc_030<B: AddressBus>(
@@ -142,6 +155,9 @@ fn read_desc_030<B: AddressBus>(
             field: lo,
             wp: hi & 0x0000_0004 != 0,
             sup: hi & 0x0000_0100 != 0,
+            status: hi,
+            at,
+            limit: Some((hi & 0x8000_0000 != 0, (hi >> 16) & 0x7FFF)),
         })
     } else {
         let at = base.wrapping_add(index * 4);
@@ -151,7 +167,21 @@ fn read_desc_030<B: AddressBus>(
             field: e,
             wp: e & 0x0000_0004 != 0,
             sup: false,
+            status: e,
+            at,
+            limit: None,
         })
+    }
+}
+
+/// Whether `index` lies outside a 68030 limit: below it for a lower limit
+/// (L/U=1), above it for an upper limit (L/U=0) (MC68030UM 9.5.1.2).
+#[inline]
+fn limit_violated(limit: Option<(bool, u32)>, index: u32) -> bool {
+    match limit {
+        Some((true, limit)) => index < limit,
+        Some((false, limit)) => index > limit,
+        None => false,
     }
 }
 
@@ -163,6 +193,9 @@ enum Walk030End {
     /// An invalid (DT=0) descriptor, or an indirect descriptor whose target
     /// is not a page descriptor (`indirect` tells the two apart).
     Invalid { indirect: bool },
+    /// The index into the next table is outside the limit of the root
+    /// pointer or of the long-format descriptor pointing to it.
+    Limit,
     /// The level limit stopped the walk on a valid table pointer (PTEST
     /// with a level operand; a full walk never ends here).
     LevelStop,
@@ -173,18 +206,20 @@ enum Walk030End {
 }
 
 /// A finished 68030 walk: the outcome plus the accumulated protection bits,
-/// the number of descriptors fetched, and the physical address of the last
-/// descriptor examined (what PTEST's A bit hands back for lazy table fills).
+/// the number of descriptors fetched, the physical address of the last
+/// descriptor examined (what PTEST's A bit hands back for lazy table fills)
+/// and the page descriptor's M bit as the walk left it.
 struct Walk030 {
     end: Walk030End,
     wp: bool,
     sup: bool,
     levels: u32,
     desc_addr: u32,
+    modified: bool,
 }
 
-/// The 68030 programmable table walk, shared between address translation
-/// and PTEST.
+/// The 68030 programmable table walk, shared between address translation,
+/// PLOAD and PTEST.
 ///
 /// TC configures an optional function-code level (FCL, bit 24) followed by
 /// up to four address-indexed levels (TIA/TIB/TIC/TID, bits 15:0), with IS
@@ -204,14 +239,27 @@ struct Walk030 {
 /// subtree to supervisor accesses. `max_levels` bounds how many descriptors
 /// are fetched (PTEST's level operand); `u32::MAX` walks to completion.
 ///
-/// Not modelled: CRP/long-descriptor limit checks, the DT=1 page-descriptor
-/// root, and used/modified descriptor write-back.
+/// The root pointer and every long-format table or early-termination
+/// descriptor carry a limit on the index into the table below them; an
+/// index outside it ends the walk (MC68030UM 9.5.1.2).
+///
+/// `history` is `Some(write)` for a search made for an access or a PLOAD,
+/// which sets the history bits in the descriptors it uses (MC68030UM
+/// 9.5.3): U in each valid table descriptor and in the page descriptor, and
+/// M in the page descriptor for a write that no descriptor on the path
+/// write-protects. An indirect descriptor is not updated (its target page
+/// descriptor is), nor is an invalid one, one whose limit the walk
+/// violates, or any descriptor once a long-format S bit has denied a user
+/// access the subtree. PTEST passes `None`: it changes no descriptor.
+///
+/// Not modelled: the DT=1 page-descriptor root.
 fn walk_030<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
     logical: u32,
     fc: u32,
     max_levels: u32,
+    history: Option<bool>,
 ) -> Walk030 {
     let supervisor = fc & 4 != 0;
     // Root pointer selection: if SRE set and supervisor space, SRP; else CRP.
@@ -243,6 +291,7 @@ fn walk_030<B: AddressBus>(
         sup: false,
         levels: 0,
         desc_addr: root_aptr,
+        modified: false,
     };
 
     // Walk state: current table pointer + descriptor format and the logical
@@ -265,20 +314,51 @@ fn walk_030<B: AddressBus>(
     if n == 0 {
         return w;
     }
+    // The index into level `li`'s table, given the bits consumed above it.
+    let index_at = |li: usize, consumed: u32| {
+        if fcl && li == 0 {
+            fc
+        } else {
+            top_index(logical, consumed, ti[li - fcl as usize])
+        }
+    };
+    let bits_at = |li: usize| {
+        if fcl && li == 0 {
+            0
+        } else {
+            ti[li - fcl as usize]
+        }
+    };
+
+    // The root pointer's limit bounds the first table's index.
+    let root_limit_field = Some((root_limit & 0x8000_0000 != 0, (root_limit >> 16) & 0x7FFF));
+    if limit_violated(root_limit_field, index_at(0, consumed)) {
+        w.end = Walk030End::Limit;
+        return w;
+    }
+
+    // Sets history bits in a fetched descriptor, unless this search makes
+    // no history updates or a supervisor-only subtree denied the access.
+    let update = |bus: &mut B, d: &Desc030, bits: u32, sup_denied: bool| -> MmuResult<u32> {
+        if history.is_none() || sup_denied {
+            return Ok(d.status);
+        }
+        set_history(bus, d.at, d.status, bits)
+    };
+    // The page descriptor's history: U, plus M for a write the path does
+    // not write-protect.
+    let page_bits = |wp: bool| match history {
+        Some(true) if !wp => U_030 | M_030,
+        _ => U_030,
+    };
 
     for li in 0..n {
         if w.levels >= max_levels {
             w.end = Walk030End::LevelStop;
             return w;
         }
-        let index = if fcl && li == 0 {
-            fc
-        } else {
-            let bits = ti[li - fcl as usize];
-            let idx = top_index(logical, consumed, bits);
-            consumed += bits;
-            idx
-        };
+        let index = index_at(li, consumed);
+        consumed += bits_at(li);
         w.desc_addr = ptr.wrapping_add(index * if long { 8 } else { 4 });
         let d = match read_desc_030(bus, ptr, index, long) {
             Ok(d) => d,
@@ -297,6 +377,20 @@ fn walk_030<B: AddressBus>(
             1 => {
                 w.wp |= d.wp;
                 w.sup |= d.sup;
+                // A long early-termination descriptor's limit bounds the
+                // index the next level would have used.
+                if li + 1 < n && limit_violated(d.limit, index_at(li + 1, consumed)) {
+                    w.end = Walk030End::Limit;
+                    return w;
+                }
+                let status = match update(bus, &d, page_bits(w.wp), w.sup && !supervisor) {
+                    Ok(s) => s,
+                    Err(f) => {
+                        w.end = Walk030End::BusErr { at: f.address };
+                        return w;
+                    }
+                };
+                w.modified = status & M_030 != 0;
                 w.end = Walk030End::Page {
                     field: d.field,
                     consumed,
@@ -308,6 +402,14 @@ fn walk_030<B: AddressBus>(
                     // Pointer to the next table level.
                     w.wp |= d.wp;
                     w.sup |= d.sup;
+                    if limit_violated(d.limit, index_at(li + 1, consumed)) {
+                        w.end = Walk030End::Limit;
+                        return w;
+                    }
+                    if let Err(f) = update(bus, &d, U_030, w.sup && !supervisor) {
+                        w.end = Walk030End::BusErr { at: f.address };
+                        return w;
+                    }
                     ptr = d.field & 0xFFFF_FFF0;
                     long = d.dt == 3;
                 } else {
@@ -318,9 +420,10 @@ fn walk_030<B: AddressBus>(
                     // not count towards N or the PTEST level limit), and an
                     // indirect descriptor carries no protection bits -- its
                     // address field reaches down to bit 2 -- so only the
-                    // fetched target contributes WP/S. PTEST's A bit hands
-                    // back the target's address: that is the shared slot
-                    // mmu.library's lazy fault handler materializes.
+                    // fetched target contributes WP/S, and only the target
+                    // takes the history bits. PTEST's A bit hands back the
+                    // target's address: that is the shared slot mmu.library's
+                    // lazy fault handler materializes.
                     w.desc_addr = d.field & 0xFFFF_FFFC;
                     let t = match read_desc_030(bus, w.desc_addr, 0, d.dt == 3) {
                         Ok(t) => t,
@@ -331,13 +434,21 @@ fn walk_030<B: AddressBus>(
                     };
                     w.wp |= t.wp;
                     w.sup |= t.sup;
-                    w.end = if t.dt == 1 {
-                        Walk030End::Page {
-                            field: t.field,
-                            consumed,
+                    if t.dt != 1 {
+                        w.end = Walk030End::Invalid { indirect: true };
+                        return w;
+                    }
+                    let status = match update(bus, &t, page_bits(w.wp), w.sup && !supervisor) {
+                        Ok(s) => s,
+                        Err(f) => {
+                            w.end = Walk030End::BusErr { at: f.address };
+                            return w;
                         }
-                    } else {
-                        Walk030End::Invalid { indirect: true }
+                    };
+                    w.modified = status & M_030 != 0;
+                    w.end = Walk030End::Page {
+                        field: t.field,
+                        consumed,
                     };
                     return w;
                 }
@@ -545,7 +656,7 @@ fn translate_030<B: AddressBus>(
             return Ok(page_base.wrapping_add(low_bits(logical, 32 - shift)));
         }
     }
-    let w = walk_030(cpu, bus, logical, fc, u32::MAX);
+    let w = walk_030(cpu, bus, logical, fc, u32::MAX, Some(write));
     match w.end {
         Walk030End::Page { field, consumed } => {
             if w.sup && !supervisor {
@@ -560,17 +671,27 @@ fn translate_030<B: AddressBus>(
                 // The search loads the entry even for a write that then
                 // faults on write protection. The entry keeps the page's
                 // translation exactly as the walk forms it, so a hit adds
-                // the in-page offset back the same way.
+                // the in-page offset back the same way. It carries the
+                // page's M bit, so a later write through an entry a read
+                // loaded searches again to set M.
                 let page_base = phys.wrapping_sub(low_bits(logical, 32 - shift));
-                cpu.atc_030
-                    .insert(fc as u8, logical >> shift, shift, page_base, w.wp);
+                cpu.atc_030.insert_entry(
+                    fc as u8,
+                    logical >> shift,
+                    shift,
+                    page_base,
+                    w.wp,
+                    w.modified,
+                );
             }
             if write && w.wp {
                 return Err(access_fault_cause(logical, MmuFaultCause::WriteProtect));
             }
             Ok(phys)
         }
-        Walk030End::Invalid { indirect: false } => Err(access_fault(logical)),
+        // A limit violation is an access fault like an invalid
+        // descriptor (MC68030UM 9.5.1.2).
+        Walk030End::Invalid { indirect: false } | Walk030End::Limit => Err(access_fault(logical)),
         Walk030End::Invalid { indirect: true } => {
             Err(access_fault_cause(logical, MmuFaultCause::Indirect))
         }
@@ -588,8 +709,10 @@ fn translate_030<B: AddressBus>(
 /// address, an invalid descriptor, a supervisor-only page probed from a
 /// user space -- leaves the next access to search and fault rather than
 /// hit a stale mapping (the silicon loads an entry marking the translation
-/// invalid; this cache keeps no such entries). Not modelled: the
-/// used/modified write-back the R/W form selects.
+/// invalid; this cache keeps no such entries). The search updates the
+/// history bits as an access of the direction PLOADR/PLOADW name would: U,
+/// and M for PLOADW of a page that is not write protected (M68000PRM
+/// PLOAD).
 pub(crate) fn pload_030<B: AddressBus>(
     cpu: &mut CpuCore,
     bus: &mut B,
@@ -609,7 +732,7 @@ pub(crate) fn pload_030<B: AddressBus>(
     {
         return;
     }
-    let w = walk_030(cpu, bus, logical, u32::from(fc), u32::MAX);
+    let w = walk_030(cpu, bus, logical, u32::from(fc), u32::MAX, Some(write));
     if let Walk030End::Page { field, consumed } = w.end {
         if w.sup && fc & 4 == 0 {
             return;
@@ -617,21 +740,30 @@ pub(crate) fn pload_030<B: AddressBus>(
         let phys = low_bits(logical, consumed).wrapping_add(field & 0xFFFF_FF00);
         let page_base = phys.wrapping_sub(low_bits(logical, 32 - shift));
         cpu.atc_030
-            .insert(fc, logical >> shift, shift, page_base, w.wp);
+            .insert_entry(fc, logical >> shift, shift, page_base, w.wp, w.modified);
     }
 }
 
-/// 68030 PTEST: walk the tables for `logical` in the `fc` address space,
-/// fetching at most `level` descriptors (level 0 tests only transparent
-/// translation), and compose the 16-bit MMUSR: B (bit 15, bus error during
-/// search), S (bit 13, supervisor-only mapping probed from a user space),
-/// W (bit 11, write-protect accumulated along the walk -- reported for
-/// reads too), I (bit 10, invalid translation), T (bit 6, transparent-
-/// translation hit, level 0 only), N (bits 2:0, descriptors fetched).
+/// 68030 PTEST: compose the 16-bit MMUSR for `logical` in the `fc` address
+/// space (MC68030UM 9.6.3, M68000PRM PTEST).
+///
+/// Level 0 searches the ATC only (and the TT registers): T (bit 6) for a
+/// transparent-translation match; otherwise I (bit 10) when no entry holds
+/// the page, else W (bit 11) and M (bit 9) from the entry.
+///
+/// Levels 1-7 walk the tables, fetching at most `level` descriptors: B
+/// (bit 15, bus error during the search), L (bit 14, limit violation, with
+/// I), S (bit 13, supervisor-only mapping probed from a user space), W
+/// (write-protect accumulated along the walk, reported for reads too), I
+/// (invalid translation), M (the page descriptor's modified bit), N (bits
+/// 2:0, descriptors fetched). The walk changes no descriptor and loads no
+/// ATC entry.
+///
 /// Returns the MMUSR and the physical address of the last descriptor
 /// examined (handed back through PTEST's A bit; mmu.library's lazy fault
 /// handler locates the shared descriptor slot to materialize with exactly
-/// this). The L (limit) and M (modified) bits are not modelled.
+/// this). Not modelled: the B bit of a level-0 search, which comes from
+/// ATC entries for invalid translations this cache does not keep.
 pub(crate) fn ptest_030<B: AddressBus>(
     cpu: &CpuCore,
     bus: &mut B,
@@ -642,11 +774,22 @@ pub(crate) fn ptest_030<B: AddressBus>(
 ) -> (u16, u32) {
     if level == 0 {
         let fc8 = fc as u8;
-        let t = super::ttr::ttr_matches(cpu.mmu_tt0, logical, fc8, write)
-            || super::ttr::ttr_matches(cpu.mmu_tt1, logical, fc8, write);
-        return (if t { 0x0040 } else { 0 }, 0);
+        if super::ttr::ttr_matches(cpu.mmu_tt0, logical, fc8, write)
+            || super::ttr::ttr_matches(cpu.mmu_tt1, logical, fc8, write)
+        {
+            return (0x0040, 0); // T
+        }
+        let entry = page_shift_030(cpu.mmu_tc)
+            .and_then(|shift| cpu.atc_030.status(fc8, logical >> shift, shift));
+        let sr = match entry {
+            None => 0x0400, // I: no ATC entry for the page
+            Some((wp, modified)) => {
+                (if wp { 0x0800 } else { 0 }) | if modified { 0x0200 } else { 0 }
+            }
+        };
+        return (sr, 0);
     }
-    let w = walk_030(cpu, bus, logical, fc, level);
+    let w = walk_030(cpu, bus, logical, fc, level, None);
     let n = (w.levels & 7) as u16;
     let mut sr = n;
     if w.wp {
@@ -656,8 +799,14 @@ pub(crate) fn ptest_030<B: AddressBus>(
         sr |= 0x2000; // S: supervisor-only mapping probed from user space
     }
     match w.end {
-        Walk030End::Page { .. } | Walk030End::LevelStop => {}
+        Walk030End::Page { .. } => {
+            if w.modified {
+                sr |= 0x0200; // M
+            }
+        }
+        Walk030End::LevelStop => {}
         Walk030End::Invalid { .. } => sr |= 0x0400, // I
+        Walk030End::Limit => sr |= 0x4400,          // L and I
         Walk030End::BusErr { .. } | Walk030End::Config => sr |= 0x8000, // B
     }
     (sr, w.desc_addr)

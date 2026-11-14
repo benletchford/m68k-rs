@@ -150,13 +150,24 @@ struct Atc030Entry {
     fc: u8,
     /// Logical page number (`logical >> shift`).
     page: u32,
-    /// Physical page base (`physical & !page_mask`).
+    /// Physical page base (`physical & !page_mask`), with the entry's M bit
+    /// in bit 0 ([`ATC_030_M`]). A page base is always even (the page shift
+    /// is at least 1, and a page descriptor's address field starts at bit
+    /// 8), so the bit is free, and keeping M there leaves the serialized
+    /// layout of the entry unchanged.
     phys_page: u32,
     /// Write-protected page: a write must fault, so it misses and re-walks.
     write_protected: bool,
     /// Last use, for least-recently-used replacement.
     stamp: u64,
 }
+
+/// [`Atc030Entry::phys_page`] bit 0: the page descriptor's M bit was set
+/// when the entry was loaded. A write through an entry without it misses,
+/// so the table search sets M in the descriptor (MC68030UM 9.4.1). Entries
+/// restored from a state saved before the bit existed read as not
+/// modified, which costs their first write a table search.
+const ATC_030_M: u32 = 1;
 
 /// The 68030 address translation cache: 22 fully associative entries, each
 /// tagged with the access's function code and logical page, holding the
@@ -171,8 +182,10 @@ struct Atc030Entry {
 /// PFLUSH and by a PMOVE to TC, SRP or CRP without FD. A CPU write to a
 /// descriptor does not reach it; software flushes, as on real hardware. A
 /// write to a write-protected page, and any access that would fault, re-walk
-/// the tables so the fault is raised there. Not modelled: entries for invalid
-/// translations (the B bit), the CI and M bits, and the silicon's exact
+/// the tables so the fault is raised there, and so does a write through an
+/// entry whose M bit is clear, so the search sets M in the page descriptor.
+/// Not modelled: entries for invalid translations (the B bit), the CI bit,
+/// and the silicon's exact
 /// replacement order.
 ///
 /// It is architectural state that decides how many descriptor fetches later
@@ -264,10 +277,10 @@ impl Atc030 {
             index
         };
         let e = &self.entries[index];
-        if write && e.write_protected {
+        if write && (e.write_protected || e.phys_page & ATC_030_M == 0) {
             return None;
         }
-        Some(e.phys_page)
+        Some(e.phys_page & !ATC_030_M)
     }
 
     /// [`Self::lookup`] without recording a use: for `run_batch` while its
@@ -288,15 +301,43 @@ impl Atc030 {
         } else {
             self.entries.iter().find(|e| hit(e))?
         };
-        if write && e.write_protected {
+        if write && (e.write_protected || e.phys_page & ATC_030_M == 0) {
             return None;
         }
-        Some(e.phys_page)
+        Some(e.phys_page & !ATC_030_M)
+    }
+
+    /// The (write-protected, modified) status of the entry for `page` in
+    /// `fc`, or `None` without one: what a PTEST of level 0 reports. It
+    /// records no use.
+    pub fn status(&self, fc: u8, page: u32, shift: u32) -> Option<(bool, bool)> {
+        if u32::from(self.shift) != shift {
+            return None;
+        }
+        self.entries
+            .iter()
+            .find(|e| e.valid && e.page == page && e.fc == fc)
+            .map(|e| (e.write_protected, e.phys_page & ATC_030_M != 0))
     }
 
     /// Record a table search's translation, replacing an invalid entry or
-    /// else the least recently used one.
+    /// else the least recently used one, for a page whose descriptor
+    /// already has M set (writes hit the entry).
     pub fn insert(&mut self, fc: u8, page: u32, shift: u32, phys_page: u32, write_protected: bool) {
+        self.insert_entry(fc, page, shift, phys_page, write_protected, true);
+    }
+
+    /// [`Self::insert`] with the page descriptor's M bit as the search left
+    /// it.
+    pub fn insert_entry(
+        &mut self,
+        fc: u8,
+        page: u32,
+        shift: u32,
+        phys_page: u32,
+        write_protected: bool,
+        modified: bool,
+    ) {
         if u32::from(self.shift) != shift {
             self.flush_all();
             self.shift = shift as u8;
@@ -322,7 +363,7 @@ impl Atc030 {
             valid: true,
             fc,
             page,
-            phys_page,
+            phys_page: (phys_page & !ATC_030_M) | if modified { ATC_030_M } else { 0 },
             write_protected,
             stamp: self.clock,
         };
@@ -524,5 +565,20 @@ mod tests {
         // Mask 0 matches every function code.
         atc.flush_fc(0, 0);
         assert_eq!(atc.valid_entries(), 0);
+    }
+
+    #[test]
+    fn atc_030_write_misses_an_entry_whose_page_is_not_modified() {
+        let mut atc = Atc030::default();
+        atc.insert_entry(5, 0x10, SHIFT, 0x0008_0000, false, false);
+        assert_eq!(atc.lookup(5, 0x10, SHIFT, false), Some(0x0008_0000));
+        assert_eq!(atc.lookup(5, 0x10, SHIFT, true), None);
+        assert_eq!(atc.probe(5, 0x10, SHIFT, true), None);
+        assert_eq!(atc.status(5, 0x10, SHIFT), Some((false, false)));
+        atc.insert_entry(5, 0x10, SHIFT, 0x0008_0000, false, true);
+        assert_eq!(atc.lookup(5, 0x10, SHIFT, true), Some(0x0008_0000));
+        assert_eq!(atc.probe(5, 0x10, SHIFT, true), Some(0x0008_0000));
+        assert_eq!(atc.status(5, 0x10, SHIFT), Some((false, true)));
+        assert_eq!(atc.status(1, 0x10, SHIFT), None);
     }
 }

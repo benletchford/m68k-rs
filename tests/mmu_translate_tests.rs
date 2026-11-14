@@ -222,7 +222,7 @@ fn translate_030_enforces_write_protect() {
     cpu.set_cpu_type(CpuType::M68030);
     cpu.set_sr(0x2700);
     cpu.mmu_crp_aptr = table;
-    cpu.mmu_crp_limit = 2; // mode 2: 4-byte descriptors
+    cpu.mmu_crp_limit = 0x8000_0002; // lower limit 0, mode 2: 4-byte descriptors
     cpu.mmu_tc = 0x8000_4000; // E (bit 31), IS=0, TIA=4 entries
     cpu.pmmu_enabled = true;
 

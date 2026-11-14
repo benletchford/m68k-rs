@@ -67,8 +67,9 @@ impl AddressBus for TestBus {
 fn test_ttr_bypass() {
     use m68k::mmu::ttr::ttr_matches;
 
-    // TTR matching addresses 0x40xxxxxx, FC=5 (supervisor data), E=1
-    let ttr = 0x4000_8500; // Base=0x40, Mask=0x00, E=1, FC=5
+    // TTR matching addresses 0x40xxxxxx, FC=5 (supervisor data), E=1,
+    // reads and writes (RWM); 68030 layout per MC68030UM 9.7.1
+    let ttr = 0x4000_8150; // Base=0x40, Mask=0x00, E=1, RWM, FC=5
 
     // Should match
     assert!(ttr_matches(ttr, 0x4000_0000, 5, false));
@@ -98,7 +99,7 @@ fn test_ttr_address_mask() {
     use m68k::mmu::ttr::ttr_matches;
 
     // TTR matching 0x40-0x4F by using mask 0x0F, E=1, FC=any
-    let ttr = 0x400F_801C; // Base=0x40, Mask=0x0F, E=1, FCBase=0, FCMask=7
+    let ttr = 0x400F_8107; // Base=0x40, Mask=0x0F, E=1, RWM, FCBase=0, FCMask=7
 
     assert!(ttr_matches(ttr, 0x4000_0000, 5, false));
     assert!(ttr_matches(ttr, 0x4F00_0000, 5, false));

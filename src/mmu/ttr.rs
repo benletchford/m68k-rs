@@ -7,29 +7,37 @@
 use crate::core::cpu::CpuCore;
 use crate::core::types::CpuType;
 
-/// TTR register format (68030/68040; see [`ttr_matches_040`] for the
-/// 68040/68060 privilege and protection fields):
+/// 68030 TT0/TT1 register format (MC68030UM 9.7.1, figure 9-23):
 /// ```text
-/// `31:24` Base Address (compared against address bits `31:24`)
-/// `23:16` Address Mask (1 = ignore bit during comparison)
-/// [15]    E: Enable
-/// [14]    CI: Cache Inhibit (ignored by us)
-/// [13]    R/W: 0=read-only, 1=read/write (68030) or W (68040)
-/// [12]    RWM: R/W Mask (68030) or 0 (68040)
-/// `10:8`  FC Base (function code to match)
-/// `4:2`   FC Mask (1 = ignore FC bit)
+/// `31:24` Logical address base (compared against address bits `31:24`)
+/// `23:16` Logical address mask (1 = ignore that bit in the comparison)
+/// [15]    E: enable
+/// [10]    CI: cache inhibit (ignored here)
+/// [9]     R/W: 1 = read accesses match, 0 = write accesses match
+/// [8]     RWM: R/W mask, 1 = reads and writes match (R/W ignored)
+/// `6:4`   FC base (function code to match)
+/// `2:0`   FC mask (1 = ignore that FC bit in the comparison)
 /// ```
+/// The 68040/68060 ITTn/DTTn keep the base, mask and enable fields and
+/// replace the rest; see [`ttr_matches_040`].
 const TTR_ENABLE: u32 = 0x8000;
 const TTR_BASE_MASK: u32 = 0xFF00_0000;
 const TTR_ADDR_MASK_SHIFT: u32 = 16;
-const TTR_FC_BASE_SHIFT: u32 = 8;
-const TTR_FC_MASK_SHIFT: u32 = 2;
+const TTR_030_RW: u32 = 0x0200;
+const TTR_030_RWM: u32 = 0x0100;
+const TTR_FC_BASE_SHIFT: u32 = 4;
+const TTR_FC_MASK_SHIFT: u32 = 0;
 
-/// Check if a single 68030-format TT register matches the given address
-/// and function code.
+/// Check if a single 68030-format TT register matches an access to `addr`
+/// in function-code space `fc`, a write when `write` is set.
 ///
-/// Returns `true` if the TTR is enabled and matches.
-pub fn ttr_matches(ttr: u32, addr: u32, fc: u8, _write: bool) -> bool {
+/// The access matches when the register is enabled, its address bits 31-24
+/// and function code agree with the base fields outside the masked bits,
+/// and either RWM is set or the access's direction is the one R/W selects
+/// (MC68030UM 9.7). Not modelled: an indivisible read-modify-write cycle
+/// (TAS, CAS, CAS2) is transparent only through a register with RWM=1;
+/// here its read and write cycles are matched one at a time.
+pub fn ttr_matches(ttr: u32, addr: u32, fc: u8, write: bool) -> bool {
     // Check enable bit
     if (ttr & TTR_ENABLE) == 0 {
         return false;
@@ -48,7 +56,10 @@ pub fn ttr_matches(ttr: u32, addr: u32, fc: u8, _write: bool) -> bool {
     // Compare function code (masked)
     let fc_match = (fc & !fc_mask) == (fc_base & !fc_mask);
 
-    addr_match && fc_match
+    // Compare the access direction unless RWM masks it.
+    let rw_match = ttr & TTR_030_RWM != 0 || (ttr & TTR_030_RW != 0) != write;
+
+    addr_match && fc_match && rw_match
 }
 
 /// Check if a single 68040-format ITT/DTT register matches. The 040
@@ -204,17 +215,17 @@ mod tests {
     #[test]
     fn test_ttr_disabled() {
         // TTR with E=0 should not match
-        let ttr = 0x0000_0000; // Disabled
+        let ttr = 0x00FF_0107; // whole space, any FC, RWM, but E=0
         assert!(!ttr_matches(ttr, 0x1000_0000, 5, false));
     }
 
     #[test]
     fn test_ttr_address_match() {
         // TTR matching addresses 0x40xxxxxx (base=0x40, mask=0x00)
-        // FCMask=7 (bits 4:2) to match any FC
-        let ttr = 0x4000_801C; // Base=0x40, Mask=0x00, E=1, FCMask=7
+        // FC mask=7 (bits 2:0) to match any FC, RWM=1 for either direction
+        let ttr = 0x4000_8107; // Base=0x40, Mask=0x00, E=1, RWM, FCMask=7
         assert!(ttr_matches(ttr, 0x4000_0000, 5, false));
-        assert!(ttr_matches(ttr, 0x40FF_FFFF, 5, false));
+        assert!(ttr_matches(ttr, 0x40FF_FFFF, 5, true));
         assert!(!ttr_matches(ttr, 0x4100_0000, 5, false));
         assert!(!ttr_matches(ttr, 0x3F00_0000, 5, false));
     }
@@ -222,8 +233,7 @@ mod tests {
     #[test]
     fn test_ttr_address_mask() {
         // TTR matching addresses 0x40-0x4F (base=0x40, mask=0x0F)
-        // FCMask=7 (bits 4:2) to match any FC
-        let ttr = 0x400F_801C; // Base=0x40, Mask=0x0F, E=1, FCMask=7
+        let ttr = 0x400F_8107; // Base=0x40, Mask=0x0F, E=1, RWM, FCMask=7
         assert!(ttr_matches(ttr, 0x4000_0000, 5, false));
         assert!(ttr_matches(ttr, 0x4F00_0000, 5, false));
         assert!(!ttr_matches(ttr, 0x5000_0000, 5, false));
@@ -232,7 +242,7 @@ mod tests {
     #[test]
     fn test_ttr_fc_match() {
         // TTR matching FC=5 (supervisor data) only
-        let ttr = 0x4000_8500; // Base=0x40, E=1, FC=5, FCMask=0
+        let ttr = 0x4000_8150; // Base=0x40, E=1, RWM, FC=5, FCMask=0
         assert!(ttr_matches(ttr, 0x4000_0000, 5, false));
         assert!(!ttr_matches(ttr, 0x4000_0000, 1, false)); // User data
         assert!(!ttr_matches(ttr, 0x4000_0000, 6, false)); // Supervisor program
@@ -241,12 +251,27 @@ mod tests {
     #[test]
     fn test_ttr_fc_mask() {
         // TTR matching any supervisor access (FC=4-7, FCMask=3)
-        let ttr = 0x4000_840C; // Base=0x40, E=1, FC=4, FCMask=3
+        let ttr = 0x4000_8143; // Base=0x40, E=1, RWM, FC=4, FCMask=3
         assert!(ttr_matches(ttr, 0x4000_0000, 4, false));
         assert!(ttr_matches(ttr, 0x4000_0000, 5, false));
         assert!(ttr_matches(ttr, 0x4000_0000, 6, false));
         assert!(ttr_matches(ttr, 0x4000_0000, 7, false));
         assert!(!ttr_matches(ttr, 0x4000_0000, 1, false)); // User data
+    }
+
+    #[test]
+    fn test_ttr_030_rw_and_rwm() {
+        // RWM=0: R/W=1 matches reads only, R/W=0 writes only.
+        let reads = 0x4000_8207; // E, R/W=1, FCMask=7
+        assert!(ttr_matches(reads, 0x4000_0000, 1, false));
+        assert!(!ttr_matches(reads, 0x4000_0000, 1, true));
+        let writes = 0x4000_8007; // E, R/W=0, FCMask=7
+        assert!(!ttr_matches(writes, 0x4000_0000, 1, false));
+        assert!(ttr_matches(writes, 0x4000_0000, 1, true));
+        // RWM=1 ignores R/W. CI (bit 10) does not affect matching.
+        let both = 0x4000_8507; // E, CI, RWM, FCMask=7
+        assert!(ttr_matches(both, 0x4000_0000, 1, false));
+        assert!(ttr_matches(both, 0x4000_0000, 1, true));
     }
 
     #[test]
