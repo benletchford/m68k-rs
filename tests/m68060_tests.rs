@@ -554,7 +554,34 @@ fn fsin_memory_source_traps_with_calculated_ea_on_68060() {
     cpu.dar[8] = 0x4000;
     step(&mut cpu, &mut bus);
     assert_fp_unimp(&cpu, &mut bus, 0x0200, 0x0204, 0x4000);
-    assert_eq!(cpu.dar[8], 0x4004, "calculated EA commits post-increment");
+    assert_eq!(cpu.dar[8], 0x4000, "A0 is left for the M68060SP to advance");
+}
+
+#[test]
+fn trapped_68060_operand_leaves_the_address_register_to_the_package() {
+    // The M68060SP's _dcalc_ea advances the register of an (An)+ or
+    // -(An) operand itself, and for an extended or packed -(An) operand
+    // takes 8 off the stacked address: the 68060 stacks the operand's
+    // address plus 8 there and does not touch An.
+    // (opcode, FSIN command word, frame EA): A0 = $4000 throughout.
+    let cases = [
+        (0xF218u16, 0x488Eu16, 0x4000u32), // FSIN.X (A0)+
+        (0xF220, 0x488E, 0x4000 - 12 + 8), // FSIN.X -(A0)
+        (0xF218, 0x548E, 0x4000),          // FSIN.D (A0)+
+        (0xF220, 0x548E, 0x4000 - 8),      // FSIN.D -(A0)
+        (0xF220, 0x448E, 0x4000 - 4),      // FSIN.S -(A0)
+        (0xF220, 0x508E, 0x4000 - 2),      // FSIN.W -(A0)
+        (0xF210, 0x488E, 0x4000),          // FSIN.X (A0)
+    ];
+    for (opcode, w2, ea) in cases {
+        let (mut cpu, mut bus) = setup_060();
+        bus.write_word_at(0x0200, opcode);
+        bus.write_word_at(0x0202, w2);
+        cpu.dar[8] = 0x4000;
+        step(&mut cpu, &mut bus);
+        assert_fp_unimp(&cpu, &mut bus, 0x0200, 0x0204, ea);
+        assert_eq!(cpu.dar[8], 0x4000, "{opcode:04X} {w2:04X}: A0 untouched");
+    }
 }
 
 #[test]
