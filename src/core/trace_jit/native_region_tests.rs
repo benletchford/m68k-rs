@@ -86,6 +86,7 @@ fn raw_state(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         is_pre_68020,
         fpu_just_reset,
         fpu_exception_pending,
+        fpu_060_excp,
         fpu_present,
         reset_cycles,
         cyc_bcc_notake_b,

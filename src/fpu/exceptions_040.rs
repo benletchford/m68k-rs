@@ -419,16 +419,7 @@ impl CpuCore {
     /// it, then goes on to the user's handler for whichever exception is
     /// enabled, or returns.
     fn fpu_040_arith_vector(&self) -> Option<u32> {
-        let raised = self.fpsr >> 8;
-        if self.trap_unimpl_040() && raised & (self.fpcr >> 8) & 0x60 == 0 {
-            if raised & 0x10 != 0 {
-                return Some(vector::FP_OVFL);
-            }
-            if raised & 0x08 != 0 {
-                return Some(vector::FP_UNFL);
-            }
-        }
-        self.fpu_enabled_exception(0x7F)
+        self.fpu_arith_vector(self.trap_unimpl_040())
     }
 
     /// Whether the operation that raised `vector` wrote its destination
@@ -502,7 +493,7 @@ impl CpuCore {
             return;
         }
         // (sign, exponent, mantissa, guard/round/sticky) of the image.
-        let image = self.fpu_040_unrounded(opmode, src, dst_before).map(|u| {
+        let image = self.fpu_unrounded_result(opmode, src, dst_before).map(|u| {
             if vector == vector::FP_OVFL {
                 let (exp, mantissa) = u.rounded();
                 (u.sign, exp, mantissa, 0)
@@ -813,7 +804,7 @@ mod tests {
                         continue; // FSQRT of a negative number; a - a
                     }
                     let u = cpu
-                        .fpu_040_unrounded(opmode, src, dst)
+                        .fpu_unrounded_result(opmode, src, dst)
                         .unwrap_or_else(|| panic!("{opmode:#x}: no intermediate"));
                     let (exp, mantissa) = u.rounded();
                     assert_eq!(
@@ -826,8 +817,8 @@ mod tests {
             }
         }
         assert!(seen > 300, "{seen}");
-        assert_eq!(cpu.fpu_040_unrounded(0x0E, a, b), None, "FSIN");
-        assert_eq!(cpu.fpu_040_unrounded(0x38, a, b), None, "FCMP");
+        assert_eq!(cpu.fpu_unrounded_result(0x0E, a, b), None, "FSIN");
+        assert_eq!(cpu.fpu_unrounded_result(0x38, a, b), None, "FCMP");
     }
 
     #[test]
