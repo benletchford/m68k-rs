@@ -584,6 +584,50 @@ fn trapped_68060_operand_leaves_the_address_register_to_the_package() {
     }
 }
 
+/// The frame of a packed-decimal operand on the 68060: vector 55 with the
+/// format $2 frame, the next instruction's address and the operand's.
+fn assert_fp_packed(cpu: &CpuCore, bus: &mut TestBus, instr: u32, next_pc: u32, ea: u32) {
+    assert_eq!(cpu.pc, 0x0380, "packed operand vectors through 55");
+    let sp = cpu.dar[15];
+    assert_eq!(bus.read_word(sp.wrapping_add(6)), 0x20DC, "format $2 frame");
+    assert_eq!(bus.read_long(sp.wrapping_add(2)), next_pc, "next-PC field");
+    assert_eq!(bus.read_long(sp.wrapping_add(8)), ea, "EA field");
+    assert_eq!(cpu.fpiar, instr, "FPIAR holds the faulting instruction");
+}
+
+#[test]
+fn packed_operands_take_vector_55_with_the_format_2_frame_on_68060() {
+    // M68060UM 6.5.2: a packed decimal source or destination saves a
+    // format $2 frame whose effective address field points at the
+    // operand, which is how the M68060SP finds it.
+    // (opcode, command word, extension, frame EA, next PC)
+    let cases = [
+        (0xF210u16, 0x4C00u16, None, 0x4000u32, 0x0204u32), // FMOVE.P (A0),FP0
+        (0xF218, 0x4C22, None, 0x4000, 0x0204),             // FADD.P (A0)+,FP0
+        (0xF220, 0x4C00, None, 0x4000 - 4, 0x0204),         // FMOVE.P -(A0),FP0
+        (0xF228, 0x4C00, Some(0x0010u16), 0x4010, 0x0206),  // FMOVE.P (16,A0),FP0
+        (0xF210, 0x6C03, None, 0x4000, 0x0204),             // FMOVE.P FP0,(A0){#3}
+        (0xF218, 0x6C03, None, 0x4000, 0x0204),             // FMOVE.P FP0,(A0)+{#3}
+        (0xF220, 0x7C10, None, 0x4000 - 4, 0x0204),         // FMOVE.P FP0,-(A0){D1}
+        (0xF228, 0x6C03, Some(0x0010), 0x4010, 0x0206),     // FMOVE.P FP0,(16,A0){#3}
+    ];
+    for (opcode, w2, ext, ea, next_pc) in cases {
+        let (mut cpu, mut bus) = setup_060();
+        bus.write_long_at(55 * 4, 0x0380);
+        bus.write_word_at(0x0200, opcode);
+        bus.write_word_at(0x0202, w2);
+        if let Some(ext) = ext {
+            bus.write_word_at(0x0204, ext);
+        }
+        cpu.dar[8] = 0x4000;
+        bus.write_long_at(0x4000, 0x1234_5678);
+        step(&mut cpu, &mut bus);
+        assert_fp_packed(&cpu, &mut bus, 0x0200, next_pc, ea);
+        assert_eq!(cpu.dar[8], 0x4000, "{opcode:04X} {w2:04X}: A0 untouched");
+        assert_eq!(bus.read_long(0x4000), 0x1234_5678, "nothing stored");
+    }
+}
+
 #[test]
 fn fsin_executes_with_escape_flag_on_68060() {
     let (mut cpu, mut bus) = setup_060();
@@ -615,22 +659,14 @@ fn fmovecr_and_fdbcc_trap_fp_unimplemented_on_68060() {
 }
 
 #[test]
-fn packed_and_dynamic_fmovem_take_their_own_vectors_on_68060() {
-    // Packed-decimal source: FP unsupported data type (vector 55).
+fn packed_immediate_and_dynamic_fmovem_take_vector_60_on_68060() {
+    // Packed-decimal immediate source: unimplemented <ea> (vector 60).
     let (mut cpu, mut bus) = setup_060();
-    bus.write_long_at(55 * 4, 0x0380);
-    bus.write_word_at(0x0200, 0xF210); // FMOVE.P (A0),FP0
+    bus.write_long_at(60 * 4, 0x03A0);
+    bus.write_word_at(0x0200, 0xF23C); // FMOVE.P #imm,FP0
     bus.write_word_at(0x0202, 0x4C00);
-    cpu.dar[8] = 0x4000;
     step(&mut cpu, &mut bus);
-    assert_eq!(cpu.pc, 0x0380, "packed operand vectors through 55");
-    let sp = cpu.dar[15];
-    assert_eq!(bus.read_word(sp.wrapping_add(6)), 55 * 4, "format $0 frame");
-    assert_eq!(
-        bus.read_long(sp.wrapping_add(2)),
-        0x0200,
-        "pre-instruction PC"
-    );
+    assert_eq!(cpu.pc, 0x03A0, "packed immediate vectors through 60");
 
     // Dynamic FMOVEM register list: unimplemented <ea> (vector 60).
     let (mut cpu, mut bus) = setup_060();

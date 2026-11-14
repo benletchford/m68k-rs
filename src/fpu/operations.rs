@@ -220,12 +220,16 @@ impl CpuCore {
                 if self.trap_unimpl_060() && src_fmt == 3 {
                     // Packed decimal: unsupported data type in 060 hardware;
                     // the immediate form is an unimplemented <ea> instead.
-                    let vector = if (opcode & 0x3F) == 0x3C {
-                        crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA
-                    } else {
-                        crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE
-                    };
-                    return self.take_exception(bus, vector);
+                    if (opcode & 0x3F) == 0x3C {
+                        return self.take_exception(
+                            bus,
+                            crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA,
+                        );
+                    }
+                    // Format $2 frame with the operand's address: the
+                    // M68060SP reads the packed number through it.
+                    let ea = self.fpu_060_trap_ea(bus, opcode, src_fmt);
+                    return self.take_fp_unsupp_packed_060(bus, ea);
                 }
 
                 if self.trap_unimpl_040() {
@@ -256,10 +260,12 @@ impl CpuCore {
                 let src = ((w2 >> 7) & 7) as usize;
 
                 // Packed-decimal output is an unsupported data type in 68060
-                // hardware (both static and dynamic k-factor forms).
+                // hardware (both static and dynamic k-factor forms): the
+                // format $2 frame with the destination's address.
                 if self.trap_unimpl_060() && (dst_fmt == 3 || dst_fmt == 7) {
-                    return self
-                        .take_exception(bus, crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE);
+                    let _w2 = self.read_imm_16(bus);
+                    let ea = self.fpu_060_trap_ea(bus, opcode, 3);
+                    return self.take_fp_unsupp_packed_060(bus, ea);
                 }
 
                 if self.trap_unimpl_040() && (dst_fmt == 3 || dst_fmt == 7) {
