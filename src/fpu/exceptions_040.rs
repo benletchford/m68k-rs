@@ -135,7 +135,7 @@ fn operand_exception(vector: u32) -> bool {
 /// Whether an instruction reads its destination register as an operand.
 /// This is the test the FPSP's chk_dy_mo applies to CMDREG1B: opmodes
 /// $20-$2F and $60-$6F, and FCMP ($38).
-fn dyadic(opmode: u16) -> bool {
+pub(super) fn dyadic(opmode: u16) -> bool {
     opmode & 0x30 == 0x20 || opmode & 0x7F == 0x38
 }
 

@@ -21,9 +21,21 @@
 //! FPU idle; FRESTORE of an EXCP frame puts the FPU back in that state,
 //! which is how the package delivers an exception to the user's handler.
 //!
+//! A denormalized or unnormalized operand is an unsupported data type on
+//! the 68060 (M68060UM 6.5.2), as packed decimal is. With the package in
+//! the guest the instruction is not executed: vector 55 is taken at once,
+//! with the next instruction's address in the stack frame, and the FPU is
+//! left in the EXCP state with the source operand and V2-V0 = 7. An
+//! instruction with a floating-point register destination stacks the
+//! format $0 frame and has read its operand in full, address register
+//! update included. An FMOVE out of such a register stacks the format $3
+//! frame with the destination's address. With the package's work done here
+//! those operands are computed like any other.
+//!
 //! Not modelled:
-//! - The exceptions of an FMOVE to memory or to a data register, which
-//!   the 68060 takes as post-instruction exceptions. Those moves complete.
+//! - The arithmetic exceptions of an FMOVE to memory or to a data
+//!   register, which the 68060 takes as post-instruction exceptions. Those
+//!   moves complete.
 //! - An overflow or underflow of the selected rounding precision that the
 //!   extended format can still hold: the arithmetic keeps the extended
 //!   exponent range, so it raises neither.
@@ -37,9 +49,12 @@
 //!   instruction first takes it again. Here taking it ends the pending
 //!   state; the frame stays for the handler's FSAVE.
 
+use super::exceptions_040::dyadic;
 use super::operations::RawSource;
+use super::state_040::{classify, tag_unsupported};
 use crate::core::cpu::CpuCore;
 use crate::core::exceptions::vector;
+use crate::core::memory::AddressBus;
 use crate::fpu::FloatX80;
 
 /// The 68060 FPU's EXCP state: what FSAVE writes as the exception frame.
@@ -61,6 +76,14 @@ impl Fpu060Excp {
     pub(crate) fn new(vector: u32, operand: FloatX80) -> Self {
         Self {
             status: (vector - vector::FP_BSUN) as u8,
+            operand,
+        }
+    }
+
+    /// The state an operand of an unsupported data type leaves.
+    pub(crate) fn unsupported(operand: FloatX80) -> Self {
+        Self {
+            status: STATUS_UNSUPP,
             operand,
         }
     }
@@ -97,7 +120,78 @@ impl Fpu060Excp {
     }
 }
 
+/// Whether a register holds a number the 68060 leaves to the M68060SP: a
+/// denormalized or an unnormalized one. A zero mantissa is a zero.
+pub(super) fn register_unsupported(value: FloatX80) -> bool {
+    tag_unsupported(classify(value))
+}
+
+/// Whether a fetched source operand is of an unsupported data type: a
+/// denormalized number in any of the three binary formats, or an
+/// unnormalized extended one (M68060UM 6.5.2). Packed decimal has its own
+/// frame and is handled before the operand is fetched.
+pub(super) fn source_unsupported(raw: RawSource) -> bool {
+    match raw {
+        RawSource::Single(bits) => bits & 0x7F80_0000 == 0 && bits & 0x007F_FFFF != 0,
+        RawSource::Double(bits) => {
+            bits & 0x7FF0_0000_0000_0000 == 0 && bits & 0x000F_FFFF_FFFF_FFFF != 0
+        }
+        RawSource::Extended(exp_word, mantissa) => {
+            register_unsupported(FloatX80::from_extended(exp_word, mantissa))
+        }
+        _ => false,
+    }
+}
+
 impl CpuCore {
+    /// Whether the instruction of command word `w2`, which the 68060
+    /// implements and whose destination is a floating-point register,
+    /// takes the unsupported-data-type exception: its source is of such a
+    /// type (`source`), or it is dyadic and its destination register is.
+    pub(super) fn fpu_060_unsupp_operands(&self, w2: u16, source: bool) -> bool {
+        self.trap_unimpl_060()
+            && (source
+                || (dyadic(w2 & 0x7F) && register_unsupported(self.fpr[((w2 >> 7) & 7) as usize])))
+    }
+
+    /// Take the unsupported-data-type exception of an instruction whose
+    /// destination is a floating-point register. It is not executed: the
+    /// four-word frame has the next instruction's address, FPIAR the
+    /// instruction's, and the EXCP state the source operand as the frame
+    /// holds it, from which the M68060SP does the instruction (M68060UM
+    /// 6.5.2; the destination it reads from the register).
+    pub(super) fn fpu_060_take_unsupp<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        operand: FloatX80,
+    ) -> i32 {
+        self.fpiar = self.ppc;
+        self.fpu_060_excp = Some(Fpu060Excp::unsupported(operand));
+        self.take_fp_exception_past_instruction(bus, vector::FP_UNSUPP_DATA_TYPE)
+    }
+
+    /// `FMOVE FPn,<ea>` of a denormalized or unnormalized register with
+    /// the M68060SP in the guest: nothing is stored, and the exception is
+    /// taken after the instruction with the format $3 frame, whose
+    /// effective address field is the destination's (M68060UM 6.5.2). The
+    /// EXCP state holds the register. `None` = the 68060 does the move.
+    /// The command word is not yet consumed.
+    pub(super) fn fpu_060_move_out_unsupp<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+        w2: u16,
+    ) -> Option<i32> {
+        let value = self.fpr[((w2 >> 7) & 7) as usize];
+        if !self.trap_unimpl_060() || !register_unsupported(value) {
+            return None;
+        }
+        let _w2 = self.read_imm_16(bus);
+        let ea = self.fpu_060_move_out_ea(bus, opcode, (w2 >> 10) & 7);
+        self.fpu_060_excp = Some(Fpu060Excp::unsupported(value));
+        Some(self.take_fp_unsupp_post_040(bus, ea))
+    }
+
     /// A fetched source operand as the EXCP frame holds it.
     ///
     /// The 68060 widens a single or double without regard to the special

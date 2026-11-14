@@ -982,10 +982,10 @@ impl CpuCore {
         self.exception_cycles(vector)
     }
 
-    /// 68040 unsupported data type on FMOVE to memory: a post-instruction
-    /// exception through vector 55 with the six-word format $3 frame, whose
-    /// PC is the next instruction and whose EA field is the destination
-    /// (M68040UM 9.6.2).
+    /// 68040 or 68060 unsupported data type on FMOVE to memory: a
+    /// post-instruction exception through vector 55 with the six-word
+    /// format $3 frame, whose PC is the next instruction and whose EA
+    /// field is the destination (M68040UM 9.6.2, M68060UM 6.5.2).
     pub(crate) fn take_fp_unsupp_post_040<B: AddressBus>(&mut self, bus: &mut B, ea: u32) -> i32 {
         self.fpiar = self.ppc;
         let old_sr = self.get_sr();

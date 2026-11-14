@@ -344,6 +344,11 @@ impl CpuCore {
                     let mut flags = ExcFlags::default();
                     let src = raw.to_x80(&mut flags);
                     let operand = self.fpu_060_source_operand(raw, src);
+                    if self
+                        .fpu_060_unsupp_operands(w2, super::exceptions_060::source_unsupported(raw))
+                    {
+                        return self.fpu_060_take_unsupp(bus, operand);
+                    }
                     let registers = self.fpr;
                     let cycles = self.fpu_apply_op(opmode, dst, src, flags);
                     return self.fpu_060_hold_exception(cycles, w2, operand, src, &registers);
@@ -365,6 +370,10 @@ impl CpuCore {
                     let _w2 = self.read_imm_16(bus);
                     let ea = self.fpu_060_trap_ea(bus, opcode, 3);
                     return self.take_fp_unsupp_packed_060(bus, ea);
+                }
+
+                if let Some(cycles) = self.fpu_060_move_out_unsupp(bus, opcode, w2) {
+                    return cycles;
                 }
 
                 if self.trap_unimpl_040()
@@ -448,6 +457,12 @@ impl CpuCore {
                     && let Some(cycles) = self.fpu_040_register_source(bus, w2)
                 {
                     return cycles;
+                }
+                if self.fpu_060_unsupp_operands(
+                    w2,
+                    super::exceptions_060::register_unsupported(self.fpr[src]),
+                ) {
+                    return self.fpu_060_take_unsupp(bus, self.fpr[src]);
                 }
                 self.fpiar = self.ppc;
                 self.fpu_general_op(w2, self.fpr[src], ExcFlags::default())
@@ -1698,6 +1713,39 @@ impl CpuCore {
                 0
             }
             _ => 0,
+        }
+    }
+
+    /// The effective address field of the format $3 frame an `FMOVE
+    /// FPn,<ea>` of an unsupported data type stacks on the 68060, with the
+    /// extension words consumed. For a byte, word, long, single or double
+    /// destination the address is the destination's and an (An)+ or -(An)
+    /// register has been updated. An extended destination leaves the
+    /// register to the M68060SP: (An)+ stacks An, and -(An) stacks the
+    /// address eight above the destination's (its _calc_ea_fout). A data
+    /// register destination has no address.
+    pub(super) fn fpu_060_move_out_ea<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        opcode: u16,
+        fmt: u16,
+    ) -> u32 {
+        let ea_mode = ((opcode >> 3) & 7) as u8;
+        let ea_reg = (opcode & 7) as usize;
+        let bytes: u32 = match fmt {
+            4 => 2,  // word
+            6 => 1,  // byte
+            5 => 8,  // double
+            2 => 12, // extended
+            _ => 4,  // long / single
+        };
+        match (fmt, ea_mode) {
+            (2, 3) => self.a(ea_reg),
+            (2, 4) => self.a(ea_reg).wrapping_sub(4),
+            _ => match self.fpu_ea(bus, ea_mode, ea_reg, bytes) {
+                Some(FpuEa::Memory(addr)) => addr,
+                _ => 0,
+            },
         }
     }
 

@@ -471,6 +471,9 @@ pub struct CpuCore {
     /// the package. True, the result is stored, an exception is taken only
     /// when enabled, and the frame carries the exception operand the
     /// package would hand the user's handler.
+    ///
+    /// False, a denormalized or unnormalized operand is also left to the
+    /// package: vector 55, the unsupported data type (M68060UM 6.5.2).
     pub emulate_unimplemented_060: bool,
 
     /// 68040 escape hatch: execute the FPU instructions and data types the
