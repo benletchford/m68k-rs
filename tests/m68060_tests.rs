@@ -1017,14 +1017,17 @@ fn fmovecr_traps_on_68040_by_its_ea_field() {
 
 #[test]
 fn packed_operands_take_vector_55_on_68040() {
-    // FADD.P (A0),FP1: pre-instruction format $0 restarting the instruction.
+    // FADD.P (A0),FP1: format $0. The FPSP unpacks the operand and has the
+    // 68040 finish the instruction by restoring the busy frame, so the
+    // stacked PC must not run it again: it is the next instruction's.
     let (mut cpu, mut bus) = setup_040_traps();
     cpu.dar[8] = 0x4000;
     run_fp(&mut cpu, &mut bus, &[0xF210, 0x4CA2]);
     let sp = cpu.dar[15];
     assert_eq!(cpu.pc, 0x0380);
     assert_eq!(bus.read_word(sp + 6), 0x00DC);
-    assert_eq!(bus.read_long_at(sp + 2), 0x0200);
+    assert_eq!(bus.read_long_at(sp + 2), 0x0204);
+    assert_eq!(cpu.fpiar, 0x0200);
 
     // FSIN.P (A0),FP1: the unimplemented instruction takes precedence.
     let (mut cpu, mut bus) = setup_040_traps();

@@ -63,7 +63,7 @@ impl Precision {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RoundCtx {
     pub mode: RoundMode,
     pub prec: Precision,
@@ -80,10 +80,66 @@ impl RoundCtx {
 /// FPU exception accumulator. Bit layout matches the FPSR exception-status
 /// byte shifted down to bits 7:0 (BSUN=7, SNAN=6, OPERR=5, OVFL=4, UNFL=3,
 /// DZ=2, INEX2=1, INEX1=0).
+///
+/// It also carries the last finite result that went through rounding, as
+/// it was before that step ([`Unrounded`]).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct ExcFlags(pub u8);
+pub struct ExcFlags(pub u8, Option<Unrounded>);
+
+/// A finite result as it reaches the rounding step: normalized, with an
+/// exponent that is not yet confined to the format. This is the
+/// "intermediate result" of the manuals, which the 68040 exposes in its
+/// state frame when the result overflows, underflows or is inexact
+/// (M68040UM 9.4.1 and table 9-16).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Unrounded {
+    pub sign: bool,
+    /// Biased exponent of the integer bit: below 0 or above $7FFE when the
+    /// result is out of the extended range.
+    pub exp: i32,
+    /// Significand with the integer bit at bit 127.
+    mant: u128,
+    ctx: RoundCtx,
+}
+
+impl Unrounded {
+    /// The 64-bit mantissa cut off without rounding, and the guard, round
+    /// and sticky bits below it (bits 2, 1 and 0).
+    pub fn truncated(self) -> (u64, u8) {
+        let low = self.mant as u64;
+        let sticky = u8::from(low << 2 != 0);
+        ((self.mant >> 64) as u64, ((low >> 62) as u8) << 1 | sticky)
+    }
+
+    /// The exponent and mantissa rounded to the operation's precision in
+    /// its rounding mode, the exponent still unconfined.
+    pub fn rounded(self) -> (i32, u64) {
+        let p = self.ctx.prec.bits();
+        let shift = 128 - p;
+        let q = (self.mant >> shift) as u64;
+        let rem = self.mant & ((1u128 << shift) - 1);
+        let mut q = q as u128 + u128::from(rounds_up(self.sign, q, rem, shift, self.ctx.mode));
+        let mut exp = self.exp;
+        if (q >> p) != 0 {
+            q >>= 1;
+            exp += 1;
+        }
+        (exp, (q as u64) << (64 - p))
+    }
+}
 
 impl ExcFlags {
+    /// Flags from an FPSR exception-status byte.
+    pub const fn from_bits(bits: u8) -> Self {
+        Self(bits, None)
+    }
+
+    /// The result of the last rounding step before it was rounded, if a
+    /// finite result went through one.
+    pub fn unrounded(self) -> Option<Unrounded> {
+        self.1
+    }
+
     // BSUN and INEX1 are produced by the glue (FBcc / packed decimal), not by
     // the value engine itself.
     pub const BSUN: u8 = 0x80;
@@ -189,6 +245,18 @@ fn overflow_result(sign: bool, mode: RoundMode) -> FloatX80 {
     }
 }
 
+/// Whether discarding `rem`, the `shift` bits below the quotient `q`, rounds
+/// the magnitude up in `mode`.
+fn rounds_up(sign: bool, q: u64, rem: u128, shift: u32, mode: RoundMode) -> bool {
+    let halfway = 1u128 << (shift - 1);
+    match mode {
+        RoundMode::Nearest => rem > halfway || (rem == halfway && (q & 1) == 1),
+        RoundMode::Zero => false,
+        RoundMode::PosInf => !sign && rem != 0,
+        RoundMode::NegInf => sign && rem != 0,
+    }
+}
+
 /// Normalize, round to `ctx.prec`, and pack a finite result. `m` is a 128-bit
 /// significand and `exp` is the exponent of bit 127 (value = m * 2^(exp-127)).
 fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
@@ -201,6 +269,12 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     exp -= lz as i32;
 
     let mut biased = exp + BIAS;
+    f.1 = Some(Unrounded {
+        sign,
+        exp: biased,
+        mant: m,
+        ctx,
+    });
 
     // Denormalize if the exponent is below the format minimum. That is a
     // biased exponent of 0, which holds the integer bit like any other.
@@ -214,14 +288,7 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     let shift = 128 - p; // discarded low bits
     let q = (m >> shift) as u64; // p significant bits, integer bit at bit p-1
     let rem = m & ((1u128 << shift) - 1);
-    let halfway = 1u128 << (shift - 1);
-
-    let round_up = match ctx.mode {
-        RoundMode::Nearest => rem > halfway || (rem == halfway && (q & 1) == 1),
-        RoundMode::Zero => false,
-        RoundMode::PosInf => !sign && rem != 0,
-        RoundMode::NegInf => sign && rem != 0,
-    };
+    let round_up = rounds_up(sign, q, rem, shift, ctx.mode);
     if rem != 0 {
         f.raise(ExcFlags::INEX2);
     }
@@ -1127,6 +1194,46 @@ mod tests {
 
     /// Quotients below 1 and square roots have no guard bit in a 64-bit
     /// first step; both must still round to nearest, not truncate.
+    #[test]
+    fn the_unrounded_result_rides_along_with_the_flags() {
+        // 1 / 3: mantissa 1010...10 and then 1, 0, 1, 0, ... below it.
+        let mut f = ExcFlags::default();
+        let third = div(x(1.0), x(3.0), rn(), &mut f);
+        let u = f.unrounded().expect("a finite result was rounded");
+        assert!(!u.sign);
+        assert_eq!(u.exp, 0x3FFD);
+        assert_eq!(u.truncated(), (0xAAAA_AAAA_AAAA_AAAA, 0b101));
+        assert_eq!(u.rounded(), (0x3FFD, third.mantissa));
+
+        // Out of range, the exponent is not confined: max * 2, and the
+        // square of the smallest normalized number.
+        let max = FloatX80::from_extended(0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+        let mut f = ExcFlags::default();
+        mul(max, x(2.0), rn(), &mut f);
+        assert!(f.has(ExcFlags::OVFL));
+        assert_eq!(f.unrounded().unwrap().rounded(), (0x7FFF, u64::MAX));
+        let tiny = FloatX80::from_extended(0x0001, 1 << 63);
+        let mut f = ExcFlags::default();
+        mul(tiny, tiny, rn(), &mut f);
+        assert!(f.has(ExcFlags::UNFL));
+        let u = f.unrounded().unwrap();
+        assert_eq!((u.exp, u.truncated()), (2 - 0x3FFF, (1 << 63, 0)));
+
+        // A carry out of the rounded mantissa moves to the next exponent.
+        let single = RoundCtx {
+            mode: RoundMode::Nearest,
+            prec: Precision::Single,
+        };
+        let mut f = ExcFlags::default();
+        round_to_precision(FloatX80::from_extended(0x3FFF, u64::MAX), single, &mut f);
+        assert_eq!(f.unrounded().unwrap().rounded(), (0x4000, 1 << 63));
+
+        // A result that needs no rounding step leaves none.
+        let mut f = ExcFlags::default();
+        add(FloatX80::infinity(false), x(1.0), rn(), &mut f);
+        assert_eq!(f.unrounded(), None);
+    }
+
     #[test]
     fn div_and_sqrt_round_to_nearest() {
         let mut f = ExcFlags::default();

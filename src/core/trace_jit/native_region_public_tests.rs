@@ -75,6 +75,7 @@ fn architecture(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         pmmu_enabled,
         is_pre_68020,
         fpu_just_reset,
+        fpu_exception_pending,
         fpu_present,
         virq_state,
         nmi_pending,
@@ -102,6 +103,7 @@ fn architecture(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         fault_resume,
         emulate_unimplemented_060,
         emulate_unimplemented_040,
+        fpu_040,
         sst_m68000_compat
     );
     out
