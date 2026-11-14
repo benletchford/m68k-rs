@@ -203,10 +203,16 @@ impl CpuCore {
         // the system control registers and FMOVEM do not report it
         // (MC68881/MC68882UM 4.6, "FMOVE system control register" and
         // "FMOVEM"): a handler uses them to read and repair the registers.
-        if !matches!(subop, 0x4..=0x7)
+        // On the 68060 every instruction but FSAVE and FRESTORE reports
+        // it (M68060UM 6.7), and an arithmetic or FMOVE instruction that
+        // goes ahead replaces the state an earlier exception left.
+        if (self.is_060() || !matches!(subop, 0x4..=0x7))
             && let Some(cycles) = self.fpu_take_pending_exception(bus)
         {
             return cycles;
+        }
+        if matches!(subop, 0x0 | 0x2 | 0x3) {
+            self.fpu_060_excp = None;
         }
 
         // Executing any general FPU instruction takes the 6888x out of
@@ -303,6 +309,19 @@ impl CpuCore {
                 }
 
                 self.fpiar = self.ppc;
+                if self.is_060() {
+                    // The 68060's EXCP frame holds the source operand,
+                    // which for a single or double is not its value.
+                    let Some((raw, _)) = self.fpu_fetch_source(bus, opcode, src_fmt) else {
+                        return 0;
+                    };
+                    let mut flags = ExcFlags::default();
+                    let src = raw.to_x80(&mut flags);
+                    let operand = self.fpu_060_source_operand(raw, src);
+                    let registers = self.fpr;
+                    let cycles = self.fpu_apply_op(opmode, dst, src, flags);
+                    return self.fpu_060_hold_exception(cycles, w2, operand, src, &registers);
+                }
                 let Some((src, src_flags)) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
                 };
@@ -635,12 +654,9 @@ impl CpuCore {
     /// exception is reported when the next FPU instruction starts
     /// (MC68881/MC68882UM 6.1). See [`Self::fpu_take_pending_exception`].
     ///
-    /// 6888x only. The 68040 holds its exceptions with the state frame
-    /// their handler saves ([`Self::fpu_040_hold_exception`]). The 68060
-    /// reports them the same way, but its handlers read the operand from
-    /// the EXCP state frame, which is not saved yet, so its enabled
-    /// arithmetic exceptions are not taken: the instruction completes
-    /// with the disabled result.
+    /// 6888x only. The 68040 and the 68060 hold their exceptions with the
+    /// state frame their handler saves ([`Self::fpu_040_hold_exception`],
+    /// [`Self::fpu_060_hold_exception`]).
     fn fpu_hold_exception(&mut self, cycles: i32) -> i32 {
         if cycles != 0
             && self.fpu_is_6888x()
@@ -690,6 +706,9 @@ impl CpuCore {
         if self.is_040() {
             return self.fpu_040_hold_exception(cycles, w2, src, registers);
         }
+        if self.is_060() {
+            return self.fpu_060_hold_exception(cycles, w2, src, src, registers);
+        }
         if cycles != 0
             && self.fpu_is_6888x()
             && (self.fpsr >> 8) & (self.fpcr >> 8) & SNAN_OPERR_DZ != 0
@@ -699,12 +718,33 @@ impl CpuCore {
         self.fpu_hold_exception(cycles)
     }
 
-    /// The result of a 68040 hardware arithmetic instruction as it was
-    /// before rounding, for the state frame of its exception: `opmode`
-    /// on `src` and, for a dyadic instruction, the register value `dst`.
-    /// `None` for an instruction the 68040 does not execute itself and
-    /// when no finite result went through rounding.
-    pub(super) fn fpu_040_unrounded(
+    /// The vector of the arithmetic exception the operation that just
+    /// completed takes on a 68040 or 68060, from the FPSR exception byte
+    /// it left: the highest-priority enabled one, or, with `nonmaskable`,
+    /// what the part itself takes. There an overflow or underflow is
+    /// taken whether or not it is enabled, because the result a 6888x
+    /// would store is the software package's to supply (M68040UM 9.7.4.2
+    /// and 9.7.5.2, M68060UM 6.6.4 and 6.6.5).
+    pub(super) fn fpu_arith_vector(&self, nonmaskable: bool) -> Option<u32> {
+        use crate::core::exceptions::vector;
+        let raised = self.fpsr >> 8;
+        if nonmaskable && raised & (self.fpcr >> 8) & 0x60 == 0 {
+            if raised & 0x10 != 0 {
+                return Some(vector::FP_OVFL);
+            }
+            if raised & 0x08 != 0 {
+                return Some(vector::FP_UNFL);
+            }
+        }
+        self.fpu_enabled_exception(0x7F)
+    }
+
+    /// The result of an arithmetic instruction the 68040 and 68060 have
+    /// in hardware as it was before rounding, for the state frame of its
+    /// exception: `opmode` on `src` and, for a dyadic instruction, the
+    /// register value `dst`. `None` for another instruction and when no
+    /// finite result went through rounding.
+    pub(super) fn fpu_unrounded_result(
         &self,
         opmode: u16,
         src: FloatX80,
@@ -762,6 +802,14 @@ impl CpuCore {
         self.fpsr |= 0x0000_8080; // BSUN, accrued IOP
         if self.fpcr & 0x8000 == 0 {
             return None;
+        }
+        if self.is_060() {
+            // The handler's FSAVE finds the EXCP state (M68060UM 6.6.1.2);
+            // the operand of a BSUN frame is undefined.
+            self.fpu_060_excp = Some(super::Fpu060Excp::new(
+                crate::core::exceptions::vector::FP_BSUN,
+                FloatX80::default(),
+            ));
         }
         Some(self.take_exception(bus, crate::core::exceptions::vector::FP_BSUN))
     }
@@ -974,49 +1022,43 @@ impl CpuCore {
     /// NULL (MC68060UM, section 6.7, pp. 6-35–6-36; appendix D, FSAVE).
     /// The four-byte
     /// NULL frame used by earlier FPUs does not apply to the 68060.
+    /// With an exception in the FPU, taken or not, the frame is EXCP
+    /// ($E0) with the exception operand, and the FPU is idle afterwards.
     fn exec_fsave_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
-        let header = if self.fpu_just_reset {
-            0x0000_0000
-        } else {
-            0x0000_6000
+        let frame = match self.fpu_060_excp {
+            Some(excp) => excp.frame(),
+            None if self.fpu_just_reset => [0; 3],
+            None => [0x0000_6000, 0, 0],
         };
         let size = 12;
-        match ea_mode {
+        let addr = match ea_mode {
+            // (An) / (An)+
             2 | 3 => {
-                // (An) / (An)+
                 let addr = self.a(ea_reg);
                 if ea_mode == 3 {
                     self.set_a(ea_reg, addr.wrapping_add(size));
                 }
-                self.write_32(bus, addr, header);
-                for off in (4..size).step_by(4) {
-                    self.write_32(bus, addr.wrapping_add(off), 0);
-                }
-                8
+                addr
             }
+            // -(An)
             4 => {
-                // -(An)
                 let addr = self.a(ea_reg).wrapping_sub(size);
                 self.set_a(ea_reg, addr);
-                self.write_32(bus, addr, header);
-                for off in (4..size).step_by(4) {
-                    self.write_32(bus, addr.wrapping_add(off), 0);
-                }
-                8
+                addr
             }
             // Remaining control modes: frame written at the resolved
             // address, no register update.
             _ => match self.fpu_frame_control_ea(bus, ea_mode, ea_reg, false) {
-                Some(addr) => {
-                    self.write_32(bus, addr, header);
-                    for off in (4..size).step_by(4) {
-                        self.write_32(bus, addr.wrapping_add(off), 0);
-                    }
-                    8
-                }
-                None => 0,
+                Some(addr) => addr,
+                None => return 0,
             },
+        };
+        for (i, long) in frame.into_iter().enumerate() {
+            self.write_32(bus, addr.wrapping_add(4 * i as u32), long);
         }
+        self.fpu_060_excp = None;
+        self.fpu_exception_pending = 0;
+        8
     }
 
     /// 68060 FRESTORE always consumes three long words, including NULL
@@ -1026,8 +1068,10 @@ impl CpuCore {
     /// The frame format byte (bits 15-8 of the first long) must be $00
     /// (NULL), $60 (IDLE) or $E0 (EXCP); any other value takes a format
     /// error exception with the address register unchanged (M68060UM 6.7).
-    /// The exception an EXCP frame carries is not held: the 68060's
-    /// arithmetic exceptions are not taken yet.
+    /// An EXCP frame puts the FPU back in the exception state: the next
+    /// floating-point instruction other than FSAVE and FRESTORE takes the
+    /// exception in its bits 2-0, and FSAVE gets the frame back with its
+    /// operand. An IDLE or NULL frame leaves none.
     fn exec_frestore_060<B: AddressBus>(&mut self, bus: &mut B, ea_mode: u8, ea_reg: usize) -> i32 {
         let addr = match ea_mode {
             2 | 3 => self.a(ea_reg),
@@ -1042,15 +1086,24 @@ impl CpuCore {
         if !matches!((header >> 8) & 0xFF, 0x00 | 0x60 | 0xE0) {
             return self.take_exception(bus, crate::core::exceptions::vector::FORMAT_ERROR);
         }
-        let _ = self.read_32(bus, addr.wrapping_add(4));
-        let _ = self.read_32(bus, addr.wrapping_add(8));
+        let operand = [
+            self.read_32(bus, addr.wrapping_add(4)),
+            self.read_32(bus, addr.wrapping_add(8)),
+        ];
         if ea_mode == 3 {
             self.set_a(ea_reg, addr.wrapping_add(12));
         }
+        self.fpu_060_excp = None;
+        self.fpu_exception_pending = 0;
         if (header & 0x0000_FF00) == 0 {
             self.do_frestore_null();
         } else {
             self.fpu_just_reset = false;
+            if (header & 0x0000_FF00) == 0xE000 {
+                let excp = super::Fpu060Excp::from_frame([header, operand[0], operand[1]]);
+                self.fpu_exception_pending = excp.vector() as u8;
+                self.fpu_060_excp = Some(excp);
+            }
         }
         8
     }

@@ -114,7 +114,17 @@ impl Unrounded {
     /// The exponent and mantissa rounded to the operation's precision in
     /// its rounding mode, the exponent still unconfined.
     pub fn rounded(self) -> (i32, u64) {
-        let p = self.ctx.prec.bits();
+        self.rounded_to(self.ctx.prec)
+    }
+
+    /// The exponent and mantissa rounded to extended precision in the
+    /// operation's rounding mode, the exponent still unconfined.
+    pub fn rounded_extended(self) -> (i32, u64) {
+        self.rounded_to(Precision::Extended)
+    }
+
+    fn rounded_to(self, prec: Precision) -> (i32, u64) {
+        let p = prec.bits();
         let shift = 128 - p;
         let q = (self.mant >> shift) as u64;
         let rem = self.mant & ((1u128 << shift) - 1);

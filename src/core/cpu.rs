@@ -225,6 +225,12 @@ pub struct CpuCore {
     /// loads it from one.
     #[cfg_attr(feature = "serde", serde(default))]
     pub(crate) fpu_exception_pending: u8,
+    /// The 68060 FPU's EXCP state: the exception frame FSAVE writes next,
+    /// from the exception that put the FPU in that state or from an
+    /// FRESTORE, whether or not the exception has been taken yet
+    /// ([`Self::fpu_exception_pending`] says that). `None` when idle.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub(crate) fpu_060_excp: Option<crate::fpu::Fpu060Excp>,
     /// Whether a floating-point unit is fitted. On the 68020/030 it says
     /// whether an external 68881/68882 is attached; when false, cpID-1
     /// F-line operations raise Line-F. The 040 models FPU absence through
@@ -456,6 +462,15 @@ pub struct CpuCore {
     /// silicon (MOVEP, CHK2/CMP2, CAS2, misaligned CAS, 64-bit MUL/DIV, and
     /// the unimplemented FPU subset) natively instead of trapping for the
     /// OS-side 68060 software package. False = faithful traps.
+    ///
+    /// The flag also says who does the package's part in floating-point
+    /// arithmetic exceptions (M68060UM 6.6 and C.3.2.3). False, the 68060
+    /// takes an overflow or underflow through vector 53 or 51 whether or
+    /// not it is enabled, writes no destination register for an exception
+    /// it takes, and leaves the source operand in the EXCP state frame for
+    /// the package. True, the result is stored, an exception is taken only
+    /// when enabled, and the frame carries the exception operand the
+    /// package would hand the user's handler.
     pub emulate_unimplemented_060: bool,
 
     /// 68040 escape hatch: execute the FPU instructions and data types the
@@ -683,6 +698,7 @@ impl CpuCore {
             // writes a NULL frame until the first FPU instruction runs.
             fpu_just_reset: true,
             fpu_exception_pending: 0,
+            fpu_060_excp: None,
             reset_cycles: 0,
             cyc_bcc_notake_b: -2,
             cyc_bcc_notake_w: 2,
@@ -866,6 +882,7 @@ impl CpuCore {
         self.stopped = 0;
         // Reset also resets the FPU, which drops an unreported exception.
         self.fpu_exception_pending = 0;
+        self.fpu_060_excp = None;
         self.t1_flag = 0;
         self.t0_flag = 0;
         self.m_flag = 0;
