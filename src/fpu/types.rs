@@ -65,9 +65,12 @@ impl FloatX80 {
         self.biased_exp() == 0x7FFF && (self.mantissa << 1) == 0
     }
 
-    /// Return whether the value is positive or negative zero.
+    /// Return whether the value is positive or negative zero: a zero
+    /// mantissa below the maximum exponent. The exponent field need not be
+    /// zero - an unnormalized operand with no mantissa bits set normalizes
+    /// to zero, and FMOVEM can load one into a register.
     pub const fn is_zero(self) -> bool {
-        self.biased_exp() == 0 && self.mantissa == 0
+        self.biased_exp() != 0x7FFF && self.mantissa == 0
     }
 
     /// Return whether the value is a finite nonzero denormal.
