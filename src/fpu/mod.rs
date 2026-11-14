@@ -8,11 +8,16 @@
 //! are enforced by [`CpuCore`](crate::CpuCore).
 
 mod dd;
+mod exceptions_040;
+mod exceptions_060;
 mod operations;
 mod packed;
 mod softfloat;
+mod state_040;
 mod transcendental;
 mod two_over_pi;
 mod types;
 
+pub(crate) use exceptions_060::Fpu060Excp;
+pub use state_040::{Fpu040Frame, Fpu040State};
 pub use types::*;
