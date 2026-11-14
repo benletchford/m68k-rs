@@ -220,12 +220,16 @@ impl CpuCore {
                 if self.trap_unimpl_060() && src_fmt == 3 {
                     // Packed decimal: unsupported data type in 060 hardware;
                     // the immediate form is an unimplemented <ea> instead.
-                    let vector = if (opcode & 0x3F) == 0x3C {
-                        crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA
-                    } else {
-                        crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE
-                    };
-                    return self.take_exception(bus, vector);
+                    if (opcode & 0x3F) == 0x3C {
+                        return self.take_exception(
+                            bus,
+                            crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA,
+                        );
+                    }
+                    // Format $2 frame with the operand's address: the
+                    // M68060SP reads the packed number through it.
+                    let ea = self.fpu_060_trap_ea(bus, opcode, src_fmt);
+                    return self.take_fp_unsupp_packed_060(bus, ea);
                 }
 
                 if self.trap_unimpl_040() {
@@ -256,10 +260,12 @@ impl CpuCore {
                 let src = ((w2 >> 7) & 7) as usize;
 
                 // Packed-decimal output is an unsupported data type in 68060
-                // hardware (both static and dynamic k-factor forms).
+                // hardware (both static and dynamic k-factor forms): the
+                // format $2 frame with the destination's address.
                 if self.trap_unimpl_060() && (dst_fmt == 3 || dst_fmt == 7) {
-                    return self
-                        .take_exception(bus, crate::core::exceptions::vector::FP_UNSUPP_DATA_TYPE);
+                    let _w2 = self.read_imm_16(bus);
+                    let ea = self.fpu_060_trap_ea(bus, opcode, 3);
+                    return self.take_fp_unsupp_packed_060(bus, ea);
                 }
 
                 if self.trap_unimpl_040() && (dst_fmt == 3 || dst_fmt == 7) {
@@ -1284,12 +1290,18 @@ impl CpuCore {
     /// apply the FPU operand width; every other mode -- including the
     /// 68020 indexed and full-extension forms -- goes through the core
     /// resolver. Address-register direct is not a legal FPU operand.
-    /// Resolve the operand address of an FP instruction that traps as
-    /// unimplemented on the 68060: extension words are consumed (the trap
-    /// frame carries the next-instruction PC) and post-increment /
-    /// pre-decrement commit, matching the calculated-EA semantics of the
-    /// format $2 frame. Returns the EA long for the frame (0 when the
-    /// operand is not in memory).
+    /// Resolve the operand address of an FP instruction that traps to the
+    /// software package: extension words are consumed (the trap frame
+    /// carries the next-instruction PC). Returns the EA long for the
+    /// frame (0 when the operand is not in memory).
+    ///
+    /// On the 68060 the address register of an (An)+ or -(An) operand is
+    /// left as it was: the M68060SP advances it. The stacked address is
+    /// the operand's, except that for an extended or packed -(An) operand
+    /// it is 8 bytes above it. The package's _dcalc_ea and _calc_ea_fout
+    /// state both rules and correct for them, so an address register the
+    /// processor had already moved would be moved twice. On the 68040
+    /// post-increment and pre-decrement commit.
     fn fpu_060_trap_ea<B: AddressBus>(&mut self, bus: &mut B, opcode: u16, fmt: u16) -> u32 {
         let ea_mode = ((opcode >> 3) & 7) as u8;
         let ea_reg = (opcode & 7) as usize;
@@ -1300,6 +1312,18 @@ impl CpuCore {
             2 | 3 => 12, // extended / packed
             _ => 4,      // long / single
         };
+        if self.is_060() {
+            // A7 stays word-aligned for byte operands.
+            let step = if bytes == 1 && ea_reg == 7 { 2 } else { bytes };
+            match ea_mode {
+                3 => return self.a(ea_reg),
+                4 => {
+                    let ea = self.a(ea_reg).wrapping_sub(step);
+                    return if bytes == 12 { ea.wrapping_add(8) } else { ea };
+                }
+                _ => {}
+            }
+        }
         match self.fpu_ea(bus, ea_mode, ea_reg, bytes) {
             Some(FpuEa::Memory(addr)) => addr,
             Some(FpuEa::Immediate) => {

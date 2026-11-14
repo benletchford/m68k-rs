@@ -867,18 +867,36 @@ impl CpuCore {
     /// and FPIAR points at the faulting instruction - the 060SP fetches
     /// the opcode through FPIAR, not the frame.
     pub(crate) fn take_fp_unimp_060<B: AddressBus>(&mut self, bus: &mut B, ea: u32) -> i32 {
+        self.take_fp_format_2(bus, vector::LINE_1111, ea)
+    }
+
+    /// 68060 packed-decimal operand, source or destination: the
+    /// unsupported-data-type exception through vector 55 with the six-word
+    /// format $2 frame (fmt/vector word $20DC), not the format $0 or $3
+    /// frame a denormalized or unnormalized operand gets. The frame's PC
+    /// is the next instruction and its EA field the operand's address,
+    /// from which the M68060SP reads or writes the packed number
+    /// (M68060UM 6.5.2).
+    pub(crate) fn take_fp_unsupp_packed_060<B: AddressBus>(&mut self, bus: &mut B, ea: u32) -> i32 {
+        self.take_fp_format_2(bus, vector::FP_UNSUPP_DATA_TYPE, ea)
+    }
+
+    /// Stack the six-word format $2 frame of a floating-point exception
+    /// and take `vector`: next-instruction PC, the operand's effective
+    /// address, and FPIAR on the faulting instruction.
+    fn take_fp_format_2<B: AddressBus>(&mut self, bus: &mut B, vector: u32, ea: u32) -> i32 {
         self.fpiar = self.ppc;
         let old_sr = self.get_sr();
         self.set_s_flag(SFLAG_SET);
         self.t1_flag = 0;
         self.t0_flag = 0;
-        let vec_word = (vector::LINE_1111 as u16) << 2;
+        let vec_word = (vector as u16) << 2;
         self.push_32(bus, ea);
         self.push_16(bus, 0x2000 | (vec_word & 0x0FFF));
         self.push_32(bus, self.pc);
         self.push_16(bus, old_sr);
-        self.jump_vector(bus, vector::LINE_1111);
-        self.exception_cycles(vector::LINE_1111)
+        self.jump_vector(bus, vector);
+        self.exception_cycles(vector)
     }
 
     /// 68040 unsupported data type on FMOVE to memory: a post-instruction
