@@ -54,6 +54,23 @@ pub mod vector {
     /// FMOVEM.L #imm) - pre-instruction, format $0.
     pub const FP_UNIMPLEMENTED_EA: u32 = 60;
 
+    /// FPU exception vectors 48-54 (MC68881/MC68882UM 6.1, M68040UM 9.5,
+    /// M68060UM 6.5): branch/set on unordered, inexact (INEX1 or INEX2),
+    /// divide by zero, underflow, operand error, overflow, signaling NaN.
+    pub const FP_BSUN: u32 = 48;
+    /// FPU inexact-result exception (INEX1 or INEX2).
+    pub const FP_INEX: u32 = 49;
+    /// FPU divide-by-zero exception.
+    pub const FP_DZ: u32 = 50;
+    /// FPU underflow exception.
+    pub const FP_UNFL: u32 = 51;
+    /// FPU operand-error exception.
+    pub const FP_OPERR: u32 = 52;
+    /// FPU overflow exception.
+    pub const FP_OVFL: u32 = 53;
+    /// FPU signaling-NaN exception.
+    pub const FP_SNAN: u32 = 54;
+
     /// 68020+ MMU configuration-error vector.
     pub const MMU_CONFIGURATION_ERROR: u32 = 56;
     /// 68020+ MMU illegal-operation vector.
@@ -879,6 +896,44 @@ impl CpuCore {
         self.push_16(bus, old_sr);
         self.jump_vector(bus, vector::LINE_1111);
         self.exception_cycles(vector::LINE_1111)
+    }
+
+    /// An enabled exception (vectors 49-54) of a 6888x FMOVE out, which
+    /// the coprocessor signals during the instruction, after the
+    /// destination has been written. The 68020/68030 stacks the ten-word
+    /// format $9 coprocessor mid-instruction frame: the stacked PC is the
+    /// next instruction, the FMOVE's address is at +$08, and the evaluated
+    /// destination address `ea` is at +$10, where the handler finds the
+    /// operand it has to repair (MC68881/MC68882UM 6.1.3 and 7.4.2.6,
+    /// MC68020UM 10.5.3.3). `ea` is 0 for a data-register destination; the
+    /// other two internal words are not modelled and read as zero.
+    pub(crate) fn take_fp_mid_instruction_exception<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        vector: u32,
+        ea: u32,
+    ) -> i32 {
+        if self.exception_processing {
+            self.stopped = 1;
+            self.run_mode = RUN_MODE_BERR_AERR_RESET;
+            return 0;
+        }
+        self.exception_processing = true;
+        self.internal_cycles(4);
+        let old_sr = self.get_sr();
+        self.settle_pending_trace(vector);
+        self.set_s_flag(SFLAG_SET);
+        self.t1_flag = 0;
+        self.t0_flag = 0;
+        self.push_32(bus, ea); // internal words at +$10: destination address
+        self.push_32(bus, 0); // internal words at +$0C
+        self.push_32(bus, self.ppc); // instruction address
+        self.push_16(bus, 0x9000 | ((vector as u16) << 2));
+        self.push_32(bus, self.pc);
+        self.push_16(bus, old_sr);
+        self.jump_vector(bus, vector);
+        self.exception_processing = false;
+        self.exception_cycles(vector)
     }
 
     /// 68040 unsupported data type on FMOVE to memory: a post-instruction
