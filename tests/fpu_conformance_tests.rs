@@ -439,6 +439,43 @@ fn packed_decimal_conversions_report_inexact() {
 }
 
 #[test]
+fn a_packed_nan_keeps_its_payload() {
+    // MC68881/MC68882UM table 3-4, note 1: the fraction of a packed NaN
+    // is moved bit for bit into the mantissa, and its second bit clear
+    // makes it a signaling one.
+    let load = |cpu, longs: [u32; 3]| {
+        let mut m = Machine::new(cpu);
+        for (i, long) in longs.into_iter().enumerate() {
+            m.bus.write_long(DATA + 4 * i as u32, long);
+        }
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x4C00]); // FMOVE.P (A0),FP0
+        m
+    };
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        let m = load(cpu, [0x7FFF_0000, 0xC000_0000, 0x0000_0001]);
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0x7FFF, 0xC000_0000_0000_0001),
+            "{cpu:?}"
+        );
+        assert_eq!(m.cpu.fpsr, CC_NAN, "{cpu:?}");
+
+        let m = load(cpu, [0xFFFF_0000, 0x8000_0000, 0x0000_0001]);
+        assert_eq!(
+            bits(m.cpu.fpr[0]),
+            (0xFFFF, 0xC000_0000_0000_0001),
+            "{cpu:?} signaling"
+        );
+        assert_eq!(
+            m.cpu.fpsr,
+            CC_N | CC_NAN | EXC_SNAN | AEXC_IOP,
+            "{cpu:?} signaling"
+        );
+    }
+}
+
+#[test]
 fn packed_decimal_move_out_follows_the_rounding_mode_and_the_operand() {
     for cpu in [CpuType::M68030, CpuType::M68040] {
         // FMOVE.P FP0,(A0){#3} of 123456 in each rounding mode: only
