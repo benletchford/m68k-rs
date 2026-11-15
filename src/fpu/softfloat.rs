@@ -1106,6 +1106,15 @@ pub fn round_to_precision(a: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> Float
     round_pack(ua.sign, ua.exp, (ua.mant as u128) << 64, ctx, f)
 }
 
+/// A finite nonzero `a` moved off its value by less than half a unit in
+/// its last place, away from zero or toward it, and rounded: always
+/// inexact, and an underflow where that is too small to be normalized.
+pub fn round_inexact(a: FloatX80, away: bool, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
+    let ua = unpack(a);
+    let m = (ua.mant as u128) << 64;
+    round_pack(ua.sign, ua.exp, if away { m | 1 } else { m - 1 }, ctx, f)
+}
+
 /// FGETEXP: the unbiased exponent as an integer-valued extended number.
 pub fn getexp(a: FloatX80, f: &mut ExcFlags) -> FloatX80 {
     if a.is_nan() {

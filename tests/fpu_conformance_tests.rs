@@ -578,6 +578,27 @@ fn a_denormalized_result_underflows_whether_or_not_it_is_inexact() {
 }
 
 #[test]
+fn a_function_of_a_denormalized_operand_underflows_inexactly() {
+    // The sine of a number this small is the number, less a term too
+    // small to represent: an inexact result that cannot be normalized.
+    // FSIN FP1,FP0, on the 68060 with its package's work done here.
+    const DENORMAL: (u16, u64) = (0x0000, 0x4000_0000_0000_0000);
+    for cpu in ALL_FPUS {
+        let mut m = Machine::new(cpu);
+        m.cpu.emulate_unimplemented_060 = true;
+        m.cpu.fpr[1] = x80(DENORMAL.0, DENORMAL.1);
+        m.run(&[0xF200, 0x040E]);
+        assert_eq!(m.vector(), None, "{cpu:?}");
+        assert_eq!(bits(m.cpu.fpr[0]), DENORMAL, "{cpu:?}");
+        assert_eq!(
+            m.cpu.fpsr,
+            EXC_UNFL | EXC_INEX2 | AEXC_UNFL | AEXC_INEX,
+            "{cpu:?}"
+        );
+    }
+}
+
+#[test]
 fn an_overflow_sets_inex2_only_for_a_rounded_mantissa() {
     // MC68881/MC68882UM 6.1.7: an overflow is recorded as inexact in the
     // accrued byte; INEX2 itself may stay clear.
