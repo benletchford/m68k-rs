@@ -831,31 +831,481 @@ fn overflow_takes_the_inexact_exception_when_only_inex2_is_enabled() {
     assert_eq!(m.vector(), None);
 }
 
+/// A 68060 with FP1 = `src`, FP0 = `dst` and the given FPCR. `package`
+/// says whether the M68060SP's work is done by the CPU model
+/// (`emulate_unimplemented_060`) or left to the guest.
+fn m060(package: bool, src: (u16, u64), dst: (u16, u64), fpcr: u32) -> Machine {
+    let mut m = Machine::new(CpuType::M68060);
+    m.cpu.emulate_unimplemented_060 = package;
+    m.cpu.fpr[1] = x80(src.0, src.1);
+    m.cpu.fpr[0] = x80(dst.0, dst.1);
+    m.cpu.fpsr = 0;
+    m.cpu.fpcr = fpcr;
+    m.cpu.dar[8] = DATA + 0x100;
+    m
+}
+
+/// The three longs FSAVE -(A0) wrote below DATA + $100.
+fn frame060(m: &mut Machine) -> [u32; 3] {
+    let at = DATA + 0x100 - 12;
+    [
+        m.bus.read_long(at),
+        m.bus.read_long(at + 4),
+        m.bus.read_long(at + 8),
+    ]
+}
+
+const X_ONE: (u16, u64) = (0x3FFF, 0x8000_0000_0000_0000);
+const X_TWO: (u16, u64) = (0x4000, 0x8000_0000_0000_0000);
+const X_THREE: (u16, u64) = (0x4000, 0xC000_0000_0000_0000);
+const X_MAX: (u16, u64) = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+const X_TINY: (u16, u64) = (0x0001, 0x8000_0000_0000_0000);
+const FSAVE_PREDEC_A0: u16 = 0xF320;
+const FRESTORE_POSTINC_A0: u16 = 0xF358;
+const FNOP: [u16; 2] = [0xF280, 0x0000];
+
 #[test]
-fn the_68060_does_not_take_enabled_arithmetic_exceptions() {
-    // Its handlers work from the EXCP state frame FSAVE gives them, which
-    // is not modelled, so the exception is not delivered: the instruction
-    // completes with the disabled result.
-    let one = (0x3FFF, 0x8000_0000_0000_0000);
-    let two = (0x4000, 0x8000_0000_0000_0000);
-    let max = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+fn the_68060_takes_overflow_and_underflow_whether_or_not_they_are_enabled() {
+    // Nonmaskable on the part: the destination register is not written
+    // and the EXCP frame holds the source operand, from which the
+    // M68060SP redoes the instruction (M68060UM 6.6.4, 6.6.5, C.3.2.3.1).
+    for (src, dst, vector, status) in [(X_TWO, X_MAX, 53, 0xE005), (X_TINY, X_TINY, 51, 0xE003)] {
+        for fpcr in [0, 0x1800] {
+            // FMUL FP1,FP0 ; MOVEQ #7,D0 ; FNOP
+            let mut m = m060(false, src, dst, fpcr);
+            m.run(&[0xF200, 0x0423, 0x7007, FNOP[0], FNOP[1]]);
+            assert_eq!(m.vector(), Some(vector), "FPCR {fpcr:#x}");
+            assert_eq!(m.cpu.dar[0], 7, "held for the next FP instruction");
+            let (_, pc, fv) = m.frame();
+            assert_eq!(pc, CODE + 6, "PC restarts the FNOP");
+            assert_eq!(fv, (vector * 4) as u16, "format $0");
+            assert_eq!(m.cpu.fpiar, CODE);
+            assert_eq!(bits(m.cpu.fpr[0]), dst, "vector {vector}: FP0 kept");
+
+            // FMUL FP1,FP0 ; FSAVE -(A0) ; FNOP: FSAVE collects it.
+            let mut m = m060(false, src, dst, fpcr);
+            m.run(&[0xF200, 0x0423, FSAVE_PREDEC_A0, FNOP[0], FNOP[1]]);
+            assert_eq!(m.vector(), None, "collected by FSAVE");
+            let frame = frame060(&mut m);
+            assert_eq!(frame[0], (u32::from(src.0) << 16) | status);
+            assert_eq!(frame[1], (src.1 >> 32) as u32, "the source operand");
+            assert_eq!(frame[2], src.1 as u32);
+        }
+
+        // With the package's work done by the model the instruction
+        // completes with the 6888x result and nothing is taken.
+        let mut m = m060(true, src, dst, 0);
+        m.run(&[0xF200, 0x0423, FSAVE_PREDEC_A0, FNOP[0], FNOP[1]]);
+        assert_eq!(m.vector(), None);
+        assert_ne!(bits(m.cpu.fpr[0]), dst, "vector {vector}: result stored");
+        assert_eq!(frame060(&mut m), [0x0000_6000, 0, 0], "idle frame");
+    }
+}
+
+#[test]
+fn the_68060_writes_no_register_for_an_enabled_exception() {
+    // SNAN, OPERR and DZ leave the registers alone on every FPU. On the
+    // 68060 itself an enabled inexact result is not stored either: the
+    // M68060SP stores it before the user's handler runs (C.3.2.3.3).
+    let minus_one = (0xBFFF, 0x8000_0000_0000_0000);
     let cases = [
-        ("OVFL", 0x23, two, max, 0x1000),    // FMUL max * 2
-        ("DZ", 0x20, (0, 0), one, 0x0400),   // FDIV 1 / 0
-        ("SNAN", 0x22, SNAN_X, one, 0x4000), // FADD SNaN + 1
+        ("SNAN", 0x22, SNAN_X, X_ONE, 0x4000, 54, 0xE006),
+        ("OPERR", 0x04, minus_one, X_ONE, 0x2000, 52, 0xE004),
+        ("DZ", 0x20, (0, 0), X_ONE, 0x0400, 50, 0xE002),
+        ("INEX2", 0x20, X_THREE, X_ONE, 0x0200, 49, 0xE001),
     ];
-    let cpu = CpuType::M68060;
-    for (name, opmode, src, dst, enable) in cases {
-        let disabled = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, 0, 0);
-        let m = exc_run(cpu, &[0xF200, 0x0400 | opmode], src, dst, enable, 0);
-        assert_eq!(m.vector(), None, "{name}");
-        assert_ne!(m.cpu.fpsr & enable, 0, "{name}: FPSR bit");
+    for (name, opmode, src, dst, enable, vector, status) in cases {
+        for package in [false, true] {
+            let mut m = m060(package, src, dst, enable);
+            m.run(&[0xF200, 0x0400 | opmode, FNOP[0], FNOP[1]]);
+            assert_eq!(m.vector(), Some(vector), "{name} {package}");
+            let stored = bits(m.cpu.fpr[0]) != dst;
+            assert_eq!(stored, package && name == "INEX2", "{name} {package}");
+            assert_eq!(bits(m.cpu.fpr[1]), src, "{name}: FP1 kept");
+
+            // The frame holds the source operand either way.
+            let mut m = m060(package, src, dst, enable);
+            m.run(&[0xF200, 0x0400 | opmode, FSAVE_PREDEC_A0]);
+            let frame = frame060(&mut m);
+            assert_eq!(frame[0], (u32::from(src.0) << 16) | status, "{name}");
+            assert_eq!(frame[1], (src.1 >> 32) as u32, "{name}");
+        }
+        // Disabled, the operation completes on the part itself.
+        let mut m = m060(false, src, dst, 0);
+        m.run(&[0xF200, 0x0400 | opmode, FNOP[0], FNOP[1]]);
+        assert_eq!(m.vector(), None, "{name} disabled");
+        assert_ne!(bits(m.cpu.fpr[0]), dst, "{name} disabled: stored");
+    }
+}
+
+#[test]
+fn the_package_hands_the_users_handler_the_exception_operand() {
+    // With the M68060SP's work done by the model: the result is stored,
+    // only an enabled exception is taken, and the EXCP frame carries the
+    // intermediate result rounded to extended precision with its
+    // exponent moved by $6000 into range (M68060UM 6.7).
+    // max * 2 = $7FFF, all ones: $7FFF - $6000.
+    let mut m = m060(true, X_TWO, X_MAX, 0x1000);
+    m.run(&[0xF200, 0x0423, FSAVE_PREDEC_A0, FNOP[0], FNOP[1]]);
+    assert_eq!(m.vector(), None, "collected by FSAVE");
+    assert_eq!(frame060(&mut m), [0x1FFF_E005, 0xFFFF_FFFF, 0xFFFF_FFFF]);
+    assert_eq!(bits(m.cpu.fpr[0]), (0x7FFF, 0), "infinity stored");
+
+    // tiny * tiny has the exponent 2 - $3FFF: plus $6000 is $2003.
+    let mut m = m060(true, X_TINY, X_TINY, 0x0800);
+    m.run(&[0xF200, 0x0423, FSAVE_PREDEC_A0]);
+    assert_eq!(frame060(&mut m), [0x2003_E003, 0x8000_0000, 0]);
+
+    // Rounded to extended whatever the rounding precision: at single
+    // precision this product still shows its 64-bit mantissa.
+    let mut m = m060(true, X_THREE, X_MAX, 0x1040);
+    m.run(&[0xF200, 0x0423, FSAVE_PREDEC_A0]);
+    assert_eq!(frame060(&mut m), [0x2000_E005, 0xBFFF_FFFF, 0xFFFF_FFFF]);
+
+    // A disabled overflow with INEX2 enabled goes to the inexact handler
+    // with the overflow's operand (M68060UM 6.6.7, 6.7).
+    let mut m = m060(true, X_TWO, X_MAX, 0x0200);
+    m.run(&[0xF200, 0x0423, FNOP[0], FNOP[1]]);
+    assert_eq!(m.vector(), Some(49));
+    let mut m = m060(true, X_TWO, X_MAX, 0x0200);
+    m.run(&[0xF200, 0x0423, FSAVE_PREDEC_A0]);
+    assert_eq!(frame060(&mut m), [0x1FFF_E001, 0xFFFF_FFFF, 0xFFFF_FFFF]);
+}
+
+#[test]
+fn the_68060_frame_holds_a_single_or_double_source_as_the_part_widens_it() {
+    // FADD.S (A1),FP0 with a single signaling NaN, SNAN enabled. The part
+    // rebiases the exponent field as it is ($FF + $3F80) under an integer
+    // bit that is always set; the M68060SP corrects that to a NaN, the
+    // integer bit clear, before the user's handler sees it (M68060UM
+    // C.3.2.3.2).
+    for (package, exp, hi) in [(false, 0x407F, 0xA000_0000u32), (true, 0x7FFF, 0x2000_0000)] {
+        let mut m = m060(package, X_ONE, X_ONE, 0x4000);
+        m.cpu.dar[9] = DATA;
+        m.bus.write_long(DATA, 0x7FA0_0000);
+        m.run(&[0xF211, 0x4422, FSAVE_PREDEC_A0]);
+        let frame = frame060(&mut m);
+        assert_eq!(frame[0], (exp << 16) | 0xE006, "package {package}");
+        assert_eq!(frame[1], hi, "still signaling");
+        assert_eq!(bits(m.cpu.fpr[0]), X_ONE, "FP0 kept");
+    }
+    // FDIV.D (A1),FP0 by a double zero, DZ enabled: $000 + $3C00.
+    let mut m = m060(false, X_ONE, X_ONE, 0x0400);
+    m.cpu.dar[9] = DATA;
+    m.run(&[0xF211, 0x5420, FSAVE_PREDEC_A0]);
+    assert_eq!(frame060(&mut m), [0x3C00_E002, 0x8000_0000, 0]);
+}
+
+#[test]
+fn a_restored_68060_excp_frame_is_taken_by_the_next_fpu_instruction() {
+    // FRESTORE of an EXCP frame puts the FPU in the exception state: any
+    // floating-point instruction but FSAVE and FRESTORE takes the
+    // exception in bits 2-0, FMOVEM and a control-register move included
+    // (M68060UM 6.7 and appendix D). This is how the M68060SP delivers an
+    // exception to the user's handler.
+    let frame = [0x1FFF_E005u32, 0x1234_5678, 0x9ABC_DEF0];
+    let setup = |frame: [u32; 3]| {
+        let mut m = m060(false, X_ONE, X_ONE, 0);
+        m.cpu.dar[8] = DATA;
+        for (i, long) in frame.into_iter().enumerate() {
+            m.bus.write_long(DATA + 4 * i as u32, long);
+        }
+        m
+    };
+    for next in [
+        [FNOP[0], FNOP[1]],
+        [0xF200, 0x0400], // FMOVE FP1,FP0
+        [0xF201, 0xA800], // FMOVE.L FPSR,D1
+        [0xF211, 0xF080], // FMOVEM.X FP0,(A1)
+    ] {
+        let mut m = setup(frame);
+        m.cpu.dar[9] = DATA + 0x200;
+        m.run(&[FRESTORE_POSTINC_A0, next[0], next[1]]);
+        assert_eq!(m.vector(), Some(53), "{next:04X?}");
+        assert_eq!(m.frame().1, CODE + 2, "{next:04X?}: PC restarts it");
+    }
+
+    // FSAVE gets the frame back, operand included, and clears the state.
+    let mut m = setup(frame);
+    m.run(&[FRESTORE_POSTINC_A0, 0xF320, FNOP[0], FNOP[1]]);
+    assert_eq!(m.vector(), None);
+    assert_eq!(m.cpu.dar[8], DATA, "FRESTORE (A0)+ then FSAVE -(A0)");
+    for (i, long) in frame.into_iter().enumerate() {
+        assert_eq!(m.bus.read_long(DATA + 4 * i as u32), long);
+    }
+
+    // An IDLE or NULL frame after it leaves nothing pending.
+    for clear in [0x0000_6000u32, 0] {
+        let mut m = setup(frame);
+        m.bus.write_long(DATA + 12, clear);
+        m.run(&[FRESTORE_POSTINC_A0, FRESTORE_POSTINC_A0, FNOP[0], FNOP[1]]);
+        assert_eq!(m.vector(), None, "{clear:#x}");
+    }
+
+    // An unsupported-data-type frame goes back through vector 55.
+    let mut m = setup([0x0000_E007, 0, 0]);
+    m.run(&[FRESTORE_POSTINC_A0, FNOP[0], FNOP[1]]);
+    assert_eq!(m.vector(), Some(55));
+}
+
+#[test]
+fn a_taken_68060_exception_leaves_its_frame_for_the_handler() {
+    // The handler returns without FSAVE: the exception is not taken
+    // again. One that does FSAVE gets the EXCP frame; an arithmetic
+    // instruction that goes ahead drops the stale state.
+    let handler = |m: &mut Machine, words: &[u16]| {
+        for (i, w) in words.iter().enumerate() {
+            m.bus.write_word(HANDLERS + 50 * 8 + 2 * i as u32, *w);
+        }
+    };
+    // FDIV FP1,FP0 (1 / 0, DZ enabled) ; FNOP ; FNOP, handler ADDQ.L
+    // #1,D6 ; RTE.
+    let mut m = m060(false, (0, 0), X_ONE, 0x0400);
+    handler(&mut m, &[0x5286, 0x4E73]);
+    m.cpu.dar[6] = 0;
+    m.run(&[0xF200, 0x0420, FNOP[0], FNOP[1], FNOP[0], FNOP[1]]);
+    assert_eq!(m.cpu.dar[6], 1, "taken once");
+    assert_eq!(m.vector(), None, "ran to the final STOP");
+
+    // Handler FSAVE -(A0) ; RTE: the frame is there after the exception.
+    let mut m = m060(false, (0, 0), X_ONE, 0x0400);
+    handler(&mut m, &[FSAVE_PREDEC_A0, 0x4E73]);
+    m.run(&[0xF200, 0x0420, FNOP[0], FNOP[1]]);
+    assert_eq!(frame060(&mut m), [0x0000_E002, 0, 0]);
+
+    // FDIV ; FNOP (taken, handler returns) ; FMOVE FP1,FP2 ; FSAVE.
+    let mut m = m060(false, (0, 0), X_ONE, 0x0400);
+    handler(&mut m, &[0x4E73]);
+    m.run(&[
+        0xF200,
+        0x0420,
+        FNOP[0],
+        FNOP[1],
+        0xF200,
+        0x0500,
+        FSAVE_PREDEC_A0,
+    ]);
+    assert_eq!(frame060(&mut m), [0x0000_6000, 0, 0], "idle again");
+}
+
+const X_DENORMAL: (u16, u64) = (0x0000, 0x4000_0000_0000_0000);
+const X_UNNORMAL: (u16, u64) = (0x4000, 0x4000_0000_0000_0000);
+
+/// A 68060 whose vector 55 handler is `FSAVE -(A0) ; MOVEQ #55,D7 ; STOP`,
+/// with A1 at DATA + $40 for a memory operand.
+fn m060_unsupp(package: bool, src: (u16, u64), dst: (u16, u64)) -> Machine {
+    let mut m = m060(package, src, dst, 0);
+    for (i, w) in [FSAVE_PREDEC_A0, 0x7E37, 0x4E72, 0x2700]
+        .into_iter()
+        .enumerate()
+    {
+        m.bus.write_word(HANDLERS + 55 * 8 + 2 * i as u32, w);
+    }
+    m.cpu.dar[9] = DATA + 0x40;
+    m
+}
+
+#[test]
+fn a_denormalized_or_unnormalized_operand_is_left_to_the_68060_package() {
+    // M68060UM 6.5.2: an unsupported data type. The instruction is not
+    // executed; vector 55 is taken with the next instruction's address in
+    // a format $0 frame, and the EXCP frame holds the source operand.
+    for (name, code, src, dst, operand) in [
+        // FADD FP1,FP0 with either operand denormalized or unnormalized.
+        ("source", 0x0422, X_DENORMAL, X_ONE, X_DENORMAL),
+        ("destination", 0x0422, X_ONE, X_DENORMAL, X_ONE),
+        ("unnormalized", 0x0422, X_UNNORMAL, X_ONE, X_UNNORMAL),
+        // FCMP reads its destination too; FTST and FMOVE have a source.
+        ("FCMP", 0x0438, X_ONE, X_UNNORMAL, X_ONE),
+        ("FTST", 0x043A, X_DENORMAL, X_ONE, X_DENORMAL),
+        ("FMOVE", 0x0400, X_DENORMAL, X_ONE, X_DENORMAL),
+    ] {
+        let mut m = m060_unsupp(false, src, dst);
+        m.cpu.fpsr = 0x0400_0000;
+        m.run(&[0xF200, code, 0x7007]);
+        assert_eq!(m.vector(), Some(55), "{name}");
+        let (_, pc, fv) = m.frame();
+        assert_eq!(pc, CODE + 4, "{name}: the next instruction");
+        assert_eq!(fv, 55 * 4, "{name}: format $0");
+        assert_eq!(m.cpu.dar[0], 0, "{name}: taken at once");
+        assert_eq!(m.cpu.fpiar, CODE, "{name}");
+        assert_eq!(bits(m.cpu.fpr[0]), dst, "{name}: not executed");
+        assert_eq!(m.cpu.fpsr, 0x0400_0000, "{name}: FPSR untouched");
         assert_eq!(
-            bits(m.cpu.fpr[0]),
-            bits(disabled.cpu.fpr[0]),
-            "{name}: the disabled result"
+            frame060(&mut m),
+            [
+                (u32::from(operand.0) << 16) | 0xE007,
+                (operand.1 >> 32) as u32,
+                operand.1 as u32
+            ],
+            "{name}"
         );
     }
+
+    // Not unsupported: a monadic instruction does not read its
+    // destination, a zero mantissa is a zero whatever the exponent, and a
+    // zero exponent with the integer bit set is a normalized number.
+    for (name, code, src, dst) in [
+        ("FMOVE over a denormal", 0x0400, X_ONE, X_DENORMAL),
+        ("FABS over an unnormal", 0x0418, X_ONE, X_UNNORMAL),
+        ("unnormal zero", 0x0422, (0x4000, 0), X_ONE),
+        ("smallest normal", 0x0422, (0, 1 << 63), X_ONE),
+    ] {
+        let mut m = m060_unsupp(false, src, dst);
+        m.run(&[0xF200, code]);
+        assert_eq!(m.vector(), None, "{name}");
+        assert_eq!(bits(m.cpu.fpr[0]), X_ONE, "{name}");
+    }
+
+    // With the package's work done in the crate it is ordinary arithmetic.
+    let mut m = m060_unsupp(true, X_DENORMAL, X_ONE);
+    m.run(&[0xF200, 0x0422]);
+    assert_eq!(m.vector(), None);
+    assert_eq!(bits(m.cpu.fpr[0]), X_ONE);
+    assert_eq!(m.cpu.fpsr & 0xFFFF, EXC_INEX2 | AEXC_INEX);
+}
+
+#[test]
+fn a_68060_memory_operand_of_an_unsupported_type_is_fetched_first() {
+    // The operand is read in full, (An)+ included, and is in the EXCP
+    // frame as the 68060 widens it: a single or double denormal has its
+    // fraction under a set integer bit and the exponent $3F80 or $3C00.
+    for (name, opcode, w2, mem, size, frame) in [
+        (
+            "single",
+            0xF219,
+            0x4422,
+            [0x0000_0400, 0, 0],
+            4,
+            [0x3F80_E007, 0x8004_0000, 0],
+        ),
+        (
+            "double",
+            0xF219,
+            0x5422,
+            [0x8000_0000, 0x0000_0800, 0],
+            8,
+            [0xBC00_E007, 0x8000_0000, 0x0040_0000],
+        ),
+        (
+            "extended denormal",
+            0xF219,
+            0x4822,
+            [0x0000_0000, 0x0000_0001, 0x8000_0000],
+            12,
+            [0x0000_E007, 0x0000_0001, 0x8000_0000],
+        ),
+        (
+            "extended unnormal",
+            0xF219,
+            0x4822,
+            [0xC002_0000, 0x7000_0000, 0],
+            12,
+            [0xC002_E007, 0x7000_0000, 0],
+        ),
+    ] {
+        let mut m = m060_unsupp(false, X_ONE, X_ONE);
+        for (i, long) in mem.into_iter().enumerate() {
+            m.bus.write_long(DATA + 0x40 + 4 * i as u32, long);
+        }
+        m.run(&[opcode, w2]);
+        assert_eq!(m.vector(), Some(55), "{name}");
+        let (_, pc, fv) = m.frame();
+        assert_eq!((pc, fv), (CODE + 4, 55 * 4), "{name}");
+        assert_eq!(m.cpu.dar[9], DATA + 0x40 + size, "{name}: (A1)+");
+        assert_eq!(bits(m.cpu.fpr[0]), X_ONE, "{name}");
+        assert_eq!(frame060(&mut m), frame, "{name}");
+    }
+
+    // A normalized single added to a denormalized register: the frame
+    // still holds the source.
+    let mut m = m060_unsupp(false, X_ONE, X_DENORMAL);
+    m.bus.write_long(DATA + 0x40, 0x4040_0000);
+    m.run(&[0xF211, 0x4422]);
+    assert_eq!(m.vector(), Some(55));
+    assert_eq!(frame060(&mut m), [0x4000_E007, 0xC000_0000, 0]);
+
+    // An integer cannot be of an unsupported type.
+    let mut m = m060_unsupp(false, X_ONE, X_ONE);
+    m.bus.write_long(DATA + 0x40, 1);
+    m.run(&[0xF211, 0x4022]);
+    assert_eq!(m.vector(), None);
+    assert_eq!(bits(m.cpu.fpr[0]), X_TWO);
+}
+
+#[test]
+fn a_68060_move_out_of_an_unsupported_type_takes_the_format_3_frame() {
+    // FMOVE FP0,<ea> of a denormalized or unnormalized register: a
+    // post-instruction exception whose frame has the destination's
+    // address (M68060UM 6.5.2). Nothing is stored. An extended (An)+ or
+    // -(An) destination leaves An to the M68060SP and, predecremented,
+    // has the address eight above the destination's in the frame.
+    const A1: u32 = DATA + 0x40;
+    for (name, opcode, w2, a1_after, ea) in [
+        ("X (A1)", 0xF211, 0x6800, A1, A1),
+        ("X (A1)+", 0xF219, 0x6800, A1, A1),
+        ("X -(A1)", 0xF221, 0x6800, A1, A1 - 4),
+        ("S (A1)+", 0xF219, 0x6400, A1 + 4, A1),
+        ("D -(A1)", 0xF221, 0x7400, A1 - 8, A1 - 8),
+        ("L (A1)+", 0xF219, 0x6000, A1 + 4, A1),
+        ("W -(A1)", 0xF221, 0x7000, A1 - 2, A1 - 2),
+        ("B (A1)", 0xF211, 0x7800, A1, A1),
+        ("L D0", 0xF200, 0x6000, A1, 0),
+    ] {
+        for value in [X_DENORMAL, X_UNNORMAL] {
+            let mut m = m060_unsupp(false, X_ONE, value);
+            for at in (A1 - 16..A1 + 16).step_by(4) {
+                m.bus.write_long(at, 0xAAAA_AAAA);
+            }
+            m.cpu.dar[0] = 0x5555_5555;
+            m.run(&[opcode, w2]);
+            assert_eq!(m.vector(), Some(55), "{name}");
+            let (_, pc, fv) = m.frame();
+            assert_eq!(pc, CODE + 4, "{name}: the next instruction");
+            assert_eq!(fv, 0x3000 | (55 * 4), "{name}: format $3");
+            let sp = m.cpu.dar[15];
+            assert_eq!(m.bus.read_long(sp + 8), ea, "{name}: effective address");
+            assert_eq!(m.cpu.dar[9], a1_after, "{name}: A1");
+            assert_eq!(m.cpu.fpiar, CODE, "{name}");
+            assert_eq!(m.cpu.dar[0], 0x5555_5555, "{name}: D0");
+            for at in (A1 - 16..A1 + 16).step_by(4) {
+                assert_eq!(m.bus.read_long(at), 0xAAAA_AAAA, "{name}: nothing stored");
+            }
+            assert_eq!(
+                frame060(&mut m),
+                [
+                    (u32::from(value.0) << 16) | 0xE007,
+                    (value.1 >> 32) as u32,
+                    value.1 as u32
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    // A normalized register is moved by the 68060 itself, and with the
+    // package's work done in the crate so is a denormalized one.
+    let mut m = m060_unsupp(false, X_ONE, X_ONE);
+    m.run(&[0xF211, 0x6400]);
+    assert_eq!(m.vector(), None);
+    assert_eq!(m.bus.read_long(A1), 0x3F80_0000);
+    let mut m = m060_unsupp(true, X_ONE, X_DENORMAL);
+    m.run(&[0xF211, 0x6800]);
+    assert_eq!(m.vector(), None);
+    assert_eq!(m.bus.read_long(A1 + 4), 0x4000_0000);
+}
+
+#[test]
+fn bsun_on_a_68060_leaves_an_excp_frame() {
+    // FBGT with the NAN condition code set and BSUN enabled takes vector
+    // 48; the handler's FSAVE finds the exception state (M68060UM 6.6.1).
+    let mut m = m060(false, X_ONE, X_ONE, 0x8000);
+    m.cpu.fpsr = 0x0100_0000;
+    for (i, w) in [FSAVE_PREDEC_A0, 0x4E72, 0x2700].into_iter().enumerate() {
+        m.bus.write_word(HANDLERS + 48 * 8 + 2 * i as u32, w);
+    }
+    m.run(&[0xF292, 0x0002]);
+    assert_eq!(frame060(&mut m)[0] & 0xFFFF, 0xE000);
 }
 
 #[test]
