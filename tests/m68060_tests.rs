@@ -677,6 +677,127 @@ fn packed_immediate_and_dynamic_fmovem_take_vector_60_on_68060() {
     assert_eq!(cpu.pc, 0x03A0, "dynamic list vectors through 60");
 }
 
+/// Vector 60 with a format $0 frame whose PC is the instruction's own.
+fn assert_unimplemented_ea(cpu: &CpuCore, bus: &mut TestBus, instr: u32, name: &str) {
+    assert_eq!(cpu.pc, 0x03A0, "{name}: vector 60");
+    let sp = cpu.dar[15];
+    assert_eq!(bus.read_long(sp.wrapping_add(2)), instr, "{name}: PC");
+    assert_eq!(bus.read_word(sp.wrapping_add(6)), 0x00F0, "{name}: format");
+}
+
+fn setup_060_at(words: &[u16]) -> (CpuCore, TestBus) {
+    let (mut cpu, mut bus) = setup_060();
+    bus.write_long_at(60 * 4, 0x03A0);
+    for (i, &word) in words.iter().enumerate() {
+        bus.write_word_at(0x0210 + 2 * i as u32, word);
+    }
+    cpu.pc = 0x0210;
+    (cpu, bus)
+}
+
+// 2.0 as an extended, a packed and a double immediate.
+const FMOVE_X_IMM: [u16; 8] = [0xF23C, 0x4800, 0x4000, 0, 0x8000, 0, 0, 0];
+const FMOVE_P_IMM: [u16; 8] = [0xF23C, 0x4C00, 0x0000, 0x0002, 0, 0, 0, 0];
+const FMOVE_D_IMM: [u16; 6] = [0xF23C, 0x5400, 0x4000, 0, 0, 0];
+
+#[test]
+fn an_extended_or_packed_immediate_takes_vector_60_on_68060() {
+    // M68060UM 6.5.3: a floating-point instruction with an extended or
+    // packed immediate operand. The instruction is not executed and FPIAR
+    // is not written (8.2.4).
+    let fsin_x = [0xF23C, 0x480E, 0x4000, 0, 0x8000, 0, 0, 0];
+    let fsin_p = [0xF23C, 0x4C0E, 0x0000, 0x0002, 0, 0, 0, 0];
+    let cases: [(&str, &[u16]); 4] = [
+        ("FMOVE.X #imm,FP0", &FMOVE_X_IMM),
+        ("FMOVE.P #imm,FP0", &FMOVE_P_IMM),
+        // Ahead of the unimplemented-instruction exception, which FSIN
+        // takes with any other source: the M68060SP emulates it from here.
+        ("FSIN.X #imm,FP0", &fsin_x),
+        ("FSIN.P #imm,FP0", &fsin_p),
+    ];
+    for (name, words) in cases {
+        let (mut cpu, mut bus) = setup_060_at(words);
+        cpu.fpiar = 0x1234_5678;
+        let fp0 = cpu.fpr[0];
+        step(&mut cpu, &mut bus);
+        assert_unimplemented_ea(&cpu, &mut bus, 0x0210, name);
+        assert_eq!(cpu.fpiar, 0x1234_5678, "{name}: FPIAR");
+        assert_eq!(cpu.fpr[0], fp0, "{name}: not executed");
+    }
+
+    // A double immediate is implemented.
+    let (mut cpu, mut bus) = setup_060_at(&FMOVE_D_IMM);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, 0x021C, "FMOVE.D #imm,FP0 executes");
+    assert_eq!(cpu.fpr[0].to_f64(), 2.0);
+
+    // With the package's work done here the instruction executes.
+    for (name, words) in [("extended", &FMOVE_X_IMM), ("packed", &FMOVE_P_IMM)] {
+        let (mut cpu, mut bus) = setup_060_at(words);
+        cpu.emulate_unimplemented_060 = true;
+        step(&mut cpu, &mut bus);
+        assert_eq!(cpu.pc, 0x0220, "{name}: executes");
+        assert_eq!(cpu.fpr[0].to_f64(), 2.0, "{name}");
+    }
+}
+
+#[test]
+fn fmovem_l_immediate_to_several_control_registers_takes_vector_60_on_68060() {
+    // FMOVEM.L #imm,FPCR/FPSR and #imm,FPCR/FPSR/FPIAR.
+    for (name, w2) in [("two", 0x9800), ("three", 0x9C00)] {
+        let (mut cpu, mut bus) = setup_060_at(&[0xF23C, w2, 0, 0x0010, 0, 0, 0, 0]);
+        step(&mut cpu, &mut bus);
+        assert_unimplemented_ea(&cpu, &mut bus, 0x0210, name);
+        assert_eq!(cpu.fpcr, 0, "{name}: not executed");
+    }
+    // One control register is implemented.
+    let (mut cpu, mut bus) = setup_060_at(&[0xF23C, 0x9000, 0, 0x0010]);
+    step(&mut cpu, &mut bus);
+    assert_eq!(cpu.pc, 0x0218, "FMOVE.L #imm,FPCR executes");
+    assert_eq!(cpu.fpcr, 0x0010);
+}
+
+#[test]
+fn an_unimplemented_ea_comes_before_the_disabled_fpu_on_68060() {
+    // The 68060 takes the unimplemented effective address exception even
+    // with PCR.DFP set; the M68060SP's handler tests the bit and builds
+    // the FPU-disabled frame. With the package's work done here that
+    // frame is what the instruction takes.
+    let fmovem_dynamic = [0xF210, 0xE810];
+    let fmovem_l = [0xF23C, 0x9800, 0, 0x0010, 0, 0];
+    let cases: [(&str, &[u16]); 3] = [
+        ("FMOVE.X #imm,FP0", &FMOVE_X_IMM),
+        ("FMOVEM.X D1,(A0)", &fmovem_dynamic),
+        ("FMOVEM.L #imm,FPCR/FPSR", &fmovem_l),
+    ];
+    for lc060 in [false, true] {
+        for emulate in [false, true] {
+            for (name, words) in cases {
+                let (mut cpu, mut bus) = setup_060_at(words);
+                if lc060 {
+                    cpu.fpu_present = false;
+                    cpu.reset(&mut bus);
+                    cpu.set_sr(0x2700);
+                } else {
+                    cpu.pc = 0x0200;
+                    movec_to(&mut cpu, &mut bus, 0x808, 0x02); // set DFP
+                }
+                cpu.pc = 0x0210;
+                cpu.emulate_unimplemented_060 = emulate;
+                step(&mut cpu, &mut bus);
+                let what = format!("{name} lc060={lc060} emulate={emulate}");
+                if emulate {
+                    assert_eq!(cpu.pc, 0x0340, "{what}: Line-F");
+                    let sp = cpu.dar[15];
+                    assert_eq!(bus.read_word(sp.wrapping_add(6)), 0x402C, "{what}");
+                } else {
+                    assert_unimplemented_ea(&cpu, &mut bus, 0x0210, &what);
+                }
+            }
+        }
+    }
+}
+
 #[test]
 fn pcr_dfp_takes_the_disabled_frame_on_68060() {
     let (mut cpu, mut bus) = setup_060();
