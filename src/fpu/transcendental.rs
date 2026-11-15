@@ -62,6 +62,40 @@ fn unbiased_exp(x: FloatX80) -> i32 {
     ) as i32
 }
 
+// ============================== tiny operands ============================
+
+/// The result for an operand so small that the function's value is the
+/// operand itself, or 1, to within half a unit in the last place:
+/// sin x = x - x^3/6 + ..., cos x = 1 - x^2/2 + ..., and
+/// e^x - 1 = x + x^2/2 + ... The series cannot be left to show that. Its
+/// second term is below the double-double's precision, or underflows
+/// beside a denormalized operand, and the sum is then exactly the first
+/// term: no INEX2, and nothing for a directed rounding mode to round. The
+/// M68040FPSP and M68060SP set INEX2 for such an operand as for any other,
+/// and UNFL with it for a denormalized one (t_extdnrm).
+fn tiny_operand(opmode: u16, x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> Option<FloatX80> {
+    if x.is_nan() || x.is_inf() || x.is_zero() {
+        return None;
+    }
+    // Below 2^bound the second term is under 2^-66 of the first: it is
+    // x^2/2 of it at most where the first two terms differ by x^2, and
+    // x/2 for e^x - 1 and ln(1 + x).
+    let (bound, away, about_one) = match opmode {
+        0x0E | 0x0A | 0x09 => (-33, false, false), // sin, atan, tanh
+        0x0F | 0x0C | 0x02 | 0x0D => (-33, true, false), // tan, asin, sinh, atanh
+        0x08 => (-66, !x.sign(), false),           // e^x - 1 is above x
+        0x06 => (-66, x.sign(), false),            // ln(1 + x) is below x
+        0x1D => (-33, false, true),                // cos
+        0x19 => (-33, true, true),                 // cosh
+        _ => return None,
+    };
+    if unbiased_exp(x) >= bound {
+        return None;
+    }
+    let first_term = if about_one { one_x80() } else { x };
+    Some(softfloat::round_inexact(first_term, away, ctx, f))
+}
+
 // ============================== exp family ===============================
 
 /// exp(r) for a small |r| <= ln2/2 via the Maclaurin series, in Df.
@@ -763,6 +797,9 @@ fn atanh(x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX80 {
 /// accumulating exceptions into `f`. Returns `None` if the opmode is not a
 /// transcendental.
 pub fn eval_unary(opmode: u16, src: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> Option<FloatX80> {
+    if let Some(r) = tiny_operand(opmode, src, ctx, f) {
+        return Some(r);
+    }
     let r = match opmode {
         // Extended-precision kernels.
         0x10 => exp(src, ctx, f),
@@ -790,6 +827,10 @@ pub fn eval_unary(opmode: u16, src: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -
 
 /// FSINCOS: sine and cosine of the same operand.
 pub fn sincos(src: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> (FloatX80, FloatX80) {
+    if let Some(sin) = tiny_operand(0x0E, src, ctx, f) {
+        let cos = tiny_operand(0x1D, src, ctx, f).unwrap_or_else(one_x80);
+        return (sin, cos);
+    }
     sin_cos_x80(src, ctx, f)
 }
 
@@ -1075,6 +1116,125 @@ mod tests {
         // Still in range, close to the top: e^11356 is about 2^16383.24.
         let e = exp(fx(11356.0), rn(), &mut noflags());
         assert_eq!(e.sign_exp, 0x7FFE);
+    }
+
+    /// The neighbour of a finite nonzero `x` one unit in the last place
+    /// further from zero, or nearer to it.
+    fn neighbour(x: FloatX80, away: bool) -> FloatX80 {
+        let (sign_exp, m) = x.to_extended();
+        let (sign, exp) = (sign_exp & 0x8000, sign_exp & 0x7FFF);
+        let (exp, m) = if away {
+            match m.checked_add(1) {
+                Some(m) => (exp, m),
+                None => (exp + 1, 1 << 63),
+            }
+        } else if m == 1 << 63 && exp > 0 {
+            (exp - 1, u64::MAX)
+        } else {
+            (exp, m - 1)
+        };
+        FloatX80::from_extended(sign | exp, m)
+    }
+
+    #[test]
+    fn a_tiny_operand_is_inexact_and_rounds_off_the_first_term() {
+        // (opmode, the value is further from zero than a positive operand,
+        // and than a negative one).
+        let ops = [
+            (0x0E, false, false), // sin
+            (0x0A, false, false), // atan
+            (0x09, false, false), // tanh
+            (0x0F, true, true),   // tan
+            (0x0C, true, true),   // asin
+            (0x02, true, true),   // sinh
+            (0x0D, true, true),   // atanh
+            (0x08, true, false),  // e^x - 1
+            (0x06, false, true),  // ln(1 + x)
+        ];
+        // Denormalized, the smallest with a biased exponent of 1, one in
+        // the middle of the range and one just below 2^-66.
+        let operands = [
+            (0x0000, 0x4000_0000_0000_0000),
+            (0x0000, 0x0000_0000_0000_0001),
+            (0x0001, 0x8000_0000_0000_0000),
+            (0x3000, 0xC000_0000_0000_0001),
+            (0x3FBC, 0xFFFF_FFFF_FFFF_FFFF),
+        ];
+        let modes = [
+            RoundMode::Nearest,
+            RoundMode::Zero,
+            RoundMode::NegInf,
+            RoundMode::PosInf,
+        ];
+        for (opmode, away_pos, away_neg) in ops {
+            for (exp, m) in operands {
+                for sign in [0, 0x8000] {
+                    for mode in modes {
+                        let x = FloatX80::from_extended(sign | exp, m);
+                        let away = if sign == 0 { away_pos } else { away_neg };
+                        // Only a mode that rounds the way the value lies
+                        // moves the result off the operand.
+                        let outward = match mode {
+                            RoundMode::Nearest => false,
+                            RoundMode::Zero => !away,
+                            RoundMode::PosInf => away == (sign == 0),
+                            RoundMode::NegInf => away == (sign != 0),
+                        };
+                        let want = if outward { neighbour(x, away) } else { x };
+                        let unfl = if x.is_denormal() { ExcFlags::UNFL } else { 0 };
+                        let ctx = RoundCtx {
+                            mode,
+                            ..RoundCtx::NEAREST_EXT
+                        };
+                        let mut f = noflags();
+                        let got = eval_unary(opmode, x, ctx, &mut f).unwrap();
+                        let what = format!("opmode {opmode:#x} of {:x?} {mode:?}", x.to_extended());
+                        assert_eq!(got.to_extended(), want.to_extended(), "{what}");
+                        assert_eq!(f.0, ExcFlags::INEX2 | unfl, "{what}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cos_and_cosh_of_a_tiny_operand_are_inexactly_one() {
+        let one = one_x80();
+        for (exp, m) in [
+            (0x0000, 0x0000_0000_0000_0001),
+            (0x8001, 0x8000_0000_0000_0000),
+            (0x3FDD, 0xFFFF_FFFF_FFFF_FFFF),
+        ] {
+            let x = FloatX80::from_extended(exp, m);
+            // cos x is just below 1 and cosh x just above it.
+            for (opmode, mode, want) in [
+                (0x1D, RoundMode::Nearest, one),
+                (0x1D, RoundMode::Zero, neighbour(one, false)),
+                (0x1D, RoundMode::NegInf, neighbour(one, false)),
+                (0x1D, RoundMode::PosInf, one),
+                (0x19, RoundMode::Nearest, one),
+                (0x19, RoundMode::Zero, one),
+                (0x19, RoundMode::NegInf, one),
+                (0x19, RoundMode::PosInf, neighbour(one, true)),
+            ] {
+                let ctx = RoundCtx {
+                    mode,
+                    ..RoundCtx::NEAREST_EXT
+                };
+                let mut f = noflags();
+                let got = eval_unary(opmode, x, ctx, &mut f).unwrap();
+                let what = format!("opmode {opmode:#x} of {:x?} {mode:?}", x.to_extended());
+                assert_eq!(got.to_extended(), want.to_extended(), "{what}");
+                assert_eq!(f.0, ExcFlags::INEX2, "{what}");
+            }
+        }
+        // FSINCOS takes both from the same operand.
+        let x = FloatX80::from_extended(0x8000, 0x4000_0000_0000_0000);
+        let mut f = noflags();
+        let (s, c) = sincos(x, rn(), &mut f);
+        assert_eq!(s.to_extended(), x.to_extended());
+        assert_eq!(c.to_extended(), one.to_extended());
+        assert_eq!(f.0, ExcFlags::INEX2 | ExcFlags::UNFL);
     }
 
     #[test]
