@@ -5,7 +5,8 @@
 //!   L1: 8 BCD fraction digits (D1..D8), most significant in bits 31-28
 //!   L2: 8 BCD fraction digits (D9..D16)
 //! The value is  (-1)^SM * D0.D1D2...D16 * 10^((-1)^SE * e2e1e0).
-//! An exponent field of $FFF encodes Inf (zero mantissa) or NaN.
+//! SE, both y bits and the exponent field all ones encode an infinity (zero
+//! fraction) or a NaN.
 //!
 //! Decimal-to-binary scaling goes through the floatx80 engine (powers of ten
 //! built by exponentiation-by-squaring), so a decoded value can be an ulp
@@ -70,16 +71,15 @@ fn decode_packed(bytes: [u8; 12], f: &mut ExcFlags) -> FloatX80 {
 
     let sm = (w0 >> 31) & 1 != 0;
     let se = (w0 >> 30) & 1 != 0;
-    let exp_field = (w0 >> 16) & 0xFFF;
 
-    if exp_field == 0xFFF {
-        // Inf (zero mantissa) or NaN.
-        let mant_zero = (w0 & 0xF) == 0 && w1 == 0 && w2 == 0;
-        return if mant_zero {
-            FloatX80::infinity(sm)
-        } else {
-            FloatX80::default_nan()
-        };
+    if (w0 >> 16) & 0x7FFF == 0x7FFF {
+        // An infinity or a NaN: SE and both y bits set over the exponent
+        // $FFF. The sixteen fraction digits are moved bit for bit into
+        // the mantissa, with no conversion, so a NaN keeps its payload
+        // and a clear second bit makes it a signaling one; the integer
+        // digit plays no part (MC68881/MC68882UM table 3-4, note 1).
+        let mantissa = (u64::from(w1) << 32) | u64::from(w2);
+        return FloatX80::from_extended((u16::from(sm) << 15) | 0x7FFF, mantissa);
     }
 
     let e2 = (w0 >> 24) & 0xF;
@@ -512,6 +512,35 @@ mod tests {
         assert!(r.is_inf() && r.sign());
         let nan = to_packed(FloatX80::default_nan(), 17, RN, &mut f);
         assert!(from_packed(nan, &mut f).is_nan());
+    }
+
+    #[test]
+    fn an_infinity_or_a_nan_is_read_bit_for_bit() {
+        let read = |longs: [u32; 3]| {
+            let mut bytes = [0u8; 12];
+            for (i, long) in longs.iter().enumerate() {
+                bytes[4 * i..4 * i + 4].copy_from_slice(&long.to_be_bytes());
+            }
+            from_packed(bytes, &mut ExcFlags::default())
+        };
+        // The fraction digits are the mantissa: a NaN keeps its payload.
+        let nan = read([0x7FFF_0000, 0xC000_0000, 0x0000_0001]);
+        assert_eq!(nan.to_extended(), (0x7FFF, 0xC000_0000_0000_0001));
+        // One with the second bit clear is signaling, for the operation
+        // that uses it to report.
+        let snan = read([0xFFFF_0000, 0x8000_1234, 0x0000_0000]);
+        assert_eq!(snan.to_extended(), (0xFFFF, 0x8000_1234_0000_0000));
+        assert!(snan.is_signaling_nan());
+        // The integer digit is no part of it: this is an infinity.
+        let inf = read([0xFFFF_0009, 0, 0]);
+        assert_eq!(inf.to_extended(), (0xFFFF, 0));
+        // Without SE and both y bits, $FFF is the three digits of an
+        // exponent, each read as fifteen: 1E1665 and 1E-1665.
+        for (first, exp) in [(0x0FFF_0001, 0x559A), (0x4FFF_0001, 0x2A63)] {
+            let x = read([first, 0, 0]);
+            assert!(!x.is_nan() && !x.is_inf(), "{first:#x}");
+            assert_eq!(x.to_extended().0, exp, "{first:#x}");
+        }
     }
 
     #[test]
