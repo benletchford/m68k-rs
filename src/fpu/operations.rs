@@ -61,6 +61,21 @@ impl RawSource {
     }
 }
 
+/// Whether a general FP instruction (operation word `opcode`, command
+/// word `w2`) uses an effective address the 68060 does not implement
+/// (M68060UM 6.5.3): an extended-precision or packed immediate source,
+/// FMOVEM.L #imm to more than one control register, or FMOVEM.X with its
+/// register list in a data register.
+fn fpu_060_unimplemented_ea(opcode: u16, w2: u16) -> bool {
+    let immediate = opcode & 0x3F == 0x3C;
+    match w2 >> 13 {
+        0x2 => immediate && matches!((w2 >> 10) & 0x7, 2 | 3),
+        0x4 => immediate && ((w2 >> 10) & 0x7).count_ones() >= 2,
+        0x6 | 0x7 => w2 & 0x0800 != 0,
+        _ => false,
+    }
+}
+
 /// The FP opmodes the 68060 dropped from silicon, emulated by the 68060SP:
 /// the transcendental set, FGETEXP/FGETMAN, FMOD/FREM/FSCALE, and FSINCOS
 /// (FMOVECR is gated separately by encoding). FINT/FINTRZ, which the 68040
@@ -207,18 +222,30 @@ impl CpuCore {
             return 0;
         }
 
-        // 68060 with the FPU disabled through PCR.DFP (also how an LC/EC060
-        // presents): every FP instruction takes the format $4 disabled frame.
-        if self.is_060() && (self.pcr & crate::core::cpu::PCR_DFP) != 0 {
-            return self.take_fp_disabled_060(bus);
-        }
-
         // IMPORTANT:
         // - PC currently points at the first extension word (w2).
         // - We must NOT consume w2 (or any EA extension) unless we handle the instruction.
 
         let w2 = self.read_16(bus, self.pc);
         let subop = (w2 >> 13) & 0x7;
+
+        // An effective address the 68060 does not implement takes vector
+        // 60 with a format $0 frame whose PC is the instruction's; FPIAR
+        // is not written (M68060UM 6.5.3 and 8.2.4).
+        let unimplemented_ea = self.trap_unimpl_060() && fpu_060_unimplemented_ea(opcode, w2);
+
+        // 68060 with the FPU disabled through PCR.DFP (also how an LC/EC060
+        // presents): every FP instruction takes the format $4 disabled
+        // frame. The unimplemented effective address is recognised first
+        // even then: the M68060SP's handler for it tests PCR.DFP itself
+        // and builds the disabled frame.
+        if self.is_060() && (self.pcr & crate::core::cpu::PCR_DFP) != 0 {
+            if unimplemented_ea {
+                return self
+                    .take_exception(bus, crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA);
+            }
+            return self.take_fp_disabled_060(bus);
+        }
 
         // An exception the previous FPU operation left unreported is
         // taken now, before this instruction does anything. The moves of
@@ -233,6 +260,15 @@ impl CpuCore {
         {
             return cycles;
         }
+        // The unimplemented effective address also comes before the
+        // unimplemented-instruction exception: the package's handler for
+        // it emulates FSIN and the other instructions the 68060 lacks
+        // when their source is such an immediate. The instruction has
+        // not executed, so nothing of the FPU's state changes.
+        if unimplemented_ea {
+            return self.take_exception(bus, crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA);
+        }
+
         if matches!(subop, 0x0 | 0x2 | 0x3) {
             self.fpu_060_excp = None;
         }
@@ -312,14 +348,8 @@ impl CpuCore {
                     return self.take_fp_unimp_060(bus, ea);
                 }
                 if self.trap_unimpl_060() && src_fmt == 3 {
-                    // Packed decimal: unsupported data type in 060 hardware;
-                    // the immediate form is an unimplemented <ea> instead.
-                    if (opcode & 0x3F) == 0x3C {
-                        return self.take_exception(
-                            bus,
-                            crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA,
-                        );
-                    }
+                    // Packed decimal: unsupported data type in 060 hardware
+                    // (the immediate form was an unimplemented <ea>, above).
                     // Format $2 frame with the operand's address: the
                     // M68060SP reads the packed number through it.
                     let ea = self.fpu_060_trap_ea(bus, opcode, src_fmt);
@@ -482,13 +512,6 @@ impl CpuCore {
                 let ea_mode = (ea >> 3) & 7;
                 let ea_reg = (ea & 7) as usize;
 
-                // A dynamic register list was dropped from 68060 silicon
-                // (unimplemented <ea>).
-                if self.trap_unimpl_060() && (mode_bits & 0x1) != 0 {
-                    return self
-                        .take_exception(bus, crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA);
-                }
-
                 // MODE field (w2 bits 12-11): bit 11 selects a dynamic
                 // register list (named by w2 bits 4-6), bit 12 selects the
                 // postincrement/control mask order.
@@ -575,12 +598,6 @@ impl CpuCore {
                 let count = (ctrl_sel & 4 != 0) as u32
                     + (ctrl_sel & 2 != 0) as u32
                     + (ctrl_sel & 1 != 0) as u32;
-                // FMOVEM.L #imm to two or three control registers was
-                // dropped from 68060 silicon (unimplemented <ea>).
-                if self.trap_unimpl_060() && count >= 2 && (opcode & 0x3F) == 0x3C {
-                    return self
-                        .take_exception(bus, crate::core::exceptions::vector::FP_UNIMPLEMENTED_EA);
-                }
                 let mut values = [0u32; 3];
                 match self.fpu_ea(bus, ea_mode, ea_reg, 4 * count) {
                     Some(FpuEa::DataReg(r)) if count == 1 => values[0] = self.d(r),

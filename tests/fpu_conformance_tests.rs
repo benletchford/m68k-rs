@@ -1088,6 +1088,27 @@ fn a_taken_68060_exception_leaves_its_frame_for_the_handler() {
     assert_eq!(frame060(&mut m), [0x0000_6000, 0, 0], "idle again");
 }
 
+#[test]
+fn an_unimplemented_ea_on_a_68060_leaves_the_excp_frame() {
+    // FDIV FP1,FP0 (1 / 0, DZ enabled) ; FNOP (taken, the handler
+    // returns) ; FMOVE.X #2.0,FP0. The immediate takes vector 60 without
+    // executing, so the state the earlier exception left is still there
+    // for a handler that saves it.
+    let mut m = m060(false, (0, 0), X_ONE, 0x0400);
+    m.bus.write_word(HANDLERS + 50 * 8, 0x4E73); // RTE
+    for (i, w) in [FSAVE_PREDEC_A0, 0x7E3C, 0x4E72, 0x2700]
+        .into_iter()
+        .enumerate()
+    {
+        m.bus.write_word(HANDLERS + 60 * 8 + 2 * i as u32, w);
+    }
+    m.run(&[
+        0xF200, 0x0420, FNOP[0], FNOP[1], 0xF23C, 0x4800, 0x4000, 0, 0x8000, 0, 0, 0,
+    ]);
+    assert_eq!(m.vector(), Some(60));
+    assert_eq!(frame060(&mut m), [0x0000_E002, 0, 0]);
+}
+
 const X_DENORMAL: (u16, u64) = (0x0000, 0x4000_0000_0000_0000);
 const X_UNNORMAL: (u16, u64) = (0x4000, 0x4000_0000_0000_0000);
 
