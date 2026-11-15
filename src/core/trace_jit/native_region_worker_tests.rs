@@ -105,6 +105,7 @@ fn architecture(cpu: &CpuCore) -> Vec<(&'static str, String)> {
         fault_resume,
         emulate_unimplemented_060,
         emulate_unimplemented_040,
+        fpu_040,
         sst_m68000_compat
     );
     out
