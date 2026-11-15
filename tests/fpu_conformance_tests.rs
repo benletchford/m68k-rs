@@ -60,6 +60,10 @@ const AEXC_IOP: u32 = 0x0080;
 const AEXC_INEX: u32 = 0x0008;
 const EXC_INEX2: u32 = 0x0200;
 const EXC_INEX1: u32 = 0x0100;
+const EXC_OVFL: u32 = 0x1000;
+const EXC_UNFL: u32 = 0x0800;
+const AEXC_OVFL: u32 = 0x0040;
+const AEXC_UNFL: u32 = 0x0020;
 
 struct Machine {
     cpu: CpuCore,
@@ -492,6 +496,146 @@ fn packed_decimal_move_out_follows_the_rounding_mode_and_the_operand() {
         assert_eq!(m.bus.read_long(DATA + 4), 0, "{cpu:?}");
         assert_eq!(m.bus.read_long(DATA + 8), 0, "{cpu:?}");
         assert_eq!(m.cpu.fpsr, EXC_INEX2 | AEXC_INEX, "{cpu:?} k = 0");
+    }
+}
+
+#[test]
+fn a_denormalized_result_underflows_whether_or_not_it_is_inexact() {
+    // MC68881/MC68882UM 6.1.5: an underflow is a result too small to be
+    // normalized. The accrued bit also needs it to be inexact (6.1.10).
+    const DENORMAL: (u16, u64) = (0x0000, 0x0100_0000_0000_0000);
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        // FMOVE.X, FABS and FNEG of a denormalized register.
+        for (name, opmode, sign) in [("FMOVE", 0x00, 0), ("FABS", 0x18, 0), ("FNEG", 0x1A, 1)] {
+            let mut m = Machine::new(cpu);
+            m.cpu.fpr[1] = x80(DENORMAL.0, DENORMAL.1);
+            m.run(&[0xF200, 0x0400 | opmode]);
+            assert_eq!(
+                bits(m.cpu.fpr[0]),
+                (sign << 15, DENORMAL.1),
+                "{cpu:?} {name}"
+            );
+            assert_eq!(m.cpu.fpsr & 0xFFFF, EXC_UNFL, "{cpu:?} {name}");
+        }
+        // The exact product of two normalized numbers: 2^-8195 squared.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x1FFC, 0x8000_0000_0000_0000);
+        m.cpu.fpr[1] = x80(0x1FFC, 0x8000_0000_0000_0000);
+        m.run(&[0xF200, 0x0423]);
+        assert_eq!(bits(m.cpu.fpr[0]), DENORMAL, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr & 0xFFFF, EXC_UNFL, "{cpu:?} product");
+        // An inexact one sets the accrued bits as well: a third of it.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(DENORMAL.0, DENORMAL.1);
+        m.cpu.fpr[1] = x80(0x4000, 0xC000_0000_0000_0000);
+        m.run(&[0xF200, 0x0420]);
+        assert_eq!(
+            m.cpu.fpsr & 0xFFFF,
+            EXC_UNFL | EXC_INEX2 | AEXC_UNFL | AEXC_INEX,
+            "{cpu:?} quotient"
+        );
+        // The remainder of a denormalized number by a larger one is that
+        // number: FMOD and FREM.
+        for opmode in [0x21, 0x25] {
+            let mut m = Machine::new(cpu);
+            m.cpu.fpr[0] = x80(DENORMAL.0, DENORMAL.1);
+            m.cpu.fpr[1] = x80(0x4000, 0xC000_0000_0000_0000);
+            m.run(&[0xF200, 0x0400 | opmode]);
+            assert_eq!(bits(m.cpu.fpr[0]), DENORMAL, "{cpu:?} {opmode:#x}");
+            assert_eq!(m.cpu.fpsr & 0xFFFF, EXC_UNFL, "{cpu:?} {opmode:#x}");
+        }
+        // FTST and FCMP do not produce a result, so they do not underflow.
+        for opmode in [0x3A, 0x38] {
+            let mut m = Machine::new(cpu);
+            m.cpu.fpr[0] = x80(0x3FFF, 0x8000_0000_0000_0000);
+            m.cpu.fpr[1] = x80(DENORMAL.0, DENORMAL.1);
+            m.run(&[0xF200, 0x0400 | opmode]);
+            assert_eq!(m.cpu.fpsr & 0xFFFF, 0, "{cpu:?} {opmode:#x}");
+        }
+        // FMOVE.D to memory of a number below the double's normalized
+        // range that the double holds exactly: 2^-1030.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x3BF9, 0x8000_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x7400]);
+        assert_eq!(m.bus.read_long(DATA), 0x0000_1000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr & 0xFFFF, EXC_UNFL, "{cpu:?} move out");
+        // FMOVE.X to memory of a denormalized number stores it as it is.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(DENORMAL.0, DENORMAL.1);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6800]);
+        assert_eq!(m.bus.read_long(DATA), 0, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x0100_0000, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr & 0xFFFF, EXC_UNFL, "{cpu:?} extended move out");
+        // The smallest normalized number has a zero exponent too.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0, 0x8000_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6800]);
+        assert_eq!(m.cpu.fpsr & 0xFFFF, 0, "{cpu:?} smallest normal");
+    }
+}
+
+#[test]
+fn an_overflow_sets_inex2_only_for_a_rounded_mantissa() {
+    // MC68881/MC68882UM 6.1.7: an overflow is recorded as inexact in the
+    // accrued byte; INEX2 itself may stay clear.
+    const MAX: (u16, u64) = (0x7FFE, 0xFFFF_FFFF_FFFF_FFFF);
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        // The largest number plus itself: an exact sum, out of range.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(MAX.0, MAX.1);
+        m.cpu.fpr[1] = x80(MAX.0, MAX.1);
+        m.run(&[0xF200, 0x0422]);
+        assert_eq!(bits(m.cpu.fpr[0]), (0x7FFF, 0), "{cpu:?}");
+        assert_eq!(
+            m.cpu.fpsr & 0xFFFF,
+            EXC_OVFL | AEXC_OVFL | AEXC_INEX,
+            "{cpu:?} exact"
+        );
+        // Times itself: 128 bits of product to round.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(MAX.0, MAX.1);
+        m.cpu.fpr[1] = x80(MAX.0, MAX.1);
+        m.run(&[0xF200, 0x0423]);
+        assert_eq!(
+            m.cpu.fpsr & 0xFFFF,
+            EXC_OVFL | EXC_INEX2 | AEXC_OVFL | AEXC_INEX,
+            "{cpu:?} inexact"
+        );
+        // FMOVE.S to memory of 2^200.
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0x40C7, 0x8000_0000_0000_0000);
+        m.cpu.dar[8] = DATA;
+        m.run(&[0xF210, 0x6400]);
+        assert_eq!(m.bus.read_long(DATA), 0x7F80_0000, "{cpu:?}");
+        assert_eq!(
+            m.cpu.fpsr & 0xFFFF,
+            EXC_OVFL | AEXC_OVFL | AEXC_INEX,
+            "{cpu:?} move out"
+        );
+    }
+}
+
+#[test]
+fn an_unnormalized_register_is_stored_normalized() {
+    // MC68881/MC68882UM 3.5.2: a move out never produces an unnormalized
+    // number. FMOVEM, which does not convert, is how one gets in.
+    for cpu in [CpuType::M68030, CpuType::M68040] {
+        let mut m = Machine::new(cpu);
+        m.cpu.fpr[0] = x80(0xC002, 0x0123_4567_89AB_CDEF);
+        m.cpu.dar[8] = DATA;
+        // FMOVE.X FP0,(A0)
+        m.run(&[0xF210, 0x6800]);
+        assert_eq!(m.bus.read_long(DATA), 0xBFFB_0000, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x91A2_B3C4, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 8), 0xD5E6_F780, "{cpu:?}");
+        assert_eq!(m.cpu.fpsr & 0xFFFF, 0, "{cpu:?}");
+        // FMOVEM.X FP0,(A0) stores the register as it is.
+        m.run(&[0xF210, 0xF080]);
+        assert_eq!(m.bus.read_long(DATA), 0xC002_0000, "{cpu:?}");
+        assert_eq!(m.bus.read_long(DATA + 4), 0x0123_4567, "{cpu:?}");
     }
 }
 

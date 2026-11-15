@@ -205,6 +205,11 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     // Denormalize if the exponent is below the format minimum. That is a
     // biased exponent of 0, which holds the integer bit like any other.
     if biased < 0 {
+        // Too small to be a normalized number: that is the underflow,
+        // whether or not denormalizing it loses anything (MC68881/
+        // MC68882UM 6.1.5, M68040UM 9.7.5, M68060UM 6.6.5). The accrued
+        // bit waits for the inexact result as well.
+        f.raise(ExcFlags::UNFL);
         let sh = (-biased) as u32;
         m = shift_right_sticky(m, sh);
         biased = 0;
@@ -239,9 +244,6 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     let integer_bit_set = (q >> (p - 1)) & 1 != 0;
     if !integer_bit_set {
         // Result is subnormal (or zero).
-        if rem != 0 {
-            f.raise(ExcFlags::UNFL);
-        }
         if q == 0 {
             return FloatX80::zero(sign);
         }
@@ -253,8 +255,10 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     }
 
     if biased >= 0x7FFF {
+        // INEX2 is for the mantissa's rounding alone, raised above: an
+        // overflow is recorded as inexact in the accrued byte, not here
+        // (MC68881/MC68882UM 6.1.7, M68040UM 9.7.7, M68060UM 6.6.7).
         f.raise(ExcFlags::OVFL);
-        f.raise(ExcFlags::INEX2);
         return overflow_result(sign, ctx.mode);
     }
 
@@ -818,8 +822,9 @@ fn shift_round(m: u64, sh: u32, sign: bool, mode: RoundMode) -> (u64, bool) {
 /// result is rounded once, straight from the extended significand, with the
 /// destination's exponent range: denormals below it, and overflow to
 /// infinity or the largest finite value as the mode dictates. Raises INEX2,
-/// UNFL and OVFL like an arithmetic result, and SNAN for a signaling NaN,
-/// which is stored quiet.
+/// UNFL and OVFL like an arithmetic result (UNFL for any value below the
+/// normalized range, INEX2 only for digits lost), and SNAN for a signaling
+/// NaN, which is stored quiet.
 fn to_ieee_bits(
     x: FloatX80,
     frac_bits: u32,
@@ -869,9 +874,7 @@ fn to_ieee_bits(
         // 2^(p-1) carries into the exponent field, giving the smallest
         // normal number, which is right.
         let (q, inexact) = shift_round(mant, (64 - p) + (1 - e) as u32, sign, mode);
-        if inexact {
-            f.raise(ExcFlags::UNFL);
-        }
+        f.raise(ExcFlags::UNFL);
         e = 0;
         (q, inexact)
     };
@@ -880,7 +883,7 @@ fn to_ieee_bits(
     }
 
     if e as u64 >= exp_max {
-        f.raise(ExcFlags::OVFL | ExcFlags::INEX2);
+        f.raise(ExcFlags::OVFL);
         let to_inf = match mode {
             RoundMode::Nearest => true,
             RoundMode::Zero => false,
@@ -1277,6 +1280,71 @@ mod tests {
     }
 
     #[test]
+    fn a_result_below_the_normalized_range_underflows_even_when_exact() {
+        // 2^-16390 is a denormalized number, held exactly.
+        let mut f = ExcFlags::default();
+        let r = scale(x(1.0), -16390, rn(), &mut f);
+        assert_eq!((r.sign_exp, r.mantissa), (0, 0x0100_0000_0000_0000));
+        assert_eq!(f.0, ExcFlags::UNFL);
+        // So is the product of two normalized numbers, and a denormalized
+        // number that is only moved.
+        let mut f = ExcFlags::default();
+        let half = scale(x(1.0), -8195, rn(), &mut ExcFlags::default());
+        assert_eq!(mul(half, half, rn(), &mut f), r);
+        assert_eq!(f.0, ExcFlags::UNFL);
+        let mut f = ExcFlags::default();
+        assert_eq!(round_to_precision(r, rn(), &mut f), r);
+        assert_eq!(f.0, ExcFlags::UNFL);
+        // Losing bits on the way makes it inexact as well.
+        let mut f = ExcFlags::default();
+        let third = div(x(1.0), x(3.0), rn(), &mut ExcFlags::default());
+        scale(third, -16390, rn(), &mut f);
+        assert_eq!(f.0, ExcFlags::UNFL | ExcFlags::INEX2);
+        // A zero exponent field with the integer bit set is a normalized
+        // number: 2^-16383 does not underflow.
+        let mut f = ExcFlags::default();
+        let r = scale(x(1.0), -16383, rn(), &mut f);
+        assert_eq!((r.sign_exp, r.mantissa), (0, 0x8000_0000_0000_0000));
+        assert_eq!(f.0, 0);
+        // One that rounds up to it was still too small before rounding.
+        let mut f = ExcFlags::default();
+        let below = FloatX80 {
+            sign_exp: 0x3FFE,
+            mantissa: 0xFFFF_FFFF_FFFF_FFFF,
+        };
+        let r = scale(below, -16383, rn(), &mut f);
+        assert_eq!((r.sign_exp, r.mantissa), (0, 0x8000_0000_0000_0000));
+        assert_eq!(f.0, ExcFlags::UNFL | ExcFlags::INEX2);
+    }
+
+    #[test]
+    fn an_overflow_is_inexact_only_when_its_mantissa_was_rounded() {
+        let max = FloatX80 {
+            sign_exp: 0x7FFE,
+            mantissa: 0xFFFF_FFFF_FFFF_FFFF,
+        };
+        // 2^16384, and twice the largest number: nothing to round.
+        let mut f = ExcFlags::default();
+        assert!(scale(x(1.0), 16384, rn(), &mut f).is_inf());
+        assert_eq!(f.0, ExcFlags::OVFL);
+        let mut f = ExcFlags::default();
+        assert!(add(max, max, rn(), &mut f).is_inf());
+        assert_eq!(f.0, ExcFlags::OVFL);
+        // Its square has 128 mantissa bits.
+        let mut f = ExcFlags::default();
+        assert!(mul(max, max, rn(), &mut f).is_inf());
+        assert_eq!(f.0, ExcFlags::OVFL | ExcFlags::INEX2);
+        // The same for a move to single or double.
+        let mut f = ExcFlags::default();
+        let big = scale(x(1.0), 2000, rn(), &mut ExcFlags::default());
+        assert_eq!(to_f32_bits(big, RoundMode::Nearest, &mut f), 0x7F80_0000);
+        assert_eq!(f.0, ExcFlags::OVFL);
+        let mut f = ExcFlags::default();
+        to_f64_bits(max, RoundMode::Nearest, &mut f);
+        assert_eq!(f.0, ExcFlags::OVFL | ExcFlags::INEX2);
+    }
+
+    #[test]
     fn moves_round_to_the_precision() {
         let double = RoundCtx {
             prec: Precision::Double,
@@ -1395,7 +1463,8 @@ mod tests {
         })
     }
 
-    /// Every f64 survives FMOVE.D exactly, without raising anything.
+    /// Every f64 survives FMOVE.D exactly. A denormal one underflows,
+    /// without being inexact; nothing else raises anything.
     #[test]
     fn to_f64_is_exact_for_f64_values() {
         for v in sample_f64s().filter(|v| !v.is_nan()) {
@@ -1405,7 +1474,8 @@ mod tests {
                 v.to_bits(),
                 "{v:e}"
             );
-            assert_eq!(f, ExcFlags::default(), "{v:e}");
+            let want = if v.is_subnormal() { ExcFlags::UNFL } else { 0 };
+            assert_eq!(f.0, want, "{v:e}");
         }
     }
 
@@ -1444,7 +1514,12 @@ mod tests {
             to_f64_bits(d, RoundMode::Nearest, &mut f),
             0x000C_0000_0000_0000
         );
-        assert_eq!(f, ExcFlags::default());
+        // Below the normalized range, so an underflow, but exact.
+        assert_eq!(f.0, ExcFlags::UNFL);
+        // The smallest normalized double is not one.
+        let mut f = ExcFlags::default();
+        to_f64_bits(x(f64::MIN_POSITIVE), RoundMode::Nearest, &mut f);
+        assert_eq!(f.0, 0);
 
         // 1e-600 is far below the f64 range: zero, or the smallest
         // denormal when rounding up.
