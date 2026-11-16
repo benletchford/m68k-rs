@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.17.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.16.1...m68k-v0.17.0) (2026-11-15)
+
+
+### Features
+
+* **fpu:** save the 68040 state frames and take its arithmetic exceptions ([#245](https://github.com/benletchford/m68k-rs/issues/245)) ([d5b8cc1](https://github.com/benletchford/m68k-rs/commit/d5b8cc1b40ce46b678f534a5b065eaf23539fb57))
+* **fpu:** take the 68060's arithmetic and unsupported-operand exceptions and save its EXCP frame ([#249](https://github.com/benletchford/m68k-rs/issues/249)) ([51cfdf8](https://github.com/benletchford/m68k-rs/commit/51cfdf8f4ea015c26ea8bf7ac6f963e8ede46f6f))
+* **timing:** let hosts charge 68040 instruction-fetch stalls ([1ec050f](https://github.com/benletchford/m68k-rs/commit/1ec050f252a06d4e6f26146772443680f51e526a))
+
+
+### Bug Fixes
+
+* **fpu:** convert to packed decimal exactly and by the rounding mode ([#251](https://github.com/benletchford/m68k-rs/issues/251)) ([194dd6b](https://github.com/benletchford/m68k-rs/commit/194dd6bae736839b829b0fad388a8bd33e845643))
+* **fpu:** correct rounding, condition codes and inexact reporting ([cd721d5](https://github.com/benletchford/m68k-rs/commit/cd721d5fd87bd3d599342d0cc8f81e8888e5909d))
+* **fpu:** give the M68060SP the trap frames it expects for packed and (An)+/-(An) operands ([#250](https://github.com/benletchford/m68k-rs/issues/250)) ([5cc4635](https://github.com/benletchford/m68k-rs/commit/5cc46354b67a4bb4fc5cb5deb407b76acece4c9a))
+* **fpu:** keep the payload of a packed decimal NaN ([#254](https://github.com/benletchford/m68k-rs/issues/254)) ([56d2df5](https://github.com/benletchford/m68k-rs/commit/56d2df56eb1094979660a3b16f84bb41f7e1d5bc))
+* **fpu:** report the functions of a tiny operand as inexact ([#255](https://github.com/benletchford/m68k-rs/issues/255)) ([d5f5a5b](https://github.com/benletchford/m68k-rs/commit/d5f5a5b1aef3a6b09686410a0f2db46a76631202))
+* **fpu:** set UNFL and INEX2 as the coprocessor does and normalize unnormalized operands ([#252](https://github.com/benletchford/m68k-rs/issues/252)) ([c6717ed](https://github.com/benletchford/m68k-rs/commit/c6717ed83a9afaaf72ed03c51d4a0087ad1d4973))
+* **fpu:** take enabled 6888x exceptions and validate state frames ([#243](https://github.com/benletchford/m68k-rs/issues/243)) ([0707574](https://github.com/benletchford/m68k-rs/commit/07075749069780d447751fc157e8c2b58a782584))
+* **fpu:** take vector 60 for an extended immediate source on the 68060 ([#253](https://github.com/benletchford/m68k-rs/issues/253)) ([f9d8e0e](https://github.com/benletchford/m68k-rs/commit/f9d8e0e9a73d9bec39b2d878003a6c507b4a37e0))
+* **fpu:** treat a zero mantissa as zero whatever the exponent ([#244](https://github.com/benletchford/m68k-rs/issues/244)) ([a523916](https://github.com/benletchford/m68k-rs/commit/a5239168229b9459041bd44950f1a53f81be246e))
+* **mmu:** model 68030 TT fields, history bits, table limits and PTEST level 0 ([#241](https://github.com/benletchford/m68k-rs/issues/241)) ([6c1cd21](https://github.com/benletchford/m68k-rs/commit/6c1cd21224fee848f575eb7415e6ca9067cce4f3))
+* **mmu:** model 68040/68060 TTR matching, history bits, PTEST MMUSR and MA ([1d66497](https://github.com/benletchford/m68k-rs/commit/1d66497d7117b833bab4f4ce3927087576e5e697))
+
 ## [0.16.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.16.0...m68k-v0.16.1) (2026-11-13)
 
 
