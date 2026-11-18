@@ -347,7 +347,7 @@ impl CpuCore {
         self.fpiar = self.ppc;
         let mut flags = ExcFlags::default();
         let value = raw.to_x80(&mut flags);
-        let registers = self.fpr;
+        let registers = super::operations::FprUndo::before(&self.fpr, w2);
         let cycles = self.fpu_apply_op(opmode, dst, value, flags);
         Some(self.fpu_040_hold_exception(cycles, w2, src.value, &registers))
     }
@@ -377,7 +377,7 @@ impl CpuCore {
         }
 
         self.fpiar = self.ppc;
-        let registers = self.fpr;
+        let registers = super::operations::FprUndo::before(&self.fpr, w2);
         let cycles = self.fpu_apply_op(opmode, dst, src.value, ExcFlags::default());
         Some(self.fpu_040_hold_exception(cycles, w2, src.value, &registers))
     }
@@ -442,19 +442,21 @@ impl CpuCore {
     /// the FP registers before the operation. FSAVE before the next
     /// floating-point instruction collects the frame, and FRESTORE of it
     /// holds the exception again.
+    #[inline]
     pub(super) fn fpu_040_hold_exception(
         &mut self,
         cycles: i32,
         w2: u16,
         src: FloatX80,
-        registers: &[FloatX80; 8],
+        registers: &super::operations::FprUndo,
     ) -> i32 {
         if cycles != 0
+            && self.fpu_may_hold_exception()
             && let Some(vector) = self.fpu_040_arith_vector()
         {
-            self.fpu_040_arith_state(vector, w2, src, registers[((w2 >> 7) & 7) as usize]);
+            self.fpu_040_arith_state(vector, w2, src, registers.dst_before());
             if !self.fpu_040_stores_result(vector) {
-                self.fpr = *registers;
+                registers.restore(&mut self.fpr);
             }
             self.fpu_040.pending = true;
         }

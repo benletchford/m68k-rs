@@ -10,6 +10,8 @@
 mod dd;
 mod exceptions_040;
 mod exceptions_060;
+#[cfg(test)]
+mod fast_path_tests;
 mod operations;
 mod packed;
 mod softfloat;

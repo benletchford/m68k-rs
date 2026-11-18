@@ -288,23 +288,25 @@ impl CpuCore {
     /// EXCP state its handler saves. `w2` is the command word, `operand`
     /// the source as the frame holds it, `src` its value and `registers`
     /// the FP registers before the operation.
+    #[inline]
     pub(super) fn fpu_060_hold_exception(
         &mut self,
         cycles: i32,
         w2: u16,
         operand: FloatX80,
         src: FloatX80,
-        registers: &[FloatX80; 8],
+        registers: &super::operations::FprUndo,
     ) -> i32 {
         if cycles != 0
+            && self.fpu_may_hold_exception()
             && let Some(vector) = self.fpu_arith_vector(self.trap_unimpl_060())
         {
-            let dst_before = registers[((w2 >> 7) & 7) as usize];
+            let dst_before = registers.dst_before();
             let operand = self.fpu_060_exception_operand(w2, operand, src, dst_before);
             self.fpu_060_excp = Some(Fpu060Excp::new(vector, operand));
             self.fpu_exception_pending = vector as u8;
             if !self.fpu_060_stores_result(vector) {
-                self.fpr = *registers;
+                registers.restore(&mut self.fpr);
             }
         }
         cycles
