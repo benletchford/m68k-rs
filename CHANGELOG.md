@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.17.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.0...m68k-v0.17.1) (2026-11-18)
+
+
+### Performance Improvements
+
+* **cpu:** speed up translated memory and indexed operations ([a2ab788](https://github.com/benletchford/m68k-rs/commit/a2ab788fd25b01deba18594ed63e473a8467d3a3))
+* **fastmem:** resolve primary-window hits with a single range check ([#260](https://github.com/benletchford/m68k-rs/issues/260)) ([3d32281](https://github.com/benletchford/m68k-rs/commit/3d322818f3041796db3a9e6876c67a790a46992c))
+* **fpu:** skip exception bookkeeping when no FP exception can be held ([#262](https://github.com/benletchford/m68k-rs/issues/262)) ([abd8b5b](https://github.com/benletchford/m68k-rs/commit/abd8b5bcd67cc81d0aba7ed38b249a28aa6fe906))
+* **fpu:** skip the hold path for masked arithmetic exceptions ([c2fc65b](https://github.com/benletchford/m68k-rs/commit/c2fc65b093ac12c88f619e24ec56930b8ef7823a))
+
 ## [0.17.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.16.1...m68k-v0.17.0) (2026-11-15)
 
 
