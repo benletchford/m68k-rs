@@ -1155,16 +1155,15 @@ impl CpuCore {
                 // PMMU cannot translate without a table search, take the
                 // normal fetch path (and its fault handling).
                 let addr = self.address(self.pc);
-                let off = if TRANSLATED {
+                let p = if TRANSLATED {
                     self.code_window_off(addr)
+                        .map(|off| self.window_host_ptr(off))
                 } else {
-                    self.physical_window_off(addr, 2, false)
+                    self.physical_window_ptr(addr, 2, false)
                 };
-                if let Some(off) = off {
-                    let opcode = unsafe {
-                        let p = self.window_host_ptr(off);
-                        u16::from_be_bytes([*p, *p.add(1)])
-                    };
+                if let Some(p) = p {
+                    // SAFETY: the window covers both bytes of the opcode.
+                    let opcode = unsafe { u16::from_be_bytes([*p, *p.add(1)]) };
                     self.pc = self.pc.wrapping_add(2);
                     opcode
                 } else {

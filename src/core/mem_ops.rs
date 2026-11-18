@@ -613,12 +613,12 @@ impl<const TRANSLATED: bool> Win<TRANSLATED> {
     // different allocation. No borrow of CpuCore survives register updates.
     #[inline(always)]
     fn data(self, cpu: &CpuCore, addr: u32, bytes: u32, write: bool) -> Option<usize> {
-        let off = if TRANSLATED {
-            cpu.translated_window_off(addr, bytes, write, false)
-        } else {
-            cpu.physical_window_off(addr, bytes, write)
-        }?;
-        Some(cpu.window_host_ptr(off) as usize)
+        if TRANSLATED {
+            let off = cpu.translated_window_off(addr, bytes, write, false)?;
+            return Some(cpu.window_host_ptr(off) as usize);
+        }
+        cpu.physical_window_ptr(addr, bytes, write)
+            .map(|p| p as usize)
     }
 
     #[inline(always)]
@@ -626,8 +626,7 @@ impl<const TRANSLATED: bool> Win<TRANSLATED> {
         if TRANSLATED {
             return translated_code(cpu, addr);
         }
-        cpu.physical_window_off(addr, 2, false)
-            .map(|off| cpu.window_host_ptr(off) as usize)
+        cpu.physical_window_ptr(addr, 2, false).map(|p| p as usize)
     }
 
     #[inline]

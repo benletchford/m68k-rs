@@ -245,7 +245,7 @@ impl CpuCore {
         }
         // u32::MAX is the native helper's miss sentinel. An access at exactly
         // fm_base-1 remains correct through the bus rather than being accelerated.
-        if off == u32::MAX {
+        if off == u32::MAX || self.fm_region_count == 0 {
             return None;
         }
         self.fm_regions[..self.fm_region_count]
@@ -271,6 +271,43 @@ impl CpuCore {
         }
     }
 
+    /// Host address of a `bytes`-byte access at the physical `addr`, or
+    /// `None` when the access must go through the bus: the result of
+    /// [`Self::physical_window_off`] already resolved by
+    /// [`Self::window_host_ptr`].
+    ///
+    /// The interpreter's data accesses and opcode fetches call this on every
+    /// instruction, so a hit in the primary window costs one range check
+    /// (plus the read-only test for a write, which folds away for a read);
+    /// extra regions are searched out of line.
+    #[inline(always)]
+    pub(crate) fn physical_window_ptr(
+        &self,
+        addr: u32,
+        bytes: u32,
+        write: bool,
+    ) -> Option<*mut u8> {
+        let off = addr.wrapping_sub(self.fm_base);
+        if bytes != 0
+            && u64::from(off) + u64::from(bytes) <= u64::from(self.fm_len)
+            && !(write && self.fm_readonly)
+        {
+            // SAFETY: `[off, off + bytes)` lies inside the primary window.
+            return Some(unsafe { (self.fm_ptr as *mut u8).add(off as usize) });
+        }
+        self.extra_window_ptr(addr, bytes, write)
+    }
+
+    /// [`Self::physical_window_ptr`] outside the primary window (or for a
+    /// write to a read-only primary window, which no region can cover, as
+    /// regions never overlap it).
+    #[cold]
+    #[inline(never)]
+    fn extra_window_ptr(&self, addr: u32, bytes: u32, write: bool) -> Option<*mut u8> {
+        let off = self.physical_window_off(addr, bytes, write)?;
+        Some(self.window_host_ptr(off))
+    }
+
     /// Resolve a previously range- and permission-checked physical token.
     #[inline]
     pub(crate) fn window_host_ptr(&self, off: u32) -> *mut u8 {
@@ -278,6 +315,13 @@ impl CpuCore {
             // SAFETY: every caller has validated the complete access range.
             return unsafe { (self.fm_ptr as *mut u8).add(off as usize) };
         }
+        self.region_host_ptr(off)
+    }
+
+    /// [`Self::window_host_ptr`] for a token outside the primary window.
+    #[cold]
+    #[inline(never)]
+    fn region_host_ptr(&self, off: u32) -> *mut u8 {
         let addr = self.fm_base.wrapping_add(off);
         self.fm_regions[..self.fm_region_count]
             .iter()
@@ -292,4 +336,83 @@ impl CpuCore {
 pub(crate) extern "C" fn trace_window_ptr(cpu: *const CpuCore, off: u32) -> usize {
     // SAFETY: generated code owns the live CpuCore and has preflighted this token.
     unsafe { (&*cpu).window_host_ptr(off) as usize }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every window layout the pointer fast path must agree with the token
+    /// path on: a lone RAM window, a lone read-only window (ROM promoted to
+    /// primary), and a primary window with read-only and writable regions
+    /// on either side of it.
+    #[test]
+    fn window_pointers_match_the_checked_token_path() {
+        let mut primary = vec![0u8; 0x100];
+        let mut low_rom = vec![0u8; 0x40];
+        let mut high_ram = vec![0u8; 0x40];
+        let primary_ptr = primary.as_mut_ptr() as usize;
+        let rom_region = Region {
+            ptr: low_rom.as_mut_ptr() as usize,
+            base: 0x0800,
+            len: 0x40,
+            writable: false,
+        };
+        let ram_region = Region {
+            ptr: high_ram.as_mut_ptr() as usize,
+            base: 0x1200,
+            len: 0x40,
+            writable: true,
+        };
+        for (readonly, regions) in [
+            (false, &[][..]),
+            (true, &[][..]),
+            (false, &[rom_region, ram_region][..]),
+            (true, &[rom_region, ram_region][..]),
+        ] {
+            let mut cpu = CpuCore::new();
+            cpu.fm_ptr = primary_ptr;
+            cpu.fm_base = 0x1000;
+            cpu.fm_len = 0x100;
+            cpu.fm_readonly = readonly;
+            cpu.fm_regions[..regions.len()].copy_from_slice(regions);
+            cpu.fm_region_count = regions.len();
+            let probes = (0x07f0..0x0850)
+                .chain(0x0ff0..0x1110)
+                .chain(0x11f0..0x1250)
+                .chain([0, u32::MAX - 3, u32::MAX]);
+            for addr in probes {
+                for bytes in [1, 2, 4, 6] {
+                    for write in [false, true] {
+                        let token = cpu
+                            .physical_window_off(addr, bytes, write)
+                            .map(|off| cpu.window_host_ptr(off));
+                        let direct = cpu.physical_window_ptr(addr, bytes, write);
+                        assert_eq!(
+                            direct,
+                            token,
+                            "addr {addr:#x} bytes {bytes} write {write} \
+                             readonly {readonly} regions {}",
+                            regions.len()
+                        );
+                        // Spot-check the expected answers independently.
+                        let end = u64::from(addr) + u64::from(bytes);
+                        let in_primary = addr >= 0x1000 && end <= 0x1100;
+                        let in_rom = addr >= 0x0800 && end <= 0x0840;
+                        let in_ram = addr >= 0x1200 && end <= 0x1240;
+                        let expected = if in_primary && !(write && readonly) {
+                            Some(primary_ptr + (addr - 0x1000) as usize)
+                        } else if !regions.is_empty() && in_rom && !write {
+                            Some(rom_region.ptr + (addr - 0x0800) as usize)
+                        } else if !regions.is_empty() && in_ram {
+                            Some(ram_region.ptr + (addr - 0x1200) as usize)
+                        } else {
+                            None
+                        };
+                        assert_eq!(direct.map(|p| p as usize), expected, "addr {addr:#x}");
+                    }
+                }
+            }
+        }
+    }
 }
