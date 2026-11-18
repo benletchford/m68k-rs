@@ -1156,8 +1156,7 @@ impl CpuCore {
                 // normal fetch path (and its fault handling).
                 let addr = self.address(self.pc);
                 let p = if TRANSLATED {
-                    self.code_window_off(addr)
-                        .map(|off| self.window_host_ptr(off))
+                    self.code_window_ptr(addr).map(|ptr| ptr as *mut u8)
                 } else {
                     self.physical_window_ptr(addr, 2, false)
                 };

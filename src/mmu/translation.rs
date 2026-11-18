@@ -503,6 +503,8 @@ pub(crate) struct ResidentMmu {
     /// Whether a transparent-translation register the access path checks
     /// is enabled.
     tt: bool,
+    /// 040 data page shift when an ordinary data access can consult the ATC directly.
+    pub(crate) data_shift: u8,
     /// Byte mask of the smallest page any translation or interpreter page
     /// split uses: an access inside one such page translates through a
     /// single TT match or ATC entry, exactly as the interpreter would.
@@ -525,6 +527,15 @@ impl ResidentMmu {
             return Self {
                 kind: RESIDENT_040,
                 shift: page_bits,
+                data_shift: if (cpu.dtt0 | cpu.dtt1) & 0x8000 == 0
+                    && cpu.mmu_fc_override.is_none()
+                    && cpu.mmu_read_override.is_none()
+                    && cpu.mmu_write_suppress.is_none()
+                {
+                    page_bits
+                } else {
+                    0
+                },
                 tt,
                 page_mask: (1 << page_bits) - 1,
             };
@@ -540,6 +551,7 @@ impl ResidentMmu {
         Self {
             kind: RESIDENT_030,
             shift: shift as u8,
+            data_shift: 0,
             tt,
             page_mask: cpu.mmu_page_mask().min(atc_mask),
         }

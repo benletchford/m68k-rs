@@ -33,7 +33,6 @@ impl CpuCore {
     pub fn exec_bitfield<B: AddressBus>(&mut self, bus: &mut B, opcode: u16) -> i32 {
         // Read extension word first (before EA extension words).
         let ext = self.read_imm_16(bus);
-        let spec = self.decode_bitfield_spec(bus, ext);
 
         let ea_mode = ((opcode >> 3) & 7) as u8;
         let ea_reg = (opcode & 7) as u8;
@@ -47,78 +46,9 @@ impl CpuCore {
 
         // Read the field (from reg or memory), then apply op.
         match mode {
-            AddressingMode::DataDirect(dn) => {
-                let reg = dn as usize;
-                let orig = self.d(reg);
-                let reg_offset = spec.offset & 31;
-                let field = bf_extract_reg_msb0(orig, reg_offset, spec.width);
-
-                match op {
-                    0x8 => {
-                        // BFTST
-                        self.set_bitfield_flags(field, spec.width);
-                        8
-                    }
-                    0x9 => {
-                        // BFEXTU
-                        self.set_d(spec.reg, field);
-                        self.set_bitfield_flags(field, spec.width);
-                        8
-                    }
-                    0xA => {
-                        // BFCHG
-                        self.set_bitfield_flags(field, spec.width);
-                        let mask = bf_mask(spec.width);
-                        let new_field = field ^ mask;
-                        let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, new_field);
-                        self.set_d(reg, newv);
-                        8
-                    }
-                    0xB => {
-                        // BFEXTS
-                        let signed = bf_sign_extend(field, spec.width);
-                        self.set_d(spec.reg, signed);
-                        self.set_bitfield_flags(field, spec.width);
-                        8
-                    }
-                    0xC => {
-                        // BFCLR
-                        self.set_bitfield_flags(field, spec.width);
-                        let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, 0);
-                        self.set_d(reg, newv);
-                        8
-                    }
-                    0xD => {
-                        // BFFFO
-                        let (pos, z) = bf_find_first_one(field, spec.width, spec.offset);
-                        self.set_d(spec.reg, pos);
-                        self.set_bitfield_flags(field, spec.width);
-                        if z {
-                            self.not_z_flag = 0;
-                        }
-                        8
-                    }
-                    0xE => {
-                        // BFSET
-                        self.set_bitfield_flags(field, spec.width);
-                        let mask = bf_mask(spec.width);
-                        let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, mask);
-                        self.set_d(reg, newv);
-                        8
-                    }
-                    0xF => {
-                        // BFINS (insert from Dn spec.reg)
-                        let src = self.d(spec.reg);
-                        let src_field = src & bf_mask(spec.width);
-                        self.set_bitfield_flags(src_field, spec.width);
-                        let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, src_field);
-                        self.set_d(reg, newv);
-                        8
-                    }
-                    _ => self.take_exception(bus, 4),
-                }
-            }
+            AddressingMode::DataDirect(_) if op >= 8 => self.bitfield_data_register(opcode, ext),
             _ => {
+                let spec = self.decode_bitfield_spec(ext);
                 // Memory EA
                 if mode.is_register_direct() || matches!(mode, AddressingMode::Immediate) {
                     return self.take_exception(bus, 4);
@@ -211,7 +141,75 @@ impl CpuCore {
         }
     }
 
-    fn decode_bitfield_spec<B: AddressBus>(&mut self, _bus: &mut B, ext: u16) -> BitFieldSpec {
+    /// Register form after the extension word has been safely fetched.
+    pub(crate) fn bitfield_data_register(&mut self, opcode: u16, ext: u16) -> i32 {
+        let spec = self.decode_bitfield_spec(ext);
+        let op = (opcode >> 8) & 15;
+        let reg = usize::from(opcode & 7);
+        let orig = self.d(reg);
+        let reg_offset = spec.offset & 31;
+        let field = bf_extract_reg_msb0(orig, reg_offset, spec.width);
+
+        match op {
+            0x8 => {
+                // BFTST
+                self.set_bitfield_flags(field, spec.width);
+            }
+            0x9 => {
+                // BFEXTU
+                self.set_d(spec.reg, field);
+                self.set_bitfield_flags(field, spec.width);
+            }
+            0xA => {
+                // BFCHG
+                self.set_bitfield_flags(field, spec.width);
+                let mask = bf_mask(spec.width);
+                let new_field = field ^ mask;
+                let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, new_field);
+                self.set_d(reg, newv);
+            }
+            0xB => {
+                // BFEXTS
+                let signed = bf_sign_extend(field, spec.width);
+                self.set_d(spec.reg, signed);
+                self.set_bitfield_flags(field, spec.width);
+            }
+            0xC => {
+                // BFCLR
+                self.set_bitfield_flags(field, spec.width);
+                let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, 0);
+                self.set_d(reg, newv);
+            }
+            0xD => {
+                // BFFFO
+                let (pos, z) = bf_find_first_one(field, spec.width, spec.offset);
+                self.set_d(spec.reg, pos);
+                self.set_bitfield_flags(field, spec.width);
+                if z {
+                    self.not_z_flag = 0;
+                }
+            }
+            0xE => {
+                // BFSET
+                self.set_bitfield_flags(field, spec.width);
+                let mask = bf_mask(spec.width);
+                let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, mask);
+                self.set_d(reg, newv);
+            }
+            0xF => {
+                // BFINS (insert from Dn spec.reg)
+                let src = self.d(spec.reg);
+                let src_field = src & bf_mask(spec.width);
+                self.set_bitfield_flags(src_field, spec.width);
+                let newv = bf_insert_reg_msb0(orig, reg_offset, spec.width, src_field);
+                self.set_d(reg, newv);
+            }
+            _ => unreachable!(),
+        }
+        8
+    }
+
+    fn decode_bitfield_spec(&self, ext: u16) -> BitFieldSpec {
         let reg = ((ext >> 12) & 7) as usize;
 
         let offset = if (ext & 0x0800) != 0 {
@@ -271,39 +269,20 @@ fn bf_sign_extend(field: u32, width: u32) -> u32 {
 }
 
 fn bf_find_first_one(field: u32, width: u32, base_offset: u32) -> (u32, bool) {
-    if field == 0 {
-        // Undefined by spec; Musashi-style deterministic choice: offset + width.
-        return (base_offset.wrapping_add(width), true);
-    }
-
-    for i in 0..width {
-        let bit = (field >> (width - 1 - i)) & 1;
-        if bit != 0 {
-            return (base_offset.wrapping_add(i), false);
-        }
-    }
-    (base_offset.wrapping_add(width), true)
+    // The extracted field is right-aligned. For zero this yields width,
+    // preserving the deterministic offset + width result.
+    let position = field.leading_zeros() - (32 - width);
+    (base_offset.wrapping_add(position), field == 0)
 }
 
 fn bf_extract_reg_msb0(value: u32, offset: u32, width: u32) -> u32 {
-    let mut out = 0u32;
-    for i in 0..width {
-        let pos = (offset + i) & 31;
-        let bit = (value >> (31 - pos)) & 1;
-        out = (out << 1) | bit;
-    }
-    out
+    value.rotate_left(offset) >> (32 - width)
 }
 
 fn bf_insert_reg_msb0(orig: u32, offset: u32, width: u32, field: u32) -> u32 {
-    let mut v = orig;
-    for i in 0..width {
-        let pos = (offset + i) & 31;
-        let bit = (field >> (width - 1 - i)) & 1;
-        let shift = 31 - pos;
-        v = (v & !(1u32 << shift)) | (bit << shift);
-    }
-    v
+    let mask = bf_mask(width);
+    let rotation = offset + width;
+    (orig & !mask.rotate_right(rotation)) | (field & mask).rotate_right(rotation)
 }
 
 fn bf_extract_mem_window_msb0<B: AddressBus>(
@@ -371,5 +350,38 @@ fn bf_store_mem_window<B: AddressBus>(
     }
     if bytes_len == 5 {
         cpu.write_8(bus, start_addr.wrapping_add(4), (window & 0xFF) as u8);
+    }
+}
+
+#[cfg(test)]
+mod register_field_tests {
+    use super::*;
+
+    #[test]
+    fn register_fields_match_msb_first_bit_numbering() {
+        for value in [0, u32::MAX, 0x8123_4567, 0x5ae4_b818] {
+            for offset in 0..32 {
+                for width in 1..=32 {
+                    let mut extracted = 0;
+                    let mut inserted = !value;
+                    for i in 0..width {
+                        let bit = 31 - ((offset + i) & 31);
+                        extracted = (extracted << 1) | ((value >> bit) & 1);
+                        let replacement = (value >> (width - 1 - i)) & 1;
+                        inserted = (inserted & !(1 << bit)) | (replacement << bit);
+                    }
+                    assert_eq!(bf_extract_reg_msb0(value, offset, width), extracted);
+                    assert_eq!(bf_insert_reg_msb0(!value, offset, width, value), inserted);
+                    let first = (0..width).find(|i| extracted & (1 << (width - 1 - i)) != 0);
+                    assert_eq!(
+                        bf_find_first_one(extracted, width, u32::MAX),
+                        (
+                            u32::MAX.wrapping_add(first.unwrap_or(width)),
+                            first.is_none()
+                        )
+                    );
+                }
+            }
+        }
     }
 }

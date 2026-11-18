@@ -330,7 +330,7 @@ fn compiled_mmu_guards_translation_and_region_permissions() {
     c.run_batch(&mut b, 16384, &[]);
     assert_eq!(compiled_once(&mut c, &mut b, 0x8000), 4);
     assert_eq!(&b.primary[..4], &0x12345678u32.to_be_bytes());
-    for mode in 0..4 {
+    for mode in 0..9 {
         c.pc = 0x8000;
         c.set_a(0, if mode == 0 { 0x4ffe } else { 0x4000 });
         c.atc.insert(
@@ -340,21 +340,50 @@ fn compiled_mmu_guards_translation_and_region_permissions() {
             mode == 2,
             false,
         );
-        if mode == 3 {
-            c.atc.flush_page(5);
+        c.mmu_write_suppress = None;
+        c.dtt0 = 0;
+        match mode {
+            3 => c.atc.flush_page(5),
+            4 => c.atc.insert_entry(5, true, PRIMARY, false, false, false),
+            5 => c.atc.insert(5, false, PRIMARY, false, false),
+            6 => c.atc.insert(
+                5 + crate::mmu::atc::ATC_ENTRIES as u32,
+                true,
+                PRIMARY,
+                false,
+                false,
+            ),
+            7 => c.mmu_write_suppress = Some(0x5002),
+            // Write-protected transparent mapping applies before the ATC.
+            8 => c.dtt0 = 0x00ff_c004,
+            _ => {}
         }
         let registers = c.dar;
         let memory = b.clone();
         assert_eq!(
             compiled_once(&mut c, &mut b, 0x8000),
             0,
-            "page crossing, ROM write, ATC protection, or ATC miss: {mode}"
+            "translated MOVE must bail atomically in case {mode}"
         );
         assert_eq!(c.dar, registers);
         assert_eq!(b.primary, memory.primary);
         assert_eq!(b.rom, memory.rom);
         assert_eq!(b.writes, memory.writes);
     }
+
+    // Reuse the same compiled body under an 8 KiB user mapping.
+    c.set_sr(0);
+    c.dtt0 = 0;
+    c.mmu_tc = 0xc000;
+    c.atc.flush_all();
+    c.atc.insert(4, false, ROM, false, false);
+    c.atc.insert(2, false, RAM, false, false);
+    c.atc.insert(3, false, PRIMARY, false, false);
+    c.pc = 0x8000;
+    c.set_a(0, 0x4000);
+    c.set_a(1, 0x6000);
+    assert_eq!(compiled_once(&mut c, &mut b, 0x8000), 4);
+    assert_eq!(&b.primary[..4], &0x12345678u32.to_be_bytes());
 }
 
 #[test]
@@ -479,4 +508,45 @@ fn invalid_and_aliased_regions_are_not_installed() {
         c.capture_extra_window(region);
         assert_eq!(c.fm_region_count, count);
     }
+}
+
+#[test]
+fn translated_program_page_needs_one_contiguous_window() {
+    let mut b = Bus::new(&[]);
+    b.primary.resize(4096, 0);
+    let mut c = cpu();
+    c.mmu_tc = 0x8000;
+    c.pmmu_enabled = true;
+    c.atc.insert(4, true, PRIMARY, false, false);
+    c.atc.insert(5, true, RAM, false, false);
+    install_windows(&mut c, &mut b);
+    assert_eq!(c.code_window_ptr(0x4000), Some(b.primary.as_ptr() as usize));
+    assert_eq!(
+        c.remembered_code_ptr(0x4ffe),
+        Some(b.primary.as_ptr() as usize + 4094)
+    );
+    assert_eq!(c.code_window_ptr(0x4fff), None);
+    // RAM covers only a quarter of this page. A word in that quarter can
+    // still use the window without licensing the rest of the page.
+    assert_eq!(c.code_window_ptr(0x5000), Some(b.ram.as_ptr() as usize));
+    assert_eq!(c.remembered_code_ptr(0x5002), None);
+    assert_eq!(c.code_window_ptr(0x5400), None);
+    c.atc.flush_page(4);
+    c.refresh_window_mmu();
+    assert_eq!(c.code_window_ptr(0x4000), None);
+}
+
+#[test]
+fn full_indexed_lea_validates_the_displacement_word() {
+    // LEA (-256,A0,D2.L*4),A1 / ADDQ.L #1,D3 / BRA.S back
+    let mut b = Bus::new(&[0x43f0, 0x2d20, 0xff00, 0x5283, 0x60f6]);
+    let mut c = cpu();
+    c.set_a(0, 0x1000);
+    c.set_d(2, 0x20);
+    c.run_batch(&mut b, 12288, &[]);
+    assert_eq!(compiled_once(&mut c, &mut b, ROM), 3);
+    assert_eq!(c.dar[9], 0xf80);
+    b.rom[4..6].copy_from_slice(&0x0180u16.to_be_bytes());
+    assert_eq!(c.run_batch(&mut b, 12, &[]).instructions, 12);
+    assert_eq!(c.dar[9], 0x1200);
 }

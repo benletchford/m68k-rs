@@ -419,12 +419,12 @@ pub struct CpuCore {
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_mmu: crate::mmu::ResidentMmu,
     // The translated window's latest program-space answer: a logical page
-    // and the offset delta that locates it in the window. Valid only inside
-    // one run of the decoded batch loop (see `CpuCore::code_window_off`).
+    // and its host pointer inside a single validated window. Valid only inside
+    // one run of the decoded batch loop (see `CpuCore::code_window_ptr`).
     #[cfg_attr(feature = "serde", serde(skip))]
     pub(crate) fm_code_page: u32,
     #[cfg_attr(feature = "serde", serde(skip))]
-    pub(crate) fm_code_delta: u32,
+    pub(crate) fm_code_ptr: usize,
 
     // ========== Trace-JIT hot-loop filters ==========
     // Small PC sets (entries hold a PC or `TRACE_PC_NONE`). They keep
@@ -669,7 +669,7 @@ impl CpuCore {
             fm_store_filter: 0,
             fm_mmu: crate::mmu::ResidentMmu::default(),
             fm_code_page: super::window::NO_CODE_PAGE,
-            fm_code_delta: 0,
+            fm_code_ptr: 0,
             trace_record_skip: [super::trace_jit::TRACE_PC_NONE; 4],
             pending_trap_resume: None,
             trace_probe_skip: [super::trace_jit::TRACE_PC_NONE; 4],

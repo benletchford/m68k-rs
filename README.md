@@ -375,6 +375,14 @@ hit records a use in the 68030's replacement order -- not through the window,
 a compiled trace or the ordinary path -- so entries age by when table searches
 loaded them, and the saved order does not depend on what the trace JIT
 compiled. Outside `run_batch` replacement stays least recently used.
+Within a decoded run, opcode and extension fetches can reuse a host pointer
+when one contiguous window covers the entire translated code page. Bus
+fallbacks invalidate it. On the 68040 and 68060, native traces check the live
+ATC inline for ordinary data accesses to the primary window with 4 KiB
+pages. Transparent translation, alternate function codes, retry cycles and
+other page sizes use the general probe. A first write to a clean mapping
+still goes through the table search that sets its modified bit.
+
 Memory-to-memory MOVE notifications
 are omitted under translation, as on the ordinary path. Traces are compiled
 for translated or physical addresses and re-recorded when the PMMU is switched
