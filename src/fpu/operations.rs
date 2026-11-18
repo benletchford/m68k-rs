@@ -898,12 +898,15 @@ impl CpuCore {
     /// enabled, or it raised an overflow or underflow, which the 68040 and
     /// 68060 can take without its enable. Every hold and restore condition
     /// implies this, so when it is false (no exception raised, or none
-    /// enabled and no OVFL/UNFL, as for typical code under the reset FPCR)
+    /// of the raised flags enabled and no OVFL/UNFL)
     /// holding is skipped without the priority search.
     #[inline(always)]
     pub(super) fn fpu_may_hold_exception(&self) -> bool {
-        let raised = self.fpsr & 0xFF00;
-        raised != 0 && (self.fpcr & 0xFF00 != 0 || raised & 0x1800 != 0)
+        #[cfg(test)]
+        if super::fast_path_tests::FORCE_FULL_HOLD.get() {
+            return true;
+        }
+        self.fpsr & ((self.fpcr & 0xFF00) | 0x1800) != 0
     }
 
     /// The vector of the arithmetic exception the operation that just

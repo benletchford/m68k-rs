@@ -1,5 +1,5 @@
 //! The common-case shortcuts of the general FP instructions: holding no
-//! exception when FPCR enables none ([`CpuCore::fpu_may_hold_exception`]),
+//! exception when FPCR masks the raised flags ([`CpuCore::fpu_may_hold_exception`]),
 //! the direct dispatch of the dyadic arithmetic and the two-register undo
 //! snapshot ([`super::operations::FprUndo`]) must leave exactly the state the
 //! full exception path leaves.
@@ -7,6 +7,25 @@ use crate::core::cpu::CpuCore;
 use crate::core::memory::LinearMemoryBus;
 use crate::core::types::CpuType;
 use crate::fpu::FloatX80;
+
+std::thread_local! {
+    pub(super) static FORCE_FULL_HOLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[test]
+fn unrelated_exception_enables_skip_the_hold_path() {
+    let mut cpu = CpuCore::new();
+    cpu.fpcr = 0x3400; // OPERR, OVFL and DZ enabled
+    cpu.fpsr = 0x0208; // INEX2 raised and inexact accrued
+    assert!(!cpu.fpu_may_hold_exception());
+    cpu.fpcr |= 0x0200;
+    assert!(cpu.fpu_may_hold_exception());
+    cpu.fpcr = 0;
+    for raised in [0x1000, 0x0800] {
+        cpu.fpsr = raised;
+        assert!(cpu.fpu_may_hold_exception());
+    }
+}
 
 const PC: u32 = 0x1000;
 
@@ -114,21 +133,21 @@ fn state(cpu: &CpuCore) -> String {
 
 #[test]
 fn shortcuts_leave_the_state_of_the_full_exception_path() {
-    // FPCR $8000 enables only BSUN, which no arithmetic raises: the
-    // outcome is that of FPCR 0, but every hold goes through the full
-    // priority search. The low byte varies rounding mode and precision.
+    // Compare identical FPCRs with and without the early exit.
     let mut flagged = 0;
     for model in MODELS {
         for opmode in OPMODES {
             for &src in &operands() {
                 for &dst in &operands() {
-                    for low in [0x00, 0x30, 0x40, 0x90] {
-                        let fast = run(model, opmode, src, dst, low);
-                        let full = run(model, opmode, src, dst, 0x8000 | low);
+                    for fpcr in [0x00, 0x3430, 0x0240, 0x8090] {
+                        let fast = run(model, opmode, src, dst, fpcr);
+                        FORCE_FULL_HOLD.set(true);
+                        let full = run(model, opmode, src, dst, fpcr);
+                        FORCE_FULL_HOLD.set(false);
                         assert_eq!(
                             state(&fast),
                             state(&full),
-                            "{model:?} opmode {opmode:#x} src {src:?} dst {dst:?} fpcr {low:#x}"
+                            "{model:?} opmode {opmode:#x} src {src:?} dst {dst:?} fpcr {fpcr:#x}"
                         );
                         flagged += usize::from(fast.fpsr & 0xFF00 != 0);
                     }
