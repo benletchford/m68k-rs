@@ -230,13 +230,13 @@ pub(crate) enum JitEa {
     PreDec(u8),
     /// (d16,An), with the extension word captured in the trace.
     Disp(u8, i16),
-    /// Brief (d8,An,Xn), decoded once when the trace is recorded.
+    /// Direct indexed address with a signed displacement captured at record time.
     Index {
         base: u8,
         index: JitDirectReg,
         index_long: bool,
         scale: u8,
-        displacement: i8,
+        displacement: i16,
     },
     /// Brief (d8,PC,Xn): the PC-relative base and displacement collapse
     /// to a constant when the trace is recorded (the pc is the trace's
@@ -447,7 +447,7 @@ pub(crate) enum JitTraceOp {
         displacement: i16,
         cycles: i32,
     },
-    /// `LEA (d8,An,Xn),An` with the brief extension decoded once while
+    /// Direct indexed LEA with its extension words decoded once while
     /// recording. LEA is register-only: it accesses no memory and changes
     /// no condition codes.
     LeaIndex {
@@ -6576,10 +6576,28 @@ fn decode_an_disp_trace_op<B: AddressBus>(
             ea: FastEa::AnIndex(base),
         } => {
             let extension = read_ext(2, bus)?;
-            let src = decode_jit_ea(6, u16::from(base), extension, cpu_type)?;
+            // Direct full format, both registers present, with a null or word
+            // base displacement. The recorder can validate up to two extension
+            // words. Indirection and longer encodings stay with the decoder.
+            let (src, extension2) = if !is_pre_68020(cpu_type) && extension & 0x0100 != 0 {
+                let word = match extension & 0xff {
+                    0x10 => None,
+                    0x20 => Some(read_ext(4, bus)?),
+                    _ => return None,
+                };
+                (
+                    jit_an_index(base, extension, cpu_type, word.unwrap_or(0) as i16),
+                    word,
+                )
+            } else {
+                (
+                    decode_jit_ea(6, u16::from(base), extension, cpu_type)?,
+                    None,
+                )
+            };
             (
                 Some(extension),
-                None,
+                extension2,
                 JitTraceOp::LeaIndex {
                     src,
                     dst,
@@ -7117,6 +7135,26 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     })
 }
 
+fn jit_an_index(base: u8, extension: u16, cpu_type: CpuType, displacement: i16) -> JitEa {
+    let index_num = ((extension >> 12) & 7) as u8;
+    let index = if (extension & 0x8000) != 0 {
+        JitDirectReg::Addr(index_num)
+    } else {
+        JitDirectReg::Data(index_num)
+    };
+    JitEa::Index {
+        base,
+        index,
+        index_long: (extension & 0x0800) != 0,
+        scale: if is_pre_68020(cpu_type) {
+            0
+        } else {
+            ((extension >> 9) & 3) as u8
+        },
+        displacement,
+    }
+}
+
 fn decode_jit_ea(mode: u16, reg: u16, extension: u16, cpu_type: CpuType) -> Option<JitEa> {
     Some(match mode & 7 {
         0 => JitEa::Data(reg as u8),
@@ -7129,23 +7167,7 @@ fn decode_jit_ea(mode: u16, reg: u16, extension: u16, cpu_type: CpuType) -> Opti
             if !is_pre_68020(cpu_type) && (extension & 0x0100) != 0 {
                 return None;
             }
-            let index_num = ((extension >> 12) & 7) as u8;
-            let index = if (extension & 0x8000) != 0 {
-                JitDirectReg::Addr(index_num)
-            } else {
-                JitDirectReg::Data(index_num)
-            };
-            JitEa::Index {
-                base: reg as u8,
-                index,
-                index_long: (extension & 0x0800) != 0,
-                scale: if is_pre_68020(cpu_type) {
-                    0
-                } else {
-                    ((extension >> 9) & 3) as u8
-                },
-                displacement: extension as u8 as i8,
-            }
+            jit_an_index(reg as u8, extension, cpu_type, i16::from(extension as i8))
         }
         _ => return None,
     })
@@ -9991,6 +10013,92 @@ fn translated_window_off(
     bytes: u32,
     write: bool,
 ) -> Value {
+    // Check the live 040/060 ATC in the native loop. The general helper
+    // covers transparent mappings, exceptional cycles and other windows.
+    use crate::mmu::ResidentMmu;
+    use crate::mmu::atc::{ATC_ENTRIES, Atc, AtcEntry};
+    let slow = builder.create_block();
+    builder.set_cold_block(slow);
+    let join = builder.create_block();
+    builder.append_block_param(join, types::I32);
+    if !write || !env.primary_readonly {
+        let shift = load_u8(
+            builder,
+            env.cpu,
+            offset_of!(CpuCore, fm_mmu) + offset_of!(ResidentMmu, data_shift),
+        );
+        let ordinary = builder.ins().icmp_imm(IntCC::Equal, shift, 12);
+        let hit = builder.create_block();
+        builder.ins().brif(ordinary, hit, &[], slow, &[]);
+        builder.switch_to_block(hit);
+        let within = builder.ins().band_imm(masked, 4095);
+        if bytes > 1 {
+            let crosses =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThan, within, 4096 - i64::from(bytes));
+            branch_guard(builder, bail, crosses);
+        }
+        let frame = builder.ins().ushr_imm(masked, 12);
+        let slot = builder.ins().band_imm(frame, (ATC_ENTRIES - 1) as i64);
+        let index = if env.fm_ptr_ty == types::I32 {
+            slot
+        } else {
+            builder.ins().uextend(env.fm_ptr_ty, slot)
+        };
+        let offset = builder
+            .ins()
+            .imul_imm(index, std::mem::size_of::<AtcEntry>() as i64);
+        let entry = builder.ins().iadd(env.cpu, offset);
+        let fields = (offset_of!(CpuCore, atc) + offset_of!(Atc, entries)) as i32;
+        let cached = builder.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            entry,
+            fields + offset_of!(AtcEntry, page_frame) as i32,
+        );
+        let wrong_page = builder.ins().icmp(IntCC::NotEqual, frame, cached);
+        let supervisor = load_u32(builder, env.cpu, offset_of!(CpuCore, s_flag));
+        let sup_bit = builder
+            .ins()
+            .iconst(types::I8, i64::from(Atc::access_bit(true, write)));
+        let user_bit = builder
+            .ins()
+            .iconst(types::I8, i64::from(Atc::access_bit(false, write)));
+        let bit = builder.ins().select(supervisor, sup_bit, user_bit);
+        let access = builder.ins().load(
+            types::I8,
+            MemFlags::trusted(),
+            entry,
+            fields + offset_of!(AtcEntry, access) as i32,
+        );
+        let allowed = builder.ins().band(access, bit);
+        let denied = builder.ins().icmp_imm(IntCC::Equal, allowed, 0);
+        let miss = builder.ins().bor(wrong_page, denied);
+        branch_guard(builder, bail, miss);
+        let base = builder.ins().load(
+            types::I32,
+            MemFlags::trusted(),
+            entry,
+            fields + offset_of!(AtcEntry, phys_page) as i32,
+        );
+        let phys = builder.ins().bor(base, within);
+        let phys = builder.ins().band_imm(phys, i64::from(env.address_mask));
+        let off = builder.ins().isub(phys, env.fm_base);
+        let limit = builder.ins().iadd_imm(env.fm_len, -i64::from(bytes));
+        let mut outside = builder.ins().icmp(IntCC::UnsignedGreaterThan, off, limit);
+        if bytes > 4 {
+            let short =
+                builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedLessThan, env.fm_len, i64::from(bytes));
+            outside = builder.ins().bor(outside, short);
+        }
+        builder.ins().brif(outside, slow, &[], join, &[off.into()]);
+    } else {
+        builder.ins().jump(slow, &[]);
+    }
+    builder.switch_to_block(slow);
     let request = iconst_u32(builder, bytes | if write { 0x100 } else { 0 });
     let call = builder.ins().call_indirect(
         env.translate_sig,
@@ -10001,7 +10109,9 @@ fn translated_window_off(
     let none = iconst_u32(builder, u32::MAX);
     let bad = builder.ins().icmp(IntCC::Equal, off, none);
     branch_guard(builder, bail, bad);
-    off
+    builder.ins().jump(join, &[off.into()]);
+    builder.switch_to_block(join);
+    builder.block_params(join)[0]
 }
 
 #[cfg(all(feature = "jit", not(target_family = "wasm")))]

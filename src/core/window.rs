@@ -60,42 +60,52 @@ impl CpuCore {
         self.fm_code_page = NO_CODE_PAGE;
     }
 
-    /// Translated window offset of the instruction word at the even,
-    /// address-masked `addr`, for the decoded batch loop's opcode fetch.
-    /// Consecutive fetches mostly share a page, so the loop remembers the
-    /// last page it translated: while the ATC, TC, the TT registers and the
-    /// privilege level stay as they were (they do within one run of the
-    /// loop, which forgets the page whenever it leaves its window paths),
-    /// every address in it translates the same way.
+    /// Resolve a program word, remembering its host page only when every byte
+    /// in the logical page maps contiguously into one fastmem allocation.
     #[inline(always)]
-    pub(crate) fn code_window_off(&mut self, addr: u32) -> Option<u32> {
-        debug_assert!(self.fm_mmu.enabled());
-        match self.remembered_code_off(addr) {
-            Some(off) => Some(off),
+    pub(crate) fn code_window_ptr(&mut self, addr: u32) -> Option<usize> {
+        match self.remembered_code_ptr(addr) {
+            Some(ptr) => Some(ptr),
             None => self.remember_code_page(addr),
         }
     }
 
-    /// The window offset of `addr` through the remembered program-space
-    /// translation, if `addr` lies in that page and the window.
     #[inline(always)]
-    pub(crate) fn remembered_code_off(&self, addr: u32) -> Option<u32> {
-        if addr & !self.fm_mmu.page_mask != self.fm_code_page {
+    pub(crate) fn remembered_code_ptr(&self, addr: u32) -> Option<usize> {
+        let mask = self.fm_mmu.page_mask;
+        // A word at an even address cannot straddle an MMU page.
+        if addr & !mask != self.fm_code_page || addr & 1 != 0 {
             return None;
         }
-        // The page may run past the end of the window.
-        let off = addr.wrapping_add(self.fm_code_delta);
-        let off = self.physical_window_off(self.fm_base.wrapping_add(off), 2, false);
-        debug_assert_eq!(off, self.translated_window_off(addr, 2, false, true));
-        off
+        let ptr = self.fm_code_ptr + (addr & mask) as usize;
+        debug_assert_eq!(
+            Some(ptr),
+            self.translated_window_off(addr, 2, false, true)
+                .map(|off| self.window_host_ptr(off) as usize)
+        );
+        Some(ptr)
     }
 
     #[inline(never)]
-    fn remember_code_page(&mut self, addr: u32) -> Option<u32> {
+    fn remember_code_page(&mut self, addr: u32) -> Option<usize> {
         let off = self.translated_window_off(addr, 2, false, true)?;
-        self.fm_code_page = addr & !self.fm_mmu.page_mask;
-        self.fm_code_delta = off.wrapping_sub(addr);
-        Some(off)
+        let mask = self.fm_mmu.page_mask;
+        let within = addr & mask;
+        let phys = self.fm_base.wrapping_add(off);
+        let ptr = self.window_host_ptr(off) as usize;
+        if let Some(base) = phys.checked_sub(within)
+            && base
+                .checked_add(mask)
+                .is_some_and(|end| end <= self.address_mask)
+            && mask
+                .checked_add(1)
+                .and_then(|bytes| self.physical_window_off(base, bytes, false))
+                .is_some()
+        {
+            self.fm_code_page = addr & !mask;
+            self.fm_code_ptr = ptr - within as usize;
+        }
+        Some(ptr)
     }
 
     /// Window offset of a `bytes`-byte (1 to 4) access at the address-masked
@@ -129,6 +139,29 @@ impl CpuCore {
             return self.translated_window_off(addr, bytes, write, false);
         }
         self.physical_window_off(addr, bytes, write)
+    }
+
+    /// Resolve a decoded operand in one lookup on the common path: a 040/060
+    /// data ATC hit in the primary region. A zero data_shift keeps the TT
+    /// registers and exceptional function-code or retry cycles on the full probe.
+    #[inline(always)]
+    pub(crate) fn translated_data_ptr(&self, addr: u32, bytes: u32, write: bool) -> Option<usize> {
+        let mmu = self.fm_mmu;
+        if mmu.data_shift != 0 {
+            let within = addr & mmu.page_mask;
+            if bytes - 1 > mmu.page_mask - within {
+                return None;
+            }
+            let base = self
+                .atc
+                .lookup(addr >> mmu.data_shift, self.is_supervisor(), write)?;
+            let phys = self.address(base | within);
+            return self
+                .physical_window_ptr(phys, bytes, write)
+                .map(|p| p as usize);
+        }
+        self.translated_window_off(addr, bytes, write, false)
+            .map(|off| self.window_host_ptr(off) as usize)
     }
 
     /// Window offset of a `bytes`-byte access at the logical, address-masked

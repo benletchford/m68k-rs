@@ -13,29 +13,21 @@
 //! PFLUSH/PFLUSHA. Like real hardware, a plain CPU write to a page-table entry
 //! does NOT auto-flush; software must PFLUSH, which is where we flush.
 
-const ATC_ENTRIES: usize = 64;
+pub(crate) const ATC_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default)]
-struct AtcEntry {
-    valid: bool,
-    /// `(page_frame << 1) | supervisor`, disambiguating user vs supervisor maps.
-    tag: u32,
-    /// Physical page base (aligned to the page size in force at fill time).
-    phys_page: u32,
-    /// Write-protected page (W): a write must fault, not hit.
-    write_protected: bool,
-    /// Supervisor-only page (S): a user access must fault, not hit.
-    supervisor_only: bool,
-    /// The page descriptor's M bit was set when the entry was loaded. A
-    /// write through an entry without it misses, so the table search sets
-    /// M in the descriptor in memory (MC68040UM 3.2.3, MC68060UM 4.2.3).
-    modified: bool,
+pub(crate) struct AtcEntry {
+    pub(crate) page_frame: u32,
+    pub(crate) phys_page: u32,
+    /// Permitted access bits, user read/write then supervisor read/write.
+    /// Zero denotes an empty slot or an entry with no usable translation.
+    pub(crate) access: u8,
 }
 
 /// A direct-mapped address translation cache.
 #[derive(Debug, Clone)]
 pub struct Atc {
-    entries: [AtcEntry; ATC_ENTRIES],
+    pub(crate) entries: [AtcEntry; ATC_ENTRIES],
 }
 
 impl Default for Atc {
@@ -47,9 +39,10 @@ impl Default for Atc {
 }
 
 impl Atc {
+    /// Access bit shared by the Rust lookup and the native trace emitter.
     #[inline]
-    fn tag(page_frame: u32, supervisor: bool) -> u32 {
-        (page_frame << 1) | supervisor as u32
+    pub(crate) const fn access_bit(supervisor: bool, write: bool) -> u8 {
+        1 << ((supervisor as u8) * 2 + write as u8)
     }
 
     #[inline]
@@ -67,13 +60,8 @@ impl Atc {
     #[inline]
     pub fn lookup(&self, page_frame: u32, supervisor: bool, write: bool) -> Option<u32> {
         let e = &self.entries[Self::index(page_frame)];
-        if !e.valid || e.tag != Self::tag(page_frame, supervisor) {
-            return None;
-        }
-        if (write && (e.write_protected || !e.modified)) || (!supervisor && e.supervisor_only) {
-            return None;
-        }
-        Some(e.phys_page)
+        let access = Self::access_bit(supervisor, write);
+        (e.page_frame == page_frame && e.access & access != 0).then_some(e.phys_page)
     }
 
     /// Record a freshly-walked translation and its protection bits, for a
@@ -109,20 +97,24 @@ impl Atc {
         supervisor_only: bool,
         modified: bool,
     ) {
+        let mut access = 0;
+        if supervisor || !supervisor_only {
+            access = Self::access_bit(supervisor, false);
+            if modified && !write_protected {
+                access |= Self::access_bit(supervisor, true);
+            }
+        }
         self.entries[Self::index(page_frame)] = AtcEntry {
-            valid: true,
-            tag: Self::tag(page_frame, supervisor),
+            page_frame,
             phys_page,
-            write_protected,
-            supervisor_only,
-            modified,
+            access,
         };
     }
 
     /// Invalidate everything (PFLUSHA, TC/root-pointer/TTR write, reset).
     pub fn flush_all(&mut self) {
         for e in &mut self.entries {
-            e.valid = false;
+            e.access = 0;
         }
     }
 
@@ -130,8 +122,8 @@ impl Atc {
     /// user and supervisor variant since the same slot holds either.
     pub fn flush_page(&mut self, page_frame: u32) {
         let e = &mut self.entries[Self::index(page_frame)];
-        if e.tag >> 1 == page_frame {
-            e.valid = false;
+        if e.page_frame == page_frame {
+            e.access = 0;
         }
     }
 }

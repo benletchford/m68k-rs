@@ -123,6 +123,7 @@ pub(crate) enum DecodedMemOp {
     MovemWordPostInc {
         base: u8,
     },
+    BitFieldDataReg(u16),
     BitImmDataReg {
         op: BitOp,
         reg: u8,
@@ -236,6 +237,9 @@ pub(crate) enum DecodedMemOp {
 
 impl DecodedMemOp {
     pub(crate) fn decode(cpu_type: CpuType, opcode: u16) -> Option<Self> {
+        if opcode & 0xf8f8 == 0xe8c0 && !is_pre_68020(cpu_type) {
+            return Some(Self::BitFieldDataReg(opcode));
+        }
         let group = (opcode >> 12) & 0xF;
         match group {
             0x0 => decode_group_0(opcode),
@@ -614,8 +618,7 @@ impl<const TRANSLATED: bool> Win<TRANSLATED> {
     #[inline(always)]
     fn data(self, cpu: &CpuCore, addr: u32, bytes: u32, write: bool) -> Option<usize> {
         if TRANSLATED {
-            let off = cpu.translated_window_off(addr, bytes, write, false)?;
-            return Some(cpu.window_host_ptr(off) as usize);
+            return cpu.translated_data_ptr(addr, bytes, write);
         }
         cpu.physical_window_ptr(addr, bytes, write)
             .map(|p| p as usize)
@@ -666,11 +669,12 @@ impl<const TRANSLATED: bool> Win<TRANSLATED> {
 
 /// [`Win::code`] with the PMMU enabled: usually the page the decoded loop's
 /// opcode fetch just translated.
-#[inline(never)]
+#[inline(always)]
 fn translated_code(cpu: &CpuCore, addr: u32) -> Option<usize> {
-    cpu.remembered_code_off(addr)
-        .or_else(|| cpu.translated_window_off(addr, 2, false, true))
-        .map(|off| cpu.window_host_ptr(off) as usize)
+    cpu.remembered_code_ptr(addr).or_else(|| {
+        cpu.translated_window_off(addr, 2, false, true)
+            .map(|off| cpu.window_host_ptr(off) as usize)
+    })
 }
 
 /// Deferred post-increment/pre-decrement address-register updates. Two
@@ -1421,8 +1425,7 @@ fn resolve<const T: bool>(
             resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::AnIndex(r) => {
-            let ext = read_ext_word(cpu, win, ctx)?;
-            let a = brief_index(cpu, &ctx.pending, ctx.pending.a(cpu, r), ext)?;
+            let a = direct_index(cpu, win, ctx, ctx.pending.a(cpu, r))?;
             resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::AbsW => {
@@ -1448,9 +1451,7 @@ fn resolve<const T: bool>(
             )
         }
         FastEa::PcIndex => {
-            let base = ctx.next_ext;
-            let ext = read_ext_word(cpu, win, ctx)?;
-            let a = brief_index(cpu, &ctx.pending, base, ext)?;
+            let a = direct_index(cpu, win, ctx, ctx.next_ext)?;
             resolve_mem(cpu, win, ctx, a, size, write)
         }
         FastEa::Imm => {
@@ -1487,6 +1488,40 @@ fn resolve_mem<const T: bool>(
     Some(Loc::Mem(win.data(cpu, addr, size.bytes(), write)?))
 }
 
+/// Resolve brief and nonindirect full-format indexes using only registers and instruction words.
+#[inline]
+fn direct_index<const T: bool>(
+    cpu: &CpuCore,
+    win: Win<T>,
+    ctx: &mut Ctx,
+    base: u32,
+) -> Option<u32> {
+    let ext = read_ext_word(cpu, win, ctx)?;
+    if ext & 0x0100 == 0 || is_pre_68020(cpu.cpu_type) {
+        return brief_index(cpu, &ctx.pending, base, ext);
+    }
+    // Full extension, direct mode. Reserved encodings and memory indirect
+    // addressing still require full dispatch. Ctx is local until commit.
+    if ext & 0x000f != 0 {
+        return None;
+    }
+    let displacement = match (ext >> 4) & 3 {
+        1 => 0,
+        2 => read_ext_word(cpu, win, ctx)? as i16 as i32 as u32,
+        3 => (read_ext_word(cpu, win, ctx)? << 16) | read_ext_word(cpu, win, ctx)?,
+        _ => return None,
+    };
+    let base = if ext & 0x0080 == 0 { base } else { 0 };
+    let index = if ext & 0x0040 == 0 {
+        // The register, size and scale have the same encoding as brief
+        // indexing. The low byte no longer holds a displacement.
+        brief_index(cpu, &ctx.pending, 0, ext & 0xfe00)?
+    } else {
+        0
+    };
+    Some(base.wrapping_add(displacement).wrapping_add(index))
+}
+
 /// Resolve a control EA (LEA/PEA/JMP/JSR) to a guest address (unmasked).
 fn resolve_control_addr<const T: bool>(
     cpu: &CpuCore,
@@ -1500,10 +1535,7 @@ fn resolve_control_addr<const T: bool>(
             let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
             Some((cpu.dar[8 + r as usize] as i32).wrapping_add(d) as u32)
         }
-        FastEa::AnIndex(r) => {
-            let ext = read_ext_word(cpu, win, ctx)?;
-            brief_index(cpu, &ctx.pending, cpu.dar[8 + r as usize], ext)
-        }
+        FastEa::AnIndex(r) => direct_index(cpu, win, ctx, cpu.dar[8 + r as usize]),
         FastEa::AbsW => Some(read_ext_word(cpu, win, ctx)? as u16 as i16 as i32 as u32),
         FastEa::AbsL => {
             let hi = read_ext_word(cpu, win, ctx)?;
@@ -1515,11 +1547,7 @@ fn resolve_control_addr<const T: bool>(
             let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
             Some((base as i32).wrapping_add(d) as u32)
         }
-        FastEa::PcIndex => {
-            let base = ctx.next_ext;
-            let ext = read_ext_word(cpu, win, ctx)?;
-            brief_index(cpu, &ctx.pending, base, ext)
-        }
+        FastEa::PcIndex => direct_index(cpu, win, ctx, ctx.next_ext),
         _ => None,
     }
 }
@@ -1678,6 +1706,14 @@ fn execute_mem_op_in<const T: bool>(cpu: &mut CpuCore, op: DecodedMemOp) -> bool
     }
 
     match op {
+        DecodedMemOp::BitFieldDataReg(opcode) => {
+            let Some(ext) = read_ext_word(cpu, win, &mut ctx) else {
+                return false;
+            };
+            cpu.bitfield_data_register(opcode, ext as u16);
+            finish_pc!();
+            true
+        }
         DecodedMemOp::BitImmDataReg { .. }
         | DecodedMemOp::Link { .. }
         | DecodedMemOp::Unlk { .. }
@@ -2101,6 +2137,139 @@ mod tests {
         cpu.pc = 0x100;
         cpu.set_a(5, 0x400);
         cpu
+    }
+
+    #[test]
+    fn full_direct_indexed_lea_matches_bus_stepping() {
+        use crate::core::memory::{AddressBus, LinearMemoryBus};
+
+        let mut window = vec![0; 0x1000];
+        let mut fast = cpu_with_window(&mut window);
+        let mut bus = LinearMemoryBus::new(0x1000);
+        let mut precise = CpuCore::new();
+        precise.set_cpu_type(CpuType::M68040);
+
+        for (ea, opcode) in [(FastEa::AnIndex(2), 0x43f2), (FastEa::PcIndex, 0x43fb)] {
+            for index_register in [0, 8] {
+                for size_and_scale in 0..8 {
+                    for suppress in 0..4 {
+                        for displacement in 1..=3 {
+                            let ext = (index_register << 12)
+                                | (size_and_scale << 9)
+                                | 0x100
+                                | (suppress << 6)
+                                | (displacement << 4);
+                            let words = [ext, 0xff97, 0x8a31];
+                            bus.write_word(0xfe, opcode);
+                            for (i, &word) in words.iter().enumerate() {
+                                let at = 0x100 + i * 2;
+                                bus.write_word(at as u32, word);
+                                window[at..at + 2].copy_from_slice(&word.to_be_bytes());
+                            }
+                            fast.pc = 0x100;
+                            fast.set_d(0, 0x8000_fffa);
+                            fast.set_a(0, 0x7fff_8765);
+                            fast.set_a(2, 0xffff_fff0);
+                            fast.set_ccr(0x17);
+                            precise.pc = 0xfe;
+                            precise.dar = fast.dar;
+                            precise.set_ccr(fast.get_ccr());
+                            let _ = precise.step(&mut bus);
+                            assert!(execute_mem_op(&mut fast, DecodedMemOp::Lea { reg: 1, ea }));
+                            assert_eq!(
+                                (fast.dar, fast.pc, fast.get_ccr()),
+                                (precise.dar, precise.pc, precise.get_ccr()),
+                                "ext={ext:04x}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_control_index_bails_without_committing_partial_extensions() {
+        let mut mem = vec![0; 0x104];
+        let mut cpu = cpu_with_window(&mut mem);
+        for ext in [0x0930, 0x0922, 0x0928, 0x0900] {
+            mem[0x100..0x102].copy_from_slice(&u16::to_be_bytes(ext));
+            cpu.pc = 0x100;
+            let before = (cpu.dar, cpu.pc, cpu.get_ccr());
+            assert!(!execute_mem_op(
+                &mut cpu,
+                DecodedMemOp::Lea {
+                    reg: 0,
+                    ea: FastEa::AnIndex(0)
+                }
+            ));
+            assert_eq!((cpu.dar, cpu.pc, cpu.get_ccr()), before);
+        }
+    }
+
+    #[test]
+    fn indexed_move_observes_pending_source_increment() {
+        use crate::core::memory::{AddressBus, LinearMemoryBus};
+        let mut bytes = vec![0; 0x400];
+        // MOVE.L (A0)+,(-4,A0,D0.W)
+        bytes[0xfe..0x104].copy_from_slice(&[0x21, 0x98, 0x01, 0x20, 0xff, 0xfc]);
+        bytes[0x280..0x284].copy_from_slice(&0x87654321u32.to_be_bytes());
+        let mut reference = LinearMemoryBus::from_vec(bytes.clone());
+        let mut fast = cpu_with_window(&mut bytes);
+        fast.set_a(0, 0x280);
+        fast.set_d(0, 0x20);
+        let mut precise = CpuCore::new();
+        precise.set_cpu_type(CpuType::M68040);
+        precise.dar = fast.dar;
+        precise.pc = 0xfe;
+        precise.step(&mut reference);
+        let op = DecodedMemOp::decode(CpuType::M68040, 0x2198).unwrap();
+        assert!(execute_mem_op(&mut fast, op));
+        assert_eq!(reference.read_long(0x2a0), 0x87654321);
+        assert_eq!(bytes, reference.as_slice());
+        assert_eq!(
+            (fast.dar, fast.pc, fast.get_ccr()),
+            (precise.dar, precise.pc, precise.get_ccr())
+        );
+
+        // The source still fits but the indexed destination falls outside.
+        fast.pc = 0x100;
+        fast.set_a(0, 0x280);
+        fast.set_d(0, 0x400);
+        let before = (fast.dar, fast.pc, fast.get_ccr(), bytes.clone());
+        assert!(!execute_mem_op(&mut fast, op));
+        assert_eq!((fast.dar, fast.pc, fast.get_ccr(), bytes), before);
+    }
+
+    #[test]
+    fn decoded_register_bitfields_match_stepping() {
+        use crate::core::memory::LinearMemoryBus;
+        for selector in 8..=15 {
+            let opcode = 0xe0c3u16 | (selector << 8);
+            assert!(DecodedMemOp::decode(CpuType::M68000, opcode).is_none());
+            for ext in [0x3000u16, 0x47ca, 0x38e4, 0x0025, 0x48c0] {
+                let mut bytes = vec![0; 0x200];
+                bytes[0xfe..0x100].copy_from_slice(&opcode.to_be_bytes());
+                bytes[0x100..0x102].copy_from_slice(&ext.to_be_bytes());
+                let mut reference = LinearMemoryBus::from_vec(bytes.clone());
+                let mut fast = cpu_with_window(&mut bytes);
+                fast.set_d(3, 0x81234567);
+                fast.set_d(4, 0xffe07f04);
+                fast.set_ccr(0x1f);
+                let mut precise = CpuCore::new();
+                precise.set_cpu_type(CpuType::M68040);
+                precise.pc = 0xfe;
+                precise.dar = fast.dar;
+                precise.set_ccr(fast.get_ccr());
+                precise.step(&mut reference);
+                let op = DecodedMemOp::decode(CpuType::M68040, opcode).unwrap();
+                assert!(execute_mem_op(&mut fast, op));
+                assert_eq!(
+                    (fast.dar, fast.pc, fast.get_ccr()),
+                    (precise.dar, precise.pc, precise.get_ccr())
+                );
+            }
+        }
     }
 
     #[test]
