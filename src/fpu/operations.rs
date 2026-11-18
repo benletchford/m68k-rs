@@ -144,7 +144,28 @@ fn sgl_truncate(v: FloatX80) -> FloatX80 {
 /// down with it, as far as a zero exponent, where it is a denormalized
 /// number. FMOVEM loads registers without conversion, so a register can
 /// hold either.
+#[inline(always)]
 fn canonical_operand(v: FloatX80) -> FloatX80 {
+    if is_canonical(v) {
+        v
+    } else {
+        canonical_operand_slow(v)
+    }
+}
+
+/// Whether [`canonical_operand`] leaves `v` as it is: a normalized number
+/// (integer bit set), an infinity or NaN, or the canonical zero. The
+/// common case, tested without touching the register file.
+#[inline(always)]
+fn is_canonical(v: FloatX80) -> bool {
+    v.mantissa >> 63 != 0
+        || v.biased_exp() == 0x7FFF
+        || (v.mantissa == 0 && v.sign_exp & 0x7FFF == 0)
+}
+
+#[cold]
+#[inline(never)]
+fn canonical_operand_slow(v: FloatX80) -> FloatX80 {
     let exp = v.biased_exp();
     if exp == 0x7FFF {
         v
@@ -206,6 +227,95 @@ fn double_to_x80(bits: u64, f: &mut ExcFlags) -> FloatX80 {
     }
     // from_f64 reads the bit pattern: NaNs come out quiet with the payload.
     FloatX80::from_f64(f64::from_bits(bits))
+}
+
+/// FADD, FMUL, FSUB and FDIV with their single- and double-rounded forms:
+/// `dst = dst op src` rounded per [`CpuCore::fpu_ctx`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Dyadic {
+    Add,
+    Mul,
+    Sub,
+    Div,
+}
+
+impl Dyadic {
+    /// The opmodes: $20/$22/$23/$28 and their FS ($40 set) and FD ($44
+    /// set) forms.
+    const OPMODES: u128 = {
+        let mut mask = 0u128;
+        let base = [0x20, 0x22, 0x23, 0x28];
+        let mut i = 0;
+        while i < base.len() {
+            mask |= (1 << base[i]) | (1 << (base[i] | 0x40)) | (1 << (base[i] | 0x44));
+            i += 1;
+        }
+        mask
+    };
+
+    /// Classify with a mask and bit tests rather than a `match`, which
+    /// the compiler turns into the jump table this path exists to avoid.
+    #[inline(always)]
+    fn of(opmode: u16) -> Option<Self> {
+        if opmode > 0x7F || (Self::OPMODES >> opmode) & 1 == 0 {
+            None
+        } else if opmode & 0x08 != 0 {
+            Some(Self::Sub)
+        } else if opmode & 0x01 != 0 {
+            Some(Self::Mul)
+        } else if opmode & 0x02 != 0 {
+            Some(Self::Add)
+        } else {
+            Some(Self::Div)
+        }
+    }
+}
+
+/// The FP data registers a general operation can write, as they were
+/// before it: its destination and, for FSINCOS, the cosine's register.
+/// An exception that stops the operation before it stores a result puts
+/// them back. Saving two registers instead of all eight keeps the copy
+/// off every FP instruction's path.
+#[derive(Clone, Copy)]
+pub(super) struct FprUndo {
+    dst: usize,
+    dst_value: FloatX80,
+    cos: usize,
+    cos_value: FloatX80,
+}
+
+impl FprUndo {
+    /// The registers the operation of command word `w2` can write. Saving
+    /// one it does not write is harmless (restoring it changes nothing),
+    /// so FMOVECR, whose low bits are a ROM offset, needs no special case.
+    #[inline(always)]
+    pub(super) fn before(fpr: &[FloatX80; 8], w2: u16) -> Self {
+        let dst = ((w2 >> 7) & 7) as usize;
+        let cos = if (0x30..=0x37).contains(&(w2 & 0x7F)) {
+            (w2 & 7) as usize
+        } else {
+            dst
+        };
+        Self {
+            dst,
+            dst_value: fpr[dst],
+            cos,
+            cos_value: fpr[cos],
+        }
+    }
+
+    /// The destination register before the operation.
+    #[inline(always)]
+    pub(super) fn dst_before(&self) -> FloatX80 {
+        self.dst_value
+    }
+
+    /// Put back every register the operation may have written.
+    #[inline(always)]
+    pub(super) fn restore(&self, fpr: &mut [FloatX80; 8]) {
+        fpr[self.cos] = self.cos_value;
+        fpr[self.dst] = self.dst_value;
+    }
 }
 
 impl CpuCore {
@@ -331,7 +441,7 @@ impl CpuCore {
                     // FMOVECR - load constant from ROM. The opmode field is
                     // the ROM index; there is no <ea> source operand.
                     self.fpiar = self.ppc;
-                    let registers = self.fpr;
+                    let registers = FprUndo::before(&self.fpr, w2);
                     let ctx = self.fpu_ctx(0);
                     let mut f = ExcFlags::default();
                     self.fpr[dst] = softfloat::fmovecr(opmode as usize, ctx, &mut f);
@@ -379,7 +489,7 @@ impl CpuCore {
                     {
                         return self.fpu_060_take_unsupp(bus, operand);
                     }
-                    let registers = self.fpr;
+                    let registers = FprUndo::before(&self.fpr, w2);
                     let cycles = self.fpu_apply_op(opmode, dst, src, flags);
                     return self.fpu_060_hold_exception(cycles, w2, operand, src, &registers);
                 }
@@ -470,7 +580,7 @@ impl CpuCore {
                     // FMOVECR - load constant from ROM. In this register-form
                     // encoding the source-register field carries the ROM index.
                     self.fpiar = self.ppc;
-                    let registers = self.fpr;
+                    let registers = FprUndo::before(&self.fpr, w2);
                     let ctx = self.fpu_ctx(0);
                     let mut f = ExcFlags::default();
                     self.fpr[dst] = softfloat::fmovecr(src, ctx, &mut f);
@@ -741,8 +851,9 @@ impl CpuCore {
 
     /// Run the general operation of command word `w2` on `src` into its
     /// FP register and hold the exception it raises.
+    #[inline]
     fn fpu_general_op(&mut self, w2: u16, src: FloatX80, src_flags: ExcFlags) -> i32 {
-        let registers = self.fpr;
+        let registers = FprUndo::before(&self.fpr, w2);
         let cycles = self.fpu_apply_op(w2 & 0x7F, ((w2 >> 7) & 7) as usize, src, src_flags);
         self.fpu_op_exception(cycles, w2, src, &registers)
     }
@@ -755,14 +866,18 @@ impl CpuCore {
     /// finds the operands. An enabled OVFL, UNFL or INEX stores the
     /// result the disabled case stores (MC68881/MC68882UM 6.1.2 to
     /// 6.1.7).
+    #[inline]
     fn fpu_op_exception(
         &mut self,
         cycles: i32,
         w2: u16,
         src: FloatX80,
-        registers: &[FloatX80; 8],
+        registers: &FprUndo,
     ) -> i32 {
         const SNAN_OPERR_DZ: u32 = 0x64;
+        if cycles == 0 || !self.fpu_may_hold_exception() {
+            return cycles;
+        }
         if self.is_040() {
             return self.fpu_040_hold_exception(cycles, w2, src, registers);
         }
@@ -773,9 +888,22 @@ impl CpuCore {
             && self.fpu_is_6888x()
             && (self.fpsr >> 8) & (self.fpcr >> 8) & SNAN_OPERR_DZ != 0
         {
-            self.fpr = *registers;
+            registers.restore(&mut self.fpr);
         }
         self.fpu_hold_exception(cycles)
+    }
+
+    /// Whether the operation that just completed can have an exception to
+    /// hold, from the FPSR exception byte it left: one it raised is
+    /// enabled, or it raised an overflow or underflow, which the 68040 and
+    /// 68060 can take without its enable. Every hold and restore condition
+    /// implies this, so when it is false (no exception raised, or none
+    /// enabled and no OVFL/UNFL, as for typical code under the reset FPCR)
+    /// holding is skipped without the priority search.
+    #[inline(always)]
+    pub(super) fn fpu_may_hold_exception(&self) -> bool {
+        let raised = self.fpsr & 0xFF00;
+        raised != 0 && (self.fpcr & 0xFF00 != 0 || raised & 0x1800 != 0)
     }
 
     /// The vector of the arithmetic exception the operation that just
@@ -1414,8 +1542,29 @@ impl CpuCore {
         // zeros, and unnormalized ones as the normalized number they
         // hold. FCMP and FTST do not write the destination register.
         let src = canonical_operand(src);
-        if !matches!(opmode, 0x38 | 0x3A) {
-            self.fpr[dst] = canonical_operand(self.fpr[dst]);
+        if !matches!(opmode, 0x38 | 0x3A) && !is_canonical(self.fpr[dst]) {
+            self.fpr[dst] = canonical_operand_slow(self.fpr[dst]);
+        }
+        // The dyadic arithmetic most FP code runs is dispatched here with
+        // direct branches. Through the jump table of the match below, a
+        // run of alternating FADD, FMUL and FSUB mispredicts the indirect
+        // branch on nearly every instruction.
+        if let Some(op) = Dyadic::of(opmode) {
+            let ctx = self.fpu_ctx(opmode);
+            let mut f = src_flags;
+            let d = self.fpr[dst];
+            self.fpr[dst] = if op == Dyadic::Add {
+                softfloat::add(d, src, ctx, &mut f)
+            } else if op == Dyadic::Mul {
+                softfloat::mul(d, src, ctx, &mut f)
+            } else if op == Dyadic::Sub {
+                softfloat::sub(d, src, ctx, &mut f)
+            } else {
+                softfloat::div(d, src, ctx, &mut f)
+            };
+            self.fpu_set_cc(self.fpr[dst]);
+            self.fpu_commit(f);
+            return 4;
         }
         match opmode {
             0x00 | 0x40 | 0x44 => {
@@ -1474,33 +1623,6 @@ impl CpuCore {
                 self.fpu_commit(f);
                 4
             }
-            0x20 | 0x60 | 0x64 => {
-                // FDIV / FSDIV / FDDIV - dst = dst / src
-                let ctx = self.fpu_ctx(opmode);
-                let mut f = src_flags;
-                self.fpr[dst] = softfloat::div(self.fpr[dst], src, ctx, &mut f);
-                self.fpu_set_cc(self.fpr[dst]);
-                self.fpu_commit(f);
-                4
-            }
-            0x22 | 0x62 | 0x66 => {
-                // FADD / FSADD / FDADD
-                let ctx = self.fpu_ctx(opmode);
-                let mut f = src_flags;
-                self.fpr[dst] = softfloat::add(self.fpr[dst], src, ctx, &mut f);
-                self.fpu_set_cc(self.fpr[dst]);
-                self.fpu_commit(f);
-                4
-            }
-            0x23 | 0x63 | 0x67 => {
-                // FMUL / FSMUL / FDMUL
-                let ctx = self.fpu_ctx(opmode);
-                let mut f = src_flags;
-                self.fpr[dst] = softfloat::mul(self.fpr[dst], src, ctx, &mut f);
-                self.fpu_set_cc(self.fpr[dst]);
-                self.fpu_commit(f);
-                4
-            }
             0x24 => {
                 // FSGLDIV - dst = dst / src with the quotient mantissa
                 // rounded to single precision but the extended exponent
@@ -1532,15 +1654,6 @@ impl CpuCore {
                 let a = sgl_truncate(self.fpr[dst]);
                 let b = sgl_truncate(src);
                 self.fpr[dst] = softfloat::mul(a, b, ctx, &mut f);
-                self.fpu_set_cc(self.fpr[dst]);
-                self.fpu_commit(f);
-                4
-            }
-            0x28 | 0x68 | 0x6C => {
-                // FSUB / FSSUB / FDSUB
-                let ctx = self.fpu_ctx(opmode);
-                let mut f = src_flags;
-                self.fpr[dst] = softfloat::sub(self.fpr[dst], src, ctx, &mut f);
                 self.fpu_set_cc(self.fpr[dst]);
                 self.fpu_commit(f);
                 4
@@ -2111,5 +2224,24 @@ fn perform_fsave<B: AddressBus>(bus: &mut B, cpu: &mut CpuCore, addr: u32, inc: 
             cpu.write_32(bus, addr.wrapping_sub(i * 4), 0);
         }
         cpu.write_32(bus, addr.wrapping_sub((longs - 1) * 4), header);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Dyadic;
+
+    #[test]
+    fn dyadic_classification_matches_the_opmode_table() {
+        for opmode in 0..=0x7Fu16 {
+            let expected = match opmode {
+                0x22 | 0x62 | 0x66 => Some(Dyadic::Add),
+                0x23 | 0x63 | 0x67 => Some(Dyadic::Mul),
+                0x28 | 0x68 | 0x6C => Some(Dyadic::Sub),
+                0x20 | 0x60 | 0x64 => Some(Dyadic::Div),
+                _ => None,
+            };
+            assert!(Dyadic::of(opmode) == expected, "opmode {opmode:#x}");
+        }
     }
 }
