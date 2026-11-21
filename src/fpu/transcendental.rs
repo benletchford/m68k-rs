@@ -93,7 +93,21 @@ fn tiny_operand(opmode: u16, x: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> Op
         return None;
     }
     let first_term = if about_one { one_x80() } else { x };
-    Some(softfloat::round_inexact(first_term, away, ctx, f))
+    let result = softfloat::round_inexact(first_term, away, ctx, f);
+    // round_inexact rounds a value next to the first term, which is tiny
+    // beside 2^-16383 (a biased exponent of 0 with the integer bit set) as
+    // well. That operand is normalized, though: a 68060 and a 68882 set only
+    // INEX2 for atan of it, and UNFL is for a denormalized operand.
+    if !is_denormalized(x) {
+        f.0 &= !ExcFlags::UNFL;
+    }
+    Some(result)
+}
+
+/// Denormalized: a biased exponent of 0 and the integer bit clear. A biased
+/// exponent of 0 with the integer bit set is 2^-16383 and normalized.
+fn is_denormalized(x: FloatX80) -> bool {
+    x.biased_exp() == 0 && x.mantissa != 0 && x.mantissa >> 63 == 0
 }
 
 // ============================== exp family ===============================
@@ -1151,11 +1165,13 @@ mod tests {
             (0x08, true, false),  // e^x - 1
             (0x06, false, true),  // ln(1 + x)
         ];
-        // Denormalized, the smallest with a biased exponent of 1, one in
-        // the middle of the range and one just below 2^-66.
+        // Denormalized, 2^-16383 (a biased exponent of 0 with the integer
+        // bit set), the smallest with a biased exponent of 1, one in the
+        // middle of the range and one just below 2^-66.
         let operands = [
             (0x0000, 0x4000_0000_0000_0000),
             (0x0000, 0x0000_0000_0000_0001),
+            (0x0000, 0x8000_0000_0000_0000),
             (0x0001, 0x8000_0000_0000_0000),
             (0x3000, 0xC000_0000_0000_0001),
             (0x3FBC, 0xFFFF_FFFF_FFFF_FFFF),
@@ -1181,7 +1197,11 @@ mod tests {
                             RoundMode::NegInf => away == (sign != 0),
                         };
                         let want = if outward { neighbour(x, away) } else { x };
-                        let unfl = if x.is_denormal() { ExcFlags::UNFL } else { 0 };
+                        let unfl = if is_denormalized(x) {
+                            ExcFlags::UNFL
+                        } else {
+                            0
+                        };
                         let ctx = RoundCtx {
                             mode,
                             ..RoundCtx::NEAREST_EXT
