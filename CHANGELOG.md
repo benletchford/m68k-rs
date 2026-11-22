@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.1...m68k-v0.17.2) (2026-11-22)
+
+
+### Bug Fixes
+
+* **fpu:** preserve underflow status for tiny normalized operands ([66f1d0d](https://github.com/benletchford/m68k-rs/commit/66f1d0d4fdd6d684b9097cad1c7572250fe37cf4))
+
 ## [0.17.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.0...m68k-v0.17.1) (2026-11-18)
 
 
