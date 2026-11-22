@@ -1198,3 +1198,28 @@ fn reset_drops_the_exceptional_state() {
     cpu.set_sr(0x2700);
     assert_eq!(fsave(&mut cpu, &mut bus), 0x4100_0000);
 }
+
+#[test]
+fn ea_arithmetic_preserves_conversion_results_and_signaling_nan_flags() {
+    for (command, bits) in [
+        (0x4422, 0xbfa0_0000_0000_0000),    // FADD.S -1.25
+        (0x5422, 0xbff4_0000_0000_0000),    // FADD.D -1.25
+        (0x4422, 0x7f80_4321_0000_0000),    // signaling single NaN
+        (0x5422, 0x7ff0_0000_0000_4321u64), // signaling double NaN
+    ] {
+        let evaluate = |traps| {
+            let (mut cpu, mut bus) = setup(traps);
+            bus.write_long_at(OPERAND, (bits >> 32) as u32);
+            bus.write_long_at(OPERAND + 4, bits as u32);
+            run(&mut cpu, &mut bus, &[0xf210, command]);
+            (cpu.fpr[0].to_extended(), cpu.fpsr)
+        };
+        let reference = evaluate(false);
+        assert_eq!(evaluate(true), reference);
+        if bits >> 63 != 0 {
+            assert_eq!(reference.0, FloatX80::from_f64(-0.25).to_extended());
+        } else {
+            assert_ne!(reference.1 & 0x4000, 0, "conversion raises SNAN");
+        }
+    }
+}
