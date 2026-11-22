@@ -346,7 +346,14 @@ impl CpuCore {
 
         self.fpiar = self.ppc;
         let mut flags = ExcFlags::default();
-        let value = raw.to_x80(&mut flags);
+        // Single and double NaNs retain their signaling bit in the latched
+        // image. Their arithmetic conversion quiets it and may raise SNAN.
+        // Every other supported source already holds its arithmetic value.
+        let value = if src.tag == tag::NAN {
+            raw.to_x80(&mut flags)
+        } else {
+            src.value
+        };
         let registers = super::operations::FprUndo::before(&self.fpr, w2);
         let cycles = self.fpu_apply_op(opmode, dst, value, flags);
         Some(self.fpu_040_hold_exception(cycles, w2, src.value, &registers))
