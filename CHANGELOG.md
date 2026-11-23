@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.17.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.2...m68k-v0.17.3) (2026-11-22)
+
+
+### Performance Improvements
+
+* **fpu:** reuse converted 68040 effective address operands ([#267](https://github.com/benletchford/m68k-rs/issues/267)) ([ab6056d](https://github.com/benletchford/m68k-rs/commit/ab6056d740011b34e2467bab1aac2e66d3cbb52c))
+
 ## [0.17.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.1...m68k-v0.17.2) (2026-11-22)
 
 
