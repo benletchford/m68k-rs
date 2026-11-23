@@ -92,12 +92,29 @@ fn run(model: CpuType, words: &[u16], mismatch: bool, fault: bool) -> Bus {
     cpu.set_d(0, u32::from(mismatch));
     cpu.step(&mut bus);
     assert!(!bus.lock);
+    if fault {
+        let sp = cpu.a(7);
+        match model {
+            CpuType::M68010 => assert_ne!(bus.ram.read_word(sp + 8) & 0x0800, 0),
+            CpuType::M68020 | CpuType::M68030 => assert_ne!(bus.ram.read_word(sp + 10) & 0x80, 0),
+            CpuType::M68040 => assert_ne!(bus.ram.read_word(sp + 12) & 0x0200, 0),
+            CpuType::M68060 => assert_eq!(bus.ram.read_long(sp + 12) & 0x0380_0000, 0x0380_0000),
+            _ => {}
+        }
+    }
     bus
 }
 
 #[test]
 fn tas_skips_registers_and_releases_before_exception_entry() {
-    for model in [CpuType::M68000, CpuType::M68010, CpuType::M68040] {
+    for model in [
+        CpuType::M68000,
+        CpuType::M68010,
+        CpuType::M68020,
+        CpuType::M68030,
+        CpuType::M68040,
+        CpuType::M68060,
+    ] {
         assert!(run(model, &[0x4ac0], false, false).edges.is_empty());
         for fault in [false, true] {
             let b = run(model, &[0x4ad0], false, fault);

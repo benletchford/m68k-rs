@@ -91,6 +91,10 @@ pub fn translate<B: AddressBus>(
     // is set re-enters take_exception, whose double-fault guard halts the
     // CPU -- the same double bus fault real hardware takes.
 
+    // The PMMU checks write permission and sets M on the read portion of
+    // a locked operand too (MC68030UM 9.4, MC68040UM 3.3, MC68060UM 4.3).
+    let write = write || (cpu.rmw_locked && !instruction);
+
     // Check Transparent Translation Registers first - they bypass page table walk.
     let fc = cpu
         .mmu_fc_override
