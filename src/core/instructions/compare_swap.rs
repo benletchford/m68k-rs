@@ -65,6 +65,7 @@ impl CpuCore {
         if let Some((reg, value)) = ea_commit {
             self.set_a(reg, value);
         }
+        self.begin_locked_rmw(bus);
         let mem = match size {
             Size::Byte => self.read_8(bus, addr) as u32,
             Size::Word => self.read_16(bus, addr) as u32,
@@ -86,9 +87,13 @@ impl CpuCore {
             }
         } else {
             // Compare failed: load memory value into compare register.
+            if self.is_040() || self.is_060() {
+                self.write_resolved_ea(bus, crate::core::ea::EaResult::Memory(addr), size, mem);
+            }
             self.set_d(dc, write_d_sized(dc_val, mem, size));
         }
 
+        self.end_locked_rmw(bus);
         self.trace_t0_68040_sync();
         20
     }
@@ -108,6 +113,7 @@ impl CpuCore {
         let addr2 = self.read_cas2_rn_address(rn2);
 
         let size = decode_cas_size(opcode);
+        self.begin_locked_rmw(bus);
         let mem1 = match size {
             Size::Byte => self.read_8(bus, addr1) as u32,
             Size::Word => self.read_16(bus, addr1) as u32,
@@ -163,6 +169,11 @@ impl CpuCore {
                     | crate::core::types::CpuType::M68040
                     | crate::core::types::CpuType::M68060
             );
+            // M68000PRM, CAS2: the 040 writes destination 1 back to
+            // terminate the locked sequence even on a failed comparison.
+            if self.is_040() {
+                self.write_resolved_ea(bus, crate::core::ea::EaResult::Memory(addr1), size, mem1);
+            }
             if is_040_plus {
                 self.set_d(dc1, write_d_sized(self.d(dc1), mem1, size));
                 self.set_d(dc2, write_d_sized(self.d(dc2), mem2, size));
@@ -172,6 +183,7 @@ impl CpuCore {
             }
         }
 
+        self.end_locked_rmw(bus);
         self.trace_t0_68040_sync();
         40
     }

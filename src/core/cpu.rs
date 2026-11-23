@@ -313,16 +313,16 @@ pub struct CpuCore {
     /// Bus Control Register (MOVEC 0x008 on the 060 only; the same code is
     /// DACR0 on the 68040). Stored, not behaviorally modeled.
     pub buscr: u32,
-    /// Address Translation Cache: a pure cache of recent page-table walks, so it
-    /// is not serialized (restored empty) and is flushed on any mapping change.
-    #[cfg_attr(feature = "serde", serde(skip))]
+    /// Resident 68040/060 translations and access permissions. Older named
+    /// save states resume with a cold ATC.
+    #[cfg_attr(feature = "serde", serde(default))]
     pub atc: crate::mmu::Atc,
-    /// The 68030's own address translation cache (see
-    /// [`crate::mmu::Atc030`]). Unlike `atc` it is serialized: its contents
-    /// decide which later accesses pay for a table search, so a state
-    /// restored with it empty would run differently from the original.
+    /// The 68030's function-code-tagged address translation cache.
     #[cfg_attr(feature = "serde", serde(default))]
     pub atc_030: crate::mmu::Atc030,
+    /// Asserted between the operand cycles of a memory TAS, CAS or CAS2.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) rmw_locked: bool,
     /// Cause of the MMU fault currently being delivered (set by
     /// handle_mmu_fault, consumed while composing the 68060 FSLW); plain
     /// physical bus errors leave it None. Transient within one exception.
@@ -729,6 +729,7 @@ impl CpuCore {
             pcr: PCR_060_RESET,
             buscr: 0,
             atc: crate::mmu::Atc::default(),
+            rmw_locked: false,
             atc_030: crate::mmu::Atc030::default(),
             pending_fault_cause: None,
             pending_fault_transparent: false,
@@ -1708,6 +1709,20 @@ impl CpuCore {
         let v = cycle(self);
         self.mmu_misaligned_tail = outer;
         v
+    }
+
+    pub(crate) fn begin_locked_rmw<B: AddressBus>(&mut self, bus: &mut B) {
+        if !self.faulted() {
+            self.flush_sync(bus);
+            self.rmw_locked = true;
+            bus.set_rmw_lock(true);
+        }
+    }
+
+    pub(crate) fn end_locked_rmw<B: AddressBus>(&mut self, bus: &mut B) {
+        if std::mem::take(&mut self.rmw_locked) {
+            bus.set_rmw_lock(false);
+        }
     }
 
     /// Read byte from memory (data space).

@@ -166,28 +166,26 @@ impl CpuCore {
     /// `TAS <ea>`
     pub fn exec_tas<B: AddressBus>(&mut self, bus: &mut B, mode: AddressingMode) -> i32 {
         let ea = self.resolve_ea(bus, mode, Size::Byte);
+        if matches!(ea, crate::core::ea::EaResult::Memory(_)) {
+            self.begin_locked_rmw(bus);
+        }
         let value = self.read_resolved_ea(bus, ea, Size::Byte);
         self.set_logic_flags(value, Size::Byte);
 
         // Set bit 7
         let result = value | 0x80;
-        if self.cpu_type == crate::core::types::CpuType::M68000 {
-            if let crate::core::ea::EaResult::Memory(addr) = ea {
-                // 68000 TAS bus order (Moira execTasEa): read, 2 internal
-                // clocks, write, THEN the final prefetch -- unlike the
-                // other RMW instructions, whose prefetch precedes the
-                // writeback (the read-modify-write cycle is indivisible on
-                // real hardware). The trailing prefetch carries the IPL
-                // poll, which is the default last-access sample.
+        if let crate::core::ea::EaResult::Memory(addr) = ea {
+            // The operand write precedes the trailing prefetch. The 68000
+            // holds the bus for two internal clocks between the strobes.
+            if self.cpu_type == crate::core::types::CpuType::M68000 {
                 self.internal_cycles(2);
-                self.write_8(bus, addr, result as u8);
-            } else {
-                self.write_resolved_ea(bus, ea, Size::Byte, result);
             }
+            self.write_8(bus, addr, result as u8);
         } else {
             self.write_resolved_ea(bus, ea, Size::Byte, result);
         }
 
+        self.end_locked_rmw(bus);
         self.trace_t0_68040_sync();
         4
     }

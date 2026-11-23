@@ -562,6 +562,7 @@ impl CpuCore {
         write: bool,
         instruction: bool,
     ) -> i32 {
+        self.end_locked_rmw(bus);
         let old_sr = self.get_sr();
         let was_supervisor = (old_sr & 0x2000) != 0;
 
@@ -658,6 +659,7 @@ impl CpuCore {
         size: u32,
         cause: Option<crate::mmu::MmuFaultCause>,
     ) -> i32 {
+        self.end_locked_rmw(bus);
         // Read before the frame pushes below translate their own addresses.
         let transparent = std::mem::take(&mut self.pending_fault_transparent);
         let old_sr = self.get_sr();
