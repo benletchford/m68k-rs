@@ -34,9 +34,7 @@ const TTR_FC_MASK_SHIFT: u32 = 0;
 /// The access matches when the register is enabled, its address bits 31-24
 /// and function code agree with the base fields outside the masked bits,
 /// and either RWM is set or the access's direction is the one R/W selects
-/// (MC68030UM 9.7). Not modelled: an indivisible read-modify-write cycle
-/// (TAS, CAS, CAS2) is transparent only through a register with RWM=1;
-/// here its read and write cycles are matched one at a time.
+/// (MC68030UM 9.7). The access path also requires RWM for a locked cycle.
 pub fn ttr_matches(ttr: u32, addr: u32, fc: u8, write: bool) -> bool {
     // Check enable bit
     if (ttr & TTR_ENABLE) == 0 {
@@ -116,9 +114,9 @@ pub(crate) fn lookup(cpu: &CpuCore, addr: u32, fc: u8, write: bool) -> TtHit {
     match cpu.cpu_type {
         CpuType::M68030 => {
             // 68030 has two shared TTRs for both instruction and data
-            if ttr_matches(cpu.mmu_tt0, addr, fc, write)
-                || ttr_matches(cpu.mmu_tt1, addr, fc, write)
-            {
+            if [cpu.mmu_tt0, cpu.mmu_tt1].into_iter().any(|tt| {
+                (!cpu.rmw_locked || tt & TTR_030_RWM != 0) && ttr_matches(tt, addr, fc, write)
+            }) {
                 return TtHit::Hit;
             }
         }
@@ -272,6 +270,36 @@ mod tests {
         let both = 0x4000_8507; // E, CI, RWM, FCMask=7
         assert!(ttr_matches(both, 0x4000_0000, 1, false));
         assert!(ttr_matches(both, 0x4000_0000, 1, true));
+    }
+
+    #[test]
+    fn a_locked_operand_requires_write_permission_on_its_first_read() {
+        use crate::{LinearMemoryBus, mmu};
+        let mut cpu = CpuCore::new();
+        let mut bus = LinearMemoryBus::new(4096);
+        let addr = 0x4000_0000;
+        cpu.set_cpu_type(CpuType::M68030);
+        cpu.mmu_tt0 = 0x4000_8207; // read only
+        cpu.mmu_tt1 = 0x4000_8007; // write only
+        cpu.begin_locked_rmw(&mut bus);
+        assert_eq!(lookup(&cpu, addr, 5, false), TtHit::Miss);
+        cpu.mmu_tt1 |= TTR_030_RWM;
+        assert_eq!(lookup(&cpu, addr, 5, false), TtHit::Hit);
+        cpu.end_locked_rmw(&mut bus);
+        for model in [CpuType::M68040, CpuType::M68060] {
+            cpu.set_cpu_type(model);
+            cpu.pmmu_enabled = true;
+            cpu.dtt0 = 0x4000_c004; // supervisor and user, write-protected
+            assert_eq!(
+                mmu::translate_address(&mut cpu, &mut bus, addr, false, true, false).unwrap(),
+                addr
+            );
+            cpu.begin_locked_rmw(&mut bus);
+            let err =
+                mmu::translate_address(&mut cpu, &mut bus, addr, false, true, false).unwrap_err();
+            assert_eq!(err.cause, mmu::MmuFaultCause::WriteProtect);
+            cpu.end_locked_rmw(&mut bus);
+        }
     }
 
     #[test]

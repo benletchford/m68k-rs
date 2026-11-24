@@ -122,6 +122,12 @@ pub trait AddressBus {
     /// Write one big-endian 32-bit longword to `address`.
     fn write_long(&mut self, address: u32, value: u32);
 
+    /// Assert or release the processor's indivisible read-modify-write cycle.
+    /// TAS, CAS and CAS2 bracket their memory operands with this signal.
+    /// A fault releases the bus before exception frame and vector accesses.
+    #[inline]
+    fn set_rmw_lock(&mut self, _asserted: bool) {}
+
     /// Snapshot host metadata for a memory-to-memory MOVE operand, after its
     /// source read and before any destination write. `bytes` is 1, 2, or 4.
     /// Addresses have the CPU address mask applied. These notifications are

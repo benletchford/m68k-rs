@@ -7,15 +7,14 @@
 //! page frame and the supervisor flag (user and supervisor can map a page
 //! differently via separate root pointers).
 //!
-//! The ATC is a pure cache: it holds nothing that backing memory does not, so it
-//! is never serialized (a save state restores it empty) and is flushed whenever
-//! the mapping could change -- a write to TC / a root pointer / a TTR, or a
-//! PFLUSH/PFLUSHA. Like real hardware, a plain CPU write to a page-table entry
-//! does NOT auto-flush; software must PFLUSH, which is where we flush.
+//! Save states preserve resident translations and their permissions. Hits avoid
+//! observable descriptor fetches, and software can change a descriptor while
+//! continuing to use the old translation until PFLUSH.
 
 pub(crate) const ATC_ENTRIES: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub(crate) struct AtcEntry {
     pub(crate) page_frame: u32,
     pub(crate) phys_page: u32,
@@ -26,7 +25,9 @@ pub(crate) struct AtcEntry {
 
 /// A direct-mapped address translation cache.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Atc {
+    #[cfg_attr(feature = "serde", serde(with = "serde_big_array::BigArray"))]
     pub(crate) entries: [AtcEntry; ATC_ENTRIES],
 }
 
@@ -445,6 +446,23 @@ mod tests {
         // re-walks and faults.
         assert_eq!(atc.lookup(0x10, true, false), Some(0x5000));
         assert_eq!(atc.lookup(0x10, true, true), None);
+    }
+
+    #[cfg(feature = "serde")]
+    #[test]
+    fn saved_cpu_retains_translation_and_access_permissions() {
+        let mut cpu = crate::CpuCore::new();
+        cpu.atc.insert(63, false, 0x1000, false, false);
+        cpu.atc.insert_entry(0, true, 0x2000, false, false, false);
+        let mut saved = serde_json::to_value(&cpu).unwrap();
+        let restored: crate::CpuCore = serde_json::from_value(saved.clone()).unwrap();
+        assert_eq!(restored.atc.lookup(63, false, true), Some(0x1000));
+        assert_eq!(restored.atc.lookup(0, true, false), Some(0x2000));
+        assert_eq!(restored.atc.lookup(0, true, true), None);
+        assert_eq!(restored.atc.lookup(0, false, false), None);
+        saved.as_object_mut().unwrap().remove("atc");
+        let legacy: crate::CpuCore = serde_json::from_value(saved).unwrap();
+        assert_eq!(legacy.atc.lookup(63, false, true), None);
     }
 
     const SHIFT: u32 = 12;

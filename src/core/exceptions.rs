@@ -85,6 +85,8 @@ pub mod fslw {
     /// Misaligned access: the fault is on the second or a later part of an
     /// operand split into several bus cycles.
     pub const MA: u32 = 0x0800_0000;
+    /// Locked transfer.
+    pub const LK: u32 = 0x0200_0000;
     /// Read access.
     pub const RW_R: u32 = 0x0100_0000;
     /// Write access.
@@ -168,8 +170,8 @@ fn fslw_060(
 /// (M68010UM figure 5-8): IF (bit 13) marks an instruction fetch, DF (bit
 /// 12) a data read, RW (bit 8) a read cycle, BY (bit 9) a byte transfer,
 /// and bits 2-0 hold the function code. A write sets neither fetch bit.
-fn ssw_010(fc: u16, write: bool, instruction: bool, size: u32) -> u16 {
-    let mut ssw = fc & 7;
+fn ssw_010(fc: u16, write: bool, instruction: bool, size: u32, locked: bool) -> u16 {
+    let mut ssw = (fc & 7) | (u16::from(locked) << 11); // RM
     if !write {
         ssw |= 0x0100;
         ssw |= if instruction { 0x2000 } else { 0x1000 };
@@ -397,6 +399,7 @@ impl CpuCore {
         instruction: bool,
         size: u32,
         fault_wdata: u32,
+        locked: bool,
     ) {
         // 68020/68030 long bus-cycle fault frame (format $B, 46
         // words, M68030UM 8.2). Real silicon dumps pipeline state
@@ -423,6 +426,7 @@ impl CpuCore {
         let mut ssw: u16 = fc & 0x7;
         if data_fault {
             ssw |= 0x0100; // DF: rerun data cycle
+            ssw |= u16::from(locked) << 7; // RM
             if !write {
                 ssw |= 0x0040; // RW: read
             }
@@ -562,6 +566,8 @@ impl CpuCore {
         write: bool,
         instruction: bool,
     ) -> i32 {
+        let locked = self.rmw_locked;
+        self.end_locked_rmw(bus);
         let old_sr = self.get_sr();
         let was_supervisor = (old_sr & 0x2000) != 0;
 
@@ -608,7 +614,7 @@ impl CpuCore {
                 );
             }
             CpuType::M68010 | CpuType::SCC68070 => {
-                let ssw = ssw_010(fc, write, instruction, 2);
+                let ssw = ssw_010(fc, write, instruction, 2, locked);
                 self.push_fault_frame_010(bus, vector::ADDRESS_ERROR, old_sr, ssw, address);
             }
             _ if self.is_040() || self.is_060() => {
@@ -638,6 +644,7 @@ impl CpuCore {
                     true,
                     2,
                     0,
+                    false,
                 );
             }
         }
@@ -658,6 +665,8 @@ impl CpuCore {
         size: u32,
         cause: Option<crate::mmu::MmuFaultCause>,
     ) -> i32 {
+        let locked = self.rmw_locked;
+        self.end_locked_rmw(bus);
         // Read before the frame pushes below translate their own addresses.
         let transparent = std::mem::take(&mut self.pending_fault_transparent);
         let old_sr = self.get_sr();
@@ -708,7 +717,7 @@ impl CpuCore {
                 self.push_group0_frame_68000(bus, fc, write, false, address, old_sr, stacked_pc);
             }
             CpuType::M68010 | CpuType::SCC68070 => {
-                let ssw = ssw_010(fc, write, instruction, size);
+                let ssw = ssw_010(fc, write, instruction, size, locked);
                 self.push_fault_frame_010(bus, vector::BUS_ERROR, old_sr, ssw, address);
             }
             _ if self.is_060() => {
@@ -717,6 +726,9 @@ impl CpuCore {
                 // (FSLW) at +$0C. The instruction has been rolled back, so
                 // RTE restarts it (same demand-paging model as the 040).
                 let mut fslw = fslw_060(write, instruction, size, fc, cause, transparent);
+                if locked {
+                    fslw |= fslw::LK | fslw::RW_R | fslw::RW_W;
+                }
                 if self.mmu_misaligned_tail {
                     fslw |= fslw::MA;
                 }
@@ -755,7 +767,8 @@ impl CpuCore {
                 // MA (bit 11): the fault is on a later part of an operand
                 // split into several bus cycles.
                 let ma = if self.mmu_misaligned_tail { 0x0800 } else { 0 };
-                let ssw = rw | ma | atc | sz | (fc & 0x7); // TM = function code
+                let lk = u16::from(locked) << 9;
+                let ssw = rw | ma | atc | lk | sz | (fc & 0x7); // TM = function code
                 let fmt_vec = 0x7000 | ((vector::BUS_ERROR as u16) << 2);
                 // A normal faulted write is reported in writeback slot 3 (V
                 // bit, size and TM in WB3S; address and data in WB3A/WB3D),
@@ -802,6 +815,7 @@ impl CpuCore {
                     instruction,
                     size,
                     fault_wdata,
+                    locked,
                 );
             }
         }
@@ -817,6 +831,7 @@ impl CpuCore {
     /// Implements double-fault detection: if an exception occurs while already
     /// processing an exception, the CPU halts (similar to x86 triple fault).
     pub fn take_exception<B: AddressBus>(&mut self, bus: &mut B, vector: u32) -> i32 {
+        self.end_locked_rmw(bus);
         // Double-fault detection: if we're already processing an exception and
         // another exception occurs, halt the CPU. This prevents infinite recursion.
         if self.exception_processing {

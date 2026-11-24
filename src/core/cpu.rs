@@ -46,6 +46,12 @@ fn emulate_unimplemented_040_default() -> bool {
 /// architectural behavior and timing is serialized; runtime-only decode
 /// tables, FastMem pointers, fault-delivery scratch state, and trace caches
 /// are skipped and reconstructed when execution resumes.
+///
+/// A 0.17.3 save stored as a map or a length-delimited sequence (for example,
+/// MessagePack) restores directly. For an unframed format such as bincode 1,
+/// use the enclosing save's version to decode the old bytes as a 0.17.3
+/// `CpuCore`. Its named fields can then be deserialized into the current
+/// type, for example via `serde_json::to_value` and `serde_json::from_value`.
 #[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CpuCore {
@@ -313,16 +319,12 @@ pub struct CpuCore {
     /// Bus Control Register (MOVEC 0x008 on the 060 only; the same code is
     /// DACR0 on the 68040). Stored, not behaviorally modeled.
     pub buscr: u32,
-    /// Address Translation Cache: a pure cache of recent page-table walks, so it
-    /// is not serialized (restored empty) and is flushed on any mapping change.
-    #[cfg_attr(feature = "serde", serde(skip))]
-    pub atc: crate::mmu::Atc,
-    /// The 68030's own address translation cache (see
-    /// [`crate::mmu::Atc030`]). Unlike `atc` it is serialized: its contents
-    /// decide which later accesses pay for a table search, so a state
-    /// restored with it empty would run differently from the original.
+    /// The 68030's function-code-tagged address translation cache.
     #[cfg_attr(feature = "serde", serde(default))]
     pub atc_030: crate::mmu::Atc030,
+    /// Asserted between the operand cycles of a memory TAS, CAS or CAS2.
+    #[cfg_attr(feature = "serde", serde(skip))]
+    pub(crate) rmw_locked: bool,
     /// Cause of the MMU fault currently being delivered (set by
     /// handle_mmu_fault, consumed while composing the 68060 FSLW); plain
     /// physical bus errors leave it None. Transient within one exception.
@@ -522,6 +524,12 @@ pub struct CpuCore {
     /// When enabled, use SingleStepTests/MAME-derived semantics for a few edge cases where
     /// Musashi and MAME fixtures intentionally differ (notably BCD "invalid digit" behavior and
     pub sst_m68000_compat: bool,
+
+    /// Resident 68040/060 translations and access permissions. This field
+    /// follows the complete 0.17.3 layout to preserve legacy field indices.
+    /// A save that omits it starts with an empty cache.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub atc: crate::mmu::Atc,
 }
 
 // CACR bit assignments (68020/68030). The 68040 redefines CACR (IE/DE
@@ -728,7 +736,7 @@ impl CpuCore {
             iacr1: 0,
             pcr: PCR_060_RESET,
             buscr: 0,
-            atc: crate::mmu::Atc::default(),
+            rmw_locked: false,
             atc_030: crate::mmu::Atc030::default(),
             pending_fault_cause: None,
             pending_fault_transparent: false,
@@ -746,6 +754,7 @@ impl CpuCore {
             emulate_unimplemented_040: emulate_unimplemented_040_default(),
             fpu_040: crate::fpu::Fpu040State::default(),
             sst_m68000_compat: false,
+            atc: crate::mmu::Atc::default(),
             fpu_present: true,
         };
         cpu.set_cpu_type(CpuType::M68000);
@@ -1708,6 +1717,20 @@ impl CpuCore {
         let v = cycle(self);
         self.mmu_misaligned_tail = outer;
         v
+    }
+
+    pub(crate) fn begin_locked_rmw<B: AddressBus>(&mut self, bus: &mut B) {
+        if !self.faulted() {
+            self.flush_sync(bus);
+            self.rmw_locked = true;
+            bus.set_rmw_lock(true);
+        }
+    }
+
+    pub(crate) fn end_locked_rmw<B: AddressBus>(&mut self, bus: &mut B) {
+        if std::mem::take(&mut self.rmw_locked) {
+            bus.set_rmw_lock(false);
+        }
     }
 
     /// Read byte from memory (data space).

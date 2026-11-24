@@ -26,6 +26,8 @@ exclude = [
 [dependencies]
 serde = { version = "1.0", features = ["derive"], optional = true }
 
+serde-big-array = { version = "0.5", optional = true }
+
 [features]
 default = []
 # Compile hot `run_batch` traces to native code with Cranelift. Without this
@@ -39,7 +41,7 @@ jit = [
 ]
 # Serialize the complete architectural CPU state for deterministic save states.
 # Runtime-only decode, FastMem, and JIT caches are rebuilt after deserialization.
-serde = ["dep:serde"]
+serde = ["dep:serde", "dep:serde-big-array"]
 # Opt-in trace-opportunity accounting for emulator profiling. Disabled builds
 # contain none of the counters or reporting code.
 trace-profile = []
