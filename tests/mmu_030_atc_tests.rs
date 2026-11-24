@@ -376,3 +376,19 @@ fn atc_survives_a_serde_round_trip() {
     let old: CpuCore = serde_json::from_value(value).unwrap();
     assert_eq!(old.atc_030.valid_entries(), 0);
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn restores_a_positional_cpu_state_written_by_0_17_3() {
+    // m68k 0.17.3 serialized this CPU with rmp_serde::to_vec. The fixture
+    // expresses those same MessagePack arrays as JSON, preserving field order.
+    let saved = include_str!("fixtures/cpu-core-0.17.3-68030-sequence.json");
+    let cpu: CpuCore = serde_json::from_str(saved).unwrap();
+    assert_eq!(cpu.cpu_type, CpuType::M68030);
+    assert_eq!(cpu.atc_030.valid_entries(), 1);
+    assert_eq!(cpu.atc_030.probe(5, 0x23, 12, false), Some(0x45000));
+    assert_eq!(cpu.atc_030.probe(5, 0x23, 12, true), None);
+    assert_eq!(cpu.cycles_remaining, -17);
+    assert!(cpu.sst_m68000_compat);
+    assert_eq!(cpu.atc.lookup(0x23, true, false), None);
+}
