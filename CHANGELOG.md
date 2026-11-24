@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.3...m68k-v0.18.0) (2026-11-24)
+
+
+### Features
+
+* **cpu:** expose locked operand cycles and preserve MMU replay ([#269](https://github.com/benletchford/m68k-rs/issues/269)) ([5d244ef](https://github.com/benletchford/m68k-rs/commit/5d244ef5a8e501c4c3ee780744af9ddb30f9251e))
+
 ## [0.17.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.2...m68k-v0.17.3) (2026-11-22)
 
 
