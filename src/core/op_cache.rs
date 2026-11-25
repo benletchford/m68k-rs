@@ -928,7 +928,9 @@ fn decode_group_alu_reg(cpu_type: CpuType, opcode: u16) -> Option<DecodedSimpleO
             _ => None,
         },
         0xC => {
-            if matches!(op_mode, 3 | 7) && ea_mode == 0 {
+            // The 68010 multiplier has its own times and makes its prefetch
+            // last (vAmigaTS CPU/Prefetch); it stays in the interpreter.
+            if matches!(op_mode, 3 | 7) && ea_mode == 0 && cpu_type != CpuType::M68010 {
                 return Some(DecodedSimpleOp::MulWordDataReg {
                     src: ea_reg,
                     dst: reg,
