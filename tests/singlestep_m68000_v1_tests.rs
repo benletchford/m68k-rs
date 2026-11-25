@@ -1540,11 +1540,13 @@ fn load_state_68000(cpu: &mut CpuCore, state: &BinState) {
 /// - `DBcc` (addrerr40/41): the address of the displacement word, where
 ///   the fixtures record the word after it;
 /// - `JSR (d16,An)` (addrerr42): the address of the extension word, where
-///   the fixtures record the word after it.
+///   the fixtures record the word after it;
+/// - `MOVEM (d8,An,Xn),<list>` (addrerr43): the address of the extension
+///   word, where the fixtures record four bytes past it.
 ///
 /// The other frame fields of these forms are still compared.
 fn stacked_pc_differs_from_hardware(opcode: u16) -> bool {
-    opcode & 0xF0F8 == 0x50C8 || opcode & 0xFFF8 == 0x4EA8
+    opcode & 0xF0F8 == 0x50C8 || opcode & 0xFFF8 == 0x4EA8 || opcode & 0xFFB8 == 0x4CB0
 }
 
 /// Check the seven-word group 0 frame of an address-error fixture.

@@ -531,3 +531,69 @@ fn m68010_odd_flow_target_faults_before_the_instruction_changes_anything() {
         assert_format_8(&mut m, case.what, SUPERVISOR, 0x2106, case.target);
     }
 }
+
+/// An odd user stack pointer.
+const ODD_USP: u32 = 0x5001;
+
+/// Drop to user mode with the given condition codes and user stack.
+fn enter_user_mode(m: &mut Machine, ccr: u16, usp: u32) {
+    m.cpu.set_usp(usp);
+    m.cpu.set_sr(ccr);
+}
+
+#[test]
+fn m68000_pea_push_fault_stacks_the_pc_past_the_final_prefetch() {
+    // PEA (An) and PEA (d16,An) make their final prefetch before the push,
+    // so a fault on the push stacks the address two bytes past that
+    // prefetch; PEA (xxx).W pushes first. Measured: addrerr32, 33 and 34.
+    let cases: [(&str, &[u16], u32); 3] = [
+        ("pea (a1)", &[0x4851], 4),
+        ("pea 4(a1)", &[0x4869, 0x0004], 6),
+        ("pea (xxx).W", &[0x4878, 0x1234], 4),
+    ];
+    for (what, code, pc_past_opcode) in cases {
+        let mut m = machine(CpuType::M68000, code);
+        m.cpu.set_a(1, EVEN);
+        enter_user_mode(&mut m, 0, ODD_USP);
+        run_to_handler(&mut m, what);
+        assert_group0(
+            &mut m,
+            what,
+            Group0 {
+                read: false,
+                fc: USER_DATA,
+                access: ODD_USP - 4,
+                ir: code[0],
+                sr: 0,
+                pc: CODE + pc_past_opcode,
+            },
+        );
+    }
+}
+
+#[test]
+fn m68000_movem_indexed_fault_stacks_the_extension_word_address() {
+    // movem.l (4,a2,d1.w),d3-d5: the stacked PC is the address of the
+    // brief extension word, four bytes past the opcode, where MOVEM (An)+
+    // stacks the address after its register mask plus two. Measured:
+    // addrerr43 (and addrerr22 for the (An)+ form).
+    let code = [0x4cf2, 0x0038, 0x1004];
+    let what = "movem.l (4,a2,d1.w),d3-d5";
+    let mut m = machine(CpuType::M68000, &code);
+    m.cpu.set_a(2, ODD);
+    m.cpu.set_d(1, 0);
+    run_to_handler(&mut m, what);
+    assert_group0(
+        &mut m,
+        what,
+        Group0 {
+            read: true,
+            fc: SUPERVISOR_DATA,
+            access: ODD + 4,
+            ir: code[0],
+            sr: SUPERVISOR,
+            pc: CODE + 4,
+        },
+    );
+    assert_eq!(m.cpu.a(2), ODD, "{what}: A2");
+}
