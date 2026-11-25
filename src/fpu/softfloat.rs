@@ -257,13 +257,18 @@ fn overflow_result(sign: bool, mode: RoundMode) -> FloatX80 {
 
 /// Whether discarding `rem`, the `shift` bits below the quotient `q`, rounds
 /// the magnitude up in `mode`.
+///
+/// The remainder of an arithmetic result is as good as random, so the
+/// tests on it are combined without short-circuiting: as branches they
+/// mispredict on every other result.
+#[inline(always)]
 fn rounds_up(sign: bool, q: u64, rem: u128, shift: u32, mode: RoundMode) -> bool {
     let halfway = 1u128 << (shift - 1);
     match mode {
-        RoundMode::Nearest => rem > halfway || (rem == halfway && (q & 1) == 1),
+        RoundMode::Nearest => (rem > halfway) | ((rem == halfway) & ((q & 1) == 1)),
         RoundMode::Zero => false,
-        RoundMode::PosInf => !sign && rem != 0,
-        RoundMode::NegInf => sign && rem != 0,
+        RoundMode::PosInf => !sign & (rem != 0),
+        RoundMode::NegInf => sign & (rem != 0),
     }
 }
 
@@ -304,18 +309,14 @@ fn round_pack(sign: bool, mut exp: i32, mut m: u128, ctx: RoundCtx, f: &mut ExcF
     let q = (m >> shift) as u64; // p significant bits, integer bit at bit p-1
     let rem = m & ((1u128 << shift) - 1);
     let round_up = rounds_up(sign, q, rem, shift, ctx.mode);
-    if rem != 0 {
-        f.raise(ExcFlags::INEX2);
-    }
+    // Branch-free, like the rounding decision.
+    f.raise(u8::from(rem != 0) * ExcFlags::INEX2);
 
-    let mut q = q as u128;
-    if round_up {
-        q += 1;
-        if (q >> p) != 0 {
-            // Carried out of the significand: renormalize.
-            q >>= 1;
-            biased += 1;
-        }
+    let mut q = q as u128 + u128::from(round_up);
+    if (q >> p) != 0 {
+        // Carried out of the significand: renormalize.
+        q >>= 1;
+        biased += 1;
     }
 
     let integer_bit_set = (q >> (p - 1)) & 1 != 0;
@@ -521,18 +522,58 @@ pub fn div(a: FloatX80, b: FloatX80, ctx: RoundCtx, f: &mut ExcFlags) -> FloatX8
     // The ratio of two normalized mantissas is in (1/2, 2). 64 fraction bits
     // leave no guard bit when it is below 1, so divide the remainder again:
     // q1 = floor(ratio * 2^64), q2 = the next 64 bits.
-    let mb = ub.mant as u128;
-    let num = (ua.mant as u128) << 64;
-    let q1 = num / mb;
-    let r1 = num % mb;
-    let q2 = (r1 << 64) / mb;
-    let r2 = (r1 << 64) % mb;
+    let (q1, q2, r2) = if (ua.mant & ub.mant) >> 63 != 0 {
+        // Normalized mantissas: the quotient's integer part is 0 or 1,
+        // and each further 64 bits are one division by a 64-bit divisor.
+        let over = ua.mant >= ub.mant;
+        let head = if over { ua.mant - ub.mant } else { ua.mant };
+        let (q1, r1) = div_wide(head, ub.mant);
+        let (q2, r2) = div_wide(r1, ub.mant);
+        (
+            (u128::from(over) << 64) | u128::from(q1),
+            u128::from(q2),
+            r2 != 0,
+        )
+    } else {
+        let mb = ub.mant as u128;
+        let num = (ua.mant as u128) << 64;
+        let r1 = num % mb;
+        (num / mb, (r1 << 64) / mb, !(r1 << 64).is_multiple_of(mb))
+    };
     // q1 has at most 65 bits: m = ratio * 2^126, so bit 127 stands for 2^1.
     let mut m = (q1 << 62) | (q2 >> 2);
-    if (q2 & 3) != 0 || r2 != 0 {
+    if (q2 & 3) != 0 || r2 {
         m |= 1;
     }
     round_pack(sign, ua.exp - ub.exp + 1, m, ctx, f)
+}
+
+/// `(n << 64) / d` and the remainder, for `n < d` and a `d` with its top
+/// bit set: one step of schoolbook division in 32-bit digits (Knuth's
+/// algorithm D), which the general 128-bit division takes far longer
+/// over.
+#[inline]
+fn div_wide(n: u64, d: u64) -> (u64, u64) {
+    debug_assert!(n < d && d >> 63 != 0);
+    const DIGIT: u64 = 1 << 32;
+    let (d1, d0) = (d >> 32, d & (DIGIT - 1));
+    // The next quotient digit of `rem * 2^32 / d`, for `rem < d`.
+    let digit = |rem: u64| -> (u64, u64) {
+        let mut q = rem / d1;
+        let mut r = rem % d1;
+        // The estimate is at most two too large.
+        while q >= DIGIT || q * d0 > r << 32 {
+            q -= 1;
+            r += d1;
+            if r >= DIGIT {
+                break;
+            }
+        }
+        (q, (rem << 32).wrapping_sub(q.wrapping_mul(d)))
+    };
+    let (q1, rem) = digit(n);
+    let (q0, rem) = digit(rem);
+    ((q1 << 32) | q0, rem)
 }
 
 // ============================== sqrt =====================================
@@ -1171,6 +1212,50 @@ mod tests {
     }
     fn rn() -> RoundCtx {
         RoundCtx::NEAREST_EXT
+    }
+
+    #[test]
+    fn div_wide_is_the_128_bit_division() {
+        let check = |n: u64, d: u64| {
+            let wide = u128::from(n) << 64;
+            let expected = ((wide / u128::from(d)) as u64, (wide % u128::from(d)) as u64);
+            assert_eq!(div_wide(n, d), expected, "{n:#x} / {d:#x}");
+        };
+        let edges = [
+            0,
+            1,
+            0xFFFF_FFFF,
+            0x1_0000_0000,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0x8000_0000_0000_0000,
+            0x8000_0000_0000_0001,
+            0x8000_0000_FFFF_FFFF,
+            0xFFFF_FFFF_0000_0000,
+            0xFFFF_FFFF_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFE,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ];
+        for d in edges.into_iter().filter(|d| d >> 63 != 0) {
+            for n in edges.into_iter().filter(|&n| n < d) {
+                check(n, d);
+            }
+            check(d - 1, d);
+        }
+        // A fixed pseudo-random walk (splitmix64).
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for _ in 0..200_000 {
+            let d = next() | (1 << 63);
+            // Divisors with sparse low halves stress the digit correction.
+            let d = if next() & 3 == 0 { d & !0xFFFF_FFFE } else { d };
+            check(next() % d, d);
+        }
     }
 
     /// For exactly-representable operands the extended result, narrowed to
