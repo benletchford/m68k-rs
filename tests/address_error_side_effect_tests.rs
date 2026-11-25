@@ -652,3 +652,21 @@ fn m68010_sets_the_ccr_before_a_faulting_write() {
     run_to_handler(&mut m, what);
     assert_format_8(&mut m, what, 0, USER_DATA, ODD - 2);
 }
+
+#[test]
+fn m68000_and_m68010_divu_overflow_sets_n_and_clears_z() {
+    // divu.w d2,d1 with a quotient that does not fit: V set, C clear, X
+    // kept, and of the two flags M68000PRM leaves undefined, N set and Z
+    // clear. Measured: addrerr30 on the MC68000 and on the MC68010.
+    for cpu_type in [CpuType::M68000, CpuType::M68010] {
+        let mut m = machine(cpu_type, &[0x82c2]);
+        m.cpu.set_d(1, 0xffff_0000);
+        m.cpu.set_d(2, 0x0000_8000);
+        let mut hle = NoOpHleHandler;
+        let r = m.cpu.step_with_hle_handler(&mut m.bus, &mut hle);
+        assert!(matches!(r, StepResult::Ok { .. }), "{cpu_type:?}: {r:?}");
+        assert_eq!(m.cpu.d(1), 0xffff_0000, "{cpu_type:?}: D1 is unchanged");
+        // X | N | V.
+        assert_eq!(m.cpu.get_sr() & 0x001f, 0x001a, "{cpu_type:?}: CCR");
+    }
+}
