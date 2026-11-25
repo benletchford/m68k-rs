@@ -33,7 +33,7 @@ pub(super) enum FpuEa {
 
 /// A source operand as fetched, before conversion to extended.
 #[derive(Clone, Copy)]
-pub(super) enum RawSource {
+pub(crate) enum RawSource {
     Long(u32),
     Word(u16),
     Byte(u8),
@@ -851,11 +851,88 @@ impl CpuCore {
 
     /// Run the general operation of command word `w2` on `src` into its
     /// FP register and hold the exception it raises.
-    #[inline]
+    #[inline(always)]
     fn fpu_general_op(&mut self, w2: u16, src: FloatX80, src_flags: ExcFlags) -> i32 {
         let registers = FprUndo::before(&self.fpr, w2);
         let cycles = self.fpu_apply_op(w2 & 0x7F, ((w2 >> 7) & 7) as usize, src, src_flags);
         self.fpu_op_exception(cycles, w2, src, &registers)
+    }
+
+    /// A general arithmetic instruction for the decoded batch loop, which
+    /// has fetched the command word `w2` and, for a memory, data-register
+    /// or immediate source, the operand `raw` through its window. PC and
+    /// the address registers are the caller's to advance.
+    ///
+    /// Only what takes no exception runs here: an instruction every FPU
+    /// has in hardware, on operands it computes with itself, with no
+    /// exception waiting to be reported. Such an instruction's own
+    /// exception is held for the next one, so nothing of full dispatch's
+    /// fault handling is needed. Returns false with nothing changed for
+    /// everything else, which [`Self::exec_fpu_op0`] then runs.
+    #[inline]
+    pub(crate) fn fpu_general_op_decoded(&mut self, w2: u16, raw: Option<RawSource>) -> bool {
+        use super::exceptions_040::{dyadic, hardware_opmode};
+        use super::exceptions_060::source_unsupported;
+        use super::state_040::{classify, tag_unsupported};
+        use crate::core::types::CpuType;
+
+        let opmode = w2 & 0x7F;
+        let dst = ((w2 >> 7) & 7) as usize;
+        if !hardware_opmode(opmode) {
+            return false;
+        }
+        let supported = match self.cpu_type {
+            CpuType::M68040 => true,
+            CpuType::M68060 => self.pcr & crate::core::cpu::PCR_DFP == 0,
+            CpuType::M68EC040 | CpuType::M68LC040 => false,
+            _ => self.fpu_present && !self.is_pre_68020 && opmode & 0x40 == 0,
+        };
+        if !supported || self.fpu_exception_pending != 0 || !self.fpu_040.is_idle() {
+            return false;
+        }
+        // A denormalized or unnormalized operand is the software
+        // package's when that runs in the guest.
+        let package = self.trap_unimpl_040() || self.trap_unimpl_060();
+        if package && dyadic(opmode) && tag_unsupported(classify(self.fpr[dst])) {
+            return false;
+        }
+        match raw {
+            None => {
+                let src = self.fpr[((w2 >> 10) & 7) as usize];
+                if package && tag_unsupported(classify(src)) {
+                    return false;
+                }
+                self.fpu_060_excp = None;
+                self.fpiar = self.ppc;
+                self.fpu_general_op(w2, src, ExcFlags::default());
+            }
+            Some(raw) if self.trap_unimpl_040() => {
+                if !self.fpu_040_source_decoded(w2, raw) {
+                    return false;
+                }
+            }
+            Some(raw) => {
+                if self.trap_unimpl_060() && source_unsupported(raw) {
+                    return false;
+                }
+                self.fpu_060_excp = None;
+                self.fpiar = self.ppc;
+                let mut flags = ExcFlags::default();
+                let src = raw.to_x80(&mut flags);
+                if self.is_060() {
+                    let operand = self.fpu_060_source_operand(raw, src);
+                    let registers = FprUndo::before(&self.fpr, w2);
+                    let cycles = self.fpu_apply_op(opmode, dst, src, flags);
+                    self.fpu_060_hold_exception(cycles, w2, operand, src, &registers);
+                } else {
+                    self.fpu_general_op(w2, src, flags);
+                }
+            }
+        }
+        self.fpu_just_reset = false;
+        #[cfg(test)]
+        super::fast_path_tests::DECODED_OPS.set(super::fast_path_tests::DECODED_OPS.get() + 1);
+        true
     }
 
     /// Hold the exception of the general operation that just completed
@@ -866,7 +943,7 @@ impl CpuCore {
     /// finds the operands. An enabled OVFL, UNFL or INEX stores the
     /// result the disabled case stores (MC68881/MC68882UM 6.1.2 to
     /// 6.1.7).
-    #[inline]
+    #[inline(always)]
     fn fpu_op_exception(
         &mut self,
         cycles: i32,

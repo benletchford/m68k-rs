@@ -20,6 +20,7 @@
 use super::cpu::CpuCore;
 use super::op_cache::{AddrOp, BinaryOp, BitOp, is_pre_68020};
 use super::types::{CpuType, Size};
+use crate::fpu::RawSource;
 
 /// Effective-address forms the fastmem path understands. Everything else
 /// (68020 full-format indexing, register pairs, …) falls back to dispatch.
@@ -1571,6 +1572,148 @@ fn store<const T: bool>(cpu: &mut CpuCore, win: Win<T>, loc: &Loc, size: Size, v
         Loc::Mem(off) => win.write(off, size, value),
         Loc::Imm(_) => unreachable!("immediate is never a destination"),
     }
+}
+
+/// The source operand of a general FPU instruction in format `fmt`, read
+/// through the window as it is stored. Extension words advance `ctx` and
+/// a post-increment or pre-decrement is left pending in it. `None` for
+/// what full dispatch must fetch (and for what it rejects): a window
+/// miss, memory-indirect addressing, packed decimal.
+#[inline]
+fn fpu_window_source<const T: bool>(
+    cpu: &CpuCore,
+    win: Win<T>,
+    ctx: &mut Ctx,
+    opcode: u16,
+    fmt: u16,
+) -> Option<RawSource> {
+    let bytes: u32 = match fmt {
+        6 => 1,
+        4 => 2,
+        0 | 1 => 4,
+        5 => 8,
+        2 => 12,
+        _ => return None,
+    };
+    let reg = (opcode & 7) as u8;
+    let an = cpu.dar[8 + reg as usize];
+    // A7 stays word-aligned for byte operands.
+    let step = if bytes == 1 && reg == 7 { 2 } else { bytes };
+    let raw = match (opcode >> 3) & 7 {
+        0 => {
+            let v = cpu.dar[reg as usize];
+            return match fmt {
+                0 => Some(RawSource::Long(v)),
+                1 => Some(RawSource::Single(v)),
+                4 => Some(RawSource::Word(v as u16)),
+                6 => Some(RawSource::Byte(v as u8)),
+                _ => None,
+            };
+        }
+        2 => an,
+        3 => {
+            ctx.pending.push(reg, an.wrapping_add(step));
+            an
+        }
+        4 => {
+            let a = an.wrapping_sub(step);
+            ctx.pending.push(reg, a);
+            a
+        }
+        5 => {
+            let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
+            (an as i32).wrapping_add(d) as u32
+        }
+        6 => direct_index(cpu, win, ctx, an)?,
+        7 => match reg {
+            0 => read_ext_word(cpu, win, ctx)? as u16 as i16 as i32 as u32,
+            1 => (read_ext_word(cpu, win, ctx)? << 16) | read_ext_word(cpu, win, ctx)?,
+            2 => {
+                // Base is the address of the extension word itself.
+                let base = ctx.next_ext;
+                let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
+                (base as i32).wrapping_add(d) as u32
+            }
+            3 => direct_index(cpu, win, ctx, ctx.next_ext)?,
+            4 => {
+                let mut long = || -> Option<u32> {
+                    Some((read_ext_word(cpu, win, ctx)? << 16) | read_ext_word(cpu, win, ctx)?)
+                };
+                return Some(match fmt {
+                    0 => RawSource::Long(long()?),
+                    1 => RawSource::Single(long()?),
+                    4 => RawSource::Word(read_ext_word(cpu, win, ctx)? as u16),
+                    6 => RawSource::Byte(read_ext_word(cpu, win, ctx)? as u8),
+                    5 => RawSource::Double((u64::from(long()?) << 32) | u64::from(long()?)),
+                    // An extended immediate is an effective address the
+                    // 68060 does not implement.
+                    _ => return None,
+                });
+            }
+            _ => return None,
+        },
+        _ => return None,
+    };
+    let addr = cpu.address(raw);
+    // The interpreter reads a long at a time, each address masked on its
+    // own: an operand running off the end of the address space is its.
+    if addr > cpu.address_mask - (bytes - 1) {
+        return None;
+    }
+    let p = win.data(cpu, addr, bytes, false)? as *const u8;
+    // SAFETY: the window covers all `bytes` of the operand.
+    let long = |at: usize| unsafe {
+        u32::from_be_bytes([*p.add(at), *p.add(at + 1), *p.add(at + 2), *p.add(at + 3)])
+    };
+    Some(match fmt {
+        0 => RawSource::Long(long(0)),
+        1 => RawSource::Single(long(0)),
+        // SAFETY: as above.
+        4 => RawSource::Word(unsafe { u16::from_be_bytes([*p, *p.add(1)]) }),
+        6 => RawSource::Byte(unsafe { *p }),
+        5 => RawSource::Double((u64::from(long(0)) << 32) | u64::from(long(4))),
+        _ => RawSource::Extended(
+            (long(0) >> 16) as u16,
+            (u64::from(long(4)) << 32) | u64::from(long(8)),
+        ),
+    })
+}
+
+/// Execute a general FPU instruction (`$F200-$F23F`) against the fastmem
+/// window: the arithmetic of [`CpuCore::fpu_general_op_decoded`] with a
+/// register source or one this module can fetch.
+///
+/// Returns `false` (with zero state changes) for everything else, which
+/// full dispatch takes: FMOVE to memory, FMOVEM and the control-register
+/// moves, an instruction or operand that traps, a held exception.
+#[inline(always)]
+pub(crate) fn execute_window_fpu_op<const T: bool>(cpu: &mut CpuCore, opcode: u16) -> bool {
+    let Some(win) = Win::<T>::from_cpu(cpu) else {
+        return false;
+    };
+    let mut ctx = Ctx {
+        next_ext: cpu.pc,
+        pending: Pending::default(),
+        aligned_only: false,
+    };
+    let Some(w2) = read_ext_word(cpu, win, &mut ctx) else {
+        return false;
+    };
+    let w2 = w2 as u16;
+    let raw = match w2 >> 13 {
+        0 => None,
+        2 => match fpu_window_source(cpu, win, &mut ctx, opcode, (w2 >> 10) & 7) {
+            Some(raw) => Some(raw),
+            None => return false,
+        },
+        _ => return false,
+    };
+    if !cpu.fpu_general_op_decoded(w2, raw) {
+        return false;
+    }
+    ctx.pending.commit(cpu);
+    cpu.pc = ctx.next_ext;
+    true
 }
 
 /// Execute a decoded memory op against the fastmem window.

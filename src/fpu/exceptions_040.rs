@@ -79,7 +79,7 @@ use crate::fpu::FloatX80;
 /// The FP opmodes the 68040 executes in hardware (M68040UM 9.4): FMOVE,
 /// FSQRT, FABS, FNEG, FDIV, FADD, FMUL, FSGLDIV, FSGLMUL, FSUB, FCMP, FTST
 /// and the single- and double-rounding variants.
-fn hardware_opmode(opmode: u16) -> bool {
+pub(super) fn hardware_opmode(opmode: u16) -> bool {
     matches!(
         opmode,
         0x00 | 0x04
@@ -335,13 +335,28 @@ impl CpuCore {
         }
 
         let (raw, _) = self.fpu_fetch_source(bus, opcode, src_fmt)?;
+        match self.fpu_040_fetched_source(w2, raw) {
+            Ok(cycles) => Some(cycles),
+            Err(src) => {
+                self.fpu_040_unsupp_state(w2, src, dst_value);
+                Some(self.fpu_040_take_unsupp(bus))
+            }
+        }
+    }
+
+    /// A hardware instruction on the fetched source `raw`. An operand of
+    /// a data type the 68040 leaves to software comes back as the
+    /// conversion unit latched it, with nothing done.
+    #[inline]
+    fn fpu_040_fetched_source(&mut self, w2: u16, raw: RawSource) -> Result<i32, Latched> {
+        let dst = ((w2 >> 7) & 7) as usize;
+        let opmode = w2 & 0x7F;
         let src = Latched::source(raw);
         if src.packed.is_some()
             || tag_unsupported(src.tag)
-            || (dyadic(opmode) && tag_unsupported(classify(dst_value)))
+            || (dyadic(opmode) && tag_unsupported(classify(self.fpr[dst])))
         {
-            self.fpu_040_unsupp_state(w2, src, dst_value);
-            return Some(self.fpu_040_take_unsupp(bus));
+            return Err(src);
         }
 
         self.fpiar = self.ppc;
@@ -356,7 +371,14 @@ impl CpuCore {
         };
         let registers = super::operations::FprUndo::before(&self.fpr, w2);
         let cycles = self.fpu_apply_op(opmode, dst, value, flags);
-        Some(self.fpu_040_hold_exception(cycles, w2, src.value, &registers))
+        Ok(self.fpu_040_hold_exception(cycles, w2, src.value, &registers))
+    }
+
+    /// [`Self::fpu_040_fetched_source`] for the decoded batch loop: false,
+    /// with nothing done, when the operand is the FPSP's.
+    #[inline]
+    pub(super) fn fpu_040_source_decoded(&mut self, w2: u16, raw: RawSource) -> bool {
+        self.fpu_040_fetched_source(w2, raw).is_ok()
     }
 
     /// A general instruction with a register source (the command word

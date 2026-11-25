@@ -21,5 +21,6 @@ mod two_over_pi;
 mod types;
 
 pub(crate) use exceptions_060::Fpu060Excp;
+pub(crate) use operations::RawSource;
 pub use state_040::{Fpu040Frame, Fpu040State};
 pub use types::*;

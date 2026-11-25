@@ -148,6 +148,7 @@ impl CpuCore {
     /// implements and whose destination is a floating-point register,
     /// takes the unsupported-data-type exception: its source is of such a
     /// type (`source`), or it is dyadic and its destination register is.
+    #[inline(always)]
     pub(super) fn fpu_060_unsupp_operands(&self, w2: u16, source: bool) -> bool {
         self.trap_unimpl_060()
             && (source
