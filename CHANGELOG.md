@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.18.0...m68k-v0.18.1) (2026-11-25)
+
+
+### Bug Fixes
+
+* **cpu:** correct the 68010's conditional branch times and MOVE bus order ([ba7dee0](https://github.com/benletchford/m68k-rs/commit/ba7dee0c3cebde4fbb6b4a9318b445a7fdac661b))
+
 ## [0.18.0](https://github.com/benletchford/m68k-rs/compare/m68k-v0.17.3...m68k-v0.18.0) (2026-11-24)
 
 
