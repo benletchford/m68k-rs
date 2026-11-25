@@ -1534,6 +1534,19 @@ fn load_state_68000(cpu: &mut CpuCore, state: &BinState) {
     cpu.prefetch_count = 2;
 }
 
+/// Address-error forms whose stacked PC the MAME-derived fixtures record
+/// differently from a real MC68000. vAmigaTS (`CPU/Exceptions/StackFrame`)
+/// photographs an A500 stacking, for an odd target or operand address:
+/// - `DBcc` (addrerr40/41): the address of the displacement word, where
+///   the fixtures record the word after it;
+/// - `JSR (d16,An)` (addrerr42): the address of the extension word, where
+///   the fixtures record the word after it.
+///
+/// The other frame fields of these forms are still compared.
+fn stacked_pc_differs_from_hardware(opcode: u16) -> bool {
+    opcode & 0xF0F8 == 0x50C8 || opcode & 0xFFF8 == 0x4EA8
+}
+
 /// Check the seven-word group 0 frame of an address-error fixture.
 ///
 /// The register and flag side effects of a faulted instruction depend on
@@ -1541,15 +1554,17 @@ fn load_state_68000(cpu: &mut CpuCore, state: &BinState) {
 /// The frame itself is architectural: when the core raised the fault within
 /// the instruction and built its frame where the fixture did, the function
 /// code, R/W and I/N bits of the status word, the 32-bit access address and
-/// the stacked PC must match the hardware trace. (Fixtures whose fault the
-/// core raises one step later -- a jump to an odd address faults on the next
-/// opcode fetch here -- and the few whose frame position depends on a
-/// partially updated A7 are skipped by the stack-pointer comparison.)
+/// the stacked PC must match the hardware trace (except where a real 68000
+/// is known to differ, see `stacked_pc_differs_from_hardware`). Fixtures
+/// whose fault the core raises one step later, and the few whose frame
+/// position depends on a partially updated A7, are skipped by the
+/// stack-pointer comparison.
 fn check_address_error_frame_68000(
     expected: &BinState,
     cpu: &CpuCore,
     bus: &mut SparseBus,
     ctx: &str,
+    opcode: u16,
 ) -> Result<(), String> {
     let exp_ssp = reg(expected, "ssp");
     let got_ssp = if cpu.is_supervisor() {
@@ -1574,6 +1589,9 @@ fn check_address_error_frame_68000(
         ("stacked PC low", 12, 0xffff),
     ];
     for (name, offset, mask) in fields {
+        if offset >= 10 && stacked_pc_differs_from_hardware(opcode) {
+            continue;
+        }
         let Some(exp) = expected_word(offset) else {
             return Ok(());
         };
@@ -1608,8 +1626,7 @@ fn check_state_68000(
         }
     }
     if has_addr_error_txn {
-        let _ = opcode;
-        return check_address_error_frame_68000(expected, cpu, bus, ctx);
+        return check_address_error_frame_68000(expected, cpu, bus, ctx, opcode);
     }
 
     fn sr_mask_for_opcode(opcode: u16) -> u16 {

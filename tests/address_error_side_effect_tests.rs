@@ -406,3 +406,128 @@ fn m68000_source_register_update_survives_a_destination_fault() {
         },
     ]);
 }
+
+/// JMP, JSR and DBcc to an odd target: the instruction, its preset A2 and
+/// D1, and the odd target.
+struct OddTarget {
+    what: &'static str,
+    code: &'static [u16],
+    a2: u32,
+    d1: u32,
+    target: u32,
+}
+
+const ODD_TARGETS: [OddTarget; 4] = [
+    OddTarget {
+        what: "jmp (a2)",
+        code: &[0x4ed2],
+        a2: ODD,
+        d1: 0,
+        target: ODD,
+    },
+    OddTarget {
+        what: "jsr 6(a2)",
+        code: &[0x4eaa, 0x0006],
+        a2: ODD,
+        d1: 0,
+        target: ODD + 6,
+    },
+    // The displacement is relative to the extension word.
+    OddTarget {
+        what: "dbra d1,*+5, branch taken",
+        code: &[0x51c9, 0x0003],
+        a2: EVEN,
+        d1: 5,
+        target: CODE + 5,
+    },
+    OddTarget {
+        what: "dbra d1,*+5, counter expired",
+        code: &[0x51c9, 0x0003],
+        a2: EVEN,
+        d1: 0,
+        target: CODE + 5,
+    },
+];
+
+fn odd_target_machine(cpu_type: CpuType, case: &OddTarget) -> Machine {
+    let mut m = machine(cpu_type, case.code);
+    m.cpu.set_a(2, case.a2);
+    m.cpu.set_d(1, case.d1);
+    m
+}
+
+fn assert_odd_target_frame_68000(m: &mut Machine, case: &OddTarget) {
+    assert_group0(
+        m,
+        case.what,
+        Group0 {
+            read: true,
+            fc: SUPERVISOR_PROGRAM,
+            access: case.target,
+            ir: case.code[0],
+            sr: SUPERVISOR,
+            pc: CODE + 2,
+        },
+    );
+}
+
+#[test]
+fn m68000_odd_flow_target_faults_inside_the_instruction() {
+    // The fault is a program-space read of the target, taken before the
+    // instruction changes anything: the PC stacked is the address of the
+    // word after the opcode, not the target; JSR has pushed no return
+    // address (the stack holds the frame alone); and DBcc faults whether
+    // the branch is taken or the counter has expired.
+    // Measured: addrerr28, 40, 41 and 42.
+    for case in &ODD_TARGETS {
+        let mut m = odd_target_machine(CpuType::M68000, case);
+        run_to_handler(&mut m, case.what);
+        assert_odd_target_frame_68000(&mut m, case);
+    }
+}
+
+#[test]
+fn m68000_decoded_fast_path_raises_the_same_odd_flow_target_fault() {
+    // run_batch executes JMP, JSR and DBcc through the decoded fast path;
+    // an odd target must be left to full dispatch.
+    for case in &ODD_TARGETS {
+        let mut m = odd_target_machine(CpuType::M68000, case);
+        let result = m.cpu.run_batch(&mut m.bus, 16, &[HANDLER]);
+        assert_eq!(m.cpu.pc, HANDLER, "{}: {result:?}", case.what);
+        assert_odd_target_frame_68000(&mut m, case);
+    }
+}
+
+/// Size of the 68010 format $8 bus and address error frame.
+const FORMAT_8_BYTES: u32 = 58;
+
+/// Compare the architecturally defined words of a 68010 address-error
+/// frame: SR, the format and vector word, the special status word and the
+/// fault address. The stacked PC is not compared: this core stacks the
+/// instruction's own address and restarts the instruction from it on RTE,
+/// where the hardware continues it from the frame's internal words.
+fn assert_format_8(m: &mut Machine, what: &str, sr: u16, ssw: u16, fault_address: u32) {
+    let sp = m.cpu.sp();
+    assert_eq!(sp, SSP - FORMAT_8_BYTES, "{what}: stack pointer");
+    assert_eq!(m.bus.read_word(sp), sr, "{what}: stacked SR");
+    assert_eq!(m.bus.read_word(sp + 6), 0x800c, "{what}: format and vector");
+    assert_eq!(m.bus.read_word(sp + 8), ssw, "{what}: special status word");
+    assert_eq!(
+        m.bus.read_long(sp + 10),
+        fault_address,
+        "{what}: fault address"
+    );
+}
+
+#[test]
+fn m68010_odd_flow_target_faults_before_the_instruction_changes_anything() {
+    // As on the 68000, with the 68010's frame: SSW $2106 (an instruction
+    // fetch, read, supervisor program), the target as the fault address,
+    // and nothing pushed by JSR. Measured: addrerr28, 40, 41 and 42 on the
+    // MC68010.
+    for case in &ODD_TARGETS {
+        let mut m = odd_target_machine(CpuType::M68010, case);
+        run_to_handler(&mut m, case.what);
+        assert_format_8(&mut m, case.what, SUPERVISOR, 0x2106, case.target);
+    }
+}

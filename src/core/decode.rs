@@ -1819,6 +1819,21 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         AddressingMode::Index(_) | AddressingMode::PcIndex => 4,
                         _ => 0,
                     });
+                    if addr & 1 != 0 && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                        // An odd target faults before the return address is
+                        // pushed (vAmigaTS addrerr42: SP unchanged). The
+                        // 68000 stacks the address of the word after the
+                        // opcode for JSR (d16,An) (addrerr42, photographed
+                        // on an A500); the other modes keep the next-word
+                        // PC the SingleStepTests frames record.
+                        let stacked_pc = if matches!(mode, AddressingMode::Displacement(_)) {
+                            cpu.ppc.wrapping_add(2)
+                        } else {
+                            cpu.pc
+                        };
+                        cpu.odd_flow_target_address_error(bus, addr, stacked_pc);
+                        return 50;
+                    }
                     cpu.change_of_flow = true;
                     let return_pc = cpu.pc;
                     // MC68000 JSR saves the return address before refilling
@@ -1843,8 +1858,19 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     // EA extension words are consumed without prefetching
                     // ahead: the stream is about to be abandoned.
                     cpu.consume_without_prefetch = true;
-                    cpu.pc = cpu.get_ea_address(bus, mode, Size::Long);
+                    let target = cpu.get_ea_address(bus, mode, Size::Long);
                     cpu.consume_without_prefetch = false;
+                    if target & 1 != 0 && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010)
+                    {
+                        // An odd target faults in the JMP itself. The 68000
+                        // stacks the address of the word after the opcode,
+                        // whatever the mode (vAmigaTS addrerr28, photographed
+                        // on an A500, for (An); the SingleStepTests frames
+                        // for every mode).
+                        cpu.odd_flow_target_address_error(bus, target, cpu.ppc.wrapping_add(2));
+                        return 50;
+                    }
+                    cpu.pc = target;
                     // Control-flow EA internal clocks before the target
                     // refill (resolve_ea charged 2 for indexed modes already).
                     cpu.internal_cycles(match mode {
@@ -2112,14 +2138,24 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 return 50;
             }
             if !cc_true {
+                // DBcc displacement is relative to the displacement word (i.e. the PC value
+                // *before* reading it). `read_imm_16` advanced PC, so compensate by -2.
+                let target = (cpu.pc as i32).wrapping_add(disp as i32 - 2) as u32;
+                if target & 1 != 0 && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                    // An odd target faults whether or not the counter
+                    // expires (vAmigaTS addrerr40/41, photographed on an
+                    // A500 and on an A500 with a 68010). The 68000 stacks
+                    // the address of the displacement word. The counter is
+                    // left as it was: no frame records it, and the fault
+                    // rollback restores it.
+                    cpu.odd_flow_target_address_error(bus, target, cpu.ppc.wrapping_add(2));
+                    return 50;
+                }
                 let new_counter = counter.wrapping_sub(1);
                 cpu.set_d(
                     ea_reg as usize,
                     (cpu.d(ea_reg as usize) & 0xFFFF0000) | new_counter as u32,
                 );
-                // DBcc displacement is relative to the displacement word (i.e. the PC value
-                // *before* reading it). `read_imm_16` advanced PC, so compensate by -2.
-                let target = (cpu.pc as i32).wrapping_add(disp as i32 - 2) as u32;
                 if new_counter != 0xFFFF {
                     cpu.pc = target;
                     cpu.full_prefetch(bus);

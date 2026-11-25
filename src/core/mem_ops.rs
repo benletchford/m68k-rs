@@ -1268,6 +1268,11 @@ fn fast_flow<const T: bool>(cpu: &mut CpuCore, win: Win<T>, op: DecodedMemOp) ->
             let Some(disp) = read_ext(cpu) else {
                 return false;
             };
+            // A 68000/68010 DBcc whose condition is false faults on an odd
+            // target, counter expired or not: full dispatch raises it.
+            if cpu.is_pre_68020 && disp & 1 != 0 && !cpu.test_condition(condition) {
+                return false;
+            }
             if !cpu.test_condition(condition) {
                 let reg = reg as usize;
                 let counter = (cpu.dar[reg] as u16).wrapping_sub(1);
@@ -2143,6 +2148,11 @@ fn execute_mem_op_in<const T: bool>(cpu: &mut CpuCore, op: DecodedMemOp) -> bool
             let Some(addr) = resolve_control_addr(cpu, win, ea, &mut ctx) else {
                 return false;
             };
+            // An odd target faults in the instruction on the 68000/68010:
+            // leave it to full dispatch.
+            if ctx.aligned_only && addr & 1 != 0 {
+                return false;
+            }
             // The interpreter assigns the EA unmasked; the mask is applied
             // at the next fetch. Mirror that so pc values stay identical.
             cpu.change_of_flow = true;
@@ -2153,6 +2163,9 @@ fn execute_mem_op_in<const T: bool>(cpu: &mut CpuCore, op: DecodedMemOp) -> bool
             let Some(addr) = resolve_control_addr(cpu, win, ea, &mut ctx) else {
                 return false;
             };
+            if ctx.aligned_only && addr & 1 != 0 {
+                return false;
+            }
             let ret = ctx.next_ext;
             let sp = cpu.dar[15].wrapping_sub(4);
             if ctx.aligned_only && (sp & 1) != 0 {
@@ -2225,6 +2238,9 @@ fn execute_mem_op_in<const T: bool>(cpu: &mut CpuCore, op: DecodedMemOp) -> bool
             let Some(disp) = read_ext_word(cpu, win, &mut ctx) else {
                 return false;
             };
+            if ctx.aligned_only && disp & 1 != 0 && !cpu.test_condition(condition) {
+                return false;
+            }
             if !cpu.test_condition(condition) {
                 let reg = reg as usize;
                 let counter = (cpu.dar[reg] as u16).wrapping_sub(1);

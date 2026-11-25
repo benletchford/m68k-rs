@@ -4286,17 +4286,32 @@ impl TraceJit {
                     JitTraceOp::IndirectJmp {
                         target,
                         expected_target: Some(expected_target),
-                    } => emit_guarded_indirect_jmp(
-                        &mut builder,
-                        cpu_ptr,
-                        op.pc,
-                        op.opcode,
-                        target,
-                        expected_target,
-                        cycles_value,
-                        bail_at.ops_before,
-                        1,
-                    ),
+                    } => {
+                        // A 68000/68010 JMP to an odd target faults in the
+                        // instruction itself: bail before committing it so
+                        // the interpreter raises the address error.
+                        let odd_target_bail = aligned_only.then(|| {
+                            let bail = builder.create_block();
+                            bails.push(BailReq {
+                                block: bail,
+                                pc: op.pc,
+                                at: bail_at,
+                            });
+                            bail
+                        });
+                        emit_guarded_indirect_jmp(
+                            &mut builder,
+                            cpu_ptr,
+                            op.pc,
+                            op.opcode,
+                            target,
+                            expected_target,
+                            cycles_value,
+                            bail_at.ops_before,
+                            1,
+                            odd_target_bail,
+                        )
+                    }
                     JitTraceOp::MoveMem { size, src, dst } => {
                         let env = mem_env.as_ref().expect("MoveMem implies a window env");
                         emit_move_mem(
@@ -6238,6 +6253,11 @@ fn decode_dbcc_trace_op<B: AddressBus>(
     }
 
     let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
+    // An odd target faults on the 68000/68010 whenever the condition is
+    // false; the interpreter raises that address error.
+    if cpu.is_pre_68020 && extension & 1 != 0 {
+        return None;
+    }
     Some(TraceBuildOp {
         opcode,
         extension: Some(extension),
@@ -7320,6 +7340,14 @@ fn execute_portable_op(cpu: &mut CpuCore, op: TraceBuildOp, spans: CodeSpans) ->
     if matches!(op.op, JitTraceOp::CondSkip { .. }) {
         unreachable!("CondSkip is handled in execute_portable_trace, not per-op");
     }
+    if let JitTraceOp::IndirectJmp { target, .. } = op.op
+        && cpu.is_pre_68020
+        && portable_indirect_jmp_target(cpu, target) & 1 != 0
+    {
+        // A 68000/68010 JMP to an odd target faults in the instruction:
+        // bail with nothing committed so the interpreter raises it.
+        return None;
+    }
     if let JitTraceOp::MoveMem { size, src, dst } = op.op {
         return execute_portable_move_mem(cpu, size, src, dst, spans);
     }
@@ -7506,6 +7534,49 @@ fn execute_portable_movem_long_postinc(cpu: &mut CpuCore, trace: TraceBuildOp) -
     }
     cpu.dar[8 + base as usize] = base_val.wrapping_add(total);
     Some(trace.op.max_cycles())
+}
+
+/// The live target of a decoded indirect JMP.
+#[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
+fn portable_indirect_jmp_target(cpu: &CpuCore, target: JitEa) -> u32 {
+    match target {
+        JitEa::Ind(reg) => cpu.a(reg as usize),
+        JitEa::Disp(reg, displacement) => {
+            cpu.a(reg as usize).wrapping_add(displacement as i32 as u32)
+        }
+        JitEa::Index {
+            base,
+            index,
+            index_long,
+            scale,
+            displacement,
+        } => {
+            let raw_index = portable_read_reg(cpu, index, Size::Long);
+            let index = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            cpu.a(base as usize)
+                .wrapping_add(index.wrapping_shl(scale as u32))
+                .wrapping_add(displacement as i32 as u32)
+        }
+        JitEa::PcIndex {
+            base,
+            index,
+            index_long,
+            scale,
+        } => {
+            let raw_index = portable_read_reg(cpu, index, Size::Long);
+            let index = if index_long {
+                raw_index
+            } else {
+                raw_index as u16 as i16 as i32 as u32
+            };
+            base.wrapping_add(index.wrapping_shl(scale as u32))
+        }
+        _ => unreachable!("JMP decoder admitted unsupported EA"),
+    }
 }
 
 #[cfg(any(not(feature = "jit"), target_family = "wasm", test))]
@@ -8383,44 +8454,7 @@ fn execute_portable_reg_op(cpu: &mut CpuCore, op: TraceBuildOp) -> i32 {
         JitTraceOp::IndirectJmp { target, .. } => {
             // The jump commits architecturally regardless of the guard. The
             // executor compares this live target with the recorded one.
-            cpu.pc = match target {
-                JitEa::Ind(reg) => cpu.a(reg as usize),
-                JitEa::Disp(reg, displacement) => {
-                    cpu.a(reg as usize).wrapping_add(displacement as i32 as u32)
-                }
-                JitEa::Index {
-                    base,
-                    index,
-                    index_long,
-                    scale,
-                    displacement,
-                } => {
-                    let raw_index = portable_read_reg(cpu, index, Size::Long);
-                    let index = if index_long {
-                        raw_index
-                    } else {
-                        raw_index as u16 as i16 as i32 as u32
-                    };
-                    cpu.a(base as usize)
-                        .wrapping_add(index.wrapping_shl(scale as u32))
-                        .wrapping_add(displacement as i32 as u32)
-                }
-                JitEa::PcIndex {
-                    base,
-                    index,
-                    index_long,
-                    scale,
-                } => {
-                    let raw_index = portable_read_reg(cpu, index, Size::Long);
-                    let index = if index_long {
-                        raw_index
-                    } else {
-                        raw_index as u16 as i16 as i32 as u32
-                    };
-                    base.wrapping_add(index.wrapping_shl(scale as u32))
-                }
-                _ => unreachable!("JMP decoder admitted unsupported EA"),
-            };
+            cpu.pc = portable_indirect_jmp_target(cpu, target);
             cpu.change_of_flow = true;
             op.op.max_cycles()
         }
@@ -11155,6 +11189,13 @@ fn emit_indirect_jsr(
         }
         _ => unreachable!("JSR decoder admitted unsupported EA"),
     };
+    if env.aligned_only {
+        // A 68000/68010 JSR to an odd target faults before pushing: leave
+        // it to the interpreter.
+        let low = builder.ins().band_imm(target, 1);
+        let odd = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
+        branch_guard(builder, bail, odd);
+    }
     let old_sp = load_reg(builder, cpu, JitDirectReg::Addr(7));
     let new_sp = builder.ins().iadd_imm(old_sp, -4);
     let (off, _) = checked_window_off(builder, env, bail, new_sp, Size::Long, true);
@@ -12691,10 +12732,12 @@ fn emit_guarded_indirect_jmp(
     cycles_before: Value,
     retired_before_iter: RetiredBefore,
     ops_done: u32,
+    odd_target_bail: Option<Block>,
 ) -> Value {
     // The jump commits architecturally on every dispatch case. Only the
     // comparison with the recorded target controls whether the trace can
-    // continue along its recorded path.
+    // continue along its recorded path. An odd target on a 68000/68010
+    // (`odd_target_bail`) exits before the commit instead.
     let target = match target_ea {
         JitEa::Ind(reg) => load_reg(builder, cpu, JitDirectReg::Addr(reg)),
         JitEa::Disp(reg, displacement) => {
@@ -12747,6 +12790,11 @@ fn emit_guarded_indirect_jmp(
         }
         _ => unreachable!("JMP decoder admitted unsupported EA"),
     };
+    if let Some(bail) = odd_target_bail {
+        let low = builder.ins().band_imm(target, 1);
+        let odd = builder.ins().icmp_imm(IntCC::NotEqual, low, 0);
+        branch_guard(builder, bail, odd);
+    }
     store_pc_value(builder, cpu, target);
     let true_change = builder.ins().iconst(types::I8, 1);
     store_value(
@@ -14526,6 +14574,117 @@ mod portable_tests {
         assert_eq!(cpu.pc, 0x0444);
         assert!(!cpu.change_of_flow);
         assert!(mem.iter().all(|&byte| byte == 0));
+    }
+
+    /// `JMP (A1)` and `JSR (A0)` at $0100 with odd targets: on the 68000 and
+    /// 68010 the address error is taken in the instruction (before JSR
+    /// pushes), so a trace must leave them to the interpreter.
+    fn odd_target_flow_ops() -> [TraceBuildOp; 2] {
+        [
+            TraceBuildOp {
+                opcode: 0x4ED1,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::IndirectJmp {
+                    target: JitEa::Ind(1),
+                    expected_target: Some(0x0340),
+                },
+            },
+            TraceBuildOp {
+                opcode: 0x4E90,
+                extension: None,
+                extension2: None,
+                pc: 0x0100,
+                op: JitTraceOp::IndirectJsr {
+                    target: JitEa::Ind(0),
+                },
+            },
+        ]
+    }
+
+    #[test]
+    fn portable_flow_to_an_odd_target_bails_before_68020() {
+        for op in odd_target_flow_ops() {
+            let mut cpu = cpu();
+            let mut mem = vec![0u8; 0x1000];
+            attach_window(&mut cpu, &mut mem);
+            cpu.set_a(0, 0x0341);
+            cpu.set_a(1, 0x0341);
+            cpu.set_a(7, 0x0800);
+            cpu.change_of_flow = false;
+            assert_eq!(
+                execute_portable_op(&mut cpu, op, CodeSpans::caller(0x0100, 0x0102)),
+                None,
+                "{:04X}",
+                op.opcode
+            );
+            assert_eq!(cpu.pc, 0x0100, "{:04X}", op.opcode);
+            assert_eq!(cpu.a(7), 0x0800, "{:04X}", op.opcode);
+            assert!(!cpu.change_of_flow, "{:04X}", op.opcode);
+            assert!(mem.iter().all(|&byte| byte == 0), "{:04X}", op.opcode);
+        }
+    }
+
+    #[cfg(all(feature = "jit", not(target_family = "wasm")))]
+    #[test]
+    fn native_flow_to_an_odd_target_bails_before_68020() {
+        // Enough NOPs ahead of the flow op for an indirect JSR to be worth
+        // compiling.
+        let nops = TRACE_MIN_INDIRECT_JSR_OPS as u32;
+        let flow_pc = 0x0100 + 2 * nops;
+        for op in odd_target_flow_ops() {
+            let mut ops: Vec<TraceBuildOp> = (0..nops)
+                .map(|index| TraceBuildOp {
+                    opcode: 0x4E71,
+                    extension: None,
+                    extension2: None,
+                    pc: 0x0100 + index * 2,
+                    op: JitTraceOp::Nop,
+                })
+                .collect();
+            ops.push(TraceBuildOp { pc: flow_pc, ..op });
+            let mut jit = TraceJit::new();
+            let compiled = jit
+                .compile_decoded_ops_reason(&cpu(), 0x0100, CpuType::M68000, ops, Some(0x0340))
+                .unwrap_or_else(|reason| panic!("{:04X}: {reason:?}", op.opcode));
+            let mut mem = vec![0u8; 0x1000];
+            let mut native = cpu();
+            attach_window(&mut native, &mut mem);
+            native.set_a(0, 0x0341);
+            native.set_a(1, 0x0341);
+            native.set_a(7, 0x0800);
+            native.change_of_flow = false;
+            let packed = unsafe { compiled.call_native(&mut native, 1) };
+            assert_eq!(
+                (packed >> 32) as u32,
+                nops,
+                "{:04X}: only the NOPs retire",
+                op.opcode
+            );
+            assert_eq!(native.pc, flow_pc, "{:04X}", op.opcode);
+            assert_eq!(native.a(7), 0x0800, "{:04X}", op.opcode);
+            assert!(!native.change_of_flow, "{:04X}", op.opcode);
+            assert!(mem.iter().all(|&byte| byte == 0), "{:04X}", op.opcode);
+        }
+    }
+
+    #[test]
+    fn dbcc_with_an_odd_displacement_is_not_traced_before_68020() {
+        let mut mem = super::super::memory::LinearMemoryBus::new(0x1000);
+        mem.write_word(0x0100, 0x51C8); // DBRA D0,*+5
+        mem.write_word(0x0102, 0x0003);
+        for cpu_type in [CpuType::M68000, CpuType::M68010] {
+            let mut cpu = cpu();
+            cpu.set_cpu_type(cpu_type);
+            assert!(
+                decode_trace_op(&cpu, &mut mem, 0x0100, cpu_type).is_none(),
+                "{cpu_type:?}: the odd target faults in the interpreter"
+            );
+        }
+        let mut cpu = cpu();
+        cpu.set_cpu_type(CpuType::M68020);
+        assert!(decode_trace_op(&cpu, &mut mem, 0x0100, CpuType::M68020).is_some());
     }
 
     #[test]
