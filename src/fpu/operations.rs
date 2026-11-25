@@ -476,22 +476,13 @@ impl CpuCore {
 
                 self.fpiar = self.ppc;
                 if self.is_060() {
-                    // The 68060's EXCP frame holds the source operand,
-                    // which for a single or double is not its value.
                     let Some((raw, _)) = self.fpu_fetch_source(bus, opcode, src_fmt) else {
                         return 0;
                     };
-                    let mut flags = ExcFlags::default();
-                    let src = raw.to_x80(&mut flags);
-                    let operand = self.fpu_060_source_operand(raw, src);
-                    if self
-                        .fpu_060_unsupp_operands(w2, super::exceptions_060::source_unsupported(raw))
-                    {
-                        return self.fpu_060_take_unsupp(bus, operand);
-                    }
-                    let registers = FprUndo::before(&self.fpr, w2);
-                    let cycles = self.fpu_apply_op(opmode, dst, src, flags);
-                    return self.fpu_060_hold_exception(cycles, w2, operand, src, &registers);
+                    return match self.fpu_060_fetched_source(w2, raw) {
+                        Ok(cycles) => cycles,
+                        Err(operand) => self.fpu_060_take_unsupp(bus, operand),
+                    };
                 }
                 let Some((src, src_flags)) = self.fpu_read_source(bus, opcode, src_fmt) else {
                     return 0;
@@ -858,48 +849,59 @@ impl CpuCore {
         self.fpu_op_exception(cycles, w2, src, &registers)
     }
 
-    /// A general arithmetic instruction for the decoded batch loop, which
-    /// has fetched the command word `w2` and, for a memory, data-register
-    /// or immediate source, the operand `raw` through its window. PC and
-    /// the address registers are the caller's to advance.
-    ///
-    /// Only what takes no exception runs here: an instruction every FPU
-    /// has in hardware, on operands it computes with itself, with no
-    /// exception waiting to be reported. Such an instruction's own
-    /// exception is held for the next one, so nothing of full dispatch's
-    /// fault handling is needed. Returns false with nothing changed for
-    /// everything else, which [`Self::exec_fpu_op0`] then runs.
+    /// Whether the decoded batch loop can run the general instruction of
+    /// command word `w2` itself, as far as that shows before its source
+    /// is fetched: an instruction every FPU has in hardware, with no
+    /// exception waiting to be reported and a destination register the
+    /// FPU computes with itself. Such an instruction takes no exception
+    /// (its own is held for the next one), so nothing of full dispatch's
+    /// fault handling is needed.
     #[inline]
-    pub(crate) fn fpu_general_op_decoded(&mut self, w2: u16, raw: Option<RawSource>) -> bool {
+    pub(crate) fn fpu_decodable(&self, w2: u16) -> bool {
         use super::exceptions_040::{dyadic, hardware_opmode};
-        use super::exceptions_060::source_unsupported;
         use super::state_040::{classify, tag_unsupported};
         use crate::core::types::CpuType;
 
         let opmode = w2 & 0x7F;
-        let dst = ((w2 >> 7) & 7) as usize;
-        if !hardware_opmode(opmode) {
-            return false;
-        }
         let supported = match self.cpu_type {
             CpuType::M68040 => true,
             CpuType::M68060 => self.pcr & crate::core::cpu::PCR_DFP == 0,
             CpuType::M68EC040 | CpuType::M68LC040 => false,
             _ => self.fpu_present && !self.is_pre_68020 && opmode & 0x40 == 0,
         };
-        if !supported || self.fpu_exception_pending != 0 || !self.fpu_040.is_idle() {
-            return false;
-        }
-        // A denormalized or unnormalized operand is the software
-        // package's when that runs in the guest.
-        let package = self.trap_unimpl_040() || self.trap_unimpl_060();
-        if package && dyadic(opmode) && tag_unsupported(classify(self.fpr[dst])) {
-            return false;
-        }
+        supported
+            && hardware_opmode(opmode)
+            && self.fpu_exception_pending == 0
+            && self.fpu_040.is_idle()
+            && !(self.fpu_package_in_guest()
+                && dyadic(opmode)
+                && tag_unsupported(classify(self.fpr[((w2 >> 7) & 7) as usize])))
+    }
+
+    /// Whether a denormalized or unnormalized operand is the software
+    /// package's, which runs in the guest.
+    #[inline(always)]
+    fn fpu_package_in_guest(&self) -> bool {
+        self.trap_unimpl_040() || self.trap_unimpl_060()
+    }
+
+    /// Run a general arithmetic instruction [`Self::fpu_decodable`]
+    /// passed for the decoded batch loop, which has fetched the command
+    /// word `w2` and, for a memory, data-register or immediate source,
+    /// the operand `raw` through its window. PC and the address registers
+    /// are the caller's to advance. Returns false with nothing changed
+    /// when the source is the software package's;
+    /// [`Self::exec_fpu_op0`] then runs the instruction.
+    #[inline]
+    pub(crate) fn fpu_general_op_decoded(&mut self, w2: u16, raw: Option<RawSource>) -> bool {
+        use super::exceptions_060::source_unsupported;
+        use super::state_040::{classify, tag_unsupported};
+
+        debug_assert!(self.fpu_decodable(w2));
         match raw {
             None => {
                 let src = self.fpr[((w2 >> 10) & 7) as usize];
-                if package && tag_unsupported(classify(src)) {
+                if self.fpu_package_in_guest() && tag_unsupported(classify(src)) {
                     return false;
                 }
                 self.fpu_060_excp = None;
@@ -911,28 +913,45 @@ impl CpuCore {
                     return false;
                 }
             }
-            Some(raw) => {
+            Some(raw) if self.is_060() => {
                 if self.trap_unimpl_060() && source_unsupported(raw) {
                     return false;
                 }
                 self.fpu_060_excp = None;
+                let done = self.fpu_060_fetched_source(w2, raw);
+                debug_assert!(done.is_ok());
+            }
+            Some(raw) => {
                 self.fpiar = self.ppc;
                 let mut flags = ExcFlags::default();
                 let src = raw.to_x80(&mut flags);
-                if self.is_060() {
-                    let operand = self.fpu_060_source_operand(raw, src);
-                    let registers = FprUndo::before(&self.fpr, w2);
-                    let cycles = self.fpu_apply_op(opmode, dst, src, flags);
-                    self.fpu_060_hold_exception(cycles, w2, operand, src, &registers);
-                } else {
-                    self.fpu_general_op(w2, src, flags);
-                }
+                self.fpu_general_op(w2, src, flags);
             }
         }
         self.fpu_just_reset = false;
         #[cfg(test)]
         super::fast_path_tests::DECODED_OPS.set(super::fast_path_tests::DECODED_OPS.get() + 1);
         true
+    }
+
+    /// A 68060 instruction on the fetched source `raw`. An operand of a
+    /// data type the 68060 leaves to software (the source, or the
+    /// destination register of a dyadic instruction) stops it with
+    /// nothing done: the source comes back as the EXCP frame holds it.
+    #[inline]
+    fn fpu_060_fetched_source(&mut self, w2: u16, raw: RawSource) -> Result<i32, FloatX80> {
+        // The 68060's EXCP frame holds the source operand, which for a
+        // single or double is not its value.
+        let mut flags = ExcFlags::default();
+        let src = raw.to_x80(&mut flags);
+        let operand = self.fpu_060_source_operand(raw, src);
+        if self.fpu_060_unsupp_operands(w2, super::exceptions_060::source_unsupported(raw)) {
+            return Err(operand);
+        }
+        self.fpiar = self.ppc;
+        let registers = FprUndo::before(&self.fpr, w2);
+        let cycles = self.fpu_apply_op(w2 & 0x7F, ((w2 >> 7) & 7) as usize, src, flags);
+        Ok(self.fpu_060_hold_exception(cycles, w2, operand, src, &registers))
     }
 
     /// Hold the exception of the general operation that just completed

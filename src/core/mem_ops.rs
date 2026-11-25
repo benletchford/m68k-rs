@@ -1574,6 +1574,13 @@ fn store<const T: bool>(cpu: &mut CpuCore, win: Win<T>, loc: &Loc, size: Size, v
     }
 }
 
+/// Post-increment and pre-decrement step of a `bytes`-byte FPU operand:
+/// A7 stays word-aligned for a byte.
+#[inline(always)]
+fn fpu_ea_step(bytes: u32, reg: u8) -> u32 {
+    if bytes == 1 && reg == 7 { 2 } else { bytes }
+}
+
 /// The source operand of a general FPU instruction in format `fmt`, read
 /// through the window as it is stored. Extension words advance `ctx` and
 /// a post-increment or pre-decrement is left pending in it. `None` for
@@ -1595,12 +1602,8 @@ fn fpu_window_source<const T: bool>(
         2 => 12,
         _ => return None,
     };
-    let reg = (opcode & 7) as u8;
-    let an = cpu.dar[8 + reg as usize];
-    // A7 stays word-aligned for byte operands.
-    let step = if bytes == 1 && reg == 7 { 2 } else { bytes };
-    let raw = match (opcode >> 3) & 7 {
-        0 => {
+    let raw = match FastEa::decode((opcode >> 3) & 7, opcode & 7)? {
+        FastEa::DataReg(reg) => {
             let v = cpu.dar[reg as usize];
             return match fmt {
                 0 => Some(RawSource::Long(v)),
@@ -1610,49 +1613,34 @@ fn fpu_window_source<const T: bool>(
                 _ => None,
             };
         }
-        2 => an,
-        3 => {
-            ctx.pending.push(reg, an.wrapping_add(step));
+        FastEa::AddrReg(_) => return None,
+        FastEa::AnPostInc(reg) => {
+            let an = cpu.dar[8 + reg as usize];
+            ctx.pending
+                .push(reg, an.wrapping_add(fpu_ea_step(bytes, reg)));
             an
         }
-        4 => {
-            let a = an.wrapping_sub(step);
-            ctx.pending.push(reg, a);
-            a
+        FastEa::AnPreDec(reg) => {
+            let an = cpu.dar[8 + reg as usize].wrapping_sub(fpu_ea_step(bytes, reg));
+            ctx.pending.push(reg, an);
+            an
         }
-        5 => {
-            let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
-            (an as i32).wrapping_add(d) as u32
+        FastEa::Imm => {
+            let mut long = || -> Option<u32> {
+                Some((read_ext_word(cpu, win, ctx)? << 16) | read_ext_word(cpu, win, ctx)?)
+            };
+            return Some(match fmt {
+                0 => RawSource::Long(long()?),
+                1 => RawSource::Single(long()?),
+                4 => RawSource::Word(read_ext_word(cpu, win, ctx)? as u16),
+                6 => RawSource::Byte(read_ext_word(cpu, win, ctx)? as u8),
+                5 => RawSource::Double((u64::from(long()?) << 32) | u64::from(long()?)),
+                // An extended immediate is an effective address the
+                // 68060 does not implement.
+                _ => return None,
+            });
         }
-        6 => direct_index(cpu, win, ctx, an)?,
-        7 => match reg {
-            0 => read_ext_word(cpu, win, ctx)? as u16 as i16 as i32 as u32,
-            1 => (read_ext_word(cpu, win, ctx)? << 16) | read_ext_word(cpu, win, ctx)?,
-            2 => {
-                // Base is the address of the extension word itself.
-                let base = ctx.next_ext;
-                let d = read_ext_word(cpu, win, ctx)? as u16 as i16 as i32;
-                (base as i32).wrapping_add(d) as u32
-            }
-            3 => direct_index(cpu, win, ctx, ctx.next_ext)?,
-            4 => {
-                let mut long = || -> Option<u32> {
-                    Some((read_ext_word(cpu, win, ctx)? << 16) | read_ext_word(cpu, win, ctx)?)
-                };
-                return Some(match fmt {
-                    0 => RawSource::Long(long()?),
-                    1 => RawSource::Single(long()?),
-                    4 => RawSource::Word(read_ext_word(cpu, win, ctx)? as u16),
-                    6 => RawSource::Byte(read_ext_word(cpu, win, ctx)? as u8),
-                    5 => RawSource::Double((u64::from(long()?) << 32) | u64::from(long()?)),
-                    // An extended immediate is an effective address the
-                    // 68060 does not implement.
-                    _ => return None,
-                });
-            }
-            _ => return None,
-        },
-        _ => return None,
+        control => resolve_control_addr(cpu, win, control, ctx)?,
     };
     let addr = cpu.address(raw);
     // The interpreter reads a long at a time, each address masked on its
@@ -1680,14 +1668,38 @@ fn fpu_window_source<const T: bool>(
 }
 
 /// Execute a general FPU instruction (`$F200-$F23F`) against the fastmem
-/// window: the arithmetic of [`CpuCore::fpu_general_op_decoded`] with a
+/// window: the arithmetic [`CpuCore::fpu_decodable`] passes, with a
 /// register source or one this module can fetch.
 ///
 /// Returns `false` (with zero state changes) for everything else, which
 /// full dispatch takes: FMOVE to memory, FMOVEM and the control-register
 /// moves, an instruction or operand that traps, a held exception.
+/// `TRANSLATED` is the window mode, as for [`execute_window_mem_op`], and
+/// the executors stay out of the decoded loop like its own.
 #[inline(always)]
-pub(crate) fn execute_window_fpu_op<const T: bool>(cpu: &mut CpuCore, opcode: u16) -> bool {
+pub(crate) fn execute_window_fpu_op<const TRANSLATED: bool>(
+    cpu: &mut CpuCore,
+    opcode: u16,
+) -> bool {
+    if TRANSLATED {
+        execute_translated_fpu_op(cpu, opcode)
+    } else {
+        execute_physical_fpu_op(cpu, opcode)
+    }
+}
+
+#[inline(never)]
+fn execute_physical_fpu_op(cpu: &mut CpuCore, opcode: u16) -> bool {
+    execute_fpu_op_in::<false>(cpu, opcode)
+}
+
+#[inline(never)]
+fn execute_translated_fpu_op(cpu: &mut CpuCore, opcode: u16) -> bool {
+    execute_fpu_op_in::<true>(cpu, opcode)
+}
+
+#[inline(always)]
+fn execute_fpu_op_in<const T: bool>(cpu: &mut CpuCore, opcode: u16) -> bool {
     let Some(win) = Win::<T>::from_cpu(cpu) else {
         return false;
     };
@@ -1700,13 +1712,18 @@ pub(crate) fn execute_window_fpu_op<const T: bool>(cpu: &mut CpuCore, opcode: u1
         return false;
     };
     let w2 = w2 as u16;
-    let raw = match w2 >> 13 {
-        0 => None,
-        2 => match fpu_window_source(cpu, win, &mut ctx, opcode, (w2 >> 10) & 7) {
+    // Rejected before the operand is resolved and read: full dispatch
+    // would only do that again.
+    if !matches!(w2 >> 13, 0 | 2) || !cpu.fpu_decodable(w2) {
+        return false;
+    }
+    let raw = if w2 >> 13 == 0 {
+        None
+    } else {
+        match fpu_window_source(cpu, win, &mut ctx, opcode, (w2 >> 10) & 7) {
             Some(raw) => Some(raw),
             None => return false,
-        },
-        _ => return false,
+        }
     };
     if !cpu.fpu_general_op_decoded(w2, raw) {
         return false;

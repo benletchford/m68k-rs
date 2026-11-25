@@ -470,7 +470,8 @@ fn addressed(fmt: u16, opmode: u16, data: &[u8]) -> Vec<Case> {
         memory(0x38, &[DATA as u16]),
         memory(0x39, &[0, DATA as u16]),
         memory(0x3A, &[(DATA - PC - 4) as u16]),
-        memory(0x3B, &[0x1C00 | ((DATA - PC - 4 - 8) as u16 & 0xFF)]),
+        // (bd16,PC,D1.L*4): a brief extension word's byte cannot reach.
+        memory(0x3B, &[0x1D20, (DATA - PC - 4 - 8) as u16]),
         // The stack pointer steps by two for a byte.
         Case {
             a7: DATA,

@@ -1292,7 +1292,12 @@ impl CpuCore {
             Some(op) => CachedOp::Simple(op),
             None => match super::mem_ops::DecodedMemOp::decode(cpu_type, opcode) {
                 Some(op) => CachedOp::Mem(op),
-                None if opcode & 0xFFC0 == 0xF200 && !is_pre_68020(cpu_type) => CachedOp::Fpu,
+                None if opcode & 0xFFC0 == 0xF200
+                    && !is_pre_68020(cpu_type)
+                    && !matches!(cpu_type, CpuType::M68EC040 | CpuType::M68LC040) =>
+                {
+                    CachedOp::Fpu
+                }
                 None => CachedOp::Complex,
             },
         };
