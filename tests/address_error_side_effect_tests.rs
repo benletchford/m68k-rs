@@ -670,3 +670,21 @@ fn m68000_and_m68010_divu_overflow_sets_n_and_clears_z() {
         assert_eq!(m.cpu.get_sr() & 0x001f, 0x001a, "{cpu_type:?}: CCR");
     }
 }
+
+#[test]
+fn m68010_addx_long_memory_form_reads_the_low_word_first() {
+    // addx.l -(a2),-(a3): the first cycle of each operand is its low word,
+    // so the fault address is An - 2, for a fault on the source and on the
+    // destination. SSW $1105: a data fetch, read, supervisor data.
+    // Measured: addrerr23 and 24 on the MC68010.
+    for (what, a2, a3) in [
+        ("addx.l -(a2),-(a3), source odd", ODD, EVEN),
+        ("addx.l -(a2),-(a3), destination odd", EVEN, ODD),
+    ] {
+        let mut m = machine(CpuType::M68010, &[0xd78a]);
+        m.cpu.set_a(2, a2);
+        m.cpu.set_a(3, a3);
+        run_to_handler(&mut m, what);
+        assert_format_8(&mut m, what, SUPERVISOR, 0x1105, ODD - 2);
+    }
+}

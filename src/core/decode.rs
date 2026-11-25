@@ -2553,8 +2553,13 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 // word first, and the writeback interleaves the final
                 // prefetch between the low and high result writes.
                 let long_mm_68000 = cpu.cpu_type == CpuType::M68000 && size == Size::Long;
+                // The 68010 reads the long operands low word first as well:
+                // a misaligned source faults at An-2 (vAmigaTS addrerr23/24,
+                // photographed on an A500 with a 68010).
+                let long_mm_low_first =
+                    size == Size::Long && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010);
 
-                let src = if long_mm_68000 && let EaResult::Memory(sa) = src_ea {
+                let src = if long_mm_low_first && let EaResult::Memory(sa) = src_ea {
                     cpu.read_long_predec_68000(bus, sa)
                 } else {
                     cpu.read_resolved_ea(bus, src_ea, size)
@@ -2569,7 +2574,7 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 {
                     cpu.commit_address_register_68000(ea_reg, sa);
                 }
-                let dst = if long_mm_68000 && let EaResult::Memory(da) = dst_ea {
+                let dst = if long_mm_low_first && let EaResult::Memory(da) = dst_ea {
                     cpu.read_long_predec_68000(bus, da)
                 } else {
                     cpu.read_resolved_ea(bus, dst_ea, size)
@@ -2948,8 +2953,13 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 // word first, and the writeback interleaves the final
                 // prefetch between the low and high result writes.
                 let long_mm_68000 = cpu.cpu_type == CpuType::M68000 && size == Size::Long;
+                // The 68010 reads the long operands low word first as well:
+                // a misaligned source faults at An-2 (vAmigaTS addrerr23/24,
+                // photographed on an A500 with a 68010).
+                let long_mm_low_first =
+                    size == Size::Long && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010);
 
-                let src = if long_mm_68000 && let EaResult::Memory(sa) = src_ea {
+                let src = if long_mm_low_first && let EaResult::Memory(sa) = src_ea {
                     cpu.read_long_predec_68000(bus, sa)
                 } else {
                     cpu.read_resolved_ea(bus, src_ea, size)
@@ -2964,7 +2974,7 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 {
                     cpu.commit_address_register_68000(ea_reg, sa);
                 }
-                let dst = if long_mm_68000 && let EaResult::Memory(da) = dst_ea {
+                let dst = if long_mm_low_first && let EaResult::Memory(da) = dst_ea {
                     cpu.read_long_predec_68000(bus, da)
                 } else {
                     cpu.read_resolved_ea(bus, dst_ea, size)
