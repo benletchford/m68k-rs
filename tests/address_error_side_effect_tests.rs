@@ -597,3 +597,58 @@ fn m68000_movem_indexed_fault_stacks_the_extension_word_address() {
     );
     assert_eq!(m.cpu.a(2), ODD, "{what}: A2");
 }
+
+/// move.w #$0123,-(a1): a positive, non-zero source.
+const MOVE_WORD_TO_PREDECREMENT: [u16; 2] = [0x333c, 0x0123];
+const CARRY: u16 = 0x0001;
+
+#[test]
+fn m68000_move_word_to_predecrement_fault_stacks_the_next_opcode_and_the_new_ccr() {
+    // MOVE.W to -(An) makes its final prefetch before the write, so the
+    // instruction register (and with it the upper bits of the status word)
+    // already holds the next opcode. The condition codes are set from the
+    // source before the write: carry set beforehand is clear in the
+    // stacked SR. Measured: addrerr35 (carry clear) and addrerr36 (carry
+    // set), both in user mode.
+    for ccr in [0, CARRY] {
+        let what = "move.w #$0123,-(a1)";
+        let mut m = machine(CpuType::M68000, &MOVE_WORD_TO_PREDECREMENT);
+        m.cpu.set_a(1, ODD);
+        enter_user_mode(&mut m, ccr, EVEN);
+        run_to_handler(&mut m, what);
+        assert_group0(
+            &mut m,
+            what,
+            Group0 {
+                read: false,
+                fc: USER_DATA,
+                access: ODD - 2,
+                ir: NOP,
+                sr: 0,
+                pc: CODE + 6,
+            },
+        );
+    }
+}
+
+#[test]
+fn m68010_sets_the_ccr_before_a_faulting_write() {
+    // CLR on the 68010 does not read its destination first, and sets Z
+    // before the write faults: the frame stacks Z set, with X kept, and a
+    // write in the special status word. The first cycle of the long write
+    // is the low word, so the fault address is two past the operand
+    // address. Measured: addrerr31 on the MC68010.
+    let what = "clr.l (xxx).L";
+    let mut m = machine(CpuType::M68010, &[0x42b9, (ODD >> 16) as u16, ODD as u16]);
+    run_to_handler(&mut m, what);
+    assert_format_8(&mut m, what, SUPERVISOR | 0x0004, SUPERVISOR_DATA, ODD + 2);
+
+    // MOVE.W to -(An) with carry set beforehand stacks it clear.
+    // Measured: addrerr36 on the MC68010.
+    let what = "move.w #$0123,-(a1)";
+    let mut m = machine(CpuType::M68010, &MOVE_WORD_TO_PREDECREMENT);
+    m.cpu.set_a(1, ODD);
+    enter_user_mode(&mut m, CARRY, EVEN);
+    run_to_handler(&mut m, what);
+    assert_format_8(&mut m, what, 0, USER_DATA, ODD - 2);
+}

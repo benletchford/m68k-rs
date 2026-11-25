@@ -319,6 +319,12 @@ impl CpuCore {
                 return 50;
             }
         }
+        if self.cpu_type == CpuType::M68010 && matches!(ea, EaResult::Memory(_)) {
+            // The 68010 sets the condition codes before the write: a fault
+            // on it stacks Z set (vAmigaTS addrerr31, photographed on an
+            // A500 with a 68010).
+            self.set_ccr_before_write(0, size);
+        }
         // CLR polls IPL during the pre-writeback prefetch.
         self.write_resolved_ea_np_poll(bus, ea, size, 0);
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {

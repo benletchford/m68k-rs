@@ -323,7 +323,19 @@ impl CpuCore {
         old_sr: u16,
         stacked_pc: u32,
     ) {
-        let ir = self.ir as u16;
+        let opcode = self.ir as u16;
+        // The frame's instruction register is the decoded-instruction latch,
+        // which the final prefetch reloads with the next opcode. MOVE.B and
+        // MOVE.W to -(An) perform that prefetch before the write, so a fault
+        // on the write stacks the following opcode (vAmigaTS addrerr35/36,
+        // photographed on an A500). MOVE.L to -(An) still stacks its own
+        // opcode (addrerr16).
+        let move_word_predec = matches!(opcode >> 12, 1 | 3) && opcode & 0x01C0 == 0x0100;
+        let ir = if write && move_word_predec && self.prefetch_count > 0 {
+            self.prefetch_queue[0]
+        } else {
+            opcode
+        };
         let mut status = (ir & !0x001F) | (fc & 7);
         if !write {
             status |= 0x0010;
