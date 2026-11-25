@@ -2496,8 +2496,16 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             } else if ea_mode == 1 {
                 // SUBX -(Am), -(An) - predecrement
                 // Use proper predecrement semantics (A7 byte alignment) by resolving as -(An).
+                let (src_start, dst_start) = (cpu.a(ea_reg as usize), cpu.a(reg));
                 let src_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(ea_reg), size);
                 let dst_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(reg as u8), size);
+                // The 68000 does not write either decrement back before the
+                // operand reads: a fault on the source read leaves both
+                // address registers unchanged (vAmigaTS addrerr23,
+                // photographed on an A500). Undo resolve_ea's commits; the
+                // source decrement is committed once its read completes.
+                cpu.uncommit_predecrement_68000(reg as u8, dst_start);
+                cpu.uncommit_predecrement_68000(ea_reg, src_start);
 
                 // The memory-to-memory form's leading internal period is 2
                 // clocks total (the two predecrements overlap in microcode);
@@ -2517,6 +2525,13 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 };
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
+                }
+                // The source read is complete: a fault on the destination
+                // keeps the source decrement (vAmigaTS addrerr24, A500).
+                if cpu.cpu_type == CpuType::M68000
+                    && let EaResult::Memory(sa) = src_ea
+                {
+                    cpu.commit_address_register_68000(ea_reg, sa);
                 }
                 let dst = if long_mm_68000 && let EaResult::Memory(da) = dst_ea {
                     cpu.read_long_predec_68000(bus, da)
@@ -2649,6 +2664,11 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let src_val = cpu.read_resolved_ea(bus, src_ea, size);
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
+                }
+                // The source read is complete: a fault on the destination
+                // read keeps the source increment (vAmigaTS addrerr26, A500).
+                if cpu.cpu_type == CpuType::M68000 {
+                    cpu.commit_address_register_68000(ea_reg, cpu.a(ea_reg as usize));
                 }
                 let dst_ea = cpu.resolve_ea(bus, AddressingMode::PostIncrement(reg as u8), size);
                 let dst_val = cpu.read_resolved_ea(bus, dst_ea, size);
@@ -2871,8 +2891,16 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             } else if ea_mode == 1 {
                 // ADDX -(Am), -(An)
                 // Use proper predecrement semantics (A7 byte alignment) by resolving as -(An).
+                let (src_start, dst_start) = (cpu.a(ea_reg as usize), cpu.a(reg));
                 let src_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(ea_reg), size);
                 let dst_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(reg as u8), size);
+                // The 68000 does not write either decrement back before the
+                // operand reads: a fault on the source read leaves both
+                // address registers unchanged (vAmigaTS addrerr23,
+                // photographed on an A500). Undo resolve_ea's commits; the
+                // source decrement is committed once its read completes.
+                cpu.uncommit_predecrement_68000(reg as u8, dst_start);
+                cpu.uncommit_predecrement_68000(ea_reg, src_start);
 
                 // The memory-to-memory form's leading internal period is 2
                 // clocks total (the two predecrements overlap in microcode);
@@ -2892,6 +2920,13 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 };
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
+                }
+                // The source read is complete: a fault on the destination
+                // keeps the source decrement (vAmigaTS addrerr24, A500).
+                if cpu.cpu_type == CpuType::M68000
+                    && let EaResult::Memory(sa) = src_ea
+                {
+                    cpu.commit_address_register_68000(ea_reg, sa);
                 }
                 let dst = if long_mm_68000 && let EaResult::Memory(da) = dst_ea {
                     cpu.read_long_predec_68000(bus, da)

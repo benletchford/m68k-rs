@@ -1560,6 +1560,27 @@ impl CpuCore {
         self.run_mode = super::execute::RUN_MODE_NORMAL;
     }
 
+    /// Make an address register update by the current instruction survive a
+    /// bus or address error later in the same instruction. A fault rolls the
+    /// registers back to the snapshot taken at the start of the instruction;
+    /// an update the MC68000 has already written back to An is not undone by
+    /// the fault, so it goes into the snapshot as well.
+    #[inline]
+    pub(crate) fn commit_address_register_68000(&mut self, reg: u8, value: u32) {
+        self.dar_save[8 + (reg as usize & 7)] = value;
+    }
+
+    /// Withdraw the predecrement `resolve_ea` committed for a destination
+    /// whose decrement the MC68000 does not write back before the bus cycle
+    /// (MOVE.L to -(An) and the -(Ay),-(Ax) forms): a fault on that cycle
+    /// leaves An at its value from the start of the instruction.
+    #[inline]
+    pub(crate) fn uncommit_predecrement_68000(&mut self, reg: u8, start_value: u32) {
+        if self.cpu_type == CpuType::M68000 {
+            self.commit_address_register_68000(reg, start_value);
+        }
+    }
+
     /// Trigger a 68000-style address error and mark the current instruction as faulted so that
     /// subsequent EA resolution/memory operations become no-ops.
     pub(crate) fn trigger_address_error<B: AddressBus>(

@@ -22,6 +22,15 @@ impl CpuCore {
     ) -> i32 {
         let source = self.resolve_ea(bus, src_mode, size);
         let value = self.read_resolved_ea(bus, source, size);
+        if self.cpu_type == CpuType::M68000 && self.run_mode != RUN_MODE_BERR_AERR_RESET {
+            // The source operand is complete: its (An)+/-(An) update is not
+            // undone by a fault on the destination write (vAmigaTS
+            // addrerr21, photographed on an A500).
+            if let AddressingMode::PostIncrement(reg) | AddressingMode::PreDecrement(reg) = src_mode
+            {
+                self.commit_address_register_68000(reg, self.a(reg as usize));
+            }
+        }
         let copying = matches!(source, EaResult::Memory(_))
             && !dst_mode.is_register_direct()
             && !(self.has_pmmu && self.pmmu_enabled)
@@ -163,7 +172,19 @@ impl CpuCore {
         size: Size,
         value: u32,
     ) -> Option<u32> {
+        let start_an = match dst_mode {
+            AddressingMode::PreDecrement(reg) => Some((reg, self.a(reg as usize))),
+            _ => None,
+        };
         let ea = self.resolve_ea(bus, dst_mode, size);
+        if let Some((reg, start)) = start_an
+            && size == Size::Long
+        {
+            // MOVE.L to -(An) does not write the decremented address back
+            // before its first write: a fault there leaves An unchanged
+            // (vAmigaTS addrerr16, photographed on an A500).
+            self.uncommit_predecrement_68000(reg, start);
+        }
         // A MOVE destination predecrement does not pay the 2-clock
         // address-computation penalty (it overlaps the final prefetch);
         // cancel resolve_ea's charge.
