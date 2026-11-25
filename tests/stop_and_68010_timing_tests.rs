@@ -168,6 +168,96 @@ fn m68010_dbcc_outside_loop_mode_follows_its_own_table() {
     }
 }
 
+// ========== MOVE to an absolute long address, memory source ==========
+
+/// A bus that logs each data and program access in order.
+struct LoggingBus {
+    inner: TestBus,
+    log: Vec<(char, u32)>,
+}
+
+impl AddressBus for LoggingBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.log.push(('r', address));
+        self.inner.read_byte(address)
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        self.log.push(('r', address));
+        self.inner.read_word(address)
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        self.log.push(('r', address));
+        self.log.push(('r', address + 2));
+        self.inner.read_long(address)
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        self.log.push(('w', address));
+        self.inner.write_byte(address, value);
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.log.push(('w', address));
+        self.inner.write_word(address, value);
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.log.push(('w', address));
+        self.log.push(('w', address + 2));
+        self.inner.write_long(address, value);
+    }
+}
+
+#[test]
+fn move_from_memory_to_absolute_long_writes_before_its_second_prefetch() {
+    // move.l (a0),$00300020.l / nop / nop. With a memory source the write
+    // cycles come after one extension-word prefetch, and the other
+    // prefetch and the final prefetch follow them (Class 2). The 68010
+    // keeps the 68000's order.
+    for cpu_type in [CpuType::M68000, CpuType::M68010] {
+        let (mut cpu, inner) = setup(&[0x23D0, 0x0030, 0x0020, 0x4E71, 0x4E71], cpu_type);
+        let mut bus = LoggingBus {
+            inner,
+            log: Vec::new(),
+        };
+        bus.inner.write_long(0x0030_0010, 0x1234_5678);
+        cpu.dar[8] = 0x0030_0010;
+        // The first step fills the prefetch queue as well; log the second
+        // instruction on its own by running a NOP first.
+        cpu.pc = 0x1_0006;
+        let mut hle = m68k::NoOpHleHandler;
+        cpu.step_with_hle_handler(&mut bus, &mut hle);
+        cpu.pc = 0x1_0000;
+        cpu.invalidate_prefetch();
+        bus.log.clear();
+        cpu.step_with_hle_handler(&mut bus, &mut hle);
+        assert_eq!(bus.inner.read_long(0x0030_0020), 0x1234_5678);
+        let data: Vec<_> = bus
+            .log
+            .iter()
+            .filter(|(_, address)| *address >= 0x0030_0000)
+            .copied()
+            .collect();
+        assert_eq!(
+            data,
+            [
+                ('r', 0x0030_0010),
+                ('r', 0x0030_0012),
+                ('w', 0x0030_0020),
+                ('w', 0x0030_0022)
+            ],
+            "{cpu_type:?}"
+        );
+        let first_write = bus.log.iter().position(|&(kind, _)| kind == 'w').unwrap();
+        let fetches_after_write = bus.log[first_write..]
+            .iter()
+            .filter(|&&(kind, address)| kind == 'r' && address < 0x0030_0000)
+            .count();
+        assert_eq!(
+            fetches_after_write, 2,
+            "{cpu_type:?}: two prefetches follow the write: {:x?}",
+            bus.log
+        );
+    }
+}
+
 // ========== Interrupt dispatch cycles ==========
 
 fn dispatch_cycles(cpu_type: CpuType) -> i32 {
