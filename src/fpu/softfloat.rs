@@ -1214,6 +1214,78 @@ mod tests {
         RoundCtx::NEAREST_EXT
     }
 
+    /// The quotient of two finite nonzero operands by 128-bit division,
+    /// as `div` computed it before `div_wide`.
+    fn div_by_128_bit_division(
+        a: FloatX80,
+        b: FloatX80,
+        ctx: RoundCtx,
+        f: &mut ExcFlags,
+    ) -> FloatX80 {
+        let (ua, ub) = (unpack(a), unpack(b));
+        let mb = ub.mant as u128;
+        let num = (ua.mant as u128) << 64;
+        let (q1, r1) = (num / mb, num % mb);
+        let (q2, r2) = ((r1 << 64) / mb, (r1 << 64) % mb);
+        let mut m = (q1 << 62) | (q2 >> 2);
+        if (q2 & 3) != 0 || r2 != 0 {
+            m |= 1;
+        }
+        round_pack(a.sign() ^ b.sign(), ua.exp - ub.exp + 1, m, ctx, f)
+    }
+
+    #[test]
+    fn div_is_the_128_bit_division_in_every_mode_and_precision() {
+        let mut state = 0x0123_4567_89AB_CDEFu64;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        let modes = [
+            RoundMode::Nearest,
+            RoundMode::Zero,
+            RoundMode::PosInf,
+            RoundMode::NegInf,
+        ];
+        let precisions = [Precision::Extended, Precision::Double, Precision::Single];
+        let mut inexact = 0;
+        for i in 0..60_000 {
+            // Normalized mantissas: random, short (exact and halfway
+            // quotients) and equal ones. Exponents mostly mid-range, with
+            // some at the ends for overflow, underflow and denormals.
+            let mantissa = |bits: u64| match bits & 7 {
+                0 => (bits | (1 << 63)) & !0xFFFF_FFFF_FFFF,
+                1 => (bits | (1 << 63)) & !0x7FF,
+                _ => bits | (1 << 63),
+            };
+            let exponent = |bits: u64| match bits & 15 {
+                0 => (bits >> 8) as u16 & 0x3F,
+                1 => 0x7FFE - ((bits >> 8) as u16 & 0x3F),
+                _ => 0x3F00 + ((bits >> 8) as u16 & 0x1FF),
+            };
+            let ma = mantissa(next());
+            let mb = if i % 16 == 0 { ma } else { mantissa(next()) };
+            let signs = next();
+            let a = FloatX80::from_extended(exponent(next()) | ((signs as u16 & 1) << 15), ma);
+            let b = FloatX80::from_extended(exponent(next()) | ((signs as u16 & 2) << 14), mb);
+            for mode in modes {
+                for prec in precisions {
+                    let ctx = RoundCtx { mode, prec };
+                    let (mut f, mut expected_f) = (ExcFlags::default(), ExcFlags::default());
+                    let quotient = div(a, b, ctx, &mut f);
+                    let expected = div_by_128_bit_division(a, b, ctx, &mut expected_f);
+                    assert_eq!(quotient, expected, "{a:?} / {b:?} {ctx:?}");
+                    assert_eq!(f, expected_f, "{a:?} / {b:?} {ctx:?}");
+                    inexact += u32::from(f.has(ExcFlags::INEX2));
+                }
+            }
+        }
+        assert!(inexact > 100_000, "{inexact}");
+    }
+
     #[test]
     fn div_wide_is_the_128_bit_division() {
         let check = |n: u64, d: u64| {
