@@ -111,6 +111,63 @@ fn m68010_rte_format0_takes_24_cycles() {
     assert_eq!(cpu.dar[15], sp + 8);
 }
 
+// ========== 68010 conditional instruction times ==========
+
+fn conditional_cycles(prog: &[u16], cpu_type: CpuType, zero: bool, d0: u32) -> i32 {
+    let (mut cpu, mut bus) = setup(prog, cpu_type);
+    cpu.set_sr(if zero { 0x2704 } else { 0x2700 });
+    cpu.dar[0] = d0;
+    step_cycles(&mut cpu, &mut bus)
+}
+
+#[test]
+fn m68010_bcc_not_taken_is_two_clocks_shorter_than_on_the_68000() {
+    // M68000UM Table 8-9 (68000) and Table 9-15 (68010). The branch
+    // targets and the fall-through hold NOPs.
+    let byte = [0x6702, 0x4E71, 0x4E71, 0x4E71]; // beq.s *+4
+    let word = [0x6700, 0x0004, 0x4E71, 0x4E71]; // beq.w *+6
+    for (cpu_type, not_taken_byte, not_taken_word) in
+        [(CpuType::M68000, 8, 12), (CpuType::M68010, 6, 10)]
+    {
+        assert_eq!(conditional_cycles(&byte, cpu_type, true, 0), 10);
+        assert_eq!(conditional_cycles(&word, cpu_type, true, 0), 10);
+        assert_eq!(
+            conditional_cycles(&byte, cpu_type, false, 0),
+            not_taken_byte,
+            "{cpu_type:?} beq.s not taken"
+        );
+        assert_eq!(
+            conditional_cycles(&word, cpu_type, false, 0),
+            not_taken_word,
+            "{cpu_type:?} beq.w not taken"
+        );
+    }
+}
+
+#[test]
+fn m68010_dbcc_outside_loop_mode_follows_its_own_table() {
+    // dbeq d0,*+6: the displacement is not -4, so the 68010 stays out of
+    // loop mode. M68000UM Table 8-9 (68000) and Table 9-15 (68010).
+    let dbeq = [0x57C8, 0x0004, 0x4E71, 0x4E71, 0x4E71];
+    for (cpu_type, cc_true, expired) in [(CpuType::M68000, 12, 14), (CpuType::M68010, 10, 16)] {
+        assert_eq!(
+            conditional_cycles(&dbeq, cpu_type, true, 5),
+            cc_true,
+            "{cpu_type:?} dbeq, condition true"
+        );
+        assert_eq!(
+            conditional_cycles(&dbeq, cpu_type, false, 5),
+            10,
+            "{cpu_type:?} dbeq, branch taken"
+        );
+        assert_eq!(
+            conditional_cycles(&dbeq, cpu_type, false, 0),
+            expired,
+            "{cpu_type:?} dbeq, count expired"
+        );
+    }
+}
+
 // ========== Interrupt dispatch cycles ==========
 
 fn dispatch_cycles(cpu_type: CpuType) -> i32 {
