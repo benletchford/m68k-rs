@@ -203,6 +203,77 @@ impl AddressBus for LoggingBus {
         self.log.push(('w', address + 2));
         self.inner.write_long(address, value);
     }
+    fn sync(&mut self, cpu_clocks: u32) {
+        self.log.push(('i', cpu_clocks));
+    }
+}
+
+/// The bus log of `prog` run as one instruction after a NOP that fills the
+/// prefetch queue, with A0 = $00300020 and A1 = $00300010.
+fn logged_instruction(prog: &[u16], cpu_type: CpuType) -> (Vec<(char, u32)>, CpuCore, TestBus) {
+    let mut words = prog.to_vec();
+    words.resize(8, 0x4E71);
+    let (mut cpu, inner) = setup(&words, cpu_type);
+    let mut bus = LoggingBus {
+        inner,
+        log: Vec::new(),
+    };
+    bus.inner.write_long(0x0030_0010, 0x1234_5678);
+    cpu.dar[0] = 0x9ABC_DEF0;
+    cpu.dar[8] = 0x0030_0020;
+    cpu.dar[9] = 0x0030_0010;
+    cpu.pc = 0x1_000E;
+    let mut hle = m68k::NoOpHleHandler;
+    cpu.step_with_hle_handler(&mut bus, &mut hle);
+    cpu.pc = 0x1_0000;
+    cpu.invalidate_prefetch();
+    bus.log.clear();
+    cpu.step_with_hle_handler(&mut bus, &mut hle);
+    (bus.log, cpu, bus.inner)
+}
+
+#[test]
+fn m68010_move_to_predecrement_prefetches_first_and_writes_the_low_word_first() {
+    // The 68010 keeps the 68000's sequence for a predecrement destination:
+    // the final prefetch, then the write, a long with its low word first,
+    // and no clocks for the address computation.
+    for (prog, value, writes) in [
+        // move.l d0,-(a0)
+        (
+            &[0x2100][..],
+            0x9ABC_DEF0u32,
+            &[('w', 0x0030_001E), ('w', 0x0030_001C)][..],
+        ),
+        // move.l (a1),-(a0)
+        (
+            &[0x2111],
+            0x1234_5678,
+            &[('w', 0x0030_001E), ('w', 0x0030_001C)],
+        ),
+        // move.w d0,-(a0)
+        (&[0x3100], 0xDEF0_0000, &[('w', 0x0030_001E)]),
+    ] {
+        let (m68000, _, _) = logged_instruction(prog, CpuType::M68000);
+        let (m68010, cpu, mut bus) = logged_instruction(prog, CpuType::M68010);
+        assert_eq!(m68010, m68000, "{prog:04x?}: the 68010 follows the 68000");
+        let written: Vec<_> = m68010.iter().filter(|(k, _)| *k == 'w').copied().collect();
+        assert_eq!(written, writes, "{prog:04x?}");
+        let first_write = m68010.iter().position(|&(k, _)| k == 'w').unwrap();
+        assert!(
+            m68010[..first_write]
+                .iter()
+                .any(|&(k, a)| k == 'r' && a < 0x0030_0000),
+            "{prog:04x?}: the prefetch comes before the write: {m68010:x?}"
+        );
+        assert!(
+            m68010[first_write..].iter().all(|&(k, _)| k == 'w'),
+            "{prog:04x?}: the write is last: {m68010:x?}"
+        );
+        let size = writes.len() as u32 * 2;
+        assert_eq!(cpu.dar[8], 0x0030_0020 - size);
+        let stored = bus.read_long(0x0030_001C);
+        assert_eq!(if size == 4 { stored } else { stored << 16 }, value);
+    }
 }
 
 #[test]
