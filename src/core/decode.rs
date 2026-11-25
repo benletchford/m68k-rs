@@ -2098,8 +2098,11 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let cc_true = cpu.test_condition(condition);
             // Condition/counter-evaluation internal clocks before any bus
             // activity: 4 when the condition is true ("nn np np"), 2 on the
-            // branching paths ("n np np").
-            cpu.internal_cycles(if cc_true { 4 } else { 2 });
+            // branching paths ("n np np"). The 68010 spends 2 on every
+            // path: its true-condition DBcc is 10(2/0) against the 68000's
+            // 12(2/0) (M68000UM Table 9-15).
+            let m68010 = cpu.cpu_type == CpuType::M68010;
+            cpu.internal_cycles(if cc_true && !m68010 { 4 } else { 2 });
             cpu.consume_without_prefetch = !cc_true;
             // Always fetch the displacement word (even if the branch is not taken) to match
             // 68000 behavior and to correctly trigger address errors on misaligned PC.
@@ -2148,9 +2151,20 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         let masked = cpu.address(cpu.pc);
                         let _ = bus.read_word(masked);
                     }
-                    cpu.full_prefetch(bus);
-                    14
+                    if m68010 {
+                        // The 68010 spends two more clocks between the
+                        // discarded read and the refill: 16(3/0) against
+                        // the 68000's 14(3/0) (M68000UM Table 9-15).
+                        cpu.internal_cycles(2);
+                        cpu.full_prefetch(bus);
+                        16
+                    } else {
+                        cpu.full_prefetch(bus);
+                        14
+                    }
                 }
+            } else if m68010 {
+                10
             } else {
                 12
             }
@@ -2256,7 +2270,11 @@ fn dispatch_group_6<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
     let taken = condition < 2 || cpu.test_condition(condition);
     // Condition-evaluation internal clocks before any bus activity:
     // 2 on taken paths ("n np np"), 4 on not-taken ("nn np ...").
-    cpu.internal_cycles(if taken { 2 } else { 4 });
+    // The 68010 spends 2 on both: its not-taken Bcc is 6(1/0) byte and
+    // 10(2/0) word against the 68000's 8(1/0) and 12(2/0) (M68000UM
+    // Table 9-15).
+    let m68010 = cpu.cpu_type == CpuType::M68010;
+    cpu.internal_cycles(if taken || m68010 { 2 } else { 4 });
     cpu.consume_without_prefetch = taken;
     // 68020+ adds the Bcc.L encoding with a displacement byte of $FF.
     // Earlier cores keep treating $FF as the signed 8-bit displacement -1.
@@ -2296,10 +2314,9 @@ fn dispatch_group_6<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 cpu.pc = (base_pc as i32).wrapping_add(disp) as u32;
                 cpu.full_prefetch(bus);
                 10
-            } else if displacement == 0 {
-                12
             } else {
-                8
+                let base = if displacement == 0 { 12 } else { 8 };
+                if m68010 { base - 2 } else { base }
             }
         }
     }

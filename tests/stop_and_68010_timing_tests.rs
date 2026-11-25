@@ -111,6 +111,224 @@ fn m68010_rte_format0_takes_24_cycles() {
     assert_eq!(cpu.dar[15], sp + 8);
 }
 
+// ========== 68010 conditional instruction times ==========
+
+fn conditional_cycles(prog: &[u16], cpu_type: CpuType, zero: bool, d0: u32) -> i32 {
+    let (mut cpu, mut bus) = setup(prog, cpu_type);
+    cpu.set_sr(if zero { 0x2704 } else { 0x2700 });
+    cpu.dar[0] = d0;
+    step_cycles(&mut cpu, &mut bus)
+}
+
+#[test]
+fn m68010_bcc_not_taken_is_two_clocks_shorter_than_on_the_68000() {
+    // M68000UM Table 8-9 (68000) and Table 9-15 (68010). The branch
+    // targets and the fall-through hold NOPs.
+    let byte = [0x6702, 0x4E71, 0x4E71, 0x4E71]; // beq.s *+4
+    let word = [0x6700, 0x0004, 0x4E71, 0x4E71]; // beq.w *+6
+    for (cpu_type, not_taken_byte, not_taken_word) in
+        [(CpuType::M68000, 8, 12), (CpuType::M68010, 6, 10)]
+    {
+        assert_eq!(conditional_cycles(&byte, cpu_type, true, 0), 10);
+        assert_eq!(conditional_cycles(&word, cpu_type, true, 0), 10);
+        assert_eq!(
+            conditional_cycles(&byte, cpu_type, false, 0),
+            not_taken_byte,
+            "{cpu_type:?} beq.s not taken"
+        );
+        assert_eq!(
+            conditional_cycles(&word, cpu_type, false, 0),
+            not_taken_word,
+            "{cpu_type:?} beq.w not taken"
+        );
+    }
+}
+
+#[test]
+fn m68010_dbcc_outside_loop_mode_follows_its_own_table() {
+    // dbeq d0,*+6: the displacement is not -4, so the 68010 stays out of
+    // loop mode. M68000UM Table 8-9 (68000) and Table 9-15 (68010).
+    let dbeq = [0x57C8, 0x0004, 0x4E71, 0x4E71, 0x4E71];
+    for (cpu_type, cc_true, expired) in [(CpuType::M68000, 12, 14), (CpuType::M68010, 10, 16)] {
+        assert_eq!(
+            conditional_cycles(&dbeq, cpu_type, true, 5),
+            cc_true,
+            "{cpu_type:?} dbeq, condition true"
+        );
+        assert_eq!(
+            conditional_cycles(&dbeq, cpu_type, false, 5),
+            10,
+            "{cpu_type:?} dbeq, branch taken"
+        );
+        assert_eq!(
+            conditional_cycles(&dbeq, cpu_type, false, 0),
+            expired,
+            "{cpu_type:?} dbeq, count expired"
+        );
+    }
+}
+
+// ========== MOVE to an absolute long address, memory source ==========
+
+/// A bus that logs each data and program access in order.
+struct LoggingBus {
+    inner: TestBus,
+    log: Vec<(char, u32)>,
+}
+
+impl AddressBus for LoggingBus {
+    fn read_byte(&mut self, address: u32) -> u8 {
+        self.log.push(('r', address));
+        self.inner.read_byte(address)
+    }
+    fn read_word(&mut self, address: u32) -> u16 {
+        self.log.push(('r', address));
+        self.inner.read_word(address)
+    }
+    fn read_long(&mut self, address: u32) -> u32 {
+        self.log.push(('r', address));
+        self.log.push(('r', address + 2));
+        self.inner.read_long(address)
+    }
+    fn write_byte(&mut self, address: u32, value: u8) {
+        self.log.push(('w', address));
+        self.inner.write_byte(address, value);
+    }
+    fn write_word(&mut self, address: u32, value: u16) {
+        self.log.push(('w', address));
+        self.inner.write_word(address, value);
+    }
+    fn write_long(&mut self, address: u32, value: u32) {
+        self.log.push(('w', address));
+        self.log.push(('w', address + 2));
+        self.inner.write_long(address, value);
+    }
+    fn sync(&mut self, cpu_clocks: u32) {
+        self.log.push(('i', cpu_clocks));
+    }
+}
+
+/// The bus log of `prog` run as one instruction after a NOP that fills the
+/// prefetch queue, with A0 = $00300020 and A1 = $00300010.
+fn logged_instruction(prog: &[u16], cpu_type: CpuType) -> (Vec<(char, u32)>, CpuCore, TestBus) {
+    let mut words = prog.to_vec();
+    words.resize(8, 0x4E71);
+    let (mut cpu, inner) = setup(&words, cpu_type);
+    let mut bus = LoggingBus {
+        inner,
+        log: Vec::new(),
+    };
+    bus.inner.write_long(0x0030_0010, 0x1234_5678);
+    cpu.dar[0] = 0x9ABC_DEF0;
+    cpu.dar[8] = 0x0030_0020;
+    cpu.dar[9] = 0x0030_0010;
+    cpu.pc = 0x1_000E;
+    let mut hle = m68k::NoOpHleHandler;
+    cpu.step_with_hle_handler(&mut bus, &mut hle);
+    cpu.pc = 0x1_0000;
+    cpu.invalidate_prefetch();
+    bus.log.clear();
+    cpu.step_with_hle_handler(&mut bus, &mut hle);
+    (bus.log, cpu, bus.inner)
+}
+
+#[test]
+fn m68010_move_to_predecrement_prefetches_first_and_writes_the_low_word_first() {
+    // The 68010 keeps the 68000's sequence for a predecrement destination:
+    // the final prefetch, then the write, a long with its low word first,
+    // and no clocks for the address computation.
+    for (prog, value, writes) in [
+        // move.l d0,-(a0)
+        (
+            &[0x2100][..],
+            0x9ABC_DEF0u32,
+            &[('w', 0x0030_001E), ('w', 0x0030_001C)][..],
+        ),
+        // move.l (a1),-(a0)
+        (
+            &[0x2111],
+            0x1234_5678,
+            &[('w', 0x0030_001E), ('w', 0x0030_001C)],
+        ),
+        // move.w d0,-(a0)
+        (&[0x3100], 0xDEF0_0000, &[('w', 0x0030_001E)]),
+    ] {
+        let (m68000, _, _) = logged_instruction(prog, CpuType::M68000);
+        let (m68010, cpu, mut bus) = logged_instruction(prog, CpuType::M68010);
+        assert_eq!(m68010, m68000, "{prog:04x?}: the 68010 follows the 68000");
+        let written: Vec<_> = m68010.iter().filter(|(k, _)| *k == 'w').copied().collect();
+        assert_eq!(written, writes, "{prog:04x?}");
+        let first_write = m68010.iter().position(|&(k, _)| k == 'w').unwrap();
+        assert!(
+            m68010[..first_write]
+                .iter()
+                .any(|&(k, a)| k == 'r' && a < 0x0030_0000),
+            "{prog:04x?}: the prefetch comes before the write: {m68010:x?}"
+        );
+        assert!(
+            m68010[first_write..].iter().all(|&(k, _)| k == 'w'),
+            "{prog:04x?}: the write is last: {m68010:x?}"
+        );
+        let size = writes.len() as u32 * 2;
+        assert_eq!(cpu.dar[8], 0x0030_0020 - size);
+        let stored = bus.read_long(0x0030_001C);
+        assert_eq!(if size == 4 { stored } else { stored << 16 }, value);
+    }
+}
+
+#[test]
+fn move_from_memory_to_absolute_long_writes_before_its_second_prefetch() {
+    // move.l (a0),$00300020.l / nop / nop. With a memory source the write
+    // cycles come after one extension-word prefetch, and the other
+    // prefetch and the final prefetch follow them (Class 2). The 68010
+    // keeps the 68000's order.
+    for cpu_type in [CpuType::M68000, CpuType::M68010] {
+        let (mut cpu, inner) = setup(&[0x23D0, 0x0030, 0x0020, 0x4E71, 0x4E71], cpu_type);
+        let mut bus = LoggingBus {
+            inner,
+            log: Vec::new(),
+        };
+        bus.inner.write_long(0x0030_0010, 0x1234_5678);
+        cpu.dar[8] = 0x0030_0010;
+        // The first step fills the prefetch queue as well; log the second
+        // instruction on its own by running a NOP first.
+        cpu.pc = 0x1_0006;
+        let mut hle = m68k::NoOpHleHandler;
+        cpu.step_with_hle_handler(&mut bus, &mut hle);
+        cpu.pc = 0x1_0000;
+        cpu.invalidate_prefetch();
+        bus.log.clear();
+        cpu.step_with_hle_handler(&mut bus, &mut hle);
+        assert_eq!(bus.inner.read_long(0x0030_0020), 0x1234_5678);
+        let data: Vec<_> = bus
+            .log
+            .iter()
+            .filter(|(_, address)| *address >= 0x0030_0000)
+            .copied()
+            .collect();
+        assert_eq!(
+            data,
+            [
+                ('r', 0x0030_0010),
+                ('r', 0x0030_0012),
+                ('w', 0x0030_0020),
+                ('w', 0x0030_0022)
+            ],
+            "{cpu_type:?}"
+        );
+        let first_write = bus.log.iter().position(|&(kind, _)| kind == 'w').unwrap();
+        let fetches_after_write = bus.log[first_write..]
+            .iter()
+            .filter(|&&(kind, address)| kind == 'r' && address < 0x0030_0000)
+            .count();
+        assert_eq!(
+            fetches_after_write, 2,
+            "{cpu_type:?}: two prefetches follow the write: {:x?}",
+            bus.log
+        );
+    }
+}
+
 // ========== Interrupt dispatch cycles ==========
 
 fn dispatch_cycles(cpu_type: CpuType) -> i32 {

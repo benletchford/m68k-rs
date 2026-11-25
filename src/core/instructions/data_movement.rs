@@ -62,29 +62,7 @@ impl CpuCore {
         if self.cpu_type == CpuType::M68000 {
             match dst_mode {
                 AddressingMode::PreDecrement(_) => {
-                    let ea = self.resolve_ea(bus, dst_mode, size);
-                    // A MOVE destination predecrement does not pay the
-                    // 2-clock address-computation penalty (it overlaps the
-                    // final prefetch); cancel resolve_ea's charge.
-                    self.pending_sync_clocks = self.pending_sync_clocks.saturating_sub(2);
-                    self.top_up_prefetch(bus);
-                    // MOVE to -(An) behaves like an RMW instruction (pasti
-                    // class 0): the IPL poll rides this prefetch and the
-                    // trailing write does not re-latch it.
-                    self.ipl_poll_point(bus);
-                    if let EaResult::Memory(addr) = ea {
-                        destination = Some(addr);
-                        match size {
-                            Size::Byte => self.write_8(bus, addr, value as u8),
-                            Size::Word => self.write_16(bus, addr, value as u16),
-                            // Long predecrement writes descend: low word at
-                            // the higher address first, then the high word.
-                            Size::Long => {
-                                self.write_16(bus, addr.wrapping_add(2), (value & 0xFFFF) as u16);
-                                self.write_16(bus, addr, (value >> 16) as u16);
-                            }
-                        }
-                    }
+                    destination = self.write_move_predecrement(bus, dst_mode, size, value);
                 }
                 AddressingMode::PostIncrement(_) => {
                     // MOVE to (An)+ polls IPL during the destination write
@@ -118,26 +96,29 @@ impl CpuCore {
                     self.ipl_poll_point(bus);
                 }
                 AddressingMode::AbsoluteLong if class2_abs_long => {
-                    // Consume the address high word normally, the low word
-                    // without its accompanying prefetch.
-                    let hi = self.read_imm_16(bus) as u32;
-                    self.consume_without_prefetch = true;
-                    let lo = self.read_imm_16(bus) as u32;
-                    self.consume_without_prefetch = false;
-                    let addr = (hi << 16) | lo;
-                    destination = Some(addr);
-                    match size {
-                        Size::Byte => self.write_8(bus, addr, value as u8),
-                        Size::Word => self.write_16(bus, addr, value as u16),
-                        Size::Long => self.write_32(bus, addr, value),
-                    }
-                    // The deferred np + final prefetch follow via the
-                    // end-of-instruction top-up.
+                    destination = Some(self.write_move_abs_long_class2(bus, size, value));
                 }
                 _ => {
                     destination = self.write_move_ea(bus, dst_mode, size, value);
                 }
             }
+        } else if self.cpu_type == CpuType::M68010
+            && matches!(dst_mode, AddressingMode::PreDecrement(_))
+        {
+            // The 68010 keeps the 68000's predecrement sequence (Moira
+            // execMove4 is shared by both cores): the final prefetch comes
+            // before the write, a long writes its low word first, and the
+            // address computation costs no clocks of its own.
+            destination = self.write_move_predecrement(bus, dst_mode, size, value);
+        } else if self.cpu_type == CpuType::M68010
+            && class2_abs_long
+            && matches!(dst_mode, AddressingMode::AbsoluteLong)
+        {
+            // The 68010 keeps the 68000's Class 2 order for a memory source
+            // and an absolute long destination (Moira execMove8 is shared
+            // by both cores): the write comes before the second
+            // extension-word prefetch, not after it.
+            destination = Some(self.write_move_abs_long_class2(bus, size, value));
         } else {
             destination = self.write_move_ea(bus, dst_mode, size, value);
         }
@@ -170,6 +151,65 @@ impl CpuCore {
             }
             c
         }
+    }
+
+    /// MOVE to a predecrement destination on the 68000 and 68010: the final
+    /// prefetch comes first and the write is last (pasti class 0), for
+    /// every source and size. Returns the destination address.
+    fn write_move_predecrement<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        dst_mode: AddressingMode,
+        size: Size,
+        value: u32,
+    ) -> Option<u32> {
+        let ea = self.resolve_ea(bus, dst_mode, size);
+        // A MOVE destination predecrement does not pay the 2-clock
+        // address-computation penalty (it overlaps the final prefetch);
+        // cancel resolve_ea's charge.
+        self.pending_sync_clocks = self.pending_sync_clocks.saturating_sub(2);
+        self.top_up_prefetch(bus);
+        // MOVE to -(An) behaves like an RMW instruction: the IPL poll
+        // rides this prefetch and the trailing write does not re-latch it.
+        self.ipl_poll_point(bus);
+        let EaResult::Memory(addr) = ea else {
+            return None;
+        };
+        match size {
+            Size::Byte => self.write_8(bus, addr, value as u8),
+            Size::Word => self.write_16(bus, addr, value as u16),
+            // Long predecrement writes descend: low word at the higher
+            // address first, then the high word.
+            Size::Long => {
+                self.write_16(bus, addr.wrapping_add(2), (value & 0xFFFF) as u16);
+                self.write_16(bus, addr, (value >> 16) as u16);
+            }
+        }
+        Some(addr)
+    }
+
+    /// MOVE to an absolute long destination from a memory source (Class 2):
+    /// the address high word is consumed with its prefetch, the low word
+    /// without, and the write follows at once. The deferred prefetch and
+    /// the final prefetch come after the write, through the
+    /// end-of-instruction top-up. Returns the destination address.
+    fn write_move_abs_long_class2<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        size: Size,
+        value: u32,
+    ) -> u32 {
+        let hi = self.read_imm_16(bus) as u32;
+        self.consume_without_prefetch = true;
+        let lo = self.read_imm_16(bus) as u32;
+        self.consume_without_prefetch = false;
+        let addr = (hi << 16) | lo;
+        match size {
+            Size::Byte => self.write_8(bus, addr, value as u8),
+            Size::Word => self.write_16(bus, addr, value as u16),
+            Size::Long => self.write_32(bus, addr, value),
+        }
+        addr
     }
 
     /// MOVE destination write on the 68000, split into its word bus cycles:
