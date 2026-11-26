@@ -4,9 +4,10 @@
 //! rewrites the word the instruction under test prefetches, and counts the
 //! stripes in which the old word was read. Photographed on an A500 with an
 //! MC68010 (`*_A500_ECS_68010.jpeg`): DIVU 15, DIVS 16, MULU 14, MULS 14
-//! stripes. The README concludes that the 68010 multiplier prefetches last
-//! and the divider first (the 68000 is the other way round). Execution times
-//! are M68000UM Table 9-6: MULU 40, MULS 42 (maxima), DIVU 108, DIVS 122.
+//! stripes. The 68010 multiplier prefetches last and its divider early (the
+//! 68000 is the other way round): DIVS at once, DIVU after 16 clocks, which
+//! is what puts it one stripe below DIVS. Execution times are M68000UM Table
+//! 9-6: MULU 40, MULS 42 (maxima), DIVU 108, DIVS 122.
 use m68k::{AddressBus, CpuCore, CpuType, LinearMemoryBus, StepResult};
 
 #[derive(Debug, PartialEq)]
@@ -91,19 +92,22 @@ fn register_multiplies_compute_before_the_final_prefetch() {
 }
 
 #[test]
-fn register_divides_prefetch_before_computing() {
-    // DIVU/DIVS D1,D0: 100 / 7, as in vAmigaTS.
-    for (opcode, total) in [(0x80c1u16, 108u32), (0x81c1, 122)] {
+fn register_divides_prefetch_before_the_divider_finishes() {
+    // DIVU/DIVS D1,D0 with a small quotient. DIVS prefetches at once; DIVU
+    // spends 16 clocks first.
+    for (opcode, total, lead) in [(0x80c1u16, 108u32, 16u32), (0x81c1, 122, 0)] {
         let (mut cpu, mut bus) = setup(opcode, 0x4e71);
         cpu.set_d(0, 100);
         cpu.set_d(1, 7);
         let cycles = step(&mut cpu, &mut bus);
         assert_eq!(cycles, total, "{opcode:04x}");
-        assert_eq!(
-            bus.events,
-            [Event::Read(0x1004), Event::Internal(cycles - 4)],
-            "{opcode:04x}"
-        );
+        let mut expected = Vec::new();
+        if lead != 0 {
+            expected.push(Event::Internal(lead));
+        }
+        expected.push(Event::Read(0x1004));
+        expected.push(Event::Internal(cycles - 4 - lead));
+        assert_eq!(bus.events, expected, "{opcode:04x}");
         assert_eq!(cpu.d(0), (100 % 7) << 16 | (100 / 7), "{opcode:04x}");
     }
 }
