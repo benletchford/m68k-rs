@@ -33,6 +33,10 @@
 //! exposes stay with the implementation: a shift by a register count, a bit
 //! operation on a register, MOVEM's register count, the multiplies and
 //! divides, the branches, loop mode and every exception.
+//!
+//! The table fixes totals; `tail_clocks` is the part of a total that an
+//! instruction ending on a register spends after its final prefetch, which
+//! the core bills in place.
 
 use super::cpu::CpuCore;
 
@@ -359,6 +363,64 @@ fn group_e(op: u16) -> Option<i32> {
         count => i32::from(count),
     };
     Some(if size == 2 { 8 } else { 6 } + 2 * count)
+}
+
+/// Internal clocks an instruction that ends on a register spends after its
+/// final prefetch: its table time less its bus cycles. Shifts and rotates of
+/// a register depend on the count and are billed where it is known.
+pub(crate) fn tail_clocks(op: u16) -> i32 {
+    let (mode, reg) = ((op >> 3) & 7, op & 7);
+    let size = (op >> 6) & 3;
+    match op >> 12 {
+        // ORI, ANDI, SUBI, ADDI and EORI.L #,Dn: 14(3/0).
+        0x0 => {
+            let operation = (op >> 9) & 7;
+            let arithmetic = operation <= 3 || operation == 5;
+            i32::from(op & 0x0100 == 0 && arithmetic && size == 2 && mode == 0) * 2
+        }
+        0x4 if op & 0x0100 == 0 => match (op >> 9) & 7 {
+            // NEGX, CLR, NEG and NOT.L Dn: 6(1/0).
+            0..=3 if size == 2 && mode == 0 => 2,
+            // NBCD Dn: 6(1/0).
+            4 if size == 0 && mode == 0 => 2,
+            // MOVEC: 12(2/0) from a control register, 10(2/0) to one.
+            7 => match op & 0x00FF {
+                0x7A => 4,
+                0x7B => 2,
+                _ => 0,
+            },
+            _ => 0,
+        },
+        // ADDQ and SUBQ: 8(1/0) for a long data register and for an
+        // address register.
+        0x5 if size != 3 => match mode {
+            0 if size == 2 => 4,
+            1 if size != 0 => 4,
+            _ => 0,
+        },
+        group @ (0x8 | 0x9 | 0xB | 0xC | 0xD) => {
+            let opmode = (op >> 6) & 7;
+            let logical = matches!(group, 0x8 | 0xC);
+            match opmode {
+                // MULU, MULS, DIVU and DIVS bill themselves.
+                3 | 7 if logical => 0,
+                // CMPA: 6 plus the fetch.
+                3 | 7 if group == 0xB => 2,
+                // ADDA and SUBA: 8 plus the fetch, or 6 for a long from
+                // memory.
+                7 if !register_or_immediate(mode, reg) => 2,
+                3 | 7 => 4,
+                // Long op <ea>,Dn: 6 plus the fetch; a compare with memory
+                // has no tail.
+                2 if group == 0xB && !register_or_immediate(mode, reg) => 0,
+                2 if !(logical && mode == 1) => 2,
+                // ADDX.L, SUBX.L and EOR.L Dn,Dn: 6(1/0).
+                6 if mode == 0 && !logical => 2,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
 }
 
 fn table(op: u16) -> Option<i32> {

@@ -658,6 +658,25 @@ impl CpuCore {
         base + self.ea_source_cycles(mode, size)
     }
 
+    /// Internal clocks the MC68010 spends computing the address of a
+    /// destination it does not read (Scc, TAS, MOVE from SR), beyond the
+    /// extension-word fetches and the clocks `resolve_ea` bills: the "No
+    /// Fetch" columns of M68000UM Table 9-1. They come before the
+    /// instruction's remaining bus cycles.
+    #[inline]
+    pub(crate) fn m68010_no_fetch_lead(&mut self, mode: AddressingMode) {
+        if self.cpu_type != crate::core::types::CpuType::M68010 {
+            return;
+        }
+        let clocks = match mode {
+            AddressingMode::AddressIndirect(_) => 2,
+            AddressingMode::PostIncrement(_) => 4,
+            AddressingMode::PreDecrement(_) | AddressingMode::Index(_) => 2,
+            _ => 0,
+        };
+        self.internal_cycles(clocks);
+    }
+
     /// MC68000 timing for an immediate ALU op (ADDI/SUBI/ANDI/ORI/EORI) with a
     /// data-register destination (8 byte/word, 16 long) or a memory destination
     /// (12 byte/word, 20 long, plus the destination read/EA cost).

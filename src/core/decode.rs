@@ -111,6 +111,9 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     // Fast path: normal instructions return small non-negative cycle counts;
     // sentinels are large negative values.
     if cycles >= 0 {
+        if cpu.cpu_type == CpuType::M68010 {
+            finish_m68010_tail(cpu, bus, super::timing_010::tail_clocks(opcode));
+        }
         return InternalStepResult::Ok { cycles };
     }
 
@@ -1062,7 +1065,9 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             return 4;
         }
         // 68000 quirk: like CLR, MOVE from SR reads its destination before
-        // writing (removed on the 68010+).
+        // writing (removed on the 68010+, which spends the address
+        // calculation's internal clocks first, as MOVE from CCR does).
+        cpu.m68010_no_fetch_lead(mode);
         let ea = cpu.resolve_ea(bus, mode, Size::Word);
         if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
             return 50;
@@ -1112,6 +1117,11 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             AddressingMode::AddressIndirect(_) => 2,
             AddressingMode::PostIncrement(_) => 4,
             AddressingMode::PreDecrement(_) => 2,
+            // Only the 68010 is known to spend the index calculation's two
+            // clocks ahead of the write: 16 clocks in all, as M68000UM
+            // Tables 9-1 and 9-18 give. The later models keep their own
+            // times.
+            AddressingMode::Index(_) if cpu.cpu_type == CpuType::M68010 => 2,
             _ => 0,
         };
         cpu.internal_cycles(ea_internal as u32);
@@ -2273,6 +2283,11 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     return 50;
                 }
             }
+            // The 68010 does not read the destination; it spends the
+            // address calculation's internal clocks before the prefetch and
+            // the write (M68000UM Table 9-9 with the no-fetch times of
+            // Table 9-1).
+            cpu.m68010_no_fetch_lead(mode);
             // Scc to memory polls IPL during the pre-writeback prefetch.
             cpu.write_resolved_ea_np_poll(bus, ea, Size::Byte, value);
             if cpu.cpu_type == CpuType::M68000 {
@@ -3160,6 +3175,12 @@ fn dispatch_group_e<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             _ => return illegal_instruction(cpu, bus),
         };
         cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
+        if cpu.cpu_type == CpuType::M68010 {
+            // 6 + 2n clocks for a byte or word and 8 + 2n for a long
+            // (M68000UM Table 9-12), four of them the prefetch.
+            let base = if size == Size::Long { 4 } else { 2 };
+            finish_m68010_tail(cpu, bus, base + 2 * shift as i32);
+        }
         cycles
     }
 }
@@ -3192,6 +3213,30 @@ fn read_immediate<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, size: Size) -> 
         Size::Word => cpu.read_imm_16(bus) as u32,
         Size::Long => cpu.read_imm_32(bus),
     }
+}
+
+/// MC68010 instructions that end on a register: the final prefetch comes
+/// first and the remaining internal clocks follow it, as on the 68000. The
+/// clocks are billed here rather than left for the host to make up from the
+/// reported time, because a host can only add them once the bus is free
+/// again: a prefetch held off by another bus master would swallow them.
+#[inline(never)]
+fn finish_m68010_tail<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, clocks: i32) {
+    if clocks <= 0
+        || cpu.loop_mode
+        || cpu.instruction_exception_vector.is_some()
+        || cpu.run_mode == RUN_MODE_BERR_AERR_RESET
+        || !cpu.prefetch_enabled()
+    {
+        return;
+    }
+    cpu.top_up_prefetch(bus);
+    cpu.ipl_poll_point(bus);
+    if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
+        return;
+    }
+    cpu.internal_cycles(clocks as u32);
+    cpu.flush_sync(bus);
 }
 
 fn finish_m68000_alu_ea_dn_long_tail<B: AddressBus>(

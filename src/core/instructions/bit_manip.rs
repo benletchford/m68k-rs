@@ -165,6 +165,11 @@ impl CpuCore {
     ///
     /// `TAS <ea>`
     pub fn exec_tas<B: AddressBus>(&mut self, bus: &mut B, mode: AddressingMode) -> i32 {
+        if !mode.is_register_direct() {
+            // 14(2/1) plus the no-fetch address time on the 68010 (M68000UM
+            // Table 9-9).
+            self.m68010_no_fetch_lead(mode);
+        }
         let ea = self.resolve_ea(bus, mode, Size::Byte);
         if matches!(ea, crate::core::ea::EaResult::Memory(_)) {
             self.begin_locked_rmw(bus);
@@ -176,8 +181,12 @@ impl CpuCore {
         let result = value | 0x80;
         if let crate::core::ea::EaResult::Memory(addr) = ea {
             // The operand write precedes the trailing prefetch. The 68000
-            // holds the bus for two internal clocks between the strobes.
-            if self.cpu_type == crate::core::types::CpuType::M68000 {
+            // and 68010 hold the bus for two internal clocks between the
+            // strobes.
+            if matches!(
+                self.cpu_type,
+                crate::core::types::CpuType::M68000 | crate::core::types::CpuType::M68010
+            ) {
                 self.internal_cycles(2);
             }
             self.write_8(bus, addr, result as u8);

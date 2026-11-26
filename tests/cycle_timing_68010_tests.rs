@@ -4,11 +4,12 @@
 //! Every case runs one instruction from a steady prefetch queue and checks
 //! two things: the time the core reports is the manual's, and the clocks it
 //! spends on the bus (four per bus cycle, plus the internal clocks it hands
-//! to `AddressBus::sync`) do not exceed it. A host that advances time from
-//! the bus tops an instruction up to the reported time, so a report above
-//! the manual's figure makes the instruction run long.
+//! to `AddressBus::sync`) add up to it. A host that advances time from the
+//! bus tops an instruction up to the reported time, but only once its last
+//! bus cycle is over: a clock the core does not bill itself lands in the
+//! wrong place, and is lost when that cycle was held off.
 //!
-//! Four entries follow measurements of the hardware where the manual prints
+//! Some entries follow measurements of the hardware where the manual prints
 //! something else; they are marked "Measured" below and explained in
 //! `src/core/timing_010.rs`.
 //!
@@ -236,7 +237,16 @@ fn check(cases: Vec<Case>) {
     let mut failures = Vec::new();
     for case in &cases {
         let (reported, bus) = run(case);
-        if reported != case.expected || bus > case.expected {
+        // The core bills every clock itself, so that a host has none to add
+        // after the last bus cycle. The exception is BCLR on memory: it is
+        // two clocks longer than BSET and nothing measured says where they
+        // fall, so they are left to the host.
+        let host = if case.name.starts_with("bclr ") && !case.name.ends_with(",Dn") {
+            2
+        } else {
+            0
+        };
+        if reported != case.expected || bus + host != case.expected {
             failures.push(format!(
                 "{} ({:04x}): manual {} reported {} bus {}",
                 case.name, case.words[0], case.expected, reported, bus
@@ -842,6 +852,38 @@ fn miscellaneous_times_follow_table_9_18() {
     entry.d1 = 0x100;
     cases.push(entry);
     check(cases);
+}
+
+#[test]
+fn the_indexed_move_from_ccr_lead_is_the_68010s_alone() {
+    // MOVE CCR,(0,A0,D1.W): the 68010 spends the index calculation's two
+    // clocks ahead of the write. The later models keep their own times.
+    for (cpu_type, expected) in [
+        (CpuType::M68010, 16),
+        (CpuType::M68020, 9),
+        (CpuType::M68040, 3),
+        (CpuType::M68060, 3),
+        (CpuType::SCC68070, 9),
+    ] {
+        let mut cpu = CpuCore::new();
+        cpu.set_cpu_type(cpu_type);
+        let mut memory = LinearMemoryBus::new(0x10000);
+        memory.write_word(CODE, 0x42f0);
+        memory.write_word(CODE + 2, 0x1000);
+        memory.write_word(CODE + 4, 0x4e71);
+        memory.write_word(CODE + 6, 0x4e71);
+        cpu.set_sr(0x2715);
+        cpu.pc = CODE;
+        if cpu.prefetch_enabled() {
+            cpu.prefetch_queue = [0x42f0, 0x1000];
+            cpu.prefetch_count = 2;
+        }
+        cpu.set_a(0, 0x2000);
+        cpu.set_d(1, 2);
+        let result = cpu.step(&mut memory);
+        assert_eq!(result, StepResult::Ok { cycles: expected }, "{cpu_type:?}");
+        assert_eq!(memory.read_word(0x2002), 0x0015, "{cpu_type:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

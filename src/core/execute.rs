@@ -1131,6 +1131,16 @@ impl CpuCore {
                     size,
                 },
             ) => self.exec_clr(bus, size, super::ea::AddressingMode::DataDirect(reg)),
+            // The 68010 CLR.L Dn spends two internal clocks after its
+            // prefetch, which the full dispatcher bills.
+            (
+                CpuType::M68010,
+                DecodedSimpleOp::UnaryDataReg {
+                    op: UnaryOp::Clr,
+                    size: Size::Long,
+                    ..
+                },
+            ) => return dispatch_instruction(self, bus, opcode),
             _ => fast_op.execute(self, bus),
         };
 

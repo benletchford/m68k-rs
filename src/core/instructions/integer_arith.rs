@@ -325,6 +325,11 @@ impl CpuCore {
             // A500 with a 68010).
             self.set_ccr_before_write(0, size);
         }
+        if self.cpu_type == CpuType::M68010 && matches!(mode, AddressingMode::Index(_)) {
+            // 16(2/1) on the 68010 (M68000UM Table 9-10): two internal
+            // clocks beyond the index calculation's own.
+            self.internal_cycles(2);
+        }
         // CLR polls IPL during the pre-writeback prefetch.
         self.write_resolved_ea_np_poll(bus, ea, size, 0);
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
@@ -751,7 +756,10 @@ impl CpuCore {
         // before the final prefetch, 4 on the 68010 (8(1/0) against the
         // 68000's 10(1/0), M68000UM Table 9-18).
         if self.cpu_type == CpuType::M68010 {
+            self.flush_sync(bus);
+            self.top_up_prefetch(bus);
             self.internal_cycles(4);
+            self.flush_sync(bus);
             8
         } else {
             self.internal_cycles(6);
