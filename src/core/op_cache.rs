@@ -35,6 +35,11 @@ pub(crate) enum CachedOp {
     /// Memory-operand op — runs only in the instruction-budgeted batch
     /// loop when a fastmem window is active (no cycle accounting).
     Mem(super::mem_ops::DecodedMemOp),
+    /// General FPU operation (`$F200-$F23F`): the batch loop runs the
+    /// common arithmetic itself when a fastmem window is active
+    /// ([`super::mem_ops::execute_window_fpu_op`]); the rest is full
+    /// dispatch.
+    Fpu,
     /// Neither: full dispatch.
     Complex,
 }
@@ -1235,6 +1240,12 @@ impl CpuCore {
                         probe = trace_jit::note_backward_branch(self, cpu_type);
                     }
                 }
+                CachedOp::Fpu => {
+                    if !super::mem_ops::execute_window_fpu_op::<TRANSLATED>(self, opcode) {
+                        return BatchInnerExit::Miss(opcode);
+                    }
+                    trace_jit::record_executed(self, bus, self.ppc, self.pc);
+                }
                 CachedOp::Complex => {
                     return BatchInnerExit::Miss(opcode);
                 }
@@ -1281,6 +1292,12 @@ impl CpuCore {
             Some(op) => CachedOp::Simple(op),
             None => match super::mem_ops::DecodedMemOp::decode(cpu_type, opcode) {
                 Some(op) => CachedOp::Mem(op),
+                None if opcode & 0xFFC0 == 0xF200
+                    && !is_pre_68020(cpu_type)
+                    && !matches!(cpu_type, CpuType::M68EC040 | CpuType::M68LC040) =>
+                {
+                    CachedOp::Fpu
+                }
                 None => CachedOp::Complex,
             },
         };

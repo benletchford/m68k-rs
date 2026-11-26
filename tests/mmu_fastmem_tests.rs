@@ -946,3 +946,53 @@ fn history_bits_match_the_interpreter() {
         assert_eq!(batched.1.peek_long(phys(DATA2)), 3000, "{label}");
     }
 }
+
+/// FPU arithmetic runs in the batch loop with its operands read through
+/// the translated window. A double that spans two pages mapped to
+/// separate frames is fetched by the interpreter, a long at a time.
+#[test]
+fn fpu_arithmetic_reads_its_operands_through_the_window() {
+    // loop: FADD.D (A0),FP0 ; FMUL.D (16,A1),FP0 ; FSUB.X FP1,FP0
+    //       FMOVE.L D0,FP2 ; FADD.D (A3),FP0 ; ADDQ.L #1,D0 ; DBRA D7,loop
+    // FMOVE.D FP0,(A2)
+    let program = [
+        0xF210, 0x5422, 0xF229, 0x5423, 0x0010, 0xF200, 0x0428, 0xF200, 0x4100, 0xF213, 0x5422,
+        0x5280, 0x51CF, 0xFFE6, 0xF212, 0x7400, ALINE,
+    ];
+    let poke_double = |bus: &mut Bus, at: u32, value: f64| {
+        let bits = value.to_bits();
+        bus.poke_long(at, (bits >> 32) as u32);
+        bus.poke_long(at + 4, bits as u32);
+    };
+    for (label, mmu) in [("040", Mmu::Mc68040), ("030", Mmu::Mc68030 { tc: TC_030 })] {
+        let (reference, batched) = compare(label, mmu, &program, &|cpu, bus| {
+            cpu.fpu_present = true;
+            cpu.fpr[0] = m68k::fpu::FloatX80::from_f64(1.0);
+            cpu.fpr[1] = m68k::fpu::FloatX80::from_f64(0.25);
+            cpu.set_a(0, DATA);
+            cpu.set_a(1, DATA2);
+            cpu.set_a(2, DATA2 + 0x100);
+            cpu.set_a(3, DATA + 0xFFC);
+            cpu.set_d(7, 199);
+            poke_double(bus, phys(DATA), 1.000_001);
+            poke_double(bus, phys(DATA2) + 16, 0.999);
+            // 0.125 across the page boundary: the low long is zero.
+            bus.poke_long(phys(DATA) + 0xFFC, 0x3FC0_0000);
+        });
+        assert_eq!(reference.0.fpr, batched.0.fpr, "{label}: FP registers");
+        assert_eq!(reference.0.fpsr, batched.0.fpsr, "{label}: FPSR");
+        assert_eq!(reference.0.fpiar, batched.0.fpiar, "{label}: FPIAR");
+        assert_eq!(
+            batched.0.fpr[2],
+            m68k::fpu::FloatX80::from_f64(199.0),
+            "{label}"
+        );
+        assert_ne!(batched.1.peek_long(phys(DATA2) + 0x100), 0, "{label}");
+        assert!(
+            batched.1.cycles * 3 < reference.1.cycles,
+            "{label}: {} bus cycles with the window, {} without",
+            batched.1.cycles,
+            reference.1.cycles
+        );
+    }
+}
