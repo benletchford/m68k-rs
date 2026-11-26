@@ -207,6 +207,7 @@ impl CpuCore {
         // MOVE to -(An) behaves like an RMW instruction: the IPL poll
         // rides this prefetch and the trailing write does not re-latch it.
         self.ipl_poll_point(bus);
+        self.m68010_loop_write_lead();
         let EaResult::Memory(addr) = ea else {
             return None;
         };
@@ -822,6 +823,7 @@ impl CpuCore {
             EaResult::AddrReg(reg) => self.dar[8 + reg as usize] = value,
             EaResult::Memory(addr) => {
                 self.top_up_prefetch(bus);
+                self.m68010_loop_write_lead();
                 if np_poll {
                     self.ipl_poll_point(bus);
                 }

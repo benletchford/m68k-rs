@@ -32,11 +32,17 @@
 //! Times that depend on a run-time value the retired instruction no longer
 //! exposes stay with the implementation: a shift by a register count, a bit
 //! operation on a register, MOVEM's register count, the multiplies and
-//! divides, the branches, loop mode and every exception.
+//! divides, the branches and every exception.
 //!
 //! The table fixes totals; `tail_clocks` is the part of a total that an
 //! instruction ending on a register spends after its final prefetch, which
 //! the core bills in place.
+//!
+//! In loop mode an instruction and the DBcc behind it are timed as a pair
+//! (Tables 9-3, 9-5, 9-7, 9-11, 9-13 and 9-17): `loop_times` gives the
+//! pair's three times and the DBcc takes its share from them. The body's
+//! internal clocks fall between its last read and its write, or after its
+//! last read when it writes nothing.
 
 use super::cpu::CpuCore;
 
@@ -365,6 +371,270 @@ fn group_e(op: u16) -> Option<i32> {
     Some(if size == 2 { 8 } else { 6 } + 2 * count)
 }
 
+/// Loop-mode times of a loopable instruction and the DBcc that closes its
+/// loop, taken together: the loop continuing, the loop ending with the
+/// condition true, and the loop ending with the count expired (Tables 9-3,
+/// 9-5, 9-7, 9-11, 9-13 and 9-17).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LoopTimes {
+    pub(crate) continued: i32,
+    pub(crate) condition_true: i32,
+    pub(crate) expired: i32,
+}
+
+impl LoopTimes {
+    const fn new(continued: i32, condition_true: i32, expired: i32) -> Self {
+        Self {
+            continued,
+            condition_true,
+            expired,
+        }
+    }
+
+    /// The tables add two clocks for a -(An) operand.
+    const fn predecrement(self, apply: bool) -> Self {
+        if apply {
+            Self::new(
+                self.continued + 2,
+                self.condition_true + 2,
+                self.expired + 2,
+            )
+        } else {
+            self
+        }
+    }
+}
+
+/// The looping DBcc's own share of a loop iteration: it re-enters the body
+/// in 6 clocks without touching the bus.
+pub(crate) const LOOP_DBCC_CONTINUED: i32 = 6;
+
+/// Loop-mode times for the body instruction `op`, or `None` when the tables
+/// have no entry for it.
+pub(crate) fn loop_times(op: u16) -> Option<LoopTimes> {
+    let mode = (op >> 3) & 7;
+    let t = LoopTimes::new;
+    match op >> 12 {
+        // Tables 9-3 and 9-5: MOVE to (An), (An)+ or -(An).
+        group @ 0x1..=0x3 => {
+            let long = group == 0x2;
+            let dst_mode = (op >> 6) & 7;
+            if !(2..=4).contains(&dst_mode) {
+                return None;
+            }
+            let to_predecrement = dst_mode == 4;
+            let times = match (mode, long) {
+                (0 | 1, _) if to_predecrement => return None,
+                (0 | 1, false) => t(10, 18, 16),
+                (0 | 1, true) => t(14, 20, 18),
+                (2 | 3, false) => t(14, 20, 18),
+                (2 | 3, true) => t(22, 28, 24),
+                (4, false) => t(16, 22, 20),
+                (4, true) => t(24, 30, 26),
+                _ => return None,
+            };
+            Some(times.predecrement(to_predecrement && mode >= 2))
+        }
+        // Table 9-11 (single operand) and, for TST, the same table.
+        0x4 => {
+            if !(2..=4).contains(&mode) {
+                return None;
+            }
+            let size = (op >> 6) & 3;
+            let long = size == 2;
+            let times = match (op >> 8) & 0xF {
+                // NEGX, NEG and NOT
+                0x0 | 0x4 | 0x6 if size != 3 => {
+                    if long {
+                        t(24, 30, 28)
+                    } else {
+                        t(16, 22, 20)
+                    }
+                }
+                // CLR
+                0x2 if size != 3 => {
+                    if long {
+                        t(14, 22, 20)
+                    } else {
+                        t(10, 18, 16)
+                    }
+                }
+                // NBCD
+                0x8 if size == 0 => t(18, 24, 22),
+                // TST
+                0xA if size != 3 => {
+                    if long {
+                        t(18, 24, 20)
+                    } else {
+                        t(12, 18, 16)
+                    }
+                }
+                _ => return None,
+            };
+            Some(times.predecrement(mode == 4))
+        }
+        // Tables 9-7 and 9-17.
+        group @ (0x8 | 0x9 | 0xB | 0xC | 0xD) => {
+            let opmode = (op >> 6) & 7;
+            let logical = matches!(group, 0x8 | 0xC);
+            // ABCD and SBCD -(Ay),-(Ax).
+            if logical && op & 0x01F8 == 0x0108 {
+                return Some(t(24, 30, 28));
+            }
+            let long = opmode & 3 == 2;
+            if op & 0x0138 == 0x0108 && opmode & 3 != 3 {
+                return match group {
+                    // ADDX and SUBX -(Ay),-(Ax).
+                    0x9 | 0xD => Some(if long { t(32, 38, 36) } else { t(22, 28, 26) }),
+                    // CMPM (Ay)+,(Ax)+.
+                    0xB => Some(if long { t(24, 30, 26) } else { t(14, 20, 18) }),
+                    _ => None,
+                };
+            }
+            if !(2..=4).contains(&mode) {
+                return None;
+            }
+            let compare = group == 0xB;
+            let times = match opmode {
+                // op <ea>,An: ADDA, SUBA and CMPA.
+                3 | 7 if logical => return None,
+                3 if compare => t(12, 18, 16),
+                7 if compare => t(18, 24, 20),
+                3 => t(18, 24, 22),
+                7 => t(22, 28, 26),
+                // op <ea>,Dn. Table 9-7 prints 20/26/24 for SUB.L; ADD.L's
+                // row is used for both.
+                0..=2 if compare => {
+                    if long {
+                        t(18, 24, 20)
+                    } else {
+                        t(12, 18, 16)
+                    }
+                }
+                0..=2 => {
+                    if long {
+                        t(22, 28, 26)
+                    } else {
+                        t(16, 22, 20)
+                    }
+                }
+                // op Dn,<ea> (EOR for the compare group).
+                _ => {
+                    if long {
+                        t(24, 30, 28)
+                    } else {
+                        t(16, 22, 20)
+                    }
+                }
+            };
+            Some(times.predecrement(mode == 4))
+        }
+        // Table 9-13: word shifts and rotates on memory.
+        0xE => {
+            if (op >> 6) & 3 != 3 || op & 0x0800 != 0 || !(2..=4).contains(&mode) {
+                return None;
+            }
+            Some(t(18, 24, 22).predecrement(mode == 4))
+        }
+        _ => None,
+    }
+}
+
+/// Bus cycles of the loop body `op` in loop mode, where it fetches nothing:
+/// its operand reads and writes.
+fn loop_bus_cycles(op: u16) -> i32 {
+    let mode = (op >> 3) & 7;
+    let per_operand = |long: bool| if long { 2 } else { 1 };
+    match op >> 12 {
+        group @ 0x1..=0x3 => {
+            let n = per_operand(group == 0x2);
+            if mode <= 1 { n } else { 2 * n }
+        }
+        0x4 => {
+            let n = per_operand((op >> 6) & 3 == 2);
+            // CLR only writes and TST only reads.
+            if matches!((op >> 8) & 0xF, 0x2 | 0xA) {
+                n
+            } else {
+                2 * n
+            }
+        }
+        0xE => 2,
+        group => {
+            let opmode = (op >> 6) & 7;
+            let n = per_operand(opmode == 7 || opmode & 3 == 2);
+            match opmode {
+                // <ea>,Dn and <ea>,An read their source.
+                0..=3 | 7 => n,
+                // CMPM reads twice; ADDX, SUBX, ABCD and SBCD also write.
+                _ if mode == 1 => {
+                    if group == 0xB {
+                        2 * n
+                    } else {
+                        3 * n
+                    }
+                }
+                // Dn,<ea> reads and writes.
+                _ => 2 * n,
+            }
+        }
+    }
+}
+
+/// Clocks the loop body `op` already spends forming a -(An) address before
+/// its operand cycles: two, once, for a predecremented source or single
+/// operand and for the -(Ay),-(Ax) pairs. A predecremented MOVE destination
+/// has none of its own.
+fn loop_predecrement_clocks(op: u16) -> i32 {
+    let mode = (op >> 3) & 7;
+    let pair = matches!(op >> 12, 0x8 | 0x9 | 0xC | 0xD) && op & 0x0138 == 0x0108;
+    if mode == 4 || pair { 2 } else { 0 }
+}
+
+/// Whether the loop body `op` writes to memory.
+fn loop_body_writes(op: u16) -> bool {
+    match op >> 12 {
+        0x1..=0x3 | 0xE => true,
+        // Every single-operand body but TST.
+        0x4 => (op >> 8) & 0xF != 0xA,
+        // op Dn,<ea> and the -(Ay),-(Ax) pairs; not CMPM or op <ea>,An.
+        group => {
+            let opmode = (op >> 6) & 7;
+            (4..=6).contains(&opmode) && !(group == 0xB && (op >> 3) & 7 == 1)
+        }
+    }
+}
+
+/// Internal clocks a loop body that writes spends between its last read and
+/// its write (measured: the ADD Dn,(An) loops of vAmigaTS CPU/68010/Loopmode
+/// keep their time under bus contention only with the clocks there).
+pub(crate) fn loop_write_lead(op: u16) -> u32 {
+    if loop_body_writes(op) {
+        loop_body_clocks(op) as u32
+    } else {
+        0
+    }
+}
+
+/// Internal clocks a loop body that only reads spends after its last read.
+pub(crate) fn loop_tail_clocks(op: u16) -> i32 {
+    if loop_body_writes(op) {
+        0
+    } else {
+        loop_body_clocks(op)
+    }
+}
+
+/// Internal clocks the loop body `op` spends in loop mode besides its
+/// operand cycles: its share of a continuing iteration less those cycles and
+/// the address clocks that precede them.
+fn loop_body_clocks(op: u16) -> i32 {
+    loop_times(op).map_or(0, |times| {
+        let body = times.continued - LOOP_DBCC_CONTINUED;
+        (body - 4 * loop_bus_cycles(op) - loop_predecrement_clocks(op)).max(0)
+    })
+}
+
 /// Internal clocks an instruction that ends on a register spends after its
 /// final prefetch: its table time less its bus cycles. Shifts and rotates of
 /// a register depend on the count and are billed where it is known.
@@ -442,10 +712,20 @@ impl CpuCore {
     /// retired, or `raw` when the tables do not fix it from the opcode
     /// alone.
     pub(crate) fn cycles_010(&self, raw: i32) -> i32 {
-        if self.instruction_exception_vector.is_some() || self.loop_mode {
+        if self.instruction_exception_vector.is_some() {
             return raw;
         }
-        table(self.ir as u16).unwrap_or(raw)
+        let op = self.ir as u16;
+        if self.loop_mode {
+            // The body of a loop in loop mode: its share of an iteration is
+            // the table's time less the looping DBcc's. The DBcc itself and
+            // the loop's last pass bill their own time.
+            if op & 0xF0F8 == 0x50C8 {
+                return raw;
+            }
+            return loop_times(op).map_or(raw, |times| times.continued - LOOP_DBCC_CONTINUED);
+        }
+        table(op).unwrap_or(raw)
     }
 }
 

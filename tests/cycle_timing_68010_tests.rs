@@ -13,7 +13,7 @@
 //! something else; they are marked "Measured" below and explained in
 //! `src/core/timing_010.rs`.
 //!
-//! The multiply, divide, branch and loop-mode times have their own suites.
+//! The multiply, divide and branch times have their own suites.
 use m68k::{AddressBus, CpuCore, CpuType, LinearMemoryBus, NoOpHleHandler, StepResult};
 
 struct Bus {
@@ -914,5 +914,139 @@ fn movec_to_a_missing_control_register_takes_46_and_44_clocks() {
     for (opcode, expected) in [(0x4e7au16, 46), (0x4e7b, 44)] {
         let (_, bus) = run(&case("movec", vec![opcode, 0x1002], expected));
         assert_eq!(bus, expected, "{opcode:04x}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tables 9-3, 9-5, 9-7, 9-11, 9-13 and 9-17: loop mode
+// ---------------------------------------------------------------------------
+
+/// Run `body ; dbcc d4,body` for `count + 1` passes and return, for each
+/// pass, the clocks reported and the bus clocks of the pair.
+fn run_loop(body: u16, dbcc: u16, count: u32, zero_at: Option<u32>) -> Vec<(u32, u32)> {
+    let mut cpu = CpuCore::new();
+    cpu.set_cpu_type(CpuType::M68010);
+    let mut memory = LinearMemoryBus::new(0x10000);
+    for address in (0x3f00..0x4400u32).step_by(2) {
+        memory.write_word(address, 0x0001);
+    }
+    // A word of zero ends a DBEQ loop on a true condition.
+    if let Some(index) = zero_at {
+        memory.write_long(0x4200 + 2 * index, 0);
+    }
+    for (index, word) in [body, dbcc, 0xfffc, 0x4e71, 0x4e71, 0x4e71]
+        .iter()
+        .enumerate()
+    {
+        memory.write_word(CODE + 2 * index as u32, *word);
+    }
+    cpu.set_sr(0x2700);
+    cpu.pc = CODE;
+    cpu.prefetch_queue = [body, dbcc];
+    cpu.prefetch_count = 2;
+    for reg in 0..8 {
+        cpu.set_d(reg, 1);
+        cpu.set_a(reg, 0x4000);
+    }
+    cpu.set_d(4, count);
+    cpu.set_a(4, 0x4100);
+    cpu.set_a(5, 0x4200);
+    cpu.set_a(7, STACK);
+    let mut bus = Bus { memory, clocks: 0 };
+    let mut passes = Vec::new();
+    let mut pair = (0, 0);
+    for _ in 0..64 {
+        let pc = cpu.pc;
+        if pc >= CODE + 6 {
+            return passes;
+        }
+        let before = bus.clocks;
+        let cycles = match cpu.step_with_hle_handler(&mut bus, &mut NoOpHleHandler) {
+            StepResult::Ok { cycles } => cycles as u32,
+            other => panic!("{body:04x}: {other:?}"),
+        };
+        pair.0 += cycles;
+        pair.1 += bus.clocks - before;
+        if pc == CODE + 2 {
+            passes.push(pair);
+            pair = (0, 0);
+        }
+    }
+    panic!("{body:04x}: the loop did not end");
+}
+
+#[test]
+fn loop_mode_times_follow_the_loop_tables() {
+    // body, loop continued, loop ended by an expired count
+    let rows: [(&str, u16, u32, u32); 33] = [
+        ("move.w d0,(a5)", 0x3a80, 10, 16),
+        ("move.w (a4),(a5)", 0x3a94, 14, 18),
+        ("move.b (a4)+,(a5)+", 0x1adc, 14, 18),
+        ("move.w (a4),-(a5)", 0x3b14, 16, 20),
+        ("move.w -(a4),(a5)", 0x3aa4, 16, 20),
+        ("move.w -(a4),-(a5)", 0x3b24, 18, 22),
+        ("move.l d0,(a5)+", 0x2ac0, 14, 18),
+        ("move.l (a4)+,(a5)+", 0x2adc, 22, 24),
+        ("move.l -(a4),-(a5)", 0x2b24, 26, 28),
+        ("clr.w (a5)", 0x4255, 10, 16),
+        ("clr.w -(a5)", 0x4265, 12, 18),
+        ("clr.l (a5)+", 0x429d, 14, 20),
+        ("tst.w (a5)", 0x4a55, 12, 16),
+        ("tst.l (a5)+", 0x4a9d, 18, 20),
+        ("neg.w (a5)", 0x4455, 16, 20),
+        ("not.l (a5)", 0x4695, 24, 28),
+        ("negx.w -(a5)", 0x4065, 18, 22),
+        ("nbcd (a5)", 0x4815, 18, 22),
+        ("add.w (a5),d0", 0xd055, 16, 20),
+        ("add.l (a5)+,d0", 0xd09d, 22, 26),
+        ("add.w d0,(a5)", 0xd155, 16, 20),
+        ("add.l d0,(a5)", 0xd195, 24, 28),
+        ("add.w d0,-(a5)", 0xd165, 18, 22),
+        ("adda.w (a5),a3", 0xd6d5, 18, 22),
+        ("adda.l (a5),a3", 0xd7d5, 22, 26),
+        ("cmp.w (a5),d0", 0xb055, 12, 16),
+        ("cmp.l (a5),d0", 0xb095, 18, 20),
+        ("eor.w d0,(a5)", 0xb155, 16, 20),
+        ("asl.w (a5)", 0xe1d5, 18, 22),
+        ("addx.w -(a4),-(a5)", 0xdb4c, 22, 26),
+        ("addx.l -(a4),-(a5)", 0xdb8c, 32, 36),
+        ("cmpm.w (a4)+,(a5)+", 0xbb4c, 14, 18),
+        ("abcd -(a4),-(a5)", 0xcb0c, 24, 28),
+    ];
+    let mut failures = Vec::new();
+    for (name, body, continued, expired) in rows {
+        // Five passes: the first runs normally and its DBRA enters loop
+        // mode, three continue the loop and the last one finds the count
+        // expired.
+        let passes = run_loop(body, 0x51cc, 4, None);
+        let expected = [continued, continued, continued, expired];
+        let got = &passes[1..];
+        let reported: Vec<u32> = got.iter().map(|pass| pass.0).collect();
+        // Every clock is billed by the core: nothing is left for the host
+        // to add.
+        let billed: Vec<u32> = got.iter().map(|pass| pass.1).collect();
+        if passes.len() != 5 || reported != expected || billed != expected {
+            failures.push(format!(
+                "{name} ({body:04x}): manual {expected:?} got {passes:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn a_loop_ended_by_its_condition_takes_the_condition_true_time() {
+    // DBEQ leaves on the fourth pass, when the body reads a zero.
+    for (name, body, continued, condition_true) in [
+        ("tst.w (a5)+", 0x4a5du16, 12u32, 18u32),
+        ("move.w (a5)+,(a4)+", 0x38dd, 14, 20),
+        ("move.l (a5)+,(a4)+", 0x28dd, 22, 28),
+    ] {
+        let zero_at = if body == 0x28dd { 6 } else { 3 };
+        let passes = run_loop(body, 0x57cc, 9, Some(zero_at));
+        let reported: Vec<u32> = passes[1..].iter().map(|pass| pass.0).collect();
+        let billed: Vec<u32> = passes[1..].iter().map(|pass| pass.1).collect();
+        assert_eq!(reported, [continued, continued, condition_true], "{name}");
+        assert_eq!(billed, reported, "{name}");
     }
 }

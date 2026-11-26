@@ -658,6 +658,15 @@ impl CpuCore {
         base + self.ea_source_cycles(mode, size)
     }
 
+    /// A 68010 loop body in loop mode spends its internal clocks between its
+    /// last read and its write.
+    #[inline]
+    pub(crate) fn m68010_loop_write_lead(&mut self) {
+        if self.loop_mode {
+            self.internal_cycles(crate::core::timing_010::loop_write_lead(self.ir as u16));
+        }
+    }
+
     /// Internal clocks the MC68010 spends computing the address of a
     /// destination it does not read (Scc, TAS, MOVE from SR), beyond the
     /// extension-word fetches and the clocks `resolve_ea` bills: the "No

@@ -112,7 +112,11 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     // sentinels are large negative values.
     if cycles >= 0 {
         if cpu.cpu_type == CpuType::M68010 {
-            finish_m68010_tail(cpu, bus, super::timing_010::tail_clocks(opcode));
+            if cpu.loop_mode {
+                finish_m68010_loop_body(cpu, bus, opcode);
+            } else {
+                finish_m68010_tail(cpu, bus, super::timing_010::tail_clocks(opcode));
+            }
         }
         return InternalStepResult::Ok { cycles };
     }
@@ -2074,8 +2078,9 @@ fn loopable_68010(op: u16) -> bool {
                 _ => false,
             }
         }
-        // Memory shifts/rotates (word, by one): ASd/LSd/ROXd/ROd <ea>.
-        0xE => opmode == 3 && loop_ea && (op >> 9) & 7 <= 3,
+        // Memory shifts/rotates (word, by one): ASd/LSd/ROXd/ROd <ea>, in
+        // either direction (M68000UM Table 9-13 lists both).
+        0xE => opmode & 3 == 3 && loop_ea && (op >> 9) & 7 <= 3,
         _ => false,
     }
 }
@@ -2142,12 +2147,23 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             // iteration costs 6 internal clocks (Moira's execDbcc loop arm);
             // exits refill the queue from the fall-through path.
             if cpu.loop_mode {
+                // Leaving the loop costs the DBcc what M68000UM's loop-mode
+                // tables add to a continuing iteration: 6 clocks for a true
+                // condition and 4 for an expired count on most rows.
+                let times = super::timing_010::loop_times(cpu.loop_body_word);
+                let continued = super::timing_010::LOOP_DBCC_CONTINUED;
                 let condition = ((opcode >> 8) & 0xF) as u8;
+                // The clocks of either exit beyond its two fetches come
+                // before them, like the 6 of a continuing pass: all are
+                // billed here, so that none is left for the host to add
+                // after a fetch that another bus master held off.
                 if cpu.test_condition(condition) {
                     cpu.loop_mode = false;
                     cpu.pc = cpu.pc.wrapping_add(2);
+                    let total = times.map_or(12, |t| continued + t.condition_true - t.continued);
+                    cpu.internal_cycles((total - 8).max(0) as u32);
                     cpu.full_prefetch(bus);
-                    return 12;
+                    return total;
                 }
                 let dn = ea_reg as usize;
                 let counter = cpu.d(dn) as u16;
@@ -2159,12 +2175,16 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.pc = cpu.pc.wrapping_sub(4);
                     cpu.prefetch_queue = [cpu.loop_body_word, cpu.loop_dbcc_word];
                     cpu.prefetch_count = 2;
-                    return 6;
+                    cpu.internal_cycles(continued as u32);
+                    cpu.flush_sync(bus);
+                    return continued;
                 }
                 cpu.loop_mode = false;
                 cpu.pc = cpu.pc.wrapping_add(2);
+                let total = times.map_or(10, |t| continued + t.expired - t.continued);
+                cpu.internal_cycles((total - 8).max(0) as u32);
                 cpu.full_prefetch(bus);
-                return 16;
+                return total;
             }
             let counter = cpu.d(ea_reg as usize) as u16;
             // The 68000 evaluates the condition and counter before consuming
@@ -3245,6 +3265,26 @@ fn finish_m68010_tail<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, clocks: i32
     }
     cpu.internal_cycles(clocks as u32);
     cpu.flush_sync(bus);
+}
+
+/// The body of an MC68010 loop in loop mode fetches nothing, so the clocks
+/// its table time holds beyond its operand cycles are internal. They are
+/// billed here for the same reason as the register tails: left to the host
+/// they would be swallowed whenever an operand cycle is held off.
+#[inline(never)]
+fn finish_m68010_loop_body<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) {
+    // The DBcc closing the loop bills its own time.
+    if opcode & 0xF0F8 == 0x50C8
+        || cpu.instruction_exception_vector.is_some()
+        || cpu.run_mode == RUN_MODE_BERR_AERR_RESET
+    {
+        return;
+    }
+    let clocks = super::timing_010::loop_tail_clocks(opcode);
+    if clocks > 0 {
+        cpu.internal_cycles(clocks as u32);
+        cpu.flush_sync(bus);
+    }
 }
 
 fn finish_m68000_alu_ea_dn_long_tail<B: AddressBus>(
