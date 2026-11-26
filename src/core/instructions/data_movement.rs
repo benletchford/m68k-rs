@@ -22,6 +22,24 @@ impl CpuCore {
     ) -> i32 {
         let source = self.resolve_ea(bus, src_mode, size);
         let value = self.read_resolved_ea(bus, source, size);
+        if self.cpu_type == CpuType::M68000 && self.run_mode != RUN_MODE_BERR_AERR_RESET {
+            // The source operand is complete: its (An)+/-(An) update is not
+            // undone by a fault on the destination write (vAmigaTS
+            // addrerr21, photographed on an A500).
+            if let AddressingMode::PostIncrement(reg) | AddressingMode::PreDecrement(reg) = src_mode
+            {
+                self.commit_address_register_68000(reg, self.a(reg as usize));
+            }
+            // MOVE.B/MOVE.W set the condition codes from the source before
+            // the destination write, so the frame of a fault on that write
+            // stacks the new CCR (vAmigaTS addrerr36, A500; the MAME-derived
+            // SingleStepTests frames show the same for every destination
+            // mode). Long moves are left as they were: no hardware result
+            // pins their CCR at a destination fault.
+            if size != Size::Long && !dst_mode.is_register_direct() {
+                self.set_ccr_before_write(value, size);
+            }
+        }
         let copying = matches!(source, EaResult::Memory(_))
             && !dst_mode.is_register_direct()
             && !(self.has_pmmu && self.pmmu_enabled)
@@ -163,7 +181,24 @@ impl CpuCore {
         size: Size,
         value: u32,
     ) -> Option<u32> {
+        let start_an = match dst_mode {
+            AddressingMode::PreDecrement(reg) => Some((reg, self.a(reg as usize))),
+            _ => None,
+        };
         let ea = self.resolve_ea(bus, dst_mode, size);
+        if let Some((reg, start)) = start_an
+            && size == Size::Long
+        {
+            // MOVE.L to -(An) does not write the decremented address back
+            // before its first write: a fault there leaves An unchanged
+            // (vAmigaTS addrerr16, photographed on an A500).
+            self.uncommit_predecrement_68000(reg, start);
+        }
+        if self.cpu_type == CpuType::M68010 && size != Size::Long {
+            // The 68010 also sets the CCR before this write (vAmigaTS
+            // addrerr36, photographed on an A500 with a 68010).
+            self.set_ccr_before_write(value, size);
+        }
         // A MOVE destination predecrement does not pay the 2-clock
         // address-computation penalty (it overlaps the final prefetch);
         // cancel resolve_ea's charge.
@@ -831,6 +866,15 @@ impl CpuCore {
             // Immediate is not a valid control/address EA (LEA/PEA/JMP/JSR).
             EaResult::Immediate(_) | EaResult::DataReg(_) | EaResult::AddrReg(_) => 0,
         }
+    }
+
+    /// Set the logic-operation condition codes for `value` (MOVE, CLR) ahead
+    /// of the destination write, and keep them across a fault on that
+    /// write: the frame then stacks the updated CCR rather than the CCR the
+    /// instruction started with. X is not affected.
+    pub(crate) fn set_ccr_before_write(&mut self, value: u32, size: Size) {
+        self.set_logic_flags(value, size);
+        self.sr_save = (self.sr_save & !0x000F) | (self.get_sr() & 0x000F);
     }
 
     /// Set N, Z flags based on result. Clear V, C.

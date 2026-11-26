@@ -250,8 +250,11 @@ impl CpuCore {
             // V set and C cleared on every model; N and Z are undefined.
             self.v_flag = 0x80;
             self.c_flag = 0;
-            if self.sst_m68000_compat {
-                // SingleStepTests/MAME fixtures expect deterministic N/Z on overflow.
+            if self.sst_m68000_compat || matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010)
+            {
+                // The 68000 and 68010 set N and clear Z (vAmigaTS addrerr30,
+                // photographed on an A500 with a 68000 and with a 68010; the
+                // MAME-derived SingleStepTests fixtures agree for the 68000).
                 self.n_flag = 0x80;
                 self.not_z_flag = 1; // Z=0
             }

@@ -1819,6 +1819,21 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                         AddressingMode::Index(_) | AddressingMode::PcIndex => 4,
                         _ => 0,
                     });
+                    if addr & 1 != 0 && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                        // An odd target faults before the return address is
+                        // pushed (vAmigaTS addrerr42: SP unchanged). The
+                        // 68000 stacks the address of the word after the
+                        // opcode for JSR (d16,An) (addrerr42, photographed
+                        // on an A500); the other modes keep the next-word
+                        // PC the SingleStepTests frames record.
+                        let stacked_pc = if matches!(mode, AddressingMode::Displacement(_)) {
+                            cpu.ppc.wrapping_add(2)
+                        } else {
+                            cpu.pc
+                        };
+                        cpu.odd_flow_target_address_error(bus, addr, stacked_pc);
+                        return 50;
+                    }
                     cpu.change_of_flow = true;
                     let return_pc = cpu.pc;
                     // MC68000 JSR saves the return address before refilling
@@ -1843,8 +1858,19 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     // EA extension words are consumed without prefetching
                     // ahead: the stream is about to be abandoned.
                     cpu.consume_without_prefetch = true;
-                    cpu.pc = cpu.get_ea_address(bus, mode, Size::Long);
+                    let target = cpu.get_ea_address(bus, mode, Size::Long);
                     cpu.consume_without_prefetch = false;
+                    if target & 1 != 0 && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010)
+                    {
+                        // An odd target faults in the JMP itself. The 68000
+                        // stacks the address of the word after the opcode,
+                        // whatever the mode (vAmigaTS addrerr28, photographed
+                        // on an A500, for (An); the SingleStepTests frames
+                        // for every mode).
+                        cpu.odd_flow_target_address_error(bus, target, cpu.ppc.wrapping_add(2));
+                        return 50;
+                    }
+                    cpu.pc = target;
                     // Control-flow EA internal clocks before the target
                     // refill (resolve_ea charged 2 for indexed modes already).
                     cpu.internal_cycles(match mode {
@@ -2112,14 +2138,24 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 return 50;
             }
             if !cc_true {
+                // DBcc displacement is relative to the displacement word (i.e. the PC value
+                // *before* reading it). `read_imm_16` advanced PC, so compensate by -2.
+                let target = (cpu.pc as i32).wrapping_add(disp as i32 - 2) as u32;
+                if target & 1 != 0 && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
+                    // An odd target faults whether or not the counter
+                    // expires (vAmigaTS addrerr40/41, photographed on an
+                    // A500 and on an A500 with a 68010). The 68000 stacks
+                    // the address of the displacement word. The counter is
+                    // left as it was: no frame records it, and the fault
+                    // rollback restores it.
+                    cpu.odd_flow_target_address_error(bus, target, cpu.ppc.wrapping_add(2));
+                    return 50;
+                }
                 let new_counter = counter.wrapping_sub(1);
                 cpu.set_d(
                     ea_reg as usize,
                     (cpu.d(ea_reg as usize) & 0xFFFF0000) | new_counter as u32,
                 );
-                // DBcc displacement is relative to the displacement word (i.e. the PC value
-                // *before* reading it). `read_imm_16` advanced PC, so compensate by -2.
-                let target = (cpu.pc as i32).wrapping_add(disp as i32 - 2) as u32;
                 if new_counter != 0xFFFF {
                     cpu.pc = target;
                     cpu.full_prefetch(bus);
@@ -2496,8 +2532,16 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             } else if ea_mode == 1 {
                 // SUBX -(Am), -(An) - predecrement
                 // Use proper predecrement semantics (A7 byte alignment) by resolving as -(An).
+                let (src_start, dst_start) = (cpu.a(ea_reg as usize), cpu.a(reg));
                 let src_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(ea_reg), size);
                 let dst_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(reg as u8), size);
+                // The 68000 does not write either decrement back before the
+                // operand reads: a fault on the source read leaves both
+                // address registers unchanged (vAmigaTS addrerr23,
+                // photographed on an A500). Undo resolve_ea's commits; the
+                // source decrement is committed once its read completes.
+                cpu.uncommit_predecrement_68000(reg as u8, dst_start);
+                cpu.uncommit_predecrement_68000(ea_reg, src_start);
 
                 // The memory-to-memory form's leading internal period is 2
                 // clocks total (the two predecrements overlap in microcode);
@@ -2509,8 +2553,13 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 // word first, and the writeback interleaves the final
                 // prefetch between the low and high result writes.
                 let long_mm_68000 = cpu.cpu_type == CpuType::M68000 && size == Size::Long;
+                // The 68010 reads the long operands low word first as well:
+                // a misaligned source faults at An-2 (vAmigaTS addrerr23/24,
+                // photographed on an A500 with a 68010).
+                let long_mm_low_first =
+                    size == Size::Long && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010);
 
-                let src = if long_mm_68000 && let EaResult::Memory(sa) = src_ea {
+                let src = if long_mm_low_first && let EaResult::Memory(sa) = src_ea {
                     cpu.read_long_predec_68000(bus, sa)
                 } else {
                     cpu.read_resolved_ea(bus, src_ea, size)
@@ -2518,7 +2567,14 @@ fn dispatch_group_9<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                let dst = if long_mm_68000 && let EaResult::Memory(da) = dst_ea {
+                // The source read is complete: a fault on the destination
+                // keeps the source decrement (vAmigaTS addrerr24, A500).
+                if cpu.cpu_type == CpuType::M68000
+                    && let EaResult::Memory(sa) = src_ea
+                {
+                    cpu.commit_address_register_68000(ea_reg, sa);
+                }
+                let dst = if long_mm_low_first && let EaResult::Memory(da) = dst_ea {
                     cpu.read_long_predec_68000(bus, da)
                 } else {
                     cpu.read_resolved_ea(bus, dst_ea, size)
@@ -2649,6 +2705,11 @@ fn dispatch_group_b<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 let src_val = cpu.read_resolved_ea(bus, src_ea, size);
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
+                }
+                // The source read is complete: a fault on the destination
+                // read keeps the source increment (vAmigaTS addrerr26, A500).
+                if cpu.cpu_type == CpuType::M68000 {
+                    cpu.commit_address_register_68000(ea_reg, cpu.a(ea_reg as usize));
                 }
                 let dst_ea = cpu.resolve_ea(bus, AddressingMode::PostIncrement(reg as u8), size);
                 let dst_val = cpu.read_resolved_ea(bus, dst_ea, size);
@@ -2871,8 +2932,16 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             } else if ea_mode == 1 {
                 // ADDX -(Am), -(An)
                 // Use proper predecrement semantics (A7 byte alignment) by resolving as -(An).
+                let (src_start, dst_start) = (cpu.a(ea_reg as usize), cpu.a(reg));
                 let src_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(ea_reg), size);
                 let dst_ea = cpu.resolve_ea(bus, AddressingMode::PreDecrement(reg as u8), size);
+                // The 68000 does not write either decrement back before the
+                // operand reads: a fault on the source read leaves both
+                // address registers unchanged (vAmigaTS addrerr23,
+                // photographed on an A500). Undo resolve_ea's commits; the
+                // source decrement is committed once its read completes.
+                cpu.uncommit_predecrement_68000(reg as u8, dst_start);
+                cpu.uncommit_predecrement_68000(ea_reg, src_start);
 
                 // The memory-to-memory form's leading internal period is 2
                 // clocks total (the two predecrements overlap in microcode);
@@ -2884,8 +2953,13 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 // word first, and the writeback interleaves the final
                 // prefetch between the low and high result writes.
                 let long_mm_68000 = cpu.cpu_type == CpuType::M68000 && size == Size::Long;
+                // The 68010 reads the long operands low word first as well:
+                // a misaligned source faults at An-2 (vAmigaTS addrerr23/24,
+                // photographed on an A500 with a 68010).
+                let long_mm_low_first =
+                    size == Size::Long && matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010);
 
-                let src = if long_mm_68000 && let EaResult::Memory(sa) = src_ea {
+                let src = if long_mm_low_first && let EaResult::Memory(sa) = src_ea {
                     cpu.read_long_predec_68000(bus, sa)
                 } else {
                     cpu.read_resolved_ea(bus, src_ea, size)
@@ -2893,7 +2967,14 @@ fn dispatch_group_d<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
                     return 50;
                 }
-                let dst = if long_mm_68000 && let EaResult::Memory(da) = dst_ea {
+                // The source read is complete: a fault on the destination
+                // keeps the source decrement (vAmigaTS addrerr24, A500).
+                if cpu.cpu_type == CpuType::M68000
+                    && let EaResult::Memory(sa) = src_ea
+                {
+                    cpu.commit_address_register_68000(ea_reg, sa);
+                }
+                let dst = if long_mm_low_first && let EaResult::Memory(da) = dst_ea {
                     cpu.read_long_predec_68000(bus, da)
                 } else {
                     cpu.read_resolved_ea(bus, dst_ea, size)

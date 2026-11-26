@@ -127,6 +127,16 @@ impl CpuCore {
                 let dec = self.addr_inc(reg, size);
                 let addr = self.a(reg as usize).wrapping_sub(dec);
                 self.set_a(reg as usize, addr);
+                // The MC68000 writes the decremented address back to An
+                // before the operand cycle starts, so a fault on that cycle
+                // leaves An decremented (vAmigaTS addrerr13/14/18/19/39,
+                // photographed on an A500). Keep the update across the
+                // fault rollback. Destinations whose decrement the hardware
+                // does not commit first undo this (see
+                // `uncommit_predecrement_68000`).
+                if self.cpu_type == CpuType::M68000 {
+                    self.commit_address_register_68000(reg, addr);
+                }
                 EaResult::Memory(addr)
             }
             AddressingMode::Displacement(reg) => {

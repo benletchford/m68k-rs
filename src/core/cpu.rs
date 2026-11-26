@@ -1560,6 +1560,47 @@ impl CpuCore {
         self.run_mode = super::execute::RUN_MODE_NORMAL;
     }
 
+    /// Make an address register update by the current instruction survive a
+    /// bus or address error later in the same instruction. A fault rolls the
+    /// registers back to the snapshot taken at the start of the instruction;
+    /// an update the MC68000 has already written back to An is not undone by
+    /// the fault, so it goes into the snapshot as well.
+    #[inline]
+    pub(crate) fn commit_address_register_68000(&mut self, reg: u8, value: u32) {
+        self.dar_save[8 + (reg as usize & 7)] = value;
+    }
+
+    /// Withdraw the predecrement `resolve_ea` committed for a destination
+    /// whose decrement the MC68000 does not write back before the bus cycle
+    /// (MOVE.L to -(An) and the -(Ay),-(Ax) forms): a fault on that cycle
+    /// leaves An at its value from the start of the instruction.
+    #[inline]
+    pub(crate) fn uncommit_predecrement_68000(&mut self, reg: u8, start_value: u32) {
+        if self.cpu_type == CpuType::M68000 {
+            self.commit_address_register_68000(reg, start_value);
+        }
+    }
+
+    /// Raise the address error of a change of flow to an odd target on the
+    /// MC68000/MC68010. The fault is taken before the instruction changes
+    /// anything (JSR has not pushed its return address, DBcc has not
+    /// decremented its counter): the first bus cycle of the new instruction
+    /// stream would be the program fetch at the target, and that cycle is
+    /// never started. The frame reports a program-space read at `target`.
+    /// On the 68000, `stacked_pc` is the PC the group 0 frame records; the
+    /// 68010 stacks the instruction's own address, from which this core
+    /// restarts it on RTE.
+    pub(crate) fn odd_flow_target_address_error<B: AddressBus>(
+        &mut self,
+        bus: &mut B,
+        target: u32,
+        stacked_pc: u32,
+    ) {
+        // The group 0 frame of a faulted program fetch stacks `self.pc`.
+        self.pc = stacked_pc;
+        self.trigger_address_error(bus, target, false, true);
+    }
+
     /// Trigger a 68000-style address error and mark the current instruction as faulted so that
     /// subsequent EA resolution/memory operations become no-ops.
     pub(crate) fn trigger_address_error<B: AddressBus>(

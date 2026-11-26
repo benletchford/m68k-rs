@@ -201,10 +201,24 @@ fn operand_is_long_68000(opcode: u16) -> bool {
 fn group0_pc_adjust_68000(opcode: u16, write: bool) -> i32 {
     let mode = (opcode >> 3) & 7;
     let line = opcode >> 12;
+    // MOVEM (d8,An,Xn) to registers stacks the address of its extension
+    // word: two bytes before the next unread word (vAmigaTS addrerr43,
+    // photographed on an A500; the MAME-derived SingleStepTests frames
+    // record the +2 the other MOVEM modes use).
+    if opcode & 0xFFB8 == 0x4CB0 && !write {
+        return -2;
+    }
     // MOVEM (not EXT, which shares the encoding with a register mode) and
     // UNLK prefetch the next word before the first transfer.
     if (opcode & 0xFB80 == 0x4880 && mode != 0) || opcode & 0xFFF8 == 0x4E58 {
         return 2;
+    }
+    // PEA pushes after its final prefetch except in the absolute modes, so
+    // a fault on the push stacks the address past that prefetch (vAmigaTS
+    // addrerr32 (An) and addrerr33 (d16,An) against addrerr34 (xxx).W,
+    // photographed on an A500).
+    if opcode & 0xFFC0 == 0x4840 && write {
+        return if mode == 7 && opcode & 7 <= 1 { 0 } else { 2 };
     }
     // ADDX/SUBX -(Ay),-(Ax) and CMPM (Ay)+,(Ax)+.
     if matches!(opcode & 0xF138, 0x9108 | 0xB108 | 0xD108) && opcode & 0x00C0 != 0x00C0 {
@@ -309,7 +323,19 @@ impl CpuCore {
         old_sr: u16,
         stacked_pc: u32,
     ) {
-        let ir = self.ir as u16;
+        let opcode = self.ir as u16;
+        // The frame's instruction register is the decoded-instruction latch,
+        // which the final prefetch reloads with the next opcode. MOVE.B and
+        // MOVE.W to -(An) perform that prefetch before the write, so a fault
+        // on the write stacks the following opcode (vAmigaTS addrerr35/36,
+        // photographed on an A500). MOVE.L to -(An) still stacks its own
+        // opcode (addrerr16).
+        let move_word_predec = matches!(opcode >> 12, 1 | 3) && opcode & 0x01C0 == 0x0100;
+        let ir = if write && move_word_predec && self.prefetch_count > 0 {
+            self.prefetch_queue[0]
+        } else {
+            opcode
+        };
         let mut status = (ir & !0x001F) | (fc & 7);
         if !write {
             status |= 0x0010;

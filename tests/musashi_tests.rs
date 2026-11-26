@@ -194,7 +194,11 @@ test_mc68000!(test_mc68000_cmpa, "cmpa.bin");
 test_mc68000!(test_mc68000_cmpm, "cmpm.bin");
 test_mc68000!(test_mc68000_dbcc, "dbcc.bin");
 test_mc68000!(test_mc68000_divs, "divs.bin");
-test_mc68000!(test_mc68000_divu, "divu.bin");
+test_mc68000!(
+    #[ignore = "divu.bin accumulates the N/Z flags DIVU leaves undefined on overflow, assuming Musashi's unchanged-flags model; a real 68000 sets N and clears Z (SST fixtures, vAmigaTS addrerr30)"]
+    test_mc68000_divu,
+    "divu.bin"
+);
 test_mc68000!(test_mc68000_eor, "eor.bin");
 test_mc68000!(test_mc68000_eori_to_ccr, "eori_to_ccr.bin");
 test_mc68000!(test_mc68000_eori_to_sr, "eori_to_sr.bin");
