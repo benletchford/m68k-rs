@@ -726,6 +726,20 @@ impl CpuCore {
         self.v_flag = 0;
         self.c_flag = 0;
 
+        if self.cpu_type == CpuType::M68010 && (val > limit || val < 0) {
+            // A trapping CHK on the 68010 reads the word after the
+            // instruction before it builds the frame (the fifth read of
+            // 44(5/4), M68000UM Table 9-19) and then spends the rest of the
+            // comparison time: 6 clocks when the lower bound fails, 4 when
+            // the upper bound does, the 68000's 10 and 8 less the read.
+            let upper = val > limit;
+            let addr = self.pc.wrapping_add(2);
+            let _ = self.read_16(bus, addr);
+            self.internal_cycles(if upper { 4 } else { 6 });
+            let cycles = self.exception_chk(bus);
+            return if upper { cycles - 2 } else { cycles };
+        }
+
         if val > limit {
             // The 68000 performs the upper-bound comparison first. This
             // includes negative Dn values that are still greater than a

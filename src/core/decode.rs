@@ -1500,6 +1500,14 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     // Table 9-19.
                     let addr = cpu.pc.wrapping_add(2);
                     let _ = cpu.read_16(bus, addr);
+                    if cpu.cpu_type == CpuType::M68010 {
+                        // Two internal clocks separate the read from the
+                        // frame on the 68010: 40 clocks in all, where Table
+                        // 9-19 prints 38. Measured on an A500 with an
+                        // MC68010 (vAmigaTS CPU/Timing/TRAP, TRAPV3 and
+                        // TRAPV5).
+                        cpu.internal_cycles(2);
+                    }
                 }
                 cpu.take_group2_exception(bus, 7)
             } else {

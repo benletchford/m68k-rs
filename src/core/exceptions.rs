@@ -1080,7 +1080,9 @@ impl CpuCore {
             vector::ILLEGAL_INSTRUCTION => 34 + format_word,
             vector::ZERO_DIVIDE => 38 + format_word,
             vector::CHK => 40 + format_word,
-            vector::TRAPV => 34 + format_word,
+            // The 68010 spends two more clocks on a taken TRAPV than Table
+            // 9-19 prints (measured; see the TRAPV dispatch).
+            vector::TRAPV => 34 + format_word + format_word / 2,
             vector::PRIVILEGE_VIOLATION => 34 + format_word,
             vector::TRACE => 34 + format_word,
             vector::LINE_1010 | vector::LINE_1111 => 34 + format_word,

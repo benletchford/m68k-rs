@@ -894,7 +894,8 @@ fn the_indexed_move_from_ccr_lead_is_the_68010s_alone() {
 fn exception_times_follow_table_9_19() {
     let mut privilege = case("privilege violation", vec![0x4e72, 0x2000], 38);
     privilege.sr = 0x0000;
-    let mut overflow = case("trapv taken", vec![0x4e76], 38);
+    // Measured: 40 clocks, where Table 9-19 prints 38.
+    let mut overflow = case("trapv taken", vec![0x4e76], 40);
     overflow.sr = 0x2702;
     check(vec![
         case("illegal", vec![0x4afc], 38),
