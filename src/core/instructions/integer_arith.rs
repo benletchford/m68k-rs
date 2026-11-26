@@ -748,9 +748,15 @@ impl CpuCore {
         }
 
         // Successful CHK: the bounds comparison spends 6 internal clocks
-        // before the final prefetch.
-        self.internal_cycles(6);
-        10
+        // before the final prefetch, 4 on the 68010 (8(1/0) against the
+        // 68000's 10(1/0), M68000UM Table 9-18).
+        if self.cpu_type == CpuType::M68010 {
+            self.internal_cycles(4);
+            8
+        } else {
+            self.internal_cycles(6);
+            10
+        }
     }
 }
 

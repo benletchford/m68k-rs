@@ -14,11 +14,11 @@ impl CpuCore {
         internal_clocks: u32,
         poll_ipl: bool,
     ) {
-        if self.cpu_type != CpuType::M68000 {
+        if !matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) {
             return;
         }
 
-        // 68000 register-destination bit ops finish with the final prefetch,
+        // 68000 and 68010 register-destination bit ops finish with the final prefetch,
         // optional IPL poll on that prefetch, then the remaining internal
         // clocks before the instruction boundary.
         self.top_up_prefetch(bus);
@@ -74,7 +74,7 @@ impl CpuCore {
         let value = self.read_resolved_ea(bus, ea, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
         let result = value | (1 << bit);
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && size == Size::Long {
             self.finish_m68000_register_bitop(bus, if bit > 15 { 4 } else { 2 }, true);
             self.write_resolved_ea(bus, ea, size, result & size.mask());
         } else {
@@ -112,7 +112,7 @@ impl CpuCore {
         let value = self.read_resolved_ea(bus, ea, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
         let result = value & !(1 << bit);
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && size == Size::Long {
             self.finish_m68000_register_bitop(bus, if bit > 15 { 6 } else { 4 }, true);
             self.write_resolved_ea(bus, ea, size, result & size.mask());
         } else {
@@ -142,7 +142,7 @@ impl CpuCore {
         let value = self.read_resolved_ea(bus, ea, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
         let result = value ^ (1 << bit);
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && size == Size::Long {
             self.finish_m68000_register_bitop(bus, if bit > 15 { 4 } else { 2 }, true);
             self.write_resolved_ea(bus, ea, size, result & size.mask());
         } else {

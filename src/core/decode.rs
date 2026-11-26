@@ -925,7 +925,12 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     3 => cpu.exec_bset(bus, bit_num, ea),
                     _ => return illegal_instruction(cpu, bus),
                 };
-                if cpu.cpu_type == CpuType::M68000 {
+                // The 68010's register times are the 68000's (M68000UM
+                // Table 9-14 lists the same maxima); its memory times come
+                // from that table.
+                if cpu.cpu_type == CpuType::M68000
+                    || (cpu.cpu_type == CpuType::M68010 && ea.is_register_direct())
+                {
                     cpu.bitop_cycles(ea, bit_op, opcode & 0x100 == 0, bit_num)
                 } else {
                     legacy
@@ -973,6 +978,20 @@ fn movec_reg_legal(cpu_type: CpuType, ctrl_reg: u16) -> bool {
         ),
         CpuType::M68000 | CpuType::Invalid => false,
     }
+}
+
+/// MOVEC naming a control register the model does not have. The 68010
+/// examines the register after fetching the extension word and spends
+/// `internal` clocks doing so before it takes the illegal-instruction
+/// exception: 46 clocks in all from a control register, the figure M68000UM
+/// Table 9-19 prints for "MOVEC, Illegal Control Register", and 44 to one.
+/// The split was measured on an A500 with an MC68010 (vAmigaTS
+/// `CPU/Timing/MOVEC` `MOVEC3` and `MOVEC4`).
+fn movec_illegal_register<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, internal: u32) -> i32 {
+    if cpu.cpu_type == CpuType::M68010 {
+        cpu.internal_cycles(internal);
+    }
+    illegal_instruction(cpu, bus)
 }
 
 fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) -> i32 {
@@ -1435,12 +1454,22 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 // RTD changes flow exactly as RTS does; T0 trace mode
                 // (trace on change of flow, 68020+) must see it.
                 cpu.change_of_flow = true;
+                // The displacement is the queued extension word: nothing
+                // is fetched behind it, as the stream is about to be
+                // discarded. RTD is 16(4/0) on the 68010 (M68000UM Table
+                // 9-18): the two stack reads and the two refill reads.
+                cpu.consume_without_prefetch = cpu.cpu_type == CpuType::M68010;
                 let disp = cpu.read_imm_16(bus) as i16 as i32;
+                cpu.consume_without_prefetch = false;
                 cpu.pc = cpu.pull_32(bus);
                 cpu.dar[15] = (cpu.dar[15] as i32).wrapping_add(disp) as u32;
                 // Refill the 68010's prefetch queue from the return address.
                 cpu.full_prefetch(bus);
-                20
+                if cpu.cpu_type == CpuType::M68010 {
+                    16
+                } else {
+                    20
+                }
             }
         }
         0x4E75 => {
@@ -1453,10 +1482,12 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         0x4E76 => {
             // TRAPV
             if cpu.flag_v() {
-                if cpu.cpu_type == CpuType::M68000 {
+                if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
                     // The taken 68000 TRAPV performs one program-space
                     // dummy read (the would-be prefetch of the next word)
-                    // before the exception frame (Moira execTrapv).
+                    // before the exception frame (Moira execTrapv). The
+                    // 68010 lists the same fifth read: 38(5/4) in M68000UM
+                    // Table 9-19.
                     let addr = cpu.pc.wrapping_add(2);
                     let _ = cpu.read_16(bus, addr);
                 }
@@ -1491,7 +1522,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let reg_num = ((ext >> 12) & 7) as usize;
             let ctrl_reg = ext & 0xFFF;
             if !movec_reg_legal(cpu.cpu_type, ctrl_reg) {
-                return illegal_instruction(cpu, bus);
+                return movec_illegal_register(cpu, bus, 4);
             }
             if !cpu.is_supervisor() {
                 return cpu.exception_privilege(bus);
@@ -1525,7 +1556,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let reg_num = ((ext >> 12) & 7) as usize;
             let ctrl_reg = ext & 0xFFF;
             if !movec_reg_legal(cpu.cpu_type, ctrl_reg) {
-                return illegal_instruction(cpu, bus);
+                return movec_illegal_register(cpu, bus, 2);
             }
             if !cpu.is_supervisor() {
                 return cpu.exception_privilege(bus);

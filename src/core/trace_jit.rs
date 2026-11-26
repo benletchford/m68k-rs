@@ -7100,11 +7100,12 @@ fn decode_bit_imm_reg_trace_op<B: AddressBus>(
     let dst = (opcode & 7) as u8;
     let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
     let bit = (extension & 31) as u8;
-    // Start with the handlers' raw charges: the 68000 pays the extension
-    // fetch on top of the dynamic-form base (bitop_cycles), while the other
-    // CPUs use the dynamic-form legacy cost. The modifying ops add 2 clocks
-    // pre-68020 when the bit lives in the upper register half; BTST does not.
-    let m68000 = cpu.cpu_type == CpuType::M68000;
+    // Start with the handlers' raw charges: the 68000 and 68010 pay the
+    // extension fetch on top of the dynamic-form base (bitop_cycles), while
+    // the other CPUs use the dynamic-form legacy cost. The modifying ops add
+    // 2 clocks pre-68020 when the bit lives in the upper register half; BTST
+    // does not.
+    let m68000 = matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010);
     let hi = if cpu.is_pre_68020 && bit >= 16 { 2 } else { 0 };
     let raw_cycles = match op {
         JitBitOp::Test => {
