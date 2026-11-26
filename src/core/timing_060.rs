@@ -773,6 +773,7 @@ impl CpuCore {
                 .cycles_040(raw)
                 .saturating_add(i32::try_from(fetch_stall).unwrap_or(i32::MAX)),
             super::types::CpuType::M68060 => self.cycles_060(raw, fetch_cached),
+            super::types::CpuType::M68010 => self.cycles_010(raw),
             _ => self.scale_cycles_for_cpu_type(raw),
         }
     }

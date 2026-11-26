@@ -16,6 +16,7 @@ pub mod op_cache;
 pub mod registers;
 pub mod status;
 pub mod timing;
+pub mod timing_010;
 pub mod timing_020;
 pub mod timing_040;
 pub mod timing_060;
