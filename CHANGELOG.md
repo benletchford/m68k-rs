@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.18.3](https://github.com/benletchford/m68k-rs/compare/m68k-v0.18.2...m68k-v0.18.3) (2026-11-27)
+
+
+### Bug Fixes
+
+* **cpu:** time the 68010 from the M68000UM Section 9 tables ([f799d96](https://github.com/benletchford/m68k-rs/commit/f799d96f0067a1e7176581b6ef0ca1bab7ac2c0a))
+
 ## [0.18.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.18.1...m68k-v0.18.2) (2026-11-27)
 
 
