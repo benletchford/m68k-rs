@@ -325,6 +325,11 @@ impl CpuCore {
             // A500 with a 68010).
             self.set_ccr_before_write(0, size);
         }
+        if self.cpu_type == CpuType::M68010 && matches!(mode, AddressingMode::Index(_)) {
+            // 16(2/1) on the 68010 (M68000UM Table 9-10): two internal
+            // clocks beyond the index calculation's own.
+            self.internal_cycles(2);
+        }
         // CLR polls IPL during the pre-writeback prefetch.
         self.write_resolved_ea_np_poll(bus, ea, size, 0);
         if self.run_mode == RUN_MODE_BERR_AERR_RESET {
@@ -721,6 +726,20 @@ impl CpuCore {
         self.v_flag = 0;
         self.c_flag = 0;
 
+        if self.cpu_type == CpuType::M68010 && (val > limit || val < 0) {
+            // A trapping CHK on the 68010 reads the word after the
+            // instruction before it builds the frame (the fifth read of
+            // 44(5/4), M68000UM Table 9-19) and then spends the rest of the
+            // comparison time: 6 clocks when the lower bound fails, 4 when
+            // the upper bound does, the 68000's 10 and 8 less the read.
+            let upper = val > limit;
+            let addr = self.pc.wrapping_add(2);
+            let _ = self.read_16(bus, addr);
+            self.internal_cycles(if upper { 4 } else { 6 });
+            let cycles = self.exception_chk(bus);
+            return if upper { cycles - 2 } else { cycles };
+        }
+
         if val > limit {
             // The 68000 performs the upper-bound comparison first. This
             // includes negative Dn values that are still greater than a
@@ -748,9 +767,18 @@ impl CpuCore {
         }
 
         // Successful CHK: the bounds comparison spends 6 internal clocks
-        // before the final prefetch.
-        self.internal_cycles(6);
-        10
+        // before the final prefetch, 4 on the 68010 (8(1/0) against the
+        // 68000's 10(1/0), M68000UM Table 9-18).
+        if self.cpu_type == CpuType::M68010 {
+            self.flush_sync(bus);
+            self.top_up_prefetch(bus);
+            self.internal_cycles(4);
+            self.flush_sync(bus);
+            8
+        } else {
+            self.internal_cycles(6);
+            10
+        }
     }
 }
 

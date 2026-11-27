@@ -61,6 +61,7 @@ impl CpuCore {
 
         // 68000: the final prefetch precedes the destination writeback.
         self.top_up_prefetch(bus);
+        self.m68010_loop_write_lead();
         self.write_8(bus, dst_addr, result as u8);
         18
     }
@@ -110,6 +111,7 @@ impl CpuCore {
 
         // 68000: the final prefetch precedes the destination writeback.
         self.top_up_prefetch(bus);
+        self.m68010_loop_write_lead();
         self.write_8(bus, dst_addr, result as u8);
         18
     }

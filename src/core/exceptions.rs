@@ -1064,18 +1064,30 @@ impl CpuCore {
 
     /// Get cycles for exception processing.
     fn exception_cycles(&self, vector: u32) -> i32 {
+        // The 68010 stacks a fourth word, the format and vector offset: its
+        // instruction exceptions take four clocks more than the 68000's
+        // (M68000UM Table 9-19: 38 for an illegal instruction, a privilege
+        // violation, a trace, TRAP and TRAPV, 42 for a zero divide, 44 for
+        // CHK).
+        let format_word = if self.cpu_type == super::types::CpuType::M68010 {
+            4
+        } else {
+            0
+        };
         match vector {
             vector::RESET_SSP | vector::RESET_PC => 40,
             vector::BUS_ERROR | vector::ADDRESS_ERROR => 50,
-            vector::ILLEGAL_INSTRUCTION => 34,
-            vector::ZERO_DIVIDE => 38,
-            vector::CHK => 40,
-            vector::TRAPV => 34,
-            vector::PRIVILEGE_VIOLATION => 34,
-            vector::TRACE => 34,
-            vector::LINE_1010 | vector::LINE_1111 => 34,
-            24..=31 => 44, // Autovector interrupts
-            _ => 34,       // TRAPs and user vectors
+            vector::ILLEGAL_INSTRUCTION => 34 + format_word,
+            vector::ZERO_DIVIDE => 38 + format_word,
+            vector::CHK => 40 + format_word,
+            // The 68010 spends two more clocks on a taken TRAPV than Table
+            // 9-19 prints (measured; see the TRAPV dispatch).
+            vector::TRAPV => 34 + format_word + format_word / 2,
+            vector::PRIVILEGE_VIOLATION => 34 + format_word,
+            vector::TRACE => 34 + format_word,
+            vector::LINE_1010 | vector::LINE_1111 => 34 + format_word,
+            24..=31 => 44,         // Autovector interrupts
+            _ => 34 + format_word, // TRAPs and user vectors
         }
     }
 

@@ -111,6 +111,13 @@ pub(crate) fn dispatch_instruction<B: AddressBus>(
     // Fast path: normal instructions return small non-negative cycle counts;
     // sentinels are large negative values.
     if cycles >= 0 {
+        if cpu.cpu_type == CpuType::M68010 {
+            if cpu.loop_mode {
+                finish_m68010_loop_body(cpu, bus, opcode);
+            } else {
+                finish_m68010_tail(cpu, bus, super::timing_010::tail_clocks(opcode));
+            }
+        }
         return InternalStepResult::Ok { cycles };
     }
 
@@ -925,7 +932,12 @@ fn dispatch_group_0<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     3 => cpu.exec_bset(bus, bit_num, ea),
                     _ => return illegal_instruction(cpu, bus),
                 };
-                if cpu.cpu_type == CpuType::M68000 {
+                // The 68010's register times are the 68000's (M68000UM
+                // Table 9-14 lists the same maxima); its memory times come
+                // from that table.
+                if cpu.cpu_type == CpuType::M68000
+                    || (cpu.cpu_type == CpuType::M68010 && ea.is_register_direct())
+                {
                     cpu.bitop_cycles(ea, bit_op, opcode & 0x100 == 0, bit_num)
                 } else {
                     legacy
@@ -973,6 +985,20 @@ fn movec_reg_legal(cpu_type: CpuType, ctrl_reg: u16) -> bool {
         ),
         CpuType::M68000 | CpuType::Invalid => false,
     }
+}
+
+/// MOVEC naming a control register the model does not have. The 68010
+/// examines the register after fetching the extension word and spends
+/// `internal` clocks doing so before it takes the illegal-instruction
+/// exception: 46 clocks in all from a control register, the figure M68000UM
+/// Table 9-19 prints for "MOVEC, Illegal Control Register", and 44 to one.
+/// The split was measured on an A500 with an MC68010 (vAmigaTS
+/// `CPU/Timing/MOVEC` `MOVEC3` and `MOVEC4`).
+fn movec_illegal_register<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, internal: u32) -> i32 {
+    if cpu.cpu_type == CpuType::M68010 {
+        cpu.internal_cycles(internal);
+    }
+    illegal_instruction(cpu, bus)
 }
 
 fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) -> i32 {
@@ -1043,7 +1069,9 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             return 4;
         }
         // 68000 quirk: like CLR, MOVE from SR reads its destination before
-        // writing (removed on the 68010+).
+        // writing (removed on the 68010+, which spends the address
+        // calculation's internal clocks first, as MOVE from CCR does).
+        cpu.m68010_no_fetch_lead(mode);
         let ea = cpu.resolve_ea(bus, mode, Size::Word);
         if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
             return 50;
@@ -1093,6 +1121,11 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             AddressingMode::AddressIndirect(_) => 2,
             AddressingMode::PostIncrement(_) => 4,
             AddressingMode::PreDecrement(_) => 2,
+            // Only the 68010 is known to spend the index calculation's two
+            // clocks ahead of the write: 16 clocks in all, as M68000UM
+            // Tables 9-1 and 9-18 give. The later models keep their own
+            // times.
+            AddressingMode::Index(_) if cpu.cpu_type == CpuType::M68010 => 2,
             _ => 0,
         };
         cpu.internal_cycles(ea_internal as u32);
@@ -1435,12 +1468,22 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                 // RTD changes flow exactly as RTS does; T0 trace mode
                 // (trace on change of flow, 68020+) must see it.
                 cpu.change_of_flow = true;
+                // The displacement is the queued extension word: nothing
+                // is fetched behind it, as the stream is about to be
+                // discarded. RTD is 16(4/0) on the 68010 (M68000UM Table
+                // 9-18): the two stack reads and the two refill reads.
+                cpu.consume_without_prefetch = cpu.cpu_type == CpuType::M68010;
                 let disp = cpu.read_imm_16(bus) as i16 as i32;
+                cpu.consume_without_prefetch = false;
                 cpu.pc = cpu.pull_32(bus);
                 cpu.dar[15] = (cpu.dar[15] as i32).wrapping_add(disp) as u32;
                 // Refill the 68010's prefetch queue from the return address.
                 cpu.full_prefetch(bus);
-                20
+                if cpu.cpu_type == CpuType::M68010 {
+                    16
+                } else {
+                    20
+                }
             }
         }
         0x4E75 => {
@@ -1453,12 +1496,22 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
         0x4E76 => {
             // TRAPV
             if cpu.flag_v() {
-                if cpu.cpu_type == CpuType::M68000 {
+                if matches!(cpu.cpu_type, CpuType::M68000 | CpuType::M68010) {
                     // The taken 68000 TRAPV performs one program-space
                     // dummy read (the would-be prefetch of the next word)
-                    // before the exception frame (Moira execTrapv).
+                    // before the exception frame (Moira execTrapv). The
+                    // 68010 lists the same fifth read: 38(5/4) in M68000UM
+                    // Table 9-19.
                     let addr = cpu.pc.wrapping_add(2);
                     let _ = cpu.read_16(bus, addr);
+                    if cpu.cpu_type == CpuType::M68010 {
+                        // Two internal clocks separate the read from the
+                        // frame on the 68010: 40 clocks in all, where Table
+                        // 9-19 prints 38. Measured on an A500 with an
+                        // MC68010 (vAmigaTS CPU/Timing/TRAP, TRAPV3 and
+                        // TRAPV5).
+                        cpu.internal_cycles(2);
+                    }
                 }
                 cpu.take_group2_exception(bus, 7)
             } else {
@@ -1491,7 +1544,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let reg_num = ((ext >> 12) & 7) as usize;
             let ctrl_reg = ext & 0xFFF;
             if !movec_reg_legal(cpu.cpu_type, ctrl_reg) {
-                return illegal_instruction(cpu, bus);
+                return movec_illegal_register(cpu, bus, 4);
             }
             if !cpu.is_supervisor() {
                 return cpu.exception_privilege(bus);
@@ -1525,7 +1578,7 @@ fn dispatch_group_4<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             let reg_num = ((ext >> 12) & 7) as usize;
             let ctrl_reg = ext & 0xFFF;
             if !movec_reg_legal(cpu.cpu_type, ctrl_reg) {
-                return illegal_instruction(cpu, bus);
+                return movec_illegal_register(cpu, bus, 2);
             }
             if !cpu.is_supervisor() {
                 return cpu.exception_privilege(bus);
@@ -2025,8 +2078,9 @@ fn loopable_68010(op: u16) -> bool {
                 _ => false,
             }
         }
-        // Memory shifts/rotates (word, by one): ASd/LSd/ROXd/ROd <ea>.
-        0xE => opmode == 3 && loop_ea && (op >> 9) & 7 <= 3,
+        // Memory shifts/rotates (word, by one): ASd/LSd/ROXd/ROd <ea>, in
+        // either direction (M68000UM Table 9-13 lists both).
+        0xE => opmode & 3 == 3 && loop_ea && (op >> 9) & 7 <= 3,
         _ => false,
     }
 }
@@ -2093,12 +2147,23 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             // iteration costs 6 internal clocks (Moira's execDbcc loop arm);
             // exits refill the queue from the fall-through path.
             if cpu.loop_mode {
+                // Leaving the loop costs the DBcc what M68000UM's loop-mode
+                // tables add to a continuing iteration: 6 clocks for a true
+                // condition and 4 for an expired count on most rows.
+                let times = super::timing_010::loop_times(cpu.loop_body_word);
+                let continued = super::timing_010::LOOP_DBCC_CONTINUED;
                 let condition = ((opcode >> 8) & 0xF) as u8;
+                // The clocks of either exit beyond its two fetches come
+                // before them, like the 6 of a continuing pass: all are
+                // billed here, so that none is left for the host to add
+                // after a fetch that another bus master held off.
                 if cpu.test_condition(condition) {
                     cpu.loop_mode = false;
                     cpu.pc = cpu.pc.wrapping_add(2);
+                    let total = times.map_or(12, |t| continued + t.condition_true - t.continued);
+                    cpu.internal_cycles((total - 8).max(0) as u32);
                     cpu.full_prefetch(bus);
-                    return 12;
+                    return total;
                 }
                 let dn = ea_reg as usize;
                 let counter = cpu.d(dn) as u16;
@@ -2110,12 +2175,16 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     cpu.pc = cpu.pc.wrapping_sub(4);
                     cpu.prefetch_queue = [cpu.loop_body_word, cpu.loop_dbcc_word];
                     cpu.prefetch_count = 2;
-                    return 6;
+                    cpu.internal_cycles(continued as u32);
+                    cpu.flush_sync(bus);
+                    return continued;
                 }
                 cpu.loop_mode = false;
                 cpu.pc = cpu.pc.wrapping_add(2);
+                let total = times.map_or(10, |t| continued + t.expired - t.continued);
+                cpu.internal_cycles((total - 8).max(0) as u32);
                 cpu.full_prefetch(bus);
-                return 16;
+                return total;
             }
             let counter = cpu.d(ea_reg as usize) as u16;
             // The 68000 evaluates the condition and counter before consuming
@@ -2242,6 +2311,11 @@ fn dispatch_group_5<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
                     return 50;
                 }
             }
+            // The 68010 does not read the destination; it spends the
+            // address calculation's internal clocks before the prefetch and
+            // the write (M68000UM Table 9-9 with the no-fetch times of
+            // Table 9-1).
+            cpu.m68010_no_fetch_lead(mode);
             // Scc to memory polls IPL during the pre-writeback prefetch.
             cpu.write_resolved_ea_np_poll(bus, ea, Size::Byte, value);
             if cpu.cpu_type == CpuType::M68000 {
@@ -3129,6 +3203,12 @@ fn dispatch_group_e<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) 
             _ => return illegal_instruction(cpu, bus),
         };
         cpu.set_d(reg, (cpu.d(reg) & !size.mask()) | result);
+        if cpu.cpu_type == CpuType::M68010 {
+            // 6 + 2n clocks for a byte or word and 8 + 2n for a long
+            // (M68000UM Table 9-12), four of them the prefetch.
+            let base = if size == Size::Long { 4 } else { 2 };
+            finish_m68010_tail(cpu, bus, base + 2 * shift as i32);
+        }
         cycles
     }
 }
@@ -3160,6 +3240,50 @@ fn read_immediate<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, size: Size) -> 
         Size::Byte => cpu.read_imm_16(bus) as u32 & 0xFF,
         Size::Word => cpu.read_imm_16(bus) as u32,
         Size::Long => cpu.read_imm_32(bus),
+    }
+}
+
+/// MC68010 instructions that end on a register: the final prefetch comes
+/// first and the remaining internal clocks follow it, as on the 68000. The
+/// clocks are billed here rather than left for the host to make up from the
+/// reported time, because a host can only add them once the bus is free
+/// again: a prefetch held off by another bus master would swallow them.
+#[inline(never)]
+fn finish_m68010_tail<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, clocks: i32) {
+    if clocks <= 0
+        || cpu.loop_mode
+        || cpu.instruction_exception_vector.is_some()
+        || cpu.run_mode == RUN_MODE_BERR_AERR_RESET
+        || !cpu.prefetch_enabled()
+    {
+        return;
+    }
+    cpu.top_up_prefetch(bus);
+    cpu.ipl_poll_point(bus);
+    if cpu.run_mode == RUN_MODE_BERR_AERR_RESET {
+        return;
+    }
+    cpu.internal_cycles(clocks as u32);
+    cpu.flush_sync(bus);
+}
+
+/// The body of an MC68010 loop in loop mode fetches nothing, so the clocks
+/// its table time holds beyond its operand cycles are internal. They are
+/// billed here for the same reason as the register tails: left to the host
+/// they would be swallowed whenever an operand cycle is held off.
+#[inline(never)]
+fn finish_m68010_loop_body<B: AddressBus>(cpu: &mut CpuCore, bus: &mut B, opcode: u16) {
+    // The DBcc closing the loop bills its own time.
+    if opcode & 0xF0F8 == 0x50C8
+        || cpu.instruction_exception_vector.is_some()
+        || cpu.run_mode == RUN_MODE_BERR_AERR_RESET
+    {
+        return;
+    }
+    let clocks = super::timing_010::loop_tail_clocks(opcode);
+    if clocks > 0 {
+        cpu.internal_cycles(clocks as u32);
+        cpu.flush_sync(bus);
     }
 }
 

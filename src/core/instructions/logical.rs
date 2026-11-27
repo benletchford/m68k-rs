@@ -9,6 +9,25 @@ use crate::core::memory::AddressBus;
 use crate::core::types::{CpuType, Size};
 
 impl CpuCore {
+    /// Consume the immediate of ORI, ANDI or EORI to CCR or SR. The 68000
+    /// fetches a word behind it; the 68010 does not, as the stream is
+    /// refilled after the status write: 16(2/0) against 20(3/0) (M68000UM
+    /// Table 9-18).
+    fn read_status_immediate<B: AddressBus>(&mut self, bus: &mut B) -> u16 {
+        self.consume_without_prefetch = self.cpu_type == CpuType::M68010;
+        let imm = self.read_imm_16(bus);
+        self.consume_without_prefetch = false;
+        imm
+    }
+
+    fn status_immediate_cycles(&self) -> i32 {
+        if self.cpu_type == CpuType::M68010 {
+            16
+        } else {
+            20
+        }
+    }
+
     fn finish_immediate_sr_write<B: AddressBus>(&mut self, bus: &mut B, sr: u16) {
         if self.cpu_type == CpuType::M68000 {
             // On the 68000 the SR mutation happens after the status-op
@@ -97,14 +116,14 @@ impl CpuCore {
 
     /// Execute ANDI to CCR.
     pub fn exec_andi_ccr<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
-        let imm = self.read_imm_16(bus) as u8;
+        let imm = self.read_status_immediate(bus) as u8;
         let ccr = self.get_ccr() & imm;
         self.set_ccr(ccr);
         // Status modification spends 8 internal clocks before discarding and
         // refilling the prefetch queue.
         self.internal_cycles(8);
         self.full_prefetch(bus);
-        20
+        self.status_immediate_cycles()
     }
 
     /// Execute ANDI to SR.
@@ -112,12 +131,12 @@ impl CpuCore {
         if !self.is_supervisor() {
             return self.exception_privilege(bus);
         }
-        let imm = self.read_imm_16(bus);
+        let imm = self.read_status_immediate(bus);
         let sr = self.get_sr() & imm;
         // Status modification spends 8 internal clocks before discarding and
         // refilling the prefetch queue.
         self.finish_immediate_sr_write(bus, sr);
-        20
+        self.status_immediate_cycles()
     }
 
     /// Execute OR instruction.
@@ -185,14 +204,14 @@ impl CpuCore {
 
     /// Execute ORI to CCR.
     pub fn exec_ori_ccr<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
-        let imm = self.read_imm_16(bus) as u8;
+        let imm = self.read_status_immediate(bus) as u8;
         let ccr = self.get_ccr() | imm;
         self.set_ccr(ccr);
         // Status modification spends 8 internal clocks before discarding and
         // refilling the prefetch queue.
         self.internal_cycles(8);
         self.full_prefetch(bus);
-        20
+        self.status_immediate_cycles()
     }
 
     /// Execute ORI to SR.
@@ -200,12 +219,12 @@ impl CpuCore {
         if !self.is_supervisor() {
             return self.exception_privilege(bus);
         }
-        let imm = self.read_imm_16(bus);
+        let imm = self.read_status_immediate(bus);
         let sr = self.get_sr() | imm;
         // Status modification spends 8 internal clocks before discarding and
         // refilling the prefetch queue.
         self.finish_immediate_sr_write(bus, sr);
-        20
+        self.status_immediate_cycles()
     }
 
     /// Execute EOR instruction.
@@ -271,14 +290,14 @@ impl CpuCore {
 
     /// Execute EORI to CCR.
     pub fn exec_eori_ccr<B: AddressBus>(&mut self, bus: &mut B) -> i32 {
-        let imm = self.read_imm_16(bus) as u8;
+        let imm = self.read_status_immediate(bus) as u8;
         let ccr = self.get_ccr() ^ imm;
         self.set_ccr(ccr);
         // Status modification spends 8 internal clocks before discarding and
         // refilling the prefetch queue.
         self.internal_cycles(8);
         self.full_prefetch(bus);
-        20
+        self.status_immediate_cycles()
     }
 
     /// Execute EORI to SR.
@@ -286,12 +305,12 @@ impl CpuCore {
         if !self.is_supervisor() {
             return self.exception_privilege(bus);
         }
-        let imm = self.read_imm_16(bus);
+        let imm = self.read_status_immediate(bus);
         let sr = self.get_sr() ^ imm;
         // Status modification spends 8 internal clocks before discarding and
         // refilling the prefetch queue.
         self.finish_immediate_sr_write(bus, sr);
-        20
+        self.status_immediate_cycles()
     }
 }
 

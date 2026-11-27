@@ -14,11 +14,11 @@ impl CpuCore {
         internal_clocks: u32,
         poll_ipl: bool,
     ) {
-        if self.cpu_type != CpuType::M68000 {
+        if !matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) {
             return;
         }
 
-        // 68000 register-destination bit ops finish with the final prefetch,
+        // 68000 and 68010 register-destination bit ops finish with the final prefetch,
         // optional IPL poll on that prefetch, then the remaining internal
         // clocks before the instruction boundary.
         self.top_up_prefetch(bus);
@@ -74,7 +74,7 @@ impl CpuCore {
         let value = self.read_resolved_ea(bus, ea, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
         let result = value | (1 << bit);
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && size == Size::Long {
             self.finish_m68000_register_bitop(bus, if bit > 15 { 4 } else { 2 }, true);
             self.write_resolved_ea(bus, ea, size, result & size.mask());
         } else {
@@ -112,7 +112,7 @@ impl CpuCore {
         let value = self.read_resolved_ea(bus, ea, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
         let result = value & !(1 << bit);
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && size == Size::Long {
             self.finish_m68000_register_bitop(bus, if bit > 15 { 6 } else { 4 }, true);
             self.write_resolved_ea(bus, ea, size, result & size.mask());
         } else {
@@ -142,7 +142,7 @@ impl CpuCore {
         let value = self.read_resolved_ea(bus, ea, size);
         self.not_z_flag = if value & (1 << bit) != 0 { 1 } else { 0 };
         let result = value ^ (1 << bit);
-        if self.cpu_type == CpuType::M68000 && size == Size::Long {
+        if matches!(self.cpu_type, CpuType::M68000 | CpuType::M68010) && size == Size::Long {
             self.finish_m68000_register_bitop(bus, if bit > 15 { 4 } else { 2 }, true);
             self.write_resolved_ea(bus, ea, size, result & size.mask());
         } else {
@@ -165,6 +165,11 @@ impl CpuCore {
     ///
     /// `TAS <ea>`
     pub fn exec_tas<B: AddressBus>(&mut self, bus: &mut B, mode: AddressingMode) -> i32 {
+        if !mode.is_register_direct() {
+            // 14(2/1) plus the no-fetch address time on the 68010 (M68000UM
+            // Table 9-9).
+            self.m68010_no_fetch_lead(mode);
+        }
         let ea = self.resolve_ea(bus, mode, Size::Byte);
         if matches!(ea, crate::core::ea::EaResult::Memory(_)) {
             self.begin_locked_rmw(bus);
@@ -176,8 +181,12 @@ impl CpuCore {
         let result = value | 0x80;
         if let crate::core::ea::EaResult::Memory(addr) = ea {
             // The operand write precedes the trailing prefetch. The 68000
-            // holds the bus for two internal clocks between the strobes.
-            if self.cpu_type == crate::core::types::CpuType::M68000 {
+            // and 68010 hold the bus for two internal clocks between the
+            // strobes.
+            if matches!(
+                self.cpu_type,
+                crate::core::types::CpuType::M68000 | crate::core::types::CpuType::M68010
+            ) {
                 self.internal_cycles(2);
             }
             self.write_8(bus, addr, result as u8);
