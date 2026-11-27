@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.18.2](https://github.com/benletchford/m68k-rs/compare/m68k-v0.18.1...m68k-v0.18.2) (2026-11-27)
+
+
+### Bug Fixes
+
+* **cpu:** match 68000 address-error frames and side effects to A500 measurements ([5bfc48d](https://github.com/benletchford/m68k-rs/commit/5bfc48d384228272873b935957731a5e197331e6))
+* **cpu:** order and time the 68010 multiplies and divides ([#277](https://github.com/benletchford/m68k-rs/issues/277)) ([52272f5](https://github.com/benletchford/m68k-rs/commit/52272f5c8958623be7759a927a7a17d3288b0b6d))
+
+
+### Performance Improvements
+
+* **fpu:** execute hardware arithmetic in the decoded batch loop ([002b849](https://github.com/benletchford/m68k-rs/commit/002b84991d33f23abe117dcd482e2c1bebeb2a41))
+* **fpu:** reduce rounding branches and speed up division ([4fb4ad1](https://github.com/benletchford/m68k-rs/commit/4fb4ad1bae8eaf37ad83263089409b3b3c8bbcdf))
+
 ## [0.18.1](https://github.com/benletchford/m68k-rs/compare/m68k-v0.18.0...m68k-v0.18.1) (2026-11-25)
 
 
