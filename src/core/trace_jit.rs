@@ -5952,7 +5952,9 @@ fn decode_mul_word_immediate_trace_op<B: AddressBus>(
         return None;
     }
     let op_mode = (opcode >> 6) & 7;
-    if !matches!(op_mode, 3 | 7) {
+    // The 68010 multiplier has its own times and prefetch position; it
+    // stays in the interpreter.
+    if !matches!(op_mode, 3 | 7) || cpu_type == CpuType::M68010 {
         return None;
     }
     let extension = bus.try_read_word(cpu.address(pc.wrapping_add(2))).ok()?;
@@ -13148,7 +13150,8 @@ mod portable_tests {
     fn register_word_multiply_matches_interpreter_and_decoded_cache() {
         use super::super::ea::AddressingMode;
 
-        for cpu_type in [CpuType::M68000, CpuType::M68010, CpuType::M68040] {
+        // The 68010 multiplier is not cached (see DecodedSimpleOp::decode).
+        for cpu_type in [CpuType::M68000, CpuType::M68040] {
             for signed in [false, true] {
                 for source in [0x0000u32, 0x8001, 0xFFFF] {
                     let opcode = 0xC000 | (1 << 9) | ((if signed { 7 } else { 3 }) << 6) | 5;

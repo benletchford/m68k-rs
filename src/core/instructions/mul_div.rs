@@ -93,12 +93,79 @@ fn divs_cycles(dividend: i32, divisor: i16) -> i32 {
     mcycles * 2
 }
 
+/// MC68010 MULU and DIVU execution times with a register operand, in clocks
+/// (M68000UM Table 9-6). Unlike the 68000's, they do not follow the bits of
+/// the operands: photographs of an A500 with an MC68010 running a program
+/// that marks the end of the instruction (vAmigaTS `CPU/Timing/MUL` and
+/// `CPU/Timing/DIV`) show MULU at 40 clocks for the multipliers $0000,
+/// $000F, $00FF, $0FFF and $FFFF alike, and DIVU at 108 for 0 / 4.
+///
+/// No measurement covers a DIVU that overflows, or a quotient with many
+/// bits set; those keep the manual's 108 as well.
+const MULU_68010: u32 = 40;
+const DIVU_68010: u32 = 108;
+
+/// MC68010 MULS execution time with a register operand, in clocks. The same
+/// photographs show 40 clocks for the multipliers $0000, $000F, $00FF and
+/// $0FFF and 42, the manual's figure, for $FFFF, whatever the multiplicand:
+/// a negative multiplier costs one more step.
+#[inline]
+fn muls_68010_clocks(src: u16) -> u32 {
+    if src & 0x8000 != 0 { 42 } else { 40 }
+}
+
+/// MC68010 DIVS execution time with a register operand, in clocks. The
+/// photographs show 118 clocks for 0 / 4, four below the manual's 122. Only
+/// a non-negative dividend and divisor have been measured, so a negative
+/// one keeps the manual's figure.
+#[inline]
+fn divs_68010_clocks(dividend: i32, divisor: i16) -> u32 {
+    if dividend < 0 || divisor < 0 {
+        122
+    } else {
+        118
+    }
+}
+
+/// Internal clocks the MC68010 DIVU spends before its prefetch; DIVS has
+/// none. Two photographs of an A500 with an MC68010 fix the value. A program
+/// that lets the Blitter rewrite the word DIVU prefetches (vAmigaTS
+/// `CPU/Prefetch/DIVU`: 15 stripes, against 16 for DIVS) puts the read 10 to
+/// 26 clocks into the instruction, and DIVS's within the first 8. A program
+/// that marks the end of DIVU on lines with five and six bitplanes fetching
+/// (vAmigaTS `CPU/Timing/DIV/DIVU1`) only lands its markers where they were
+/// photographed when the lead-in is a whole number of 16-clock fetch units.
+const DIVU_68010_LEAD: u32 = 16;
+
 impl CpuCore {
     fn finish_m68000_mul<B: AddressBus>(&mut self, bus: &mut B, internal_clocks: u32) {
         // 68000 MULU/MULS perform the final prefetch before the multiplier's
         // internal clocks, then write Dn after that sync interval.
         self.top_up_prefetch(bus);
         self.internal_cycles(internal_clocks);
+        self.flush_sync(bus);
+    }
+
+    /// MC68010 MULU/MULS: the multiplier runs first and the instruction's
+    /// one prefetch is its last bus cycle (vAmigaTS `CPU/Prefetch` MULU and
+    /// MULS, photographed on an A500 with a 68010: 14 stripes, against 16
+    /// for the 68000, which prefetches first).
+    fn finish_m68010_mul<B: AddressBus>(&mut self, bus: &mut B, internal_clocks: u32) {
+        self.internal_cycles(internal_clocks);
+        self.flush_sync(bus);
+        self.top_up_prefetch(bus);
+    }
+
+    /// MC68010 DIVU/DIVS: `lead` internal clocks, the instruction's one
+    /// prefetch, then the rest of the divider (the 68000 divider prefetches
+    /// last). See [`DIVU_68010_LEAD`] for the split.
+    fn finish_m68010_div<B: AddressBus>(&mut self, bus: &mut B, internal_clocks: u32, lead: u32) {
+        if lead != 0 {
+            self.internal_cycles(lead);
+            self.flush_sync(bus);
+        }
+        self.top_up_prefetch(bus);
+        self.internal_cycles(internal_clocks - lead);
         self.flush_sync(bus);
     }
 
@@ -140,6 +207,8 @@ impl CpuCore {
 
         if self.cpu_type == CpuType::M68000 {
             self.finish_m68000_mul(bus, mulu_internal_clocks(src as u16));
+        } else if self.cpu_type == CpuType::M68010 {
+            self.finish_m68010_mul(bus, MULU_68010 - 4);
         }
         self.set_d(dst_reg, result);
 
@@ -155,6 +224,8 @@ impl CpuCore {
         // (-> 27 after scale_cycles_for_cpu_type).
         if self.cpu_type == CpuType::M68000 {
             38 + 2 * (src & 0xFFFF).count_ones() as i32 + self.ea_source_cycles(mode, Size::Word)
+        } else if self.cpu_type == CpuType::M68010 {
+            MULU_68010 as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
             42
         }
@@ -179,6 +250,8 @@ impl CpuCore {
 
         if self.cpu_type == CpuType::M68000 {
             self.finish_m68000_mul(bus, muls_internal_clocks(src as u16));
+        } else if self.cpu_type == CpuType::M68010 {
+            self.finish_m68010_mul(bus, muls_68010_clocks(src as u16) - 4);
         }
         self.set_d(dst_reg, result);
 
@@ -192,6 +265,8 @@ impl CpuCore {
         // 020+ fixed-cost multiplier (~27 cycles measured); pre-scale 42.
         if self.cpu_type == CpuType::M68000 {
             38 + 2 * muls_transitions(src as u16) as i32 + self.ea_source_cycles(mode, Size::Word)
+        } else if self.cpu_type == CpuType::M68010 {
+            muls_68010_clocks(src as u16) as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
             42
         }
@@ -235,11 +310,15 @@ impl CpuCore {
         };
         let cycles = if m68000 {
             div_clocks + self.ea_source_cycles(mode, Size::Word)
+        } else if self.cpu_type == CpuType::M68010 {
+            DIVU_68010 as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
             140
         };
         if m68000 {
             self.finish_m68000_div(bus, div_clocks, false);
+        } else if self.cpu_type == CpuType::M68010 {
+            self.finish_m68010_div(bus, DIVU_68010 - 4, DIVU_68010_LEAD);
         }
 
         let quotient = dst / src;
@@ -307,14 +386,19 @@ impl CpuCore {
         } else {
             158
         };
+        let m68010_clocks = divs_68010_clocks(dst, src as i16);
         let cycles = if m68000 {
             div_clocks + self.ea_source_cycles(mode, Size::Word)
+        } else if self.cpu_type == CpuType::M68010 {
+            m68010_clocks as i32 + self.ea_source_cycles(mode, Size::Word)
         } else {
             158
         };
         if m68000 {
             let early_ipl = dst >= 0 && src < 0 && ((dst as u32) >> 16) < src.unsigned_abs();
             self.finish_m68000_div(bus, div_clocks, early_ipl);
+        } else if self.cpu_type == CpuType::M68010 {
+            self.finish_m68010_div(bus, m68010_clocks - 4, 0);
         }
 
         // The MC68000 leaves the dividend register untouched when the
